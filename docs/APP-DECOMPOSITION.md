@@ -498,3 +498,35 @@ Stated so nobody is surprised:
   conflicts there. They will be one-line conflicts.
 - **`ses_`.** 181 references across seven TUs. The session model is genuinely
   global to the app and no file boundary changes that.
+
+---
+
+## 9. Decomposition done (wave 7)
+
+Executed exactly as planned. `app.cpp` (3 728 lines) became eleven files, all
+moves verbatim (no logic edits, blame follows under `git blame -C`):
+
+| file | ~lines | owns |
+|---|---|---|
+| `session.h` | 340 | the model (was app.h 1–345) |
+| `app.h` | 469 | `class App` only; includes `session.h` |
+| `app_internal.h` | 100 | `namespace lay`, the four helpers + `kReturnLetter`/`kSendUndo`/`kReturnPlaceholder`/`kArrowGesture` as `inline`, and the `UiKind` enum |
+| `app.cpp` | 526 | shell: ctor/dtor, init/shutdown/run, frame, shortcuts, kbd piano, previews, `visibleRoll` |
+| `app_engine.cpp` | 531 | send/push*/pumpEngineEvents, setTempo/togglePlay, recording |
+| `app_project.cpp` | 417 | uids, (de)serialize, adoptSession, open/save |
+| `app_undo.cpp` | 391 | undo/redo + `debugUndoSelfTest` |
+| `app_session.cpp` | 776 | session view, mixer, drag/drop + `drawDragGhost`, clip helpers |
+| `app_devices.cpp` | 501 | chain owners + add/remove/publish + DEVICES tab |
+| `app_detail.cpp` | 291 | waveform, detail panel, clip detail (hosts `PianoRoll`) |
+| `app_chrome.cpp` | 399 | control bar, file browser, status bar, arrangement |
+
+Header split kept `project.cpp`, `pianoroll.h/.cpp` and `main.cpp` compiling
+untouched (`app.h` includes `session.h`, so every downstream `#include "app.h"`
+still sees `Session`). `UiKind` lives in `app_internal.h` as the single kind
+registry. Seams preserved by co-location per §5: the `undoGesture_` latch stays
+written only in `app.cpp`'s `frame`; `drawDragGhost` sits with its resolution in
+`app_session.cpp`; `chainOwner`/add/removeDevice stay together in
+`app_devices.cpp`; `selectTrack`/`selectChainOwner` stay in `app_session.cpp`.
+Verified: `NXTAKT_DEBUG_UNDO` self-test prints "12 edits undone and redone
+cleanly" and the headless screenshot is byte-identical (md5 unchanged) before
+and after.
