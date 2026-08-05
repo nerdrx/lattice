@@ -18,11 +18,24 @@
 
 namespace lat {
 
+enum class ClipKind { Audio, Midi };
+
+// One note in a MIDI clip, clip-relative beats. The GUI edits these freely;
+// pushClip snapshots them into a heap RtNote array for the engine, and the
+// old array comes back via Ev::NotesRetired before it is freed.
+struct NoteModel {
+    f64 beat = 0.0;
+    f64 len  = 0.25;
+    u8  pitch = 60, vel = 100;
+};
+
 struct ClipModel {
     // Stable identity. UIDs never change once assigned and are serialized, so
     // undo, set-diff, automation targets and collaboration can reference an
     // entity across moves and renames. 0 = unassigned (Session::newUid()).
     u64 uid = 0;
+    ClipKind kind = ClipKind::Audio;
+    std::vector<NoteModel> notes;      // Midi clips only; kept sorted by beat
     SampleRef sample;
     std::string name;
     // Source file. Authoritative for save/load: it survives a missing sample,
@@ -40,7 +53,9 @@ struct ClipModel {
     f64  prob = 1.0;
     Follow followAction = Follow::None;
     f64  followBeats = 0.0;            // 0 => the clip's own length
-    bool valid() const { return sample != nullptr; }
+    // A MIDI clip is valid even while empty — an empty pattern is editable
+    // and launchable (it plays silence at its loop length, exactly like Live).
+    bool valid() const { return kind == ClipKind::Midi ? true : sample != nullptr; }
 };
 
 // One loaded plugin on a track. The instance is GUI-owned; the audio thread

@@ -23,9 +23,21 @@ inline constexpr int kFollowCount = 7;
 // Clip slot state as seen by the UI.
 enum class SlotState : int { Empty = 0, Stopped, Queued, Playing, StopQueued };
 
+// One note of a MIDI clip, in clip-relative beats. Arrays are sorted by
+// `beat`, heap-allocated by the GUI, shipped whole inside RtClip, and never
+// mutated after publication; a replaced array travels back to the GUI via
+// Ev::NotesRetired before it may be freed — the same lifetime protocol as
+// RtChain, for the same reason: editing notes while the clip plays.
+struct RtNote {
+    f64 beat = 0.0;
+    f64 len  = 0.25;
+    u8  pitch = 60, vel = 100;
+};
+
 // Realtime view of a clip. The GUI fills one of these and ships it across;
 // the audio thread only reads. `data` points into a SampleBuffer the GUI
-// keeps alive for the lifetime of the session.
+// keeps alive for the lifetime of the session; `notes` follows the RtNote
+// retirement protocol above.
 struct RtClip {
     const f32* data   = nullptr;   // interleaved, already at engine rate
     i64  frames       = 0;
@@ -44,6 +56,16 @@ struct RtClip {
     f64  prob         = 1.0;       // 0..1 launch probability
     int  followAction = (int)Follow::None;
     f64  followBeats  = 0.0;       // 0 => the clip's own lengthBeats
+
+    // MIDI clip payload. When `isMidi` is set, `data`/`frames` are unused,
+    // `lengthBeats` is the loop length, and playback means delivering these
+    // notes to the track's note-capable devices with sample-accurate frame
+    // offsets — including the note-offs at loop wraps, clip switches and
+    // stops (a stopped MIDI clip must never leave a voice hanging).
+    const RtNote* notes = nullptr;
+    int  noteCount    = 0;
+    bool isMidi       = false;
+
     bool valid        = false;
 };
 
@@ -78,6 +100,9 @@ struct RtChain {
 enum class Cmd : u32 {
     SetPlaying, SetTempo, SetQuantum, SetMetronome,
     LaunchClip, StopTrack, LaunchScene, StopAll,
+    // SetClip/ClearClip on a slot whose previous RtClip carried a `notes`
+    // array push Ev::NotesRetired for the old pointer (when it differs from
+    // the incoming one), and any sounding notes from it get their offs first.
     SetClip, ClearClip,
     TrackVol, TrackPan, TrackMute, TrackSolo, TrackArm,
     MasterVol,
@@ -93,6 +118,13 @@ enum class Cmd : u32 {
     // Overdub (wave 3) will re-enter the same buffer mixing instead of
     // appending — nothing in this contract precludes that.
     RecordSlot,
+
+    // MIDI take into a slot: same toggle/quantize semantics as RecordSlot,
+    // but p = GUI-owned RtNote* buffer and x = capacity in NOTES. The engine
+    // timestamps incoming MidiMsg against the beat clock, pairs ons with offs
+    // (unpaired notes are closed at the stop boundary), and returns the
+    // buffer via Ev::MidiRecordFinished with the note count in x.
+    RecordMidiSlot,
 };
 
 struct Command {
@@ -106,7 +138,9 @@ struct Command {
 enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportStopped,
                       ChainRetired,   // a = track, p = the RtChain* now safe to free
                       RecordStarted,  // a = track, b = slot, x = beat it began
-                      RecordFinished  // a = track, b = slot, x = frames written, p = the buffer
+                      RecordFinished, // a = track, b = slot, x = frames written, p = the buffer
+                      NotesRetired,   // p = the RtNote* array now safe to free
+                      MidiRecordFinished // a = track, b = slot, x = note count, p = the buffer
                     };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
@@ -154,6 +188,14 @@ private:
         int   phase = 0, hop = 1024;
         f32   env = 0.f;             // declick ramp, 0..1
         bool  releasing = false;
+
+        // MIDI clip playback: position in clip beats, the next note index to
+        // fire, and the note-offs owed. 32 sounding notes per clip is beyond
+        // anything a slot sequencer produces; overflow steals the oldest.
+        f64   beatPos = 0.0;
+        int   nextNote = 0;
+        struct PendingOff { f64 beat = 0.0; u8 pitch = 0; bool used = false; };
+        PendingOff offs[32];
     };
     struct Track {
         f32  vol = faderToGain(0.85f);
@@ -184,6 +226,19 @@ private:
         int  recSlot = -1;           // target slot, -1 when idle
         int  recPhase = 0;           // 0 idle, 1 queued start, 2 recording, 3 queued stop
         f64  recFireBeat = 0.0;
+        bool recMidi = false;        // this take captures notes, not audio
+        // MIDI take state: the note buffer aliases recBuf, capacity/len are in
+        // notes, and open notes await their off (closed at the stop boundary).
+        f64  recStartBeat = 0.0;
+        struct OpenNote { f64 beat = 0.0; u8 pitch = 0; u8 vel = 0; bool used = false; };
+        OpenNote recOpen[32];
+        // The hand-over slot that previously lived in a file-scope array
+        // (engine.cpp gPendingRec) — a mid-take retarget keeps two buffers
+        // alive, the old until the boundary and this one from it.
+        f32* pendBuf = nullptr;
+        i64  pendCap = 0;
+        int  pendSlot = -1;
+        bool pendMidi = false;
     };
 
     void  drainCommands();
