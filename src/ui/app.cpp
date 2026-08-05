@@ -45,6 +45,18 @@ static bool isAudioFile(const std::string& n) {
     return false;
 }
 
+// Case-insensitive substring test. Used by the plugin filter and by the
+// LATTICE_DEBUG_ADDFX hook, both of which match on what the user typed rather
+// than on an exact name.
+static bool icontains(const std::string& hay, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (needle.size() > hay.size()) return false;
+    const size_t n = hay.size() - needle.size();
+    for (size_t i = 0; i <= n; ++i)
+        if (strncasecmp(hay.c_str() + i, needle.c_str(), needle.size()) == 0) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // lifecycle
 // ---------------------------------------------------------------------------
@@ -103,12 +115,44 @@ bool App::init(int argc, char** argv) {
 
     pushAll();
     status_ = "Ready";
+
+    // Headless verification hook. With LATTICE_DEBUG_ADDFX=<substring> set, the
+    // first scanned plugin whose name matches is loaded onto track 0 and the
+    // DEVICES tab is opened, so tools/headless_test.sh can screenshot a
+    // populated device chain without anything driving the mouse.
+    if (const char* want = getenv("LATTICE_DEBUG_ADDFX")) {
+        ensurePluginScan();
+        const PluginDesc* hit = nullptr;
+        for (const PluginDesc& d : registry_.plugins())
+            if (icontains(d.name, want)) { hit = &d; break; }
+        if (!hit) {
+            LOGW("LATTICE_DEBUG_ADDFX: no plugin matching \"%s\"", want);
+        } else if (!ses_.tracks.empty()) {
+            selTrack_ = 0;
+            addDeviceToTrack(0, *hit);
+            selDevice_ = (int)ses_.tracks[0].devices.size() - 1;
+            detailTab_ = DetailTab::Devices;
+            showDetail_ = true;
+        }
+    }
+
     LOGI("backend: %s   audio: %s", win_.backendName(), audio_ ? audio_->name() : "none");
     return true;
 }
 
 void App::shutdown() {
+    // Order matters. Stopping the backend joins the audio thread, so once it
+    // returns nothing can be inside process() and nothing can be following a
+    // published chain. Only then is it safe to free chains without the
+    // Ev::ChainRetired handshake — the events still sitting in the ring will
+    // never be drained, so waiting for them here would deadlock or leak.
     if (audio_) { audio_->stop(); audio_.reset(); }
+    for (const RtChain*& c : published_) { delete c; c = nullptr; }
+    for (RetiredChain& rc : retiring_) delete rc.chain;
+    retiring_.clear();          // frees the instances the chains had dropped
+    // Instances still on tracks die with ses_ when App is destroyed, which is
+    // after this point and therefore also after the audio thread is gone.
+
     fSmall_.destroy(); fBody_.destroy(); fBold_.destroy(); fBig_.destroy();
     rend_.shutdown();
     win_.destroy();
@@ -178,9 +222,155 @@ void App::pushAll() {
 void App::pumpEngineEvents() {
     Event e;
     while (engine_.popEvent(e)) {
-        // Reserved for undo/recording hooks; the UI polls atomics for state.
-        (void)e;
+        if (e.type == Ev::ChainRetired) {
+            // The audio thread has swapped this chain out and will never look
+            // at it again, so the struct and every instance it was the last
+            // reference to can finally go.
+            const RtChain* old = (const RtChain*)e.p;
+            if (!old) continue;
+            auto it = retiring_.begin();
+            for (; it != retiring_.end(); ++it) if (it->chain == old) break;
+            if (it == retiring_.end()) {
+                LOGW("ChainRetired for an unknown chain %p - leaking it rather "
+                     "than freeing a pointer we do not own", (const void*)old);
+                continue;
+            }
+            delete it->chain;
+            retiring_.erase(it);
+            continue;
+        }
+        // Everything else is reserved for undo/recording hooks; the UI polls
+        // atomics for transport and clip state.
     }
+}
+
+// ---------------------------------------------------------------------------
+// device chains
+//
+// See the lifecycle comment in app.h: the GUI owns every RtChain and every
+// PluginInstance, the audio thread only borrows them, and the handshake below
+// is the only path on which anything is freed while audio runs.
+// ---------------------------------------------------------------------------
+
+void App::publishChain(int track) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    TrackModel& t = ses_.tracks[track];
+
+    RtChain* chain = new RtChain();
+    int n = 0;
+    for (const DeviceModel& d : t.devices) {
+        if (!d.inst) continue;
+        if (n >= kMaxChainFx) {
+            LOGW("track %d has more than %d devices - the extras will not sound",
+                 track, kMaxChainFx);
+            break;
+        }
+        // Bypassed devices stay in the chain: the instance itself short-circuits
+        // in process(), which keeps the chain stable across a bypass toggle.
+        chain->fx[n++] = d.inst.get();
+    }
+    chain->count = n;
+
+    Command c;
+    c.type = Cmd::SetChain;
+    c.a = track;
+    c.p = chain;
+    if (!engine_.pushCommand(c)) {
+        // The ring is full, so the engine never saw this chain. It is still
+        // solely ours, and the previously published one is still live: drop the
+        // new one and leave every piece of state exactly as it was.
+        LOGW("command ring full - chain for track %d not published", track);
+        delete chain;
+        return;
+    }
+
+    if (published_[track]) retiring_.push_back(RetiredChain{published_[track], {}});
+    published_[track] = chain;
+}
+
+void App::addDeviceToTrack(int track, const PluginDesc& d) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    TrackModel& t = ses_.tracks[track];
+    if ((int)t.devices.size() >= kMaxChainFx) {
+        status_ = "Chain is full";
+        return;
+    }
+
+    // instantiate() already calls prepare() on the instance (see the tail of
+    // instantiateLV2/instantiateCLAP), so a non-null return is ready to run.
+    std::unique_ptr<PluginInstance> inst =
+        registry_.instantiate(d, engine_.sampleRate(), kMaxBlock);
+    if (!inst) {
+        status_ = "Could not load " + d.name;
+        return;
+    }
+
+    DeviceModel dm;
+    dm.desc = d;
+    dm.inst = std::move(inst);
+    t.devices.push_back(std::move(dm));
+
+    const RtChain* before = published_[track];
+    publishChain(track);
+    if (published_[track] == before) {
+        // Publish failed. The engine never referenced this instance, so it is
+        // safe to destroy right here and leave the model matching the engine.
+        t.devices.pop_back();
+        status_ = "Engine busy - device not added";
+        return;
+    }
+    selDevice_ = (int)t.devices.size() - 1;
+    paramScroll_ = 0.f;
+    status_ = "Added " + d.name;
+}
+
+void App::removeDevice(int track, int idx) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    TrackModel& t = ses_.tracks[track];
+    if (idx < 0 || idx >= (int)t.devices.size()) return;
+
+    // Move the instance out of the model rather than letting erase() destroy
+    // it: the audio thread is still running the *outgoing* chain, which points
+    // straight at it. It may only die once that chain comes back to us.
+    DeviceModel dead = std::move(t.devices[idx]);
+    t.devices.erase(t.devices.begin() + idx);
+
+    const RtChain* outgoing = published_[track];
+    publishChain(track);
+
+    if (published_[track] == outgoing) {
+        // Publish failed; the engine still runs the old chain, so the device
+        // has to go back where it was or the model would lie about what sounds.
+        t.devices.insert(t.devices.begin() + idx, std::move(dead));
+        status_ = "Engine busy - device not removed";
+        return;
+    }
+    if (outgoing) {
+        // publishChain() just appended the entry for `outgoing`; the instance
+        // rides along in it and is freed when Ev::ChainRetired arrives.
+        retiring_.back().dying.push_back(std::move(dead.inst));
+    }
+    // Otherwise nothing was ever published, so nothing borrowed the instance
+    // and it is freed as `dead` goes out of scope.
+
+    if (t.devices.empty())                selDevice_ = -1;
+    else if (selDevice_ >= (int)t.devices.size()) selDevice_ = (int)t.devices.size() - 1;
+    paramScroll_ = 0.f;
+    status_ = "Removed " + dead.desc.name;
+}
+
+void App::ensurePluginScan() {
+    if (registryScanned_) return;
+    // lilv walks every bundle on the system and a CLAP scan dlopens each
+    // binary, which costs the better part of a second. Deferring it to the
+    // first time the DEVICES tab opens keeps startup snappy for anyone who
+    // never touches a plugin.
+    status_ = "Scanning plugins...";
+    registry_.scan();
+    registryScanned_ = true;
+    char buf[48];
+    snprintf(buf, sizeof buf, "%zu plugins", registry_.plugins().size());
+    status_ = buf;
 }
 
 void App::setTempo(f64 bpm) {
@@ -327,7 +517,7 @@ void App::frame() {
     if (view_ == MainView::Session) drawSessionView(main);
     else                            drawArrangementView(main);
 
-    if (showDetail_ && view_ == MainView::Session) drawClipDetail(detail);
+    if (showDetail_ && view_ == MainView::Session) drawDetailPanel(detail);
     drawStatusBar(status);
     drawDragGhost();
 
@@ -900,10 +1090,51 @@ void App::drawWaveform(const Rect& r, const SampleBuffer& sb, const Col& c, f64 
     }
 }
 
-void App::drawClipDetail(const Rect& r) {
+// The panel chrome: a Live-style tab strip along the top, then whichever view
+// the tab selects. Ctrl+D still hides the panel as a whole.
+void App::drawDetailPanel(const Rect& r) {
     const f32 s = win_.dpiScale();
     rend_.rect(r, pal::panel);
     rend_.rect({r.x, r.y, r.w, 1 * s}, pal::divider);
+
+    Rect head{r.x, r.y + 1 * s, r.w, 19 * s};
+    rend_.rect(head, pal::panelAlt);
+    rend_.rect({head.x, head.bottom() - 1 * s, head.w, 1 * s}, pal::divider);
+
+    const f32 tabW = 62 * s, tabH = 15 * s;
+    Rect clipTab{head.x + 6 * s, head.y + (head.h - tabH) * 0.5f, tabW, tabH};
+    Rect devTab{clipTab.right() + 3 * s, clipTab.y, tabW, tabH};
+    if (ui_.button(uiId(9, 0), clipTab, "CLIP", detailTab_ == DetailTab::Clip, pal::accent))
+        detailTab_ = DetailTab::Clip;
+    if (ui_.button(uiId(9, 1), devTab, "DEVICES", detailTab_ == DetailTab::Devices, pal::accent)) {
+        detailTab_ = DetailTab::Devices;
+        ensurePluginScan();
+    }
+
+    // Context label on the right of the tab strip, so the panel says what it is
+    // looking at even when the content area is empty.
+    {
+        char buf[128];
+        if (detailTab_ == DetailTab::Clip) {
+            const ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
+            // ASCII only: the glyph atlas has no dashes or middots.
+            snprintf(buf, sizeof buf, "%s  -  scene %d", m.valid() ? m.name.c_str() : "no clip",
+                     selSlot_ + 1);
+        } else {
+            snprintf(buf, sizeof buf, "%s  -  %zu device%s", ses_.tracks[selTrack_].name.c_str(),
+                     ses_.tracks[selTrack_].devices.size(),
+                     ses_.tracks[selTrack_].devices.size() == 1 ? "" : "s");
+        }
+        rend_.textIn(fSmall_, head, buf, pal::textFaint, Align::Right, 8 * s);
+    }
+
+    Rect content{r.x, head.bottom(), r.w, r.bottom() - head.bottom()};
+    if (detailTab_ == DetailTab::Clip) drawClipDetail(content);
+    else                               drawDeviceDetail(content);
+}
+
+void App::drawClipDetail(const Rect& r) {
+    const f32 s = win_.dpiScale();
 
     ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
     if (!m.valid()) {
@@ -1007,6 +1238,255 @@ void App::drawClipDetail(const Rect& r) {
         const f32 px = wave.x + 3 * s + (wave.w - 6 * s) * (f32)ph;
         rend_.rect({px, wave.y + 2 * s, 1.5f * s, wave.h - 4 * s}, pal::playGreen);
     }
+    rend_.popClip();
+}
+
+// ---------------------------------------------------------------------------
+// device view: plugin browser on the left, the selected track's chain right
+// ---------------------------------------------------------------------------
+
+void App::drawDeviceDetail(const Rect& r) {
+    const f32 s = win_.dpiScale();
+    // The scan is lazy, and the tab can also be reached by restoring a session
+    // with the tab already active, so make sure it has happened.
+    ensurePluginScan();
+
+    const f32 listW = 236 * s;
+    Rect list{r.x, r.y, listW, r.h};
+    Rect strip{list.right() + 1 * s, r.y, r.right() - list.right() - 1 * s, r.h};
+    drawPluginBrowser(list);
+    rend_.rect({list.right(), r.y, 1 * s, r.h}, pal::divider);
+    drawDeviceStrip(strip);
+}
+
+void App::drawPluginBrowser(const Rect& r) {
+    const f32 s = win_.dpiScale();
+    Input& in = win_.input();
+    rend_.rect(r, pal::panelAlt);
+
+    // --- filter ---
+    const u64 fid = uiId(10, 0);
+    Rect filter{r.x + 6 * s, r.y + 5 * s, r.w - 12 * s, 17 * s};
+    ui_.textField(fid, filter, &pluginFilter_, pal::appBg, pal::text, Align::Left, false);
+    // textField only writes back on commit, but a filter has to narrow as you
+    // type, so read the live edit buffer while this field owns the caret.
+    const std::string& query = (ui_.editId == fid) ? ui_.editBuf : pluginFilter_;
+    if (query.empty())
+        rend_.textIn(fSmall_, filter, "filter plugins", pal::textFaint, Align::Left, 5 * s);
+
+    // --- filtered index, rebuilt each frame: a few hundred string compares ---
+    static std::vector<int> shown;                  // reused to avoid churn
+    shown.clear();
+    const std::vector<PluginDesc>& all = registry_.plugins();
+    for (int i = 0; i < (int)all.size(); ++i)
+        if (icontains(all[i].name, query)) shown.push_back(i);
+
+    const f32 rowH = 17 * s;
+    Rect listR{r.x, filter.bottom() + 4 * s, r.w, r.bottom() - filter.bottom() - 4 * s};
+    rend_.pushClip(listR);
+    rend_.rect(listR, pal::appBg.scale(1.05f));
+
+    if (ui_.setHot(uiId(10, 1), listR) && in.wheel != 0.f) {
+        pluginScroll_ -= in.wheel * rowH * 3.f;
+    }
+    const f32 maxScroll = std::max(0.f, shown.size() * rowH - listR.h);
+    pluginScroll_ = clampv(pluginScroll_, 0.f, maxScroll);
+
+    if (shown.empty()) {
+        rend_.textIn(fSmall_, listR, all.empty() ? "no plugins found" : "no match",
+                     pal::textFaint, Align::Center);
+    }
+
+    f32 y = listR.y - pluginScroll_;
+    for (size_t k = 0; k < shown.size(); ++k) {
+        Rect row{listR.x, y, listR.w, rowH};
+        y += rowH;
+        if (row.bottom() < listR.y || row.y > listR.bottom()) continue;
+
+        const int pi = shown[k];
+        const PluginDesc& d = all[pi];
+        const u64 id = uiId(10, 100 + pi);
+        const bool hot = ui_.setHot(id, row) && ui_.isHot(id);
+        if (pi == pluginSel_) rend_.rect(row, pal::gridBg);
+        else if (hot)         rend_.rect(row, pal::slotHover);
+        if (hot) ui_.cursor = Cursor::Hand;
+
+        Rect tag{row.right() - 34 * s, row.cy() - 6 * s, 28 * s, 12 * s};
+        rend_.roundRect(tag, 2 * s, pal::panel);
+        rend_.textIn(fSmall_, tag, formatName(d.format), pal::textFaint, Align::Center, 0);
+
+        Rect vendor{tag.x - 74 * s, row.y, 70 * s, row.h};
+        if (!d.vendor.empty()) {
+            rend_.pushClip(vendor);
+            rend_.textIn(fSmall_, vendor, d.vendor.c_str(), pal::textDim, Align::Right, 0);
+            rend_.popClip();
+        }
+
+        Rect name{row.x + 8 * s, row.y, vendor.x - row.x - 12 * s, row.h};
+        rend_.pushClip(name);
+        rend_.textIn(fBody_, name, d.name.c_str(), hot || pi == pluginSel_ ? pal::text : pal::textDim,
+                     Align::Left, 0);
+        rend_.popClip();
+
+        if (hot && in.pressed[0]) pluginSel_ = pi;
+        // Double-click loads, matching how the file browser drops a sample.
+        if (hot && in.dblClick) addDeviceToTrack(selTrack_, d);
+    }
+    rend_.popClip();
+}
+
+void App::drawDeviceStrip(const Rect& r) {
+    const f32 s = win_.dpiScale();
+    Input& in = win_.input();
+    rend_.rect(r, pal::panel);
+
+    TrackModel& t = ses_.tracks[selTrack_];
+    const Col tc = pal::clipColors[t.colorIdx % pal::clipColorCount];
+
+    Rect head{r.x, r.y, r.w, 16 * s};
+    rend_.rect(head, pal::panelAlt);
+    rend_.rect({head.x, head.y, 4 * s, head.h}, tc);       // track identity chip
+    rend_.textIn(fBold_, {head.x + 10 * s, head.y, 220 * s, head.h}, t.name.c_str(),
+                 pal::text, Align::Left, 0);
+    rend_.textIn(fSmall_, head, "double-click a plugin to add it to this track",
+                 pal::textFaint, Align::Right, 8 * s);
+
+    Rect area{r.x, head.bottom(), r.w, r.bottom() - head.bottom()};
+    rend_.pushClip(area);
+
+    // Keep the selection honest: tracks can be switched under it, and a device
+    // can have been removed since the last frame.
+    if (t.devices.empty()) selDevice_ = -1;
+    else selDevice_ = clampv(selDevice_ < 0 ? 0 : selDevice_, 0, (int)t.devices.size() - 1);
+
+    if (t.devices.empty()) {
+        rend_.textIn(fBody_, area, "No devices on this track", pal::textFaint, Align::Center);
+        rend_.popClip();
+        return;
+    }
+
+    const f32 boxW = 150 * s, gap = 5 * s;
+    const f32 total = t.devices.size() * (boxW + gap) + 6 * s;
+    const f32 maxScroll = std::max(0.f, total - area.w);
+    stripScroll_ = clampv(stripScroll_, 0.f, maxScroll);
+    bool wheelUsed = false;
+
+    f32 x = area.x + 6 * s - stripScroll_;
+    for (size_t i = 0; i < t.devices.size(); ++i) {
+        DeviceModel& d = t.devices[i];
+        Rect box{x, area.y + 4 * s, boxW, area.h - 9 * s};
+        x += boxW + gap;
+        if (box.right() < area.x || box.x > area.right()) continue;
+
+        const bool sel = (int)i == selDevice_;
+        // Claim hot for the whole box first so the controls drawn afterwards
+        // can take it back — last setHot() of the frame wins.
+        const u64 bid = uiId(11, (int)i, 2);
+        const bool hotBox = ui_.setHot(bid, box) && ui_.isHot(bid);
+        rend_.roundRect(box, 3 * s, sel ? pal::gridBg : pal::panelAlt);
+        if (sel) rend_.roundRectOutline(box, 3 * s, 1 * s, pal::accent);
+
+        Rect title{box.x, box.y, box.w, 16 * s};
+        rend_.rect({title.x + 2 * s, title.y + 3 * s, 3 * s, title.h - 6 * s}, tc);
+
+        // Both controls are glyph-drawn rather than lettered: at this size the
+        // font ellipsises anything longer than a character or two.
+        Rect xr{title.right() - 17 * s, title.y + 2 * s, 14 * s, 12 * s};
+        Rect br{xr.x - 20 * s, title.y + 2 * s, 18 * s, 12 * s};
+
+        Rect nameR{title.x + 9 * s, title.y, br.x - title.x - 11 * s, title.h};
+        rend_.pushClip(nameR);
+        rend_.textIn(fBold_, nameR, d.desc.name.c_str(), sel ? pal::text : pal::textDim,
+                     Align::Left, 0);
+        rend_.popClip();
+
+        // Bypass lives on the instance, so the chain does not have to be
+        // republished; setBypassed() is GUI-safe per the host contract.
+        if (ui_.squareToggle(uiId(11, (int)i, 0), br, "", &d.bypass, pal::meterAmber))
+            if (d.inst) d.inst->setBypassed(d.bypass);
+        rend_.circle(br.cx(), br.cy(), 3.5f * s,
+                     d.bypass ? pal::textOnClip : pal::playGreen);   // lit = active
+        const bool xHot = ui_.button(uiId(11, (int)i, 1), xr, "");
+        {
+            const f32 k = 3.f * s;
+            const Col xc = pal::textDim;
+            rend_.line(xr.cx() - k, xr.cy() - k, xr.cx() + k, xr.cy() + k, 1.2f * s, xc);
+            rend_.line(xr.cx() - k, xr.cy() + k, xr.cx() + k, xr.cy() - k, 1.2f * s, xc);
+        }
+        if (xHot) {
+            removeDevice(selTrack_, (int)i);
+            rend_.popClip();
+            return;                       // t.devices changed under us
+        }
+        if (hotBox && in.pressed[0]) { selDevice_ = (int)i; paramScroll_ = 0.f; }
+
+        Rect body{box.x + 4 * s, title.bottom() + 2 * s, box.w - 8 * s,
+                  box.bottom() - title.bottom() - 6 * s};
+        if (!d.inst) continue;
+
+        if (!sel) {
+            // Unselected devices stay compact; only one chain slot is edited at
+            // a time, like Live collapsing the devices you are not touching.
+            char buf[64];
+            snprintf(buf, sizeof buf, "%d params", d.inst->paramCount());
+            rend_.pushClip(body);
+            if (!d.desc.vendor.empty())
+                rend_.textIn(fSmall_, {body.x, body.y + 2 * s, body.w, 12 * s},
+                             d.desc.vendor.c_str(), pal::textFaint, Align::Left, 0);
+            rend_.textIn(fSmall_, {body.x, body.y + 15 * s, body.w, 12 * s}, buf,
+                         pal::textFaint, Align::Left, 0);
+            rend_.popClip();
+            continue;
+        }
+
+        // --- parameters of the selected device ---
+        const int n = d.inst->paramCount();
+        const int cols = 3;
+        // 43px is knob (32) + label (11): three rows land exactly inside the
+        // panel, so a device with nine or fewer controls never has to scroll.
+        const f32 cw = body.w / (f32)cols, chh = 43 * s;
+        const int rows = (n + cols - 1) / cols;
+        const f32 pMax = std::max(0.f, rows * chh - body.h);
+        if (ui_.hovered(body) && in.wheel != 0.f) {
+            paramScroll_ -= in.wheel * chh * 0.5f;
+            wheelUsed = true;
+        }
+        paramScroll_ = clampv(paramScroll_, 0.f, pMax);
+
+        rend_.pushClip(body);
+        if (n == 0)
+            rend_.textIn(fSmall_, body, "no parameters", pal::textFaint, Align::Center);
+        for (int p = 0; p < n; ++p) {
+            Rect cell{body.x + (p % cols) * cw, body.y - paramScroll_ + (p / cols) * chh, cw, chh};
+            if (cell.bottom() < body.y || cell.y > body.bottom()) continue;
+            const ParamInfo& info = d.inst->paramInfo(p);
+            Rect lbl{cell.x, cell.bottom() - 11 * s, cell.w, 10 * s};
+
+            if (info.isBool) {
+                Rect tg{cell.cx() - 11 * s, cell.y + 8 * s, 22 * s, 14 * s};
+                bool on = d.inst->getParam(p) > 0.5f;
+                if (ui_.squareToggle(uiId(12, (int)i * 256 + p, 0), tg, "", &on, pal::accent))
+                    d.inst->setParam(p, on ? info.max : info.min);
+            } else {
+                Rect kr{cell.cx() - 16 * s, cell.y + 2 * s, 32 * s, 32 * s};
+                f32 v = d.inst->getParam(p);
+                if (ui_.knob(uiId(12, (int)i * 256 + p, 0), kr, &v, info.min, info.max,
+                             info.def, info.isInt ? "%.0f" : "%.2f"))
+                    d.inst->setParam(p, v);
+            }
+
+            rend_.pushClip(lbl);
+            rend_.textIn(fSmall_, lbl, info.name.c_str(), pal::textDim, Align::Center, 0);
+            rend_.popClip();
+        }
+        rend_.popClip();
+    }
+
+    // The strip scrolls horizontally on a plain wheel, unless the pointer was
+    // over a parameter grid that wanted the notch for itself.
+    if (!wheelUsed && maxScroll > 0.f && ui_.hovered(area) && in.wheel != 0.f)
+        stripScroll_ = clampv(stripScroll_ - in.wheel * 60.f * s, 0.f, maxScroll);
+
     rend_.popClip();
 }
 

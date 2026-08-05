@@ -72,6 +72,10 @@ struct Session {
 
 enum class MainView { Session, Arrangement };
 
+// The bottom panel shows one of two things at a time, like Live's Clip / Device
+// view toggle. Ctrl+D still hides the whole panel.
+enum class DetailTab { Clip, Devices };
+
 struct BrowserEntry {
     std::string name, path;
     bool isDir = false;
@@ -108,7 +112,11 @@ private:
     void drawSceneColumn(const Rect& r);
     void drawMixer(const Rect& r, f32 scrollX);
     void drawMasterStrip(const Rect& r);
+    void drawDetailPanel(const Rect& r);          // tab header + active tab
     void drawClipDetail(const Rect& r);
+    void drawDeviceDetail(const Rect& r);
+    void drawPluginBrowser(const Rect& r);
+    void drawDeviceStrip(const Rect& r);
     void drawArrangementView(const Rect& r);
     void drawStatusBar(const Rect& r);
     void drawDragGhost();
@@ -157,6 +165,9 @@ private:
     std::vector<RetiredChain> retiring_;
     const RtChain* published_[kMaxTracks] = {};
     void publishChain(int track);
+    void ensurePluginScan();                      // lazy, first time DEVICES opens
+    void addDeviceToTrack(int track, const PluginDesc& d);
+    void removeDevice(int track, int idx);
 
     Session  ses_;
     MainView view_ = MainView::Session;
@@ -167,9 +178,11 @@ private:
     DragState drag_{};
     f32  gridScrollX_ = 0.f;
     f32  browserW_ = 210.f;
-    f32  detailH_ = 168.f;
+    // Tall enough for three rows of device knobs under the tab header.
+    f32  detailH_ = 200.f;
     bool showBrowser_ = true;
     bool showDetail_ = true;
+    DetailTab detailTab_ = DetailTab::Clip;
 
     // browser state
     std::string browserDir_;
@@ -177,6 +190,14 @@ private:
     std::vector<std::string> browserPlaces_;
     f32  browserScroll_ = 0.f;
     int  browserSel_ = -1;
+
+    // device view state
+    std::string pluginFilter_;
+    f32  pluginScroll_ = 0.f;
+    int  pluginSel_ = -1;
+    int  selDevice_ = -1;              // index into the selected track's devices
+    f32  stripScroll_ = 0.f;           // horizontal, device boxes
+    f32  paramScroll_ = 0.f;           // vertical, inside the selected device
 
     // per-frame UI feedback
     std::string status_;
