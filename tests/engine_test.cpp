@@ -102,6 +102,15 @@ struct Host {
         Command c; c.type = Cmd::SetChain; c.a = track; c.p = (void*)ch;
         e.pushCommand(c);
     }
+    // Return and master chains ride the same borrow-until-retired protocol.
+    void setReturnChain(int ret, const RtChain* ch) {
+        Command c; c.type = Cmd::SetReturnChain; c.a = ret; c.p = (void*)ch;
+        e.pushCommand(c);
+    }
+    void setMasterChain(const RtChain* ch) {
+        Command c; c.type = Cmd::SetMasterChain; c.p = (void*)ch;
+        e.pushCommand(c);
+    }
     // Renders at least `frames` frames, block-aligned. Returns the frame index
     // just past what had already been rendered before the call.
     size_t run(i64 frames) {
@@ -511,9 +520,18 @@ static void testRingSaturation() {
 // A PluginInstance that does nothing but scale, so any level change in the
 // output is attributable to the chain and to nothing else. It also records how
 // it was called, which is how the "chains run while stopped" case is checked.
+//
+// It can also be latent. A device that *reports* latency without incurring any
+// would make the compensation tests pass for the wrong reason, so `latency`
+// does both: latencyFrames() reports it and process() really does hold the
+// signal back that many frames. Zero — the default, and what every test before
+// section 17 uses — allocates nothing and leaves the code path untouched.
 class FakeFx : public PluginInstance {
 public:
-    explicit FakeFx(f32 gain) : gain_(gain) {}
+    explicit FakeFx(f32 gain, int latency = 0) : gain_(gain), latency_(latency) {
+        if (latency_ > 0)
+            for (auto& r : ring_) r.assign((size_t)latency_, 0.f);
+    }
 
     int calls = 0;
     int maxFrames = 0;
@@ -528,6 +546,18 @@ public:
         if (bypassed_) return;                    // in aliases out, so a no-op
         for (int c = 0; c < channels; ++c) {
             if (!out[c] || !in[c]) continue;
+            if (latency_ > 0 && c < 2) {
+                std::vector<f32>& r = ring_[c];
+                int& pos = pos_[c];
+                for (int i = 0; i < nframes; ++i) {
+                    const f32 x = in[c][i];       // in may alias out: read first
+                    const f32 y = r[(size_t)pos];
+                    r[(size_t)pos] = x;
+                    pos = (pos + 1) % latency_;
+                    out[c][i] = y * gain_;
+                }
+                continue;
+            }
             for (int i = 0; i < nframes; ++i) out[c][i] = in[c][i] * gain_;
         }
     }
@@ -537,12 +567,16 @@ public:
     f32              getParam(int) const override    { return 0.f; }
     void             setParam(int, f32) override     {}
     const PluginDesc& desc() const override          { static PluginDesc d; return d; }
+    int              latencyFrames() const override  { return latency_; }
     void             setBypassed(bool b) override    { bypassed_ = b; }
     bool             bypassed() const override       { return bypassed_; }
 
 private:
     f32  gain_ = 1.f;
     bool bypassed_ = false;
+    int  latency_ = 0;
+    std::vector<f32> ring_[2];
+    int  pos_[2] = {0, 0};
 };
 
 // Drains the event ring, counting ChainRetired and remembering which chain
@@ -2586,6 +2620,624 @@ static void testOverdub() {
 }
 
 // ---------------------------------------------------------------------------
+// 17. return buses and sends
+// ---------------------------------------------------------------------------
+
+// Track `ti` playing a DC clip from beat 0 with no quantum in the way.
+static void armDc(Host& h, int ti, const std::vector<f32>& buf, f32 gain) {
+    h.setClip(ti, 0, mkClip(buf, 1, gain, Warp::Off, true, 120.0));
+    h.push(Cmd::LaunchClip, ti, 0);
+}
+static void tempoNoQuantum(Host& h) {
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+}
+
+// Levels used throughout: a DC clip at gain 0.5 with the default unity fader
+// puts 0.50 on the master, so every number below is that 0.50 times whatever
+// the send, the return chain and the return fader did to it.
+static void sendFeedsReturn(const std::vector<f32>& buf) {
+    Host h; h.init();
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);           // track 0 -> return A, unity
+    h.push(Cmd::ReturnVol, 0, 0, 0.5);
+    h.run(8000);
+
+    CHECK(std::fabs(tailLevel(h.outL) - 0.75f) < 0.005f,
+          "dry 0.50 + return (send 1.0 x vol 0.5) -> %.4f (expected 0.75)",
+          (double)tailLevel(h.outL));
+    CHECK(std::fabs(h.e.returnMeterL[0].load() - 0.25f) < 0.02f,
+          "the return meter reads post-vol -> %.4f (expected 0.25)",
+          (double)h.e.returnMeterL[0].load());
+    CHECK(std::fabs(h.e.returnMeterR[0].load() - 0.25f) < 0.02f,
+          "both return channels meter -> %.4f (expected 0.25)",
+          (double)h.e.returnMeterR[0].load());
+    for (int r = 1; r < kMaxReturns; ++r)
+        CHECK(h.e.returnMeterL[r].load() < 1e-4f,
+              "return %d saw nothing (%.3g)", r, (double)h.e.returnMeterL[r].load());
+
+    // The return fader scales what reaches the master, and nothing else does.
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::ReturnVol, 0, 0, 1.0);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 1.0f) < 0.005f,
+          "return at unity -> %.4f (expected 1.00)", (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::SendLevel, 0, 0, 0.0);           // send closed
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "closing the send leaves the dry path alone -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+    CHECK(h.e.returnMeterL[0].load() < 0.02f,
+          "the return meter falls back to silence (%.3g)",
+          (double)h.e.returnMeterL[0].load());
+}
+
+// A send is post-fader, which is a statement about mute and solo as much as
+// about the volume: audibility is decided once and both destinations obey it.
+static void sendIsPostFader(const std::vector<f32>& buf) {
+    Host h; h.init();
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);
+    h.push(Cmd::TrackMute, 0, 1);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+          "a muted track sends nothing -> %.3g", (double)tailLevel(h.outL));
+    CHECK(h.e.returnMeterL[0].load() < 1e-4f,
+          "and the return bus stays silent (%.3g)", (double)h.e.returnMeterL[0].load());
+
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::TrackMute, 0, 0);
+    h.push(Cmd::TrackSolo, 1, 1);                // solo elsewhere: track 0 is out
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+          "a track silenced by someone else's solo sends nothing -> %.3g",
+          (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::TrackSolo, 1, 0);
+    h.push(Cmd::TrackVol, 0, 0, 0.5);            // half the fader, half the send
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "the fader scales dry and send together -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+}
+
+// The return's own chain, and the retirement protocol on it.
+static void returnChainProcesses(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f), quarter(0.25f);
+    RtChain chA; chA.fx[0] = &half;    chA.count = 1;
+    RtChain chB; chB.fx[0] = &quarter; chB.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);
+    h.setReturnChain(0, &chA);
+    h.run(8000);
+    drainRetired(h.e);
+
+    CHECK(half.calls > 0, "the return chain ran (%d calls)", half.calls);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.75f) < 0.005f,
+          "0.50 dry + 0.50 through a 0.5x return -> %.4f (expected 0.75)",
+          (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.setReturnChain(0, &chB);
+    h.run(8000);
+    RetiredEvents r = drainRetired(h.e);
+    CHECK(r.count == 1 && r.ptrs[0] == (const void*)&chA,
+          "swapping the return chain retires the old one (%d events)", r.count);
+    CHECK(r.count == 1 && r.tracks[0] == kMaxTracks + 0,
+          "the event names return 0 as kMaxTracks + 0 = %d (got %d)",
+          kMaxTracks, r.count ? r.tracks[0] : -999);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.625f) < 0.005f,
+          "0.50 dry + 0.50 through a 0.25x return -> %.4f (expected 0.625)",
+          (double)tailLevel(h.outL));
+
+    // A return chain keeps running with no send feeding it, exactly like a
+    // track's: that is what lets a reverb tail survive the send closing.
+    h.push(Cmd::SendLevel, 0, 0, 0.0);
+    h.runBlocks(4);
+    const int idle = quarter.calls;
+    h.runBlocks(8);
+    CHECK(quarter.calls - idle == 8,
+          "an idle return chain still runs once per block (%d over 8)",
+          quarter.calls - idle);
+
+    h.setReturnChain(0, nullptr);
+    h.runBlocks(2);
+    CHECK(drainRetired(h.e).count == 1, "clearing the return chain retires it");
+}
+
+// The master chain: after the whole sum, before the master fader and the clip
+// stage. The clip stage is what makes the ordering observable — a 4x master
+// chain on a 0.5 mix would leave 2.0 in the buffer if nothing clamped after it.
+static void masterChainAfterSum(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx boost(4.0f), half(0.5f);
+    RtChain chBoost; chBoost.fx[0] = &boost; chBoost.count = 1;
+    RtChain chHalf;  chHalf.fx[0]  = &half;  chHalf.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);           // 0.50 dry + 0.50 wet = 1.00
+    h.setMasterChain(&chHalf);
+    h.run(8000);
+    drainRetired(h.e);
+    CHECK(half.calls > 0, "the master chain ran (%d calls)", half.calls);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "the master chain sees dry AND returns: 1.00 x 0.5 -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.setMasterChain(&chBoost);
+    h.run(8000);
+    RetiredEvents r = drainRetired(h.e);
+    CHECK(r.count == 1 && r.ptrs[0] == (const void*)&chHalf,
+          "swapping the master chain retires the old one (%d events)", r.count);
+    CHECK(r.count == 1 && r.tracks[0] == -1,
+          "the master chain retires with a = -1 (got %d)", r.count ? r.tracks[0] : -999);
+    CHECK(std::fabs(tailLevel(h.outL) - 1.0f) < 1e-4f,
+          "the clip stage is after the master chain: 1.00 x 4 clamps to %.4f",
+          (double)tailLevel(h.outL));
+
+    // ...and the master fader is after it too, so pulling the fader down
+    // recovers headroom the chain added rather than being eaten by the clamp.
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::MasterVol, 0, 0, 0.125);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "master fader after the chain: 1.00 x 4 x 0.125 -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+
+    h.setMasterChain(nullptr);
+    h.runBlocks(2);
+    CHECK(drainRetired(h.e).count == 1, "clearing the master chain retires it");
+}
+
+// Every index that reaches the audio thread is checked at both ends, because a
+// stray one writes outside the mixer.
+static void busBoundsAreChecked(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f);
+    RtChain chain; chain.fx[0] = &half; chain.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.setReturnChain(kMaxReturns, &chain);       // one past the last return
+    h.setReturnChain(-1, &chain);
+    h.push(Cmd::SendLevel, 0, kMaxReturns, 1.0);
+    h.push(Cmd::SendLevel, 0, -1, 1.0);
+    h.push(Cmd::SendLevel, kMaxTracks, 0, 1.0);
+    h.push(Cmd::ReturnVol, kMaxReturns, 0, 1.0);
+    h.push(Cmd::ReturnVol, -1, 0, 1.0);
+    h.run(8000);
+
+    CHECK(half.calls == 0, "an out-of-range return chain is never installed (%d calls)",
+          half.calls);
+    CHECK(drainRetired(h.e).count == 0, "and retires nothing");
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "the mix is untouched by any of it -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+
+    // A NaN send would multiply a bus that feeds the master; it lands on zero.
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::SendLevel, 0, 0, std::nan(""));
+    h.push(Cmd::ReturnVol, 0, 0, std::nan(""));
+    h.run(8000);
+    CHECK(std::isfinite(tailLevel(h.outL)) && std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "a NaN send level is refused, not propagated -> %.4f", (double)tailLevel(h.outL));
+}
+
+static void testBuses() {
+    banner("17. return buses and sends");
+    note("signal flow: track post-fader -> send[r] -> return chain -> return vol");
+    note("-> return meter -> master sum -> master chain -> master fader -> clip.");
+    note("returns have no sends of their own: return -> return routing is out of");
+    note("this wave on purpose (Live gates it behind an option).");
+    const auto buf = dcBuf(300000, 1, 1.0f);
+
+    sendFeedsReturn(buf);
+    sendIsPostFader(buf);
+    returnChainProcesses(buf);
+    masterChainAfterSum(buf);
+    busBoundsAreChecked(buf);
+}
+
+// ---------------------------------------------------------------------------
+// 18. plugin delay compensation
+// ---------------------------------------------------------------------------
+
+// An impulse at a known frame, far enough in that the 3 ms declick ramp is long
+// over: what comes out is a single sample whose position is the whole answer.
+static std::vector<f32> impulseBuf(i64 frames, i64 at) {
+    std::vector<f32> b((size_t)frames, 0.f);
+    b[(size_t)at] = 1.0f;
+    return b;
+}
+
+static i64 peakFrame(const std::vector<f32>& v) {
+    i64 best = -1;
+    f32 bv = 0.f;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (std::fabs(v[i]) > bv) { bv = std::fabs(v[i]); best = (i64)i; }
+    return best;
+}
+static f32 maxAbsIn(const std::vector<f32>& v, size_t from, size_t to) {
+    f32 m = 0.f;
+    for (size_t i = from; i < to && i < v.size(); ++i)
+        if (std::fabs(v[i]) > m) m = std::fabs(v[i]);
+    return m;
+}
+
+// Two tracks, the same clip, one of them behind a 256-frame device. Compensated,
+// the master gets their sum; uncompensated it would get a step — one track from
+// frame 0 and the other from frame 256.
+static void pdcAlignsTracks(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx latent(1.0f, 256);
+    RtChain chain; chain.fx[0] = &latent; chain.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.25f);
+    armDc(h, 1, buf, 0.25f);
+    h.setChain(1, &chain);
+    h.run(16000);
+
+    CHECK(h.e.latencyFrames.load() == 256,
+          "the latent track sets the engine's latency (%d, expected 256)",
+          h.e.latencyFrames.load());
+    CHECK(maxAbsIn(h.outL, 0, 256) < 1e-6f,
+          "nothing arrives before the compensation window: %.3g in [0,256)",
+          (double)maxAbsIn(h.outL, 0, 256));
+    // 256 frames of alignment + 144 frames of declick ramp; 600 is well past it.
+    f32 worst = 0.f;
+    for (size_t i = 600; i < h.outL.size(); ++i)
+        worst = std::max(worst, std::fabs(h.outL[i] - 0.5f));
+    CHECK(worst < 1e-6f,
+          "the aligned sum is flat 0.50 with no step at any block boundary "
+          "(worst deviation %.3g over %zu frames)", (double)worst, h.outL.size() - 600);
+    CHECK(maxAbsIn(h.outL, 0, h.outL.size()) <= 0.5f + 1e-6f,
+          "and never overshoots the sum (peak %.6f)",
+          (double)maxAbsIn(h.outL, 0, h.outL.size()));
+
+    // Uncompensated, the output would sit on one track alone — a 0.25 plateau
+    // 112 frames long, between the end of the declick ramp and the arrival of
+    // the second track. Aligned, the ramp only *passes through* 0.25, and it
+    // does so at 0.5/144 per frame, so at most one frame can be near it.
+    int plateau = 0;
+    for (f32 s : h.outL) if (std::fabs(s - 0.25f) < 1e-3f) ++plateau;
+    CHECK(plateau <= 1,
+          "no half-mix plateau: %d frames sit at 0.25 (one track alone would be ~112)",
+          plateau);
+}
+
+// The dry signal and its own send through a latent return have to land on the
+// same frame — the case that makes a reverb send sound like a reverb rather
+// than a slapback.
+static void pdcAlignsReturnAgainstDry() {
+    Host h; h.init();
+    const auto imp = impulseBuf(48000, 1000);
+    FakeFx latent(1.0f, 256);
+    RtChain chain; chain.fx[0] = &latent; chain.count = 1;
+
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkClip(imp, 1, 0.25f, Warp::Off, true, 120.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);
+    h.setReturnChain(0, &chain);
+    h.run(4096);
+
+    CHECK(h.e.latencyFrames.load() == 256,
+          "a latent return counts towards the published latency (%d)",
+          h.e.latencyFrames.load());
+
+    const i64 pk = peakFrame(h.outL);
+    CHECK(pk == 1000 + 256,
+          "dry and wet land together at frame %lld (peak found at %lld)",
+          (long long)(1000 + 256), (long long)pk);
+    CHECK(pk >= 0 && std::fabs(h.outL[(size_t)pk] - 0.5f) < 1e-5f,
+          "and they add rather than arriving twice: %.5f (expected 0.25 + 0.25)",
+          pk >= 0 ? (double)h.outL[(size_t)pk] : 0.0);
+    CHECK(std::fabs(h.outL[1000]) < 1e-6f,
+          "the dry copy waited for the return: nothing at frame 1000 (%.3g)",
+          (double)h.outL[1000]);
+    CHECK(std::fabs(h.outL[1000 + 512]) < 1e-6f,
+          "and no second copy where an uncompensated send would have landed (%.3g)",
+          (double)h.outL[1000 + 512]);
+    // Exactly one impulse in the whole render, not two of half the height.
+    int hits = 0;
+    for (f32 s : h.outL) if (std::fabs(s) > 1e-4f) ++hits;
+    CHECK(hits == 1, "exactly one impulse comes out (%d frames above 1e-4)", hits);
+}
+
+// Track chains and return chains stack: the return's input is already
+// track-aligned, so the two stages add rather than fighting.
+static void pdcStacksTrackAndReturn() {
+    Host h; h.init();
+    const auto imp = impulseBuf(48000, 1000);
+    FakeFx trackFx(1.0f, 128), retFx(1.0f, 256);
+    RtChain tc; tc.fx[0] = &trackFx; tc.count = 1;
+    RtChain rc; rc.fx[0] = &retFx;   rc.count = 1;
+
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkClip(imp, 1, 0.25f, Warp::Off, true, 120.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);
+    h.setChain(0, &tc);
+    h.setReturnChain(0, &rc);
+    h.run(4096);
+
+    CHECK(h.e.latencyFrames.load() == 128 + 256,
+          "latency is maxTrack + maxReturn = 384 (got %d)", h.e.latencyFrames.load());
+    const i64 pk = peakFrame(h.outL);
+    CHECK(pk == 1000 + 128 + 256,
+          "one impulse at 1000 + 128 + 256 = %lld (got %lld)",
+          (long long)(1000 + 384), (long long)pk);
+    CHECK(pk >= 0 && std::fabs(h.outL[(size_t)pk] - 0.5f) < 1e-5f,
+          "still the aligned sum: %.5f", pk >= 0 ? (double)h.outL[(size_t)pk] : 0.0);
+    int hits = 0;
+    for (f32 s : h.outL) if (std::fabs(s) > 1e-4f) ++hits;
+    CHECK(hits == 1, "and only one (%d frames above 1e-4)", hits);
+}
+
+// The metronome is a parallel path into the master sum like any other, and the
+// one with no chain in front of it at all, so it is the one that would drift
+// furthest: an uncompensated click leads the music by the whole track latency.
+static void pdcAlignsClick(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx latent(1.0f, 256);
+    RtChain chain; chain.fx[0] = &latent; chain.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.25f);
+    h.setChain(0, &chain);
+    h.push(Cmd::SetMetronome, 1);
+    h.run(4096);
+
+    i64 first = -1;
+    for (size_t i = 0; i < h.outL.size(); ++i)
+        if (std::fabs(h.outL[i]) > 1e-5f) { first = (i64)i; break; }
+    CHECK(first == 256,
+          "the downbeat click waits for the track chain: first output at %lld "
+          "(expected 256)", (long long)first);
+    CHECK(maxAbsIn(h.outL, 0, 256) < 1e-6f,
+          "nothing at all before it (%.3g)", (double)maxAbsIn(h.outL, 0, 256));
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    drainRetired(h.e);
+}
+
+// What latencyFrames publishes, as chains come and go.
+static void pdcPublishesTotals(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx t0(1.0f, 128), t1(1.0f, 512), r0(1.0f, 64), m0(1.0f, 32), silent(1.0f, 0);
+    RtChain c0; c0.fx[0] = &t0; c0.count = 1;
+    RtChain c1; c1.fx[0] = &t1; c1.count = 1;
+    RtChain cr; cr.fx[0] = &r0; cr.count = 1;
+    RtChain cm; cm.fx[0] = &m0; cm.count = 1;
+    RtChain cz; cz.fx[0] = &silent; cz.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 0, "a set with no devices publishes 0 (%d)",
+          h.e.latencyFrames.load());
+
+    h.setChain(0, &cz);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 0,
+          "a device that reports no latency stays on the zero path (%d)",
+          h.e.latencyFrames.load());
+
+    h.setChain(0, &c0);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 128, "one 128-frame track chain -> %d",
+          h.e.latencyFrames.load());
+
+    h.setChain(1, &c1);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 512,
+          "tracks are parallel, so the deepest one wins -> %d", h.e.latencyFrames.load());
+
+    h.setReturnChain(0, &cr);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 512 + 64,
+          "a return chain is in series behind the tracks -> %d (expected 576)",
+          h.e.latencyFrames.load());
+
+    h.setMasterChain(&cm);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 512 + 64 + 32,
+          "and the master chain behind both -> %d (expected 608)",
+          h.e.latencyFrames.load());
+
+    h.setChain(1, nullptr);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 128 + 64 + 32,
+          "removing the deepest track chain drops the total -> %d (expected 224)",
+          h.e.latencyFrames.load());
+
+    h.setChain(0, nullptr);
+    h.setReturnChain(0, nullptr);
+    h.setMasterChain(nullptr);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == 0, "and clearing everything returns to 0 (%d)",
+          h.e.latencyFrames.load());
+    drainRetired(h.e);
+}
+
+// Compensation is capped: a device claiming more than the delay lines can hold
+// is clamped, and what gets published is what the engine actually imposes.
+static void pdcClampsAbsurdLatency(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx absurd(1.0f, 1 << 18);
+    RtChain chain; chain.fx[0] = &absurd; chain.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.setChain(0, &chain);
+    h.runBlocks(2);
+    CHECK(h.e.latencyFrames.load() == (1 << 16) - 1,
+          "a 262144-frame claim is clamped to the delay-line cap -> %d (expected %d)",
+          h.e.latencyFrames.load(), (1 << 16) - 1);
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    drainRetired(h.e);
+}
+
+// Latency changing under running audio is a click by design (the delay lines
+// keep their contents and the read cursor jumps). What must not happen is
+// permanent damage: the mix has to come back to the right steady state.
+static void pdcResnapsOnSwap(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx a(1.0f, 256), b(1.0f, 1024), plain(1.0f, 0);
+    RtChain ca; ca.fx[0] = &a; ca.count = 1;
+    RtChain cb; cb.fx[0] = &b; cb.count = 1;
+    RtChain cp; cp.fx[0] = &plain; cp.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.25f);
+    armDc(h, 1, buf, 0.25f);
+    h.setChain(1, &ca);
+    h.run(8000);
+
+    h.outL.clear(); h.outR.clear();
+    h.setChain(1, &cb);                          // 256 -> 1024 frames, mid-flight
+    h.run(16000);
+    CHECK(h.e.latencyFrames.load() == 1024, "the new latency is published (%d)",
+          h.e.latencyFrames.load());
+    f32 worst = 0.f;
+    for (size_t i = 4096; i < h.outL.size(); ++i)
+        worst = std::max(worst, std::fabs(h.outL[i] - 0.5f));
+    CHECK(worst < 1e-6f,
+          "the mix settles back to the aligned sum after the swap (worst %.3g)",
+          (double)worst);
+
+    h.outL.clear(); h.outR.clear();
+    h.setChain(1, &cp);                          // back to no latency at all
+    h.run(16000);
+    CHECK(h.e.latencyFrames.load() == 0, "and back to zero (%d)", h.e.latencyFrames.load());
+    worst = 0.f;
+    for (size_t i = 4096; i < h.outL.size(); ++i)
+        worst = std::max(worst, std::fabs(h.outL[i] - 0.5f));
+    CHECK(worst < 1e-6f,
+          "with the delay lines out of the path entirely (worst %.3g)", (double)worst);
+    h.setChain(1, nullptr);
+    h.runBlocks(2);
+    drainRetired(h.e);
+}
+
+// The zero-latency path has to be the *old* path, sample for sample: the demo
+// renders are a byte-comparison gate on exactly this.
+static void pdcZeroIsUntouched(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f);
+    RtChain chain; chain.fx[0] = &half; chain.count = 1;
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.setChain(0, &chain);
+    h.push(Cmd::SendLevel, 0, 0, 1.0);           // a return in the graph as well
+    h.run(8000);
+
+    CHECK(h.e.latencyFrames.load() == 0, "no latency anywhere -> 0 (%d)",
+          h.e.latencyFrames.load());
+    // 0.5 clip x 0.5 chain = 0.25 dry, plus the same again through the return.
+    f32 worst = 0.f;
+    for (size_t i = 600; i < h.outL.size(); ++i)
+        worst = std::max(worst, std::fabs(h.outL[i] - 0.5f));
+    CHECK(worst < 1e-7f,
+          "and the mix is exact, not merely close (worst deviation %.3g)", (double)worst);
+    CHECK(std::fabs(h.outL[200] - h.outR[200]) < 1e-9f, "both channels agree exactly");
+}
+
+static void testPdc() {
+    banner("18. plugin delay compensation");
+    note("track dry path = trackChain; send path = trackChain + returnChain. The");
+    note("send is tapped post-track-chain, so aligning tracks aligns their sends;");
+    note("returns then align against each other and against the dry bus. Master");
+    note("chain is in series: no compensation, just added to latencyFrames.");
+    const auto buf = dcBuf(300000, 1, 1.0f);
+
+    pdcAlignsTracks(buf);
+    pdcAlignsReturnAgainstDry();
+    pdcStacksTrackAndReturn();
+    pdcAlignsClick(buf);
+    pdcPublishesTotals(buf);
+    pdcClampsAbsurdLatency(buf);
+    pdcResnapsOnSwap(buf);
+    pdcZeroIsUntouched(buf);
+}
+
+// ---------------------------------------------------------------------------
+// 19. the command drain counter
+// ---------------------------------------------------------------------------
+
+static void testDrains() {
+    banner("19. command drain counter");
+    note("Engine::drains bumps at the END of every drainCommands(). A command is");
+    note("provably consumed once the counter has advanced past the value read");
+    note("after pushCommand() returned — the exact-retirement primitive the");
+    note("process split needs to know when a pool slot is free (PROCESS-SPLIT §10).");
+
+    Host h; h.init();
+    const auto buf = dcBuf(300000, 1, 1.0f);
+
+    CHECK(h.e.drains.load() == 0, "a prepared engine has drained nothing (%llu)",
+          (unsigned long long)h.e.drains.load());
+
+    h.runBlocks(1);
+    CHECK(h.e.drains.load() == 1, "one process() is one drain (%llu)",
+          (unsigned long long)h.e.drains.load());
+
+    h.runBlocks(8);
+    CHECK(h.e.drains.load() == 9, "eight more blocks, eight more drains (%llu)",
+          (unsigned long long)h.e.drains.load());
+
+    // It advances whether or not anything was queued: the counter measures the
+    // audio thread having *looked*, which is what makes it a proof of absence.
+    const u64 idle = h.e.drains.load();
+    h.runBlocks(4);
+    CHECK(h.e.drains.load() == idle + 4,
+          "an empty ring still drains once per block (%llu -> %llu)",
+          (unsigned long long)idle, (unsigned long long)h.e.drains.load());
+
+    tempoNoQuantum(h);
+    armDc(h, 0, buf, 0.5f);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f, "a track is playing at 0.50");
+
+    // Push, observe, wait for the counter to pass it: the command is in effect.
+    const u64 observed = (h.push(Cmd::TrackVol, 0, 0, 0.0), h.e.drains.load());
+    CHECK(h.e.drains.load() == observed,
+          "pushing does not drain by itself (%llu)", (unsigned long long)h.e.drains.load());
+    h.outL.clear(); h.outR.clear();
+    h.runBlocks(1);
+    CHECK(h.e.drains.load() > observed,
+          "the next process() advances past it (%llu > %llu)",
+          (unsigned long long)h.e.drains.load(), (unsigned long long)observed);
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+          "and the command it was pushed behind has taken effect (%.3g)",
+          (double)tailLevel(h.outL));
+
+    // Monotonic, never skipping and never repeating.
+    u64 prev = h.e.drains.load();
+    bool monotone = true;
+    for (int i = 0; i < 32; ++i) {
+        h.runBlocks(1);
+        const u64 now = h.e.drains.load();
+        if (now != prev + 1) monotone = false;
+        prev = now;
+    }
+    CHECK(monotone, "the counter advances by exactly one per block over 32 blocks");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -2606,6 +3258,9 @@ int main() {
     testMidiRecording();
     testNoteRetirement();
     testOverdub();
+    testBuses();
+    testPdc();
+    testDrains();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

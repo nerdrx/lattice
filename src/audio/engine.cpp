@@ -1,6 +1,7 @@
 #include "engine.h"
 #include "../plugin/host.h"
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 namespace lat {
@@ -336,6 +337,231 @@ static inline void fetch(const RtClip& c, f64 pos, f32& outL, f32& outR) {
 }
 
 // ---------------------------------------------------------------------------
+// mixer topology and plugin delay compensation
+//
+// The graph, and what every path from a voice to the master sum costs in
+// frames (Lt = a track's chain latency, Lr = a return's, Lm = the master's):
+//
+//   dry    voice -> track chain (Lt) -> fader/pan -> master sum
+//   send   voice -> track chain (Lt) -> fader/pan -> send tap
+//                -> return chain (Lr) -> return vol -> master sum
+//   click  metronome ------------------------------> master sum   (no chain)
+//   all of the above ------------------> master chain (Lm) -> master fader
+//
+// The send tap sits *after* the track chain, so both paths out of one track
+// carry the same Lt: whatever aligns a track's dry signal aligns its sends with
+// it for free. That splits the problem into two independent stages.
+//
+//   1. Tracks against each other. Delay track i by (maxLt - Lt_i). Afterwards
+//      every track's post-fader signal — dry and tapped alike — sits at maxLt.
+//   2. Returns against each other and against the dry sum. A return's output
+//      now sits at maxLt + Lr_r while the dry sum sits at maxLt, so delay
+//      return r by (maxLr - Lr_r) and the dry sum by maxLr. Everything then
+//      lands at maxLt + maxLr.
+//
+// The metronome is not on a track and enters the graph at 0, so it takes the
+// same maxLt a zero-latency track would (it gets its own line, applied while
+// outL/outR still holds nothing but the click) and then rides the dry bus's
+// maxLr along with the tracks.
+//
+// The master chain is in series with the whole sum — nothing runs in parallel
+// beside it — so it needs no compensation at all. Its latency is simply part of
+// what the engine publishes:
+//
+//   Engine::latencyFrames = maxLt + maxLr + Lm
+//
+// Returns have no sends of their own, so there is no return -> return path to
+// align. Live gates that behind an option and so could we; it is deliberately
+// out of this wave, and nothing above assumes its absence beyond stage 2.
+//
+// Two properties this implementation holds onto:
+//   * A chain's latency is read exactly once, when the chain is published, and
+//     cached beside the pointer. latencyFrames() is const after prepare() per
+//     the PluginInstance contract, so calling it per block would be a virtual
+//     call per device per block for an answer that cannot have changed.
+//   * When no chain anywhere reports latency, not one delay line is touched and
+//     the arithmetic is the pre-PDC arithmetic, sample for sample. A set with no
+//     latent devices must render bit-identically to before this existed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Compensation is capped per stage. 1<<16 frames is 1.37 s at 48 kHz, which is
+// past any sane linear-phase mastering chain, and it bounds both the memory
+// below and the damage a plugin lying about its latency can do. A chain over
+// the cap is clamped to it: the alignment is then wrong by the excess, which is
+// strictly better than an unbounded allocation, and the audio thread cannot
+// warn about it (no logging here) so latencyFrames simply reports the clamped
+// figure — what the engine actually imposes.
+constexpr int kPdcCap  = 1 << 16;
+constexpr int kPdcMask = kPdcCap - 1;
+
+// One delay line per parallel path: every track, every return, the dry bus and
+// the click.
+constexpr int kPdcDry   = kMaxTracks + kMaxReturns;
+constexpr int kPdcClick = kPdcDry + 1;
+constexpr int kPdcLines = kPdcClick + 1;
+
+// Per-engine delay state. engine.h is a frozen contract with no room for any of
+// this, and the delay storage is far too fat to sit in the Engine by value
+// anyway (see the table below for where it lives and why).
+struct Pdc {
+    f32* mem = nullptr;                 // kPdcLines * 2 * kPdcCap frames
+
+    // Cached chain latencies, written when a chain is published and never per
+    // block. maxTrackLat / maxRetLat are derived from them at the end of the
+    // drain that changed one.
+    int  trackLat[kMaxTracks] = {};
+    int  retLat[kMaxReturns]  = {};
+    int  masterLat  = 0;
+    int  maxTrackLat = 0, maxRetLat = 0;
+
+    int  wpos   = 0;      // shared write cursor: every line is written the same
+                          // n frames per block, so one cursor serves all of them
+    int  filled = 0;      // frames written since the lines went into service
+    bool active = false;  // any compensation at all? false => lines untouched
+    bool dirty  = true;   // a cached latency changed; recompute the maxima
+
+    f32* line(int i, int ch) { return mem + ((size_t)i * 2 + (size_t)ch) * (size_t)kPdcCap; }
+
+    void reset() {
+        for (auto& v : trackLat) v = 0;
+        for (auto& v : retLat) v = 0;
+        masterLat = maxTrackLat = maxRetLat = 0;
+        wpos = 0;
+        filled = 0;
+        active = false;
+        dirty = true;
+        // The ring contents are deliberately *not* cleared: `filled` already
+        // guarantees a line reads zeros until it has been written far enough
+        // back to answer honestly, and a 20 MB memset is not free.
+    }
+};
+
+// Where the state lives.
+//
+// engine.h is frozen, so the Engine cannot carry a pointer to this and the
+// association has to be made on the side, keyed by the Engine's address.
+// prepare() (GUI thread, before the audio thread exists) claims a slot and
+// allocates; the audio thread only ever looks one up, which is a handful of
+// pointer compares once per block.
+//
+// Four slots is three more than any process has ever needed — the app, the
+// daemon, the renderer and the tests each run exactly one Engine — and the
+// table is bounded on purpose so a process that churned through Engines cannot
+// grow this without limit. A fifth *concurrently prepared* Engine evicts the
+// least recently prepared slot and shares its storage, which would mean two
+// engines writing one set of delay lines: audible nonsense, but not a crash and
+// not out-of-bounds. The real fix is a member in engine.h next time it thaws.
+struct PdcTable {
+    static constexpr int kSlots = 4;
+    std::atomic<const Engine*> owner[kSlots];
+    Pdc* slot[kSlots]  = {};
+    u64  stamp[kSlots] = {};
+    u64  clock = 0;
+    // Freed at exit so a leak checker has nothing to say about 20 MB of rings.
+    // By then the backend has stopped and no audio thread is inside process().
+    ~PdcTable() {
+        for (int i = 0; i < kSlots; ++i)
+            if (slot[i]) { std::free(slot[i]->mem); delete slot[i]; slot[i] = nullptr; }
+    }
+};
+PdcTable gPdc;
+
+// Audio thread. Null means "this Engine was never prepared, or its allocation
+// failed" — every caller then behaves as if nothing on it reported latency.
+Pdc* pdcFind(const Engine* e) {
+    for (int i = 0; i < PdcTable::kSlots; ++i)
+        if (gPdc.owner[i].load(std::memory_order_acquire) == e) return gPdc.slot[i];
+    return nullptr;
+}
+
+// GUI thread, from prepare(). Allocates on first use for a given Engine and
+// reuses the slot on every re-prepare (a sample-rate change, say).
+Pdc* pdcAcquire(const Engine* e) {
+    int idx = -1;
+    for (int i = 0; i < PdcTable::kSlots; ++i)
+        if (gPdc.owner[i].load(std::memory_order_relaxed) == e) { idx = i; break; }
+    if (idx < 0)
+        for (int i = 0; i < PdcTable::kSlots; ++i)
+            if (!gPdc.owner[i].load(std::memory_order_relaxed)) { idx = i; break; }
+    if (idx < 0) {                                  // table full: evict the oldest
+        idx = 0;
+        for (int i = 1; i < PdcTable::kSlots; ++i)
+            if (gPdc.stamp[i] < gPdc.stamp[idx]) idx = i;
+        LOGW("pdc: no free delay-compensation slot, sharing one (engine %p)", (const void*)e);
+    }
+    if (!gPdc.slot[idx]) {
+        Pdc* p = new (std::nothrow) Pdc();
+        if (!p) return nullptr;
+        // calloc, not new[]: the pages stay untouched (and unresident) until a
+        // line is actually written, which for a set with no latent device is
+        // never. Zeroed anyway, so a line read before it is filled is silent.
+        p->mem = (f32*)std::calloc((size_t)kPdcLines * 2 * (size_t)kPdcCap, sizeof(f32));
+        if (!p->mem) { delete p; return nullptr; }
+        gPdc.slot[idx] = p;
+    }
+    gPdc.stamp[idx] = ++gPdc.clock;
+    gPdc.owner[idx].store(e, std::memory_order_release);
+    return gPdc.slot[idx];
+}
+
+// Send and return-volume gains. Written this way rather than with clampv so a
+// NaN lands on 0 instead of passing straight through: both multiply a bus that
+// feeds the master, so one bad value out of a mis-scaled fader would poison the
+// whole mix rather than a single track. 16 is +24 dB, past any useful send.
+f32 busGain(f64 x) { return (x > 0.0 && x < 16.0) ? (f32)x : (x >= 16.0 ? 16.f : 0.f); }
+
+// A chain's total latency: its devices are in series, so they add. Read once
+// per publication, never per block.
+int chainLatency(const RtChain* c) {
+    if (!c) return 0;
+    const int cnt = c->count < kMaxChainFx ? c->count : kMaxChainFx;
+    int lat = 0;
+    for (int i = 0; i < cnt; ++i)
+        if (const PluginInstance* fx = c->fx[i]) {
+            const int l = fx->latencyFrames();
+            if (l > 0) lat += l;                    // a negative report is a lie
+        }
+    return lat < kPdcCap ? lat : kPdcCap - 1;
+}
+
+// Delays one channel in place by `d` frames. The ring is written first and read
+// `d` behind, so d == 0 reads back the very sample just written and is an exact
+// passthrough — that is what lets the zero-compensation case share this code
+// path without changing a single output sample. Frames older than the line has
+// been in service read as silence rather than as whatever the ring held from
+// before, which is what keeps a line that has just come back into use from
+// replaying ancient audio.
+void pdcDelayChan(f32* ring, f32* buf, int n, int wpos, int d, int filled) {
+    for (int i = 0; i < n; ++i) {
+        const int w = (wpos + i) & kPdcMask;
+        ring[w] = buf[i];
+        buf[i]  = (filled + i >= d) ? ring[(w - d) & kPdcMask] : 0.f;
+    }
+}
+
+void pdcDelay(Pdc& p, int lineIdx, f32* l, f32* r, int n, int d) {
+    if (d < 0) d = 0;
+    if (d > kPdcMask) d = kPdcMask;
+    pdcDelayChan(p.line(lineIdx, 0), l, n, p.wpos, d, p.filled);
+    pdcDelayChan(p.line(lineIdx, 1), r, n, p.wpos, d, p.filled);
+}
+
+// A line whose path produced nothing this block still has to be fed, or the
+// silence would never travel down it and the gap would come out as a repeat of
+// whatever the ring held. Costs one memset per channel per idle path.
+void pdcFlush(Pdc& p, int lineIdx, int n) {
+    for (int ch = 0; ch < 2; ++ch) {
+        f32* ring = p.line(lineIdx, ch);
+        const int head = p.wpos;
+        const int first = (head + n <= kPdcCap) ? n : (kPdcCap - head);
+        std::memset(ring + head, 0, (size_t)first * sizeof(f32));
+        if (first < n) std::memset(ring, 0, (size_t)(n - first) * sizeof(f32));
+    }
+}
+
+} // namespace
 
 // Track::fireBeat does double duty, and this is the one place to look for why.
 // While something is queued (Track::queued != -2) it is the beat that queued
@@ -358,6 +584,26 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
         recSlotIdx[t].store(-1);
         for (int s = 0; s < kMaxScenes; ++s) clips_[t][s] = RtClip{};
     }
+    // Return buses reset with the tracks. A re-prepare already drops every
+    // track's chain on the floor without retiring it (the GUI is expected to
+    // republish after a rate change, and there is no audio thread running at
+    // this point to be inside one), so the returns and the master follow the
+    // same rule rather than inventing a second one.
+    for (int r = 0; r < kMaxReturns; ++r) {
+        returns_[r] = Return{};
+        returnMeterL[r].store(0.f);
+        returnMeterR[r].store(0.f);
+    }
+    masterChain_ = nullptr;
+
+    // Delay compensation storage. This is the one allocation the engine makes,
+    // and it is made here for exactly that reason: prepare() is GUI-thread and
+    // runs before the audio thread starts (a sample-rate change re-prepares
+    // under the same rule), so process() never has to.
+    if (Pdc* p = pdcAcquire(this)) p->reset();
+    else LOGW("pdc: delay compensation unavailable, latent chains will not be aligned");
+    latencyFrames.store(0);
+
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
 
@@ -406,6 +652,7 @@ void Engine::startVoice(Track& t, const RtClip& c) {
 
 void Engine::drainCommands() {
     Command c;
+    Pdc* pdc = pdcFind(this);
     // Retires a voice that is losing the clip under it. Note-offs first: the
     // array it reads is about to go away and a release ramp it cannot hear will
     // not deliver them for us. Frame 0 because a GUI edit has no grid line of
@@ -541,9 +788,46 @@ void Engine::drainCommands() {
             Track& t = tracks_[c.a];
             const RtChain* old = t.chain;
             t.chain = (const RtChain*)c.p;
+            // The one place a chain's latency is read. It is const after
+            // prepare() per the PluginInstance contract, so the cached copy is
+            // good until the chain is replaced — and replacing it comes through
+            // here. Compensation may change, which the block below resolves.
+            if (pdc) { pdc->trackLat[c.a] = chainLatency(t.chain); pdc->dirty = true; }
             if (old) evts_.push({Ev::ChainRetired, c.a, 0, 0.0, (void*)old});
             break;
         }
+
+        // The return buses and the master, on the same protocol: a pointer swap
+        // and an event carrying the displaced chain home. The `a` field says
+        // which bus it came off — kMaxTracks + index for a return, -1 for the
+        // master — so one event type covers all three kinds of chain without the
+        // GUI having to guess.
+        case Cmd::SetReturnChain: {
+            if (c.a < 0 || c.a >= kMaxReturns) break;
+            Return& rt = returns_[c.a];
+            const RtChain* old = rt.chain;
+            rt.chain = (const RtChain*)c.p;
+            if (pdc) { pdc->retLat[c.a] = chainLatency(rt.chain); pdc->dirty = true; }
+            if (old) evts_.push({Ev::ChainRetired, kMaxTracks + c.a, 0, 0.0, (void*)old});
+            break;
+        }
+        case Cmd::SetMasterChain: {
+            const RtChain* old = masterChain_;
+            masterChain_ = (const RtChain*)c.p;
+            if (pdc) { pdc->masterLat = chainLatency(masterChain_); pdc->dirty = true; }
+            if (old) evts_.push({Ev::ChainRetired, -1, 0, 0.0, (void*)old});
+            break;
+        }
+        // Both ends checked, as everywhere else here: a stray index would have
+        // the audio thread writing outside the mixer. See busGain for why these
+        // two are the only levels in the engine that are sanitised.
+        case Cmd::SendLevel:
+            if (c.a >= 0 && c.a < kMaxTracks && c.b >= 0 && c.b < kMaxReturns)
+                tracks_[c.a].send[c.b] = busGain(c.x);
+            break;
+        case Cmd::ReturnVol:
+            if (c.a >= 0 && c.a < kMaxReturns) returns_[c.a].vol = busGain(c.x);
+            break;
 
         case Cmd::ClearClip:
             if (c.a >= 0 && c.a < kMaxTracks && c.b >= 0 && c.b < kMaxScenes) {
@@ -639,6 +923,38 @@ void Engine::drainCommands() {
         }
         }
     }
+
+    // Compensation depends on the *maxima* across the mixer, so a single chain
+    // swap can move every other path. Resolving it once here rather than per
+    // command keeps a scene's worth of chain pushes to one recompute, and keeps
+    // the per-block path free of it entirely.
+    //
+    // The delay amounts change under running audio, which is a click: the lines
+    // keep their contents and the read cursor simply jumps. That is the accepted
+    // cost of inserting a latent device while playing (Live glitches here too);
+    // what would be worse is a memset of 20 MB on the audio thread. Going from
+    // no compensation at all to some is the one case that cannot jump, because
+    // the lines have been out of service and hold whatever they last held — so
+    // that transition restarts `filled` and the lines read silence until they
+    // have been refilled honestly.
+    if (pdc && pdc->dirty) {
+        int mt = 0, mr = 0;
+        for (int ti = 0; ti < kMaxTracks; ++ti) if (pdc->trackLat[ti] > mt) mt = pdc->trackLat[ti];
+        for (int r = 0; r < kMaxReturns; ++r)   if (pdc->retLat[r]   > mr) mr = pdc->retLat[r];
+        const bool was = pdc->active;
+        pdc->maxTrackLat = mt;
+        pdc->maxRetLat   = mr;
+        pdc->active      = (mt > 0 || mr > 0);
+        if (pdc->active && !was) pdc->filled = 0;
+        pdc->dirty = false;
+    }
+
+    // Last, and after everything above has landed: this counter is what proves
+    // to the other side that a command it pushed has been consumed, so it must
+    // not be observable before the effects it vouches for. Release for the same
+    // reason — the state writes above have to be visible to anyone who sees the
+    // new value.
+    drains.fetch_add(1, std::memory_order_release);
 }
 
 void Engine::fireDue(f64 atBeat) {
@@ -1261,9 +1577,42 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     bool anySolo = false;
     for (const auto& t : tracks_) if (t.solo) { anySolo = true; break; }
 
+    // Delay compensation for this block. `comp` false is the ordinary case — no
+    // device anywhere reports latency — and it must stay free: not a line is
+    // touched and every sum below is the arithmetic it always was.
+    Pdc* pdc = pdcFind(this);
+    const bool comp = pdc && pdc->active;
+
+    // Which return buses take part in this block. A chain with devices on it has
+    // to run every block for its tail, exactly like a track's; a live track with
+    // a send up brings its return in for as long as the send is up. Their
+    // scratch is cleared here, before any track taps into it, for the same
+    // reason the tracks' is cleared before any voice writes.
+    bool retLive[kMaxReturns];
+    for (int r = 0; r < kMaxReturns; ++r)
+        retLive[r] = returns_[r].chain && returns_[r].chain->count > 0;
+    for (int ti = 0; ti < kMaxTracks; ++ti) {
+        if (!live[ti]) continue;
+        for (int r = 0; r < kMaxReturns; ++r)
+            if (tracks_[ti].send[r] != 0.f) retLive[r] = true;
+    }
+    for (int r = 0; r < kMaxReturns; ++r)
+        if (retLive[r]) {
+            std::memset(returns_[r].fxL, 0, (size_t)n * sizeof(f32));
+            std::memset(returns_[r].fxR, 0, (size_t)n * sizeof(f32));
+        }
+
+    // The click. outL/outR holds nothing but the metronome at this point, so
+    // this is the only moment it can be aligned on its own: it enters the graph
+    // with no chain in front of it, which puts it maxTrackLat ahead of every
+    // track. Stage 2 of the derivation then carries it along with the dry sum.
+    if (comp) pdcDelay(*pdc, kPdcClick, outL, outR, n, pdc->maxTrackLat);
+
     for (int ti = 0; ti < kMaxTracks; ++ti) {
         Track& t = tracks_[ti];
-        if (!live[ti]) continue;
+        // A silent path still has to feed its delay line, or the silence never
+        // travels down it and the gap comes back out as stale audio.
+        if (!live[ti]) { if (comp) pdcFlush(*pdc, ti, n); continue; }
 
         // Input monitoring, pre-chain: an armed track hears its input through
         // its own devices, so what you hear while recording is what the take
@@ -1308,6 +1657,11 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                     fx->process(bufs, bufs, 2, n);
         }
 
+        // Stage 1 of the derivation: line this track's chain up with the
+        // latest one. Post-chain and pre-fader, so the dry signal and every
+        // send tapped off it move together.
+        if (comp) pdcDelay(*pdc, ti, t.fxL, t.fxR, n, pdc->maxTrackLat - pdc->trackLat[ti]);
+
         const bool audible = !t.mute && (!anySolo || t.solo);
         const f32 pgL = t.pan <= 0.f ? 1.f : 1.f - t.pan;
         const f32 pgR = t.pan >= 0.f ? 1.f : 1.f + t.pan;
@@ -1327,6 +1681,83 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
         }
         if (pkL > t.mL) t.mL = pkL;
         if (pkR > t.mR) t.mR = pkR;
+
+        // Post-fader sends, Live's default tap: what the return hears is what
+        // the master hears from this track, scaled. Pan, mute and solo are all
+        // already in gL/gR, so a muted track sends nothing and a track silenced
+        // by someone else's solo sends nothing either — audibility is one
+        // decision, made once, for both destinations.
+        for (int r = 0; r < kMaxReturns; ++r) {
+            const f32 s = t.send[r];
+            if (s == 0.f || !retLive[r]) continue;
+            Return& rt = returns_[r];
+            const f32 sL = gL * s, sR = gR * s;
+            for (int i = 0; i < n; ++i) {
+                rt.fxL[i] += t.fxL[i] * sL;
+                rt.fxR[i] += t.fxR[i] * sR;
+            }
+        }
+    }
+
+    // Stage 2: the dry sum (tracks + the already-aligned click) waits for the
+    // longest return chain, and each return waits for the difference between it
+    // and its own. Everything now lands at maxTrackLat + maxRetLat.
+    if (comp) pdcDelay(*pdc, kPdcDry, outL, outR, n, pdc->maxRetLat);
+
+    for (int r = 0; r < kMaxReturns; ++r) {
+        Return& rt = returns_[r];
+        if (!retLive[r]) { if (comp) pdcFlush(*pdc, kMaxTracks + r, n); continue; }
+
+        if (rt.chain && rt.chain->count > 0) {
+            const int cnt = rt.chain->count < kMaxChainFx ? rt.chain->count : kMaxChainFx;
+            // No MIDI goes to a return: a return is an effect bus, and nothing
+            // is armed onto it. In-place, like a track's chain.
+            f32* bufs[2] = {rt.fxL, rt.fxR};
+            for (int fi = 0; fi < cnt; ++fi)
+                if (PluginInstance* fx = rt.chain->fx[fi])
+                    fx->process(bufs, bufs, 2, n);
+        }
+        if (comp) pdcDelay(*pdc, kMaxTracks + r, rt.fxL, rt.fxR, n,
+                           pdc->maxRetLat - pdc->retLat[r]);
+
+        // chain -> vol -> meter -> master, so the return meter reads what the
+        // master actually receives, exactly as a track's does.
+        const f32 g = rt.vol;
+        f32 rpkL = 0.f, rpkR = 0.f;
+        for (int i = 0; i < n; ++i) {
+            const f32 l = rt.fxL[i] * g;
+            const f32 rr = rt.fxR[i] * g;
+            outL[i] += l;
+            outR[i] += rr;
+            const f32 al = std::fabs(l), ar = std::fabs(rr);
+            if (al > rpkL) rpkL = al;
+            if (ar > rpkR) rpkR = ar;
+        }
+        if (rpkL > rt.mL) rt.mL = rpkL;
+        if (rpkR > rt.mR) rt.mR = rpkR;
+    }
+
+    // Every line for this block has now been written, so the cursor moves once
+    // and the fill mark follows it.
+    if (comp) {
+        pdc->wpos = (pdc->wpos + n) & kPdcMask;
+        if (pdc->filled < kPdcCap) {
+            pdc->filled += n;
+            if (pdc->filled > kPdcCap) pdc->filled = kPdcCap;
+        }
+    }
+
+    // The master chain sees the finished sum — tracks, returns and click — and
+    // sees it before the master fader and the clip stage, so a bus compressor
+    // reacts to the mix rather than to the fader. It is in series with
+    // everything, with no parallel path beside it, so it needs no compensation:
+    // its latency is simply added to what latencyFrames publishes.
+    if (masterChain_ && masterChain_->count > 0) {
+        const int cnt = masterChain_->count < kMaxChainFx ? masterChain_->count : kMaxChainFx;
+        f32* bufs[2] = {outL, outR};
+        for (int fi = 0; fi < cnt; ++fi)
+            if (PluginInstance* fx = masterChain_->fx[fi])
+                fx->process(bufs, bufs, 2, n);
     }
 
     // Master bus.
@@ -1379,9 +1810,22 @@ void Engine::publish() {
         recState[ti].store(t.recPhase == 3 ? 2 : t.recPhase, std::memory_order_relaxed);
         recSlotIdx[ti].store(t.recSlot, std::memory_order_relaxed);
     }
+    for (int r = 0; r < kMaxReturns; ++r) {
+        Return& rt = returns_[r];
+        returnMeterL[r].store(rt.mL, std::memory_order_relaxed);
+        returnMeterR[r].store(rt.mR, std::memory_order_relaxed);
+        rt.mL *= kDecay; rt.mR *= kDecay;
+    }
     masterMeterL.store(masL_, std::memory_order_relaxed);
     masterMeterR.store(masR_, std::memory_order_relaxed);
     masL_ *= kDecay; masR_ *= kDecay;
+
+    // What the engine delays the world by: the deepest track chain, plus the
+    // deepest return chain behind it, plus the master chain in series after
+    // both. A host that reports latency to a backend reads this.
+    if (const Pdc* p = pdcFind(this))
+        latencyFrames.store(p->maxTrackLat + p->maxRetLat + p->masterLat,
+                            std::memory_order_relaxed);
 }
 
 } // namespace lat
