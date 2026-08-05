@@ -89,6 +89,13 @@ public:
 
     virtual const PluginDesc& desc() const = 0;
 
+    // Processing latency in frames at the prepared rate/block size. Constant
+    // after prepare() and audio-thread-safe to read; the engine uses it for
+    // delay compensation, so a lying plugin smears transients across parallel
+    // paths. LV2: the reportsLatency control-out port. CLAP: the latency
+    // extension. Internal devices: 0.
+    virtual int latencyFrames() const { return 0; }
+
     // REALTIME-safe to read; set from the GUI thread. When bypassed, process()
     // copies input to output and does not call into the plugin at all.
     virtual void setBypassed(bool b) = 0;

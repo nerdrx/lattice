@@ -120,8 +120,19 @@ struct TrackModel {
     std::vector<SavedDevice> savedDevices;
     f32   fader = 0.85f;               // 0..1, mapped through faderToGain
     f32   pan   = 0.f;                 // -1..1
+    f32   sends[kMaxReturns] = {};     // post-fader send levels, 0..1 linear
     bool  mute = false, solo = false, arm = false;
     f32   width = 94.f;
+};
+
+// A return bus (Live's A/B/... return tracks): a device chain and a level,
+// no clips. Same instance-ownership rules as TrackModel::devices.
+struct ReturnModel {
+    u64 uid = 0;
+    std::string name = "Return";
+    std::vector<DeviceModel> devices;
+    std::vector<SavedDevice> savedDevices;
+    f32 fader = 0.85f;
 };
 
 struct SceneModel {
@@ -133,6 +144,9 @@ struct SceneModel {
 struct Session {
     std::vector<TrackModel> tracks;
     std::vector<SceneModel> scenes;
+    ReturnModel returns[kMaxReturns];   // fixed buses; empty chains = inert
+    std::vector<DeviceModel> masterDevices;
+    std::vector<SavedDevice> masterSavedDevices;
     // Monotonic UID source for every entity in this set. Serialized, so IDs
     // stay unique across save/load. Assign at creation; never reuse.
     u64 nextUid = 1;

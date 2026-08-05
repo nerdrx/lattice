@@ -91,6 +91,7 @@ struct MidiMsg {
 class PluginInstance;                  // src/plugin/host.h; RT-safe process()
 
 inline constexpr int kMaxChainFx = 8;
+inline constexpr int kMaxReturns = 4;   // A/B/C/D return tracks, like Live
 
 struct RtChain {
     PluginInstance* fx[kMaxChainFx] = {};   // in processing order; nulls skipped
@@ -108,6 +109,10 @@ enum class Cmd : u32 {
     MasterVol,
     ClipGain, ClipWarp, ClipLoop,
     SetChain,                          // a = track, p = RtChain* (null clears)
+    SetReturnChain,                    // a = return index, p = RtChain*
+    SetMasterChain,                    // p = RtChain*
+    SendLevel,                         // a = track, b = return, x = linear gain 0..1+
+    ReturnVol,                         // a = return, x = linear gain
 
     // Recording. RecordSlot toggles: first send queues a quantized record
     // start into slot (a=track, b=slot, p=GUI-owned f32* interleaved stereo
@@ -183,6 +188,14 @@ public:
     // Recording state per track: 0 idle, 1 queued, 2 recording; slot index.
     std::atomic<int>  recState[kMaxTracks]{};
     std::atomic<int>  recSlotIdx[kMaxTracks]{};
+    // Return-bus meters and the engine's total delay-compensation latency.
+    std::atomic<f32>  returnMeterL[kMaxReturns]{}, returnMeterR[kMaxReturns]{};
+    std::atomic<int>  latencyFrames{0};
+    // Bumped at the END of every drainCommands(). A command is provably
+    // consumed by the audio thread once this counter has advanced past the
+    // value observed after pushCommand() succeeded — the exact-retirement
+    // primitive the process split's sample pool needs (PROCESS-SPLIT.md §10).
+    std::atomic<u64>  drains{0};
 
     f64 sampleRate() const { return sr_; }
 
@@ -217,11 +230,18 @@ private:
 
         // Device chain (see RtChain protocol above) and the pre-mix scratch
         // this track's clips render into. Signal flow per block:
-        //   voices (clip gain + declick) -> fx chain -> vol/pan/mute/solo
-        //   -> meters -> master sum.
+        //   voices (clip gain + declick) -> fx chain -> [PDC delay] ->
+        //   vol/pan/mute/solo -> meters -> master sum
+        //   + post-fader sends into the return buses (Live's default tap).
         // Chains with count > 0 must run every block, playing or not, so
         // reverb tails and monitoring survive the transport stopping.
+        //
+        // Delay compensation invariant: every parallel path into the master
+        // sum — dry tracks, sends through returns, the master chain — is
+        // sample-aligned; Engine::latencyFrames publishes the total. The
+        // implementation owns the delay-line details.
         const RtChain* chain = nullptr;
+        f32 send[kMaxReturns] = {};    // post-fader send levels, linear
         f32 fxL[kMaxBlock]{};
         f32 fxR[kMaxBlock]{};
 
@@ -271,6 +291,20 @@ private:
 
     RtClip clips_[kMaxTracks][kMaxScenes];
     Track  tracks_[kMaxTracks];
+
+    // Return buses: a chain, a level, and their own scratch. They follow the
+    // same RtChain retirement protocol as tracks (SetReturnChain /
+    // SetMasterChain retire displaced chains via Ev::ChainRetired with
+    // a = kMaxTracks + returnIdx, or a = -1 for the master chain).
+    struct Return {
+        const RtChain* chain = nullptr;
+        f32 vol = 1.f;
+        f32 mL = 0.f, mR = 0.f;
+        f32 fxL[kMaxBlock]{};
+        f32 fxR[kMaxBlock]{};
+    };
+    Return returns_[kMaxReturns];
+    const RtChain* masterChain_ = nullptr;
 
     Ring<Command, 1024> cmds_;
     Ring<Event, 1024>   evts_;
