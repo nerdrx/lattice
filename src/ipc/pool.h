@@ -311,9 +311,11 @@ inline constexpr u32 kHash =
 // boolean: the reason string is what turns "the clip is silent" into a log line
 // that names the bug.
 inline bool poolValidate(const u8* base, size_t payloadBytes, const PoolHeader* hdr,
-                         u64 ref, u32 wantKind, u64 needBytes, const char** why) {
+                         u64 ref, u32 wantKind, u64 needBytes, const char** why,
+                         u64* outBytes = nullptr) {
     auto no = [&](const char* r) { if (why) *why = r; return false; };
     if (why) *why = "";
+    if (outBytes) *outBytes = 0;
 
     if (!base || !hdr)                       return no("no pool attached");
     if (ref == 0)                            return no("null offset");
@@ -339,18 +341,28 @@ inline bool poolValidate(const u8* base, size_t payloadBytes, const PoolHeader* 
 
     // Past the magic we are on the block's own terms, but it is still a number
     // another process wrote: a wild `bytes` would turn a valid block into an
-    // arbitrary read.
-    if (b->bytes == 0 || b->bytes % kPoolAlign != 0) return no("block size is not a positive multiple of 64");
-    if (b->bytes > arenaHi - ref)            return no("block extends past the end of the arena");
-    if (ref + b->bytes > bump)               return no("block extends past the allocator's high-water mark");
+    // arbitrary read. Load it ONCE into a local (F3): every check below, and the
+    // size handed back to the caller, must reason about one snapshot — a writer
+    // that flips `b->bytes` between the arena-bound check and the extent check
+    // could otherwise widen the accepted read past the mapping. `kind` gets the
+    // same one-load treatment for the same reason.
+    const u64 bytes = b->bytes;
+    const u32 kind  = b->kind;
+    if (bytes == 0 || bytes % kPoolAlign != 0) return no("block size is not a positive multiple of 64");
+    if (bytes > arenaHi - ref)               return no("block extends past the end of the arena");
+    if (ref + bytes > bump)                  return no("block extends past the allocator's high-water mark");
 
     const u32 st = b->state.load(std::memory_order_acquire);
     if (st == BlockFree)                     return no("block has been freed");
-    if (wantKind != PoolKindNone && b->kind != wantKind)
+    if (wantKind != PoolKindNone && kind != wantKind)
         return no(wantKind == PoolKindSamples ? "block does not hold sample data"
                 : wantKind == PoolKindNotes   ? "block does not hold notes"
                                               : "block does not hold a string");
-    if (needBytes > b->bytes)                return no("block is smaller than the clip claims");
+    if (needBytes > bytes)                   return no("block is smaller than the clip claims");
+    // Hand the validated extent back so callers never re-read the mutable field
+    // (F4): the scan/copy bound must come from what validation proved, not from
+    // a fresh load a hostile writer can widen after the fact.
+    if (outBytes) *outBytes = bytes;
     return true;
 }
 
@@ -415,11 +427,16 @@ public:
             setErr("pool size %zu is too small to hold a single block", payloadBytes);
             return false;
         }
-        // A crashed GUI leaves its pool behind by design (§4.3) — but a *stale*
-        // one, whose creator is provably gone and which nobody has adopted,
-        // would block this create() forever. Same reap rule as everywhere else:
-        // pid plus start time, never pid alone.
-        ShmRegion::reapIfStale(name);
+        // F8b: no pre-emptive reapIfStale() here. It is redundant with
+        // create()'s own EEXIST reap (the only correctly guarded form: it reaps
+        // only after O_EXCL fails), and it is dangerous — the pool's ftruncate
+        // is 256 MiB wide, so a sibling between shm_open() and ftruncate() spends
+        // a long time looking "unsized", and a pre-reap would unlink its live
+        // name. Worse, keying that reap on ShmHeader::creatorPid is wrong for the
+        // pool specifically: the pool is DESIGNED to outlive its creator and be
+        // adopted (abandon()/attach()), and an adopter did not use to re-stamp
+        // the creator — so a live, adopted pool read as stale. Adoption now
+        // re-stamps the owner (see attach()), and create() alone reaps.
         if (!region_.create(name, payloadBytes, pool::kHash, kShmVersion, /*seal*/true)) {
             setErr("%s", region_.error());
             return false;
@@ -454,6 +471,13 @@ public:
             return false;
         }
         base_ = region_.payload();
+        // F8b: this handle is a GUI adopting a pool its creator may have left
+        // behind. Take ownership of the liveness key so reapIfStale() keys on
+        // THIS live process, not the original (possibly dead) creator — a live
+        // adopted pool must never read as an orphan. attach() maps R/W for a
+        // GUI, so this write is legal; the daemon's PoolReader maps read-only
+        // and never adopts.
+        region_.adoptCreator();
         err_[0] = '\0';
         return true;
     }
@@ -520,7 +544,12 @@ public:
             return 0;
         }
 
-        PoolBlock* b = blockAt(ref);
+        // Direct pointer, not blockAt(): a freshly bump-carved block has no magic
+        // yet (it is written with release at the end of this function), so it
+        // would not pass validRef()'s F6 magic check — and it must not have to.
+        // alloc() is the trusted producer that just carved `ref`; validRef() is
+        // for offsets that arrived from outside.
+        PoolBlock* b = (PoolBlock*)(base_ + ref - sizeof(PoolBlock));
         b->key      = key;
         b->frames   = frames;
         b->rate     = rate;
@@ -726,6 +755,13 @@ private:
         if (!valid() || ref == 0 || ref % kPoolAlign != 0) return false;
         if (ref < hdr_->arenaOffset + sizeof(PoolBlock)) return false;
         if (ref > hdr_->bump.load(std::memory_order_relaxed)) return false;
+        // Bounds alone let any 64-aligned offset under the bump masquerade as a
+        // block, so a forged EvBlockRetired echo pointing into live sample data
+        // would be reinterpreted as a PoolBlock (F6). The self-mixed magic is
+        // exactly the check the daemon-side poolValidate() makes; the writer
+        // side must make it too, or a hostile echo corrupts the free list.
+        const PoolBlock* b = (const PoolBlock*)(base_ + ref - sizeof(PoolBlock));
+        if (b->magic.load(std::memory_order_acquire) != (kPoolBlockMagic ^ ref)) return false;
         return true;
     }
 
@@ -792,11 +828,16 @@ private:
     // neighbour lookup structure.
     void insertFree(u64 ref) {
         PoolBlock* b = blockAt(ref);
+        if (!b) return;                       // forged/absorbed ref: refuse to splice
         u64 prev = 0;
         u64 cur  = hdr_->freeHead.load(std::memory_order_relaxed);
-        while (cur && cur < ref) { prev = cur; cur = blockAt(cur)->next; }
+        while (cur && cur < ref) {
+            PoolBlock* c = blockAt(cur);
+            if (!c) break;                    // a corrupted `next` ends the walk, not the process
+            prev = cur; cur = c->next;
+        }
         b->next = cur;
-        if (prev) blockAt(prev)->next = ref;
+        if (prev) { PoolBlock* p = blockAt(prev); if (p) p->next = ref; }
         else      hdr_->freeHead.store(ref, std::memory_order_relaxed);
     }
 
@@ -809,9 +850,11 @@ private:
         u64 cur = hdr_->freeHead.load(std::memory_order_relaxed);
         while (cur) {
             PoolBlock* b = blockAt(cur);
+            if (!b) break;                                      // corrupted head/next: stop, don't fault
             const u64 next = b->next;
             if (next && cur + b->bytes + sizeof(PoolBlock) == next) {
                 PoolBlock* n = blockAt(next);
+                if (!n) break;                                  // the mergee is not a real block
                 b->bytes += sizeof(PoolBlock) + n->bytes;
                 b->next   = n->next;
                 n->magic.store(0, std::memory_order_release);   // absorbed
@@ -923,8 +966,9 @@ public:
     u64         epoch() const { return hdr_ ? hdr_->epoch.load(std::memory_order_relaxed) : 0; }
     const PoolHeader* header() const { return hdr_; }
 
-    bool validate(u64 ref, u32 kind, u64 needBytes, const char** why) const {
-        return poolValidate(base_, bytes_, hdr_, ref, kind, needBytes, why);
+    bool validate(u64 ref, u32 kind, u64 needBytes, const char** why,
+                  u64* outBytes = nullptr) const {
+        return poolValidate(base_, bytes_, hdr_, ref, kind, needBytes, why, outBytes);
     }
 
     // Only ever called after validate() said yes. Returns a pointer into a

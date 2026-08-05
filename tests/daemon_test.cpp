@@ -27,6 +27,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
+#include <limits>
 
 #include <dirent.h>
 #include <signal.h>
@@ -1087,6 +1090,174 @@ static void testBadOffsets(ipc::EngineClient& c) {
 }
 
 // ---------------------------------------------------------------------------
+// 10b. hostile clip SCALARS: the daemon refuses them and never faults the
+//      audio/pump thread (F1, F2, F3). Complements testBadOffsets, which
+//      attacks the *offset*; this attacks the numbers the engine multiplies.
+// ---------------------------------------------------------------------------
+
+// Pushes a clip and waits for its ack, returning true if it was REFUSED and
+// nothing reached the engine. `reason` receives the daemon's reject code.
+static bool pushClipRefused(ipc::EngineClient& c, int track, int slot,
+                            const ipc::WireClip& wc, u32& reason) {
+    const ipc::ControlHeader& h = c.header();
+    drainEvents(c);
+    const u64 applied0 = h.clipsApplied.load();
+    reason = ipc::RejectNone;
+    if (!c.setClip(track, slot, wc)) return false;
+    std::vector<ipc::WireEvent> evs;
+    const bool answered = waitUntil([&] {
+        drainEvents(c, &evs);
+        return !c.clipBusy(track, slot);
+    }, 2000);
+    const ipc::WireEvent* ack = nullptr;
+    for (const ipc::WireEvent& e : evs) if (e.type == ipc::EvClipAck) ack = &e;
+    if (ack) reason = (u32)ack->x;
+    return answered && ack && (ack->flags & ipc::ClipAckRefused) &&
+           h.clipsApplied.load() == applied0;
+}
+
+static void testHostileClips(ipc::EngineClient& c) {
+    banner("10b. hostile clip scalars are refused, and the daemon survives (F1/F2/F3)");
+
+    const std::vector<f32> dc = makeDc(4096, 2, 0.3f);
+    const u64 good = c.poolWrite(dc.data(), 4096, 2, 48000.0, 0);
+    CHECK(good != 0, "a good 4096-frame block at %llu", (unsigned long long)good);
+    if (!good) return;
+
+    // F1: frames = 2^62. The byte extent (frames*channels*4) wrapped u64 to 0
+    // and slid under poolValidate's size gate; the engine then indexed 2^62
+    // frames into a 64 KiB block. It must be refused at the boundary.
+    {
+        ipc::WireClip wc = audioClip(good, 4096, 2);
+        wc.frames  = (i64)1 << 62;
+        wc.loopEnd = (i64)1 << 62;                 // keep the loop window "consistent"
+        u32 reason = 0;
+        const bool refused = pushClipRefused(c, 2, 0, wc, reason);
+        CHECK(refused, "frames = 2^62 is refused (reason %s)", ipc::rejectReasonName(reason));
+        CHECK(c.alive(), "and the daemon is still alive");
+    }
+
+    // F2: clipBpm non-finite. rate = tempo/clipBpm would be NaN/inf and defeat
+    // the engine's own bounds guard. isfinite is checked at the boundary.
+    for (const f64 bpm : {std::numeric_limits<f64>::infinity(),
+                          std::numeric_limits<f64>::quiet_NaN()}) {
+        ipc::WireClip wc = audioClip(good, 4096, 2);
+        wc.clipBpm = bpm;
+        u32 reason = 0;
+        const bool refused = pushClipRefused(c, 2, 0, wc, reason);
+        CHECK(refused, "clipBpm = %.3g is refused (reason %s)", bpm,
+              ipc::rejectReasonName(reason));
+    }
+
+    // F2 (the subtle one): a FINITE denormal clipBpm. It passes isfinite, but
+    // tempo/clipBpm still overflows to +inf, so the DERIVED rate is what must be
+    // bounded — which the >= 1.0 boundary check now does.
+    {
+        ipc::WireClip wc = audioClip(good, 4096, 2);
+        wc.clipBpm = 1e-320;                        // denormal, finite, tiny
+        u32 reason = 0;
+        const bool refused = pushClipRefused(c, 2, 0, wc, reason);
+        CHECK(refused, "a denormal clipBpm (1e-320) is refused (reason %s)",
+              ipc::rejectReasonName(reason));
+        CHECK(c.alive(), "and the daemon is still alive");
+    }
+
+    // F3: a block whose `bytes` field is flipped huge cannot widen the accepted
+    // read extent. poolValidate loads bytes once and bounds it against the
+    // arena, so a terabyte `bytes` fails the arena-bound check rather than
+    // letting a clip read past the mapping. We flip it, push a well-formed clip,
+    // and expect a refusal — then restore it so the block is usable again.
+    {
+        ipc::PoolBlock* blk = c.pool().blockAt(good);
+        CHECK(blk != nullptr, "the good block's header is reachable to the writer");
+        if (blk) {
+            const u64 realBytes = blk->bytes;
+            blk->bytes = (u64)1 << 40;              // 1 TiB, far past the arena
+            ipc::WireClip wc = audioClip(good, 4096, 2);
+            u32 reason = 0;
+            const bool refused = pushClipRefused(c, 2, 0, wc, reason);
+            CHECK(refused, "a block with a wild `bytes` (2^40) is refused (reason %s)",
+                  ipc::rejectReasonName(reason));
+            CHECK(c.alive(), "and the daemon is still alive");
+            blk->bytes = realBytes;                 // restore for the liveness check
+        }
+    }
+
+    // The whole point of refusing rather than faulting: a valid clip still works
+    // immediately afterwards, proving the boundary is not left wedged.
+    {
+        ipc::WireClip wc = audioClip(good, 4096, 2);
+        CHECK(c.setClip(2, 0, wc), "a valid clip after every hostile one");
+        CHECK(waitClipIdle(c, 2, 0), "is acknowledged");
+        CHECK(c.pool().stateOf(good) == ipc::BlockLive, "and installed (%s)",
+              ipc::poolStateName(c.pool().stateOf(good)));
+        CHECK(c.clearClip(2, 0), "clear it");
+        CHECK(waitClipIdle(c, 2, 0), "acknowledged");
+        CHECK(waitRetired(c, good), "and retired");
+        CHECK(c.poolRelease(good), "and freed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10c. a command flood does not stall the heartbeat past a bound (F7). A peer
+//      that hammers the command ring must not livelock the pump — the daemon's
+//      per-tick drain budget keeps the heartbeat beating.
+// ---------------------------------------------------------------------------
+
+static void testCommandFloodHeartbeat(ipc::EngineClient& c) {
+    banner("10c. a command flood cannot freeze the heartbeat (F7)");
+
+    // Hammer the command ring as fast as a peer can for ~400 ms, on a thread of
+    // its own, while the main thread watches the daemon's heartbeat. Without a
+    // per-tick budget the daemon's drain loop would spin on the perpetually-full
+    // ring and never reach heartbeat.fetch_add.
+    std::atomic<bool> stop{false};
+    std::atomic<u64>  pushed{0};
+    std::thread flood([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            // A cheap, always-rejected command keeps translate() on its shortest
+            // path so the ring stays pressured rather than the engine.
+            if (c.pushCommand(Cmd::SetTempo, 0, 0, 140.0)) pushed.fetch_add(1);
+        }
+    });
+
+    // The property is "the pump does not livelock", not a tick rate: a budgeted
+    // pump keeps beating; an unbudgeted one spins on the perpetually-full ring
+    // and produces ZERO ticks no matter how long we wait. So give it a generous
+    // window and require only a modest advance — that distinguishes a beating
+    // pump from a frozen one even on a heavily loaded / ASan / plugin-less box,
+    // where a tight tick threshold would flake.
+    const u64 hb0 = c.heartbeat();
+    const bool beating = waitUntil([&] { return c.heartbeat() > hb0 + 20; }, 4000);
+    const u64 hb1 = c.heartbeat();
+    stop.store(true, std::memory_order_relaxed);
+    flood.join();
+
+    CHECK(beating,
+          "the heartbeat kept beating through the flood (%llu -> %llu, +%llu; pushed %llu)",
+          (unsigned long long)hb0, (unsigned long long)hb1,
+          (unsigned long long)(hb1 - hb0), (unsigned long long)pushed.load());
+    CHECK(c.alive(), "and the daemon never looked wedged");
+
+    // And it recovers: the flood left the command ring full, so the daemon
+    // must drain it (which it can only do if the pump is still running) before
+    // a fresh push is accepted. That the ring empties at all is the recovery
+    // proof; do it in a retry loop rather than a single push, which would race
+    // the drain.
+    const bool accepted = waitUntil([&] {
+        drainEvents(c);
+        return c.pushCommand(Cmd::SetTempo, 0, 0, 120.0);
+    }, 2000);
+    CHECK(accepted, "the ring drains and a fresh command is accepted after the flood");
+
+    // The heartbeat is still advancing after it all — the pump was never wedged.
+    const u64 hb2 = c.heartbeat();
+    const bool stillBeating = waitUntil([&] { return c.heartbeat() > hb2 + 5; }, 3000);
+    CHECK(stillBeating, "and the heartbeat is still advancing afterwards (%llu -> %llu)",
+          (unsigned long long)hb2, (unsigned long long)c.heartbeat());
+}
+
+// ---------------------------------------------------------------------------
 // 11. devices: the plugin layer lives in the daemon now
 // ---------------------------------------------------------------------------
 //
@@ -1179,9 +1350,33 @@ static void testDevices(ipc::EngineClient& c) {
     CHECK(scanned, "EvScanComplete arrived: %d plugins in %.2f s", scanEv.a, scanEv.x);
     CHECK(c.scanState() == ipc::ScanDone, "scanState is Done (%u)", c.scanState());
     CHECK(scanEv.a >= 2, "the catalog has at least the two stock devices (%d)", scanEv.a);
-    CHECK(c.heartbeat() > hb0 + 100,
-          "the pump kept beating right through the scan (%llu -> %llu ticks)",
+
+    // The "pump kept beating through the scan" property only has teeth when the
+    // scan was actually slow. On a box with hundreds of LV2 bundles it takes
+    // seconds; on a plugin-less runner (CI, LV2_PATH empty) it finishes in a
+    // couple of ticks, and a fixed hb0+100 threshold could never be met there —
+    // which is why it went red. Gate the strict, proportional check on a slow
+    // scan, and always assert the heartbeat at least advanced.
+    CHECK(c.heartbeat() > hb0,
+          "the heartbeat advanced across the scan (%llu -> %llu ticks)",
           (unsigned long long)hb0, (unsigned long long)c.heartbeat());
+    if (scanEv.x > 0.2) {
+        // 1 ms pump cadence run concurrently with an x-second scan should have
+        // produced ~x*1000 ticks; half of that is a comfortable floor.
+        const u64 expect = (u64)(scanEv.x * 1000.0 * 0.5);
+        CHECK(c.heartbeat() > hb0 + expect,
+              "and it kept beating right through a %.2fs scan (advanced %llu, > %llu)",
+              scanEv.x, (unsigned long long)(c.heartbeat() - hb0),
+              (unsigned long long)expect);
+    }
+    // Plugin-independent liveness: sample, sleep, and prove the ~1 ms cadence
+    // produced a healthy tick count. This holds on every machine, and is the
+    // real "the pump is not wedged" assertion.
+    const u64 hbA = c.heartbeat();
+    sleepMs(200);
+    CHECK(c.heartbeat() > hbA + 100,
+          "the pump beats at its ~1 ms cadence: %llu ticks in 200 ms (> 100)",
+          (unsigned long long)(c.heartbeat() - hbA));
     CHECK(c.alive(), "so the engine never looked wedged");
 
     // -- AddDevice -----------------------------------------------------------
@@ -1738,10 +1933,14 @@ static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
     // is not over until the client says so, and the pool is the session's. A
     // shutdown that took the pool with it would make "attach a new engine to a
     // running session" impossible, which is the feature §4.3 is built on.
-    CHECK(!shmExists(gRegion), "the control region is unlinked");
+    // Poll for absence rather than asserting it instantly: the daemon
+    // shm_unlink()s and then exits, and waitFor() can return before the unlink
+    // is visible here, so an instantaneous check races process teardown.
+    const bool regionGone = waitUntil([&] { return !shmExists(gRegion); }, 2000);
+    CHECK(regionGone, "the control region is unlinked");
     CHECK(shmExists(gPool), "and the pool is still there — it is the session's, not the engine's");
-    const int strays = countNxTaktShm(gPool);
-    CHECK(strays == 0, "nothing else is left in /dev/shm (%d)", strays);
+    const bool noStrays = waitUntil([&] { return countNxTaktShm(gPool) == 0; }, 2000);
+    CHECK(noStrays, "nothing else is left in /dev/shm (%d)", countNxTaktShm(gPool));
 
     c.detach();
 
@@ -1791,6 +1990,8 @@ int main(int argc, char** argv) {
         testClearAndRetire(client);
         testMidiClip(client);
         testBadOffsets(client);
+        testHostileClips(client);
+        testCommandFloodHeartbeat(client);
         testDevices(client);
         testDrainsExactness(client);
         testCrashAndRespawn(client, daemon);
@@ -1799,7 +2000,10 @@ int main(int argc, char** argv) {
 
     banner("15. /dev/shm is clean");
     cleanup();
-    const int leftover = countNxTaktShm();
+    // Poll: a daemon we just signalled may still be unlinking its region as we
+    // arrive here, so absence is a bounded wait, not an instantaneous fact.
+    int leftover = countNxTaktShm();
+    for (int i = 0; i < 40 && leftover != 0; ++i) { sleepMs(50); leftover = countNxTaktShm(); }
     CHECK(leftover == 0, "no nxtakt region left in /dev/shm (found %d)", leftover);
 
     std::printf("\n----------------------------------------\n");

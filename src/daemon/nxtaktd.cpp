@@ -272,8 +272,15 @@ public:
         //    region whose creator is provably gone, so two daemons racing for
         //    one session resolve here: the loser exits and its GUI's retry
         //    loop finds the winner (§4.1).
+        //
+        //    F8a: there is deliberately NO pre-emptive reapIfStale() here.
+        //    create() reaps on EEXIST — the correctly guarded form (attach was
+        //    refused first). Reaping *before* create races a sibling daemon that
+        //    is between shm_open() and ftruncate(): its region reads as unsized,
+        //    the pre-reap unlinks a live name, and then A's close() unlinks B's
+        //    region. "Reap only after a failed attach, never before" is the rule
+        //    the control region already obeys via create(); honour it here too.
         ipc::controlRegionName(opt_.session, gRegionName, sizeof gRegionName);
-        ipc::ShmRegion::reapIfStale(gRegionName);
         if (!region_.create(gRegionName, ipc::control::kBytes, ipc::control::kHash)) {
             LOGE("cannot create the control region: %s", region_.error());
             LOGE("another nxtaktd may already own session '%s'", opt_.session);
@@ -510,8 +517,16 @@ private:
         // Snapshot the name: it is the peer's memory and the peer may rewrite
         // it. Sized to hold ControlHeader::poolName in full, because a name
         // truncated here would open a *different* region, not fail.
+        //
+        // F10: poolName is a char[96] the peer writes and nothing guarantees a
+        // NUL inside it. snprintf("%s", ...) would read until it found one,
+        // running off the field into the rest of the control region. Copy the
+        // fixed field and terminate it ourselves — the same bounded idiom
+        // EngineClient::fixed() uses. ShmRegion::normalize() then rejects any
+        // garbage name (it requires a single path component).
         char nm[sizeof map_.hdr->poolName + 1];
-        std::snprintf(nm, sizeof nm, "%s", map_.hdr->poolName);
+        std::memcpy(nm, map_.hdr->poolName, sizeof map_.hdr->poolName);
+        nm[sizeof map_.hdr->poolName] = '\0';
         if (!pool_.attach(nm)) {
             // Back off rather than hammering shm_open every millisecond: the
             // usual cause is that the GUI has not called publishReady() yet.
@@ -549,7 +564,8 @@ private:
             havePending_ = false;
         }
         ipc::WireCommand w;
-        while (map_.cmds->pop(w)) {
+        u32 budget = kCmdBudget;                 // F7: bounded work per tick
+        while (budget-- && map_.cmds->pop(w)) {
             // Device commands are not translated and never reach the engine —
             // the daemon *executes* them, and what the engine hears about is
             // the Cmd::SetChain that comes out the other end. They are queued
@@ -711,9 +727,25 @@ private:
         if (c.warp < 0 || c.warp > (i32)Warp::Beats)             { reason = ipc::RejectBadClip; return false; }
         if (c.followAction < 0 || c.followAction >= kFollowCount){ reason = ipc::RejectBadClip; return false; }
         if (c.quantumIdx < -1 || c.quantumIdx >= kQuantumCount)  { reason = ipc::RejectBadClip; return false; }
-        if (c.clipBpm <= 0.0 || c.lengthBeats < 0.0)             { reason = ipc::RejectBadClip; return false; }
+        if (c.lengthBeats < 0.0)                                 { reason = ipc::RejectBadClip; return false; }
         if (c.prob < 0.0 || c.prob > 1.0)                        { reason = ipc::RejectBadClip; return false; }
         if (c.noteCount > (i64)INT32_MAX)                        { reason = ipc::RejectBadClip; return false; }
+        // F1: `frames` is a multiply operand for the byte-extent below
+        // ((u64)frames * channels * 4) and it indexes the sample block in the
+        // engine. noteCount is capped just above; frames was not, so 2^62 frames
+        // wrapped the u64 extent to 0 and slipped past poolValidate's size gate.
+        // Cap it to the same INT32_MAX the engine's i32 sample indices assume,
+        // which also makes the extent multiply structurally unable to wrap.
+        if (c.frames > (i64)INT32_MAX)                           { reason = ipc::RejectBadClip; return false; }
+        // F2: the engine derives rate = tempo_/clipBpm and steps srcPos by it;
+        // tempo_ is clamped to [20,999] but a denormal clipBpm (e.g. 1e-320)
+        // makes rate == +inf, then srcPos == inf, then (i64)NaN in fetch() — a
+        // wild index the engine's own bounds guard cannot catch (every compare
+        // against NaN is false). isfinite was already checked in `scalars[]`
+        // above; bound it to a sane musical range here so the DERIVED rate stays
+        // finite and small. engine.h is frozen and trusts its RtClip, so this
+        // boundary check is the only place the class can be closed.
+        if (!(c.clipBpm >= 1.0 && c.clipBpm <= 1.0e6))           { reason = ipc::RejectBadClip; return false; }
 
         // An invalid cell is a legal thing to publish — it is how a GUI parks
         // an empty slot — and it references nothing, so it skips the pool
@@ -815,7 +847,8 @@ private:
 
     void pumpMidi() {
         ipc::WireMidi w;
-        while (map_.midi->pop(w)) {
+        u32 budget = kMidiBudget;                // F7: bounded work per tick
+        while (budget-- && map_.midi->pop(w)) {
             MidiMsg m{};
             m.status = w.status; m.d1 = w.d1; m.d2 = w.d2; m.frame = w.frame;
             if (!engine_->pushMidi(m)) return;   // ring full: the rest waits a tick
@@ -932,12 +965,17 @@ private:
         if (!ref) return false;
         if (!pool_.valid()) return false;
         const char* why = "";
-        if (!pool_.validate(ref, ipc::PoolKindString, 1, &why)) {
+        // F4: take the block extent VALIDATE proved, not a fresh read of the
+        // mutable b->bytes. The old code re-loaded pool_.block(ref)->bytes after
+        // validation, so a writer that flipped it up to 4096 after validate()
+        // said yes (validated with needBytes=1) made the scan run up to ~960 B
+        // past the end of the mapping for a string block at the arena tail.
+        u64 blockBytes = 0;
+        if (!pool_.validate(ref, ipc::PoolKindString, 1, &why, &blockBytes)) {
             logBadRef("string", ref, 0, 0, why);
             return false;
         }
-        u64 n = pool_.block(ref)->bytes;
-        if (n > ipc::kMaxPoolString) n = ipc::kMaxPoolString;
+        u64 n = blockBytes < ipc::kMaxPoolString ? blockBytes : ipc::kMaxPoolString;
         const char* s = (const char*)pool_.at(ref);
         u64 len = 0;
         while (len < n && s[len]) ++len;
@@ -1485,6 +1523,28 @@ private:
     static constexpr u64 kRetireGraceNs = 100ull * 1000000ull;   // 100 ms (legacy)
     static constexpr u64 kRetireBlocks  = 4;                     //        (legacy)
 
+    // F7: the pump must keep beating under a hostile flood. Two bounds do it.
+    //
+    // Per-tick drain budget. pumpCommands/pumpMidi/pumpEvents used to drain
+    // `while (ring->pop(...))` with no ceiling, so a producer that refills as
+    // fast as the daemon drains kept the loop from ever returning — the
+    // heartbeat froze, a client concluded the engine was wedged, and respawn
+    // logic fired against a live daemon. Draining at most one ring capacity per
+    // tick lets the largest legitimate backlog (a full ring) clear in one tick
+    // while an unbounded flood is cut off, and the pump resumes next tick —
+    // pending_/the rings already model exactly "resume from here".
+    static constexpr u32 kCmdBudget  = ipc::CommandRing::capacity();
+    static constexpr u32 kMidiBudget = ipc::MidiRing::capacity();
+    static constexpr u32 kEvtBudget  = ipc::EventRing::capacity();
+
+    // Retirement-queue ceiling. `retiring_` drains only when the client pops
+    // events; a client that never pops while it keeps issuing SetClips grows it
+    // without bound (RSS climbs, and considerRetire's linear dedup makes the
+    // pump O(n^2)). Cap it and drop the OLDEST on overflow: a dropped retirement
+    // costs the client a pool leak, which is strictly better than a dead daemon
+    // and — via a logged, counted drop — observable.
+    static constexpr size_t kMaxRetiring = 8192;
+
     // Records what the engine now holds for a cell and queues whatever that
     // displaced. Runs only from commit().
     void installClip(int track, int slot, const ipc::WireClip& nc) {
@@ -1534,6 +1594,21 @@ private:
         r.dueNs     = ipc::monotonicNs() +
                       (kRetireGraceNs > 8 * blockNs ? kRetireGraceNs : 8 * blockNs);
         r.dueBlocks = (nullDriver_ ? nullDriver_->blocks() : 0) + kRetireBlocks;
+
+        // F7: bound the queue. A client that never pops events cannot make this
+        // grow without limit — drop the oldest (front) entry, which is the one
+        // most likely already past its grace, count it, and log once. The cost
+        // is a client-side pool leak of that block, not a dead daemon.
+        if (retiring_.size() >= kMaxRetiring) {
+            retiring_.erase(retiring_.begin());
+            ++retiringDropped_;
+            if (!retiringDropLogged_) {
+                retiringDropLogged_ = true;
+                LOGW("retirement queue hit %zu entries: dropping oldest "
+                     "(client is not draining events) [further drops silent]",
+                     kMaxRetiring);
+            }
+        }
         retiring_.push_back(r);
     }
 
@@ -1596,7 +1671,8 @@ private:
     // something reached the engine that should not have.
     void pumpEvents() {
         Event ev;
-        while (engine_->popEvent(ev)) {
+        u32 budget = kEvtBudget;                 // F7: bounded work per tick
+        while (budget-- && engine_->popEvent(ev)) {
             if (ev.type == Ev::NotesRetired) {
                 confirmRetire(ev.p);
                 continue;
@@ -1792,6 +1868,8 @@ private:
     // actually forwarded.
     ipc::WireClip                  shadow_[kMaxTracks][kMaxScenes]{};
     std::vector<Retire>            retiring_;
+    u64                            retiringDropped_    = 0;      // F7: overflow drops
+    bool                           retiringDropLogged_ = false;
 
     // -- phase 3 ------------------------------------------------------------
     PluginRegistry                  registry_;          // the catalog, once scanned

@@ -704,3 +704,127 @@ ends before converting, so `Ev::NotesRetired` carrying a foreign pointer is drop
 Regression tests worth adding to `tests/daemon_test.cpp:1032`'s `BadCase` table, which is already
 the right shape for all of them: `frames = 2^62`; `clipBpm = 1e-320`; a `bytes`-flipping writer
 thread racing `poolValidate`; a forged `EvBlockRetired` against `EngineClient`.
+
+---
+
+# Audit remediation (wave 8) — fixes, and the threat model made explicit
+
+This section records what was done against F1–F11, and — as the brief for F5/F9/F11
+required — states plainly what the same-uid shared-memory model does and does not defend.
+Files touched: `src/ipc/{shm,pool,client}.h`, `src/daemon/nxtaktd.cpp`,
+`tests/{daemon,ipc}_test.cpp`. (`latticed.cpp` line numbers in the body above map to the
+post-rename `nxtaktd.cpp`; the code is the same, shifted a few lines.)
+
+## What was fixed
+
+- **F1 (fixed).** `translateClip` now caps `frames` at `INT32_MAX` alongside the existing
+  `noteCount` cap (`nxtaktd.cpp`, the scalar block in `translateClip`). With `frames ≤ 2^31−1`
+  and `channels ≤ 2`, the byte-extent multiply `frames*channels*4` cannot wrap a `u64`, so the
+  `2^62`-frame clip that used to wrap to `need = 0` and slip past the size gate is refused
+  (`RejectBadClip`) at the boundary.
+
+- **F2 (fixed).** The derived `rate = tempo_/clipBpm` is bounded at the boundary by rejecting any
+  `clipBpm` outside `[1.0, 1.0e6]`. `isfinite` already rejected inf/NaN inputs; the new bound also
+  rejects a *finite denormal* (`1e-320`) whose only symptom is the derived `rate` overflowing to
+  `+inf`. engine.h is frozen and trusts its `RtClip`, so the daemon is the sole validator — the
+  boundary check is where the whole NaN/inf-index class is closed.
+
+- **F3 (fixed).** `poolValidate` loads `b->bytes` (and `b->kind`) **once** into locals after the
+  magic acquire, and every arena/high-water/extent check plus the size handed back reasons about
+  that one snapshot. A writer flipping `bytes` mid-validate can no longer widen the accepted read
+  past the mapping. (`src/ipc/pool.h`.)
+
+- **F4 (fixed).** `poolValidate`/`SamplePool::validate` gained an `outBytes` out-parameter;
+  `readPoolString` uses the *validated* extent as its scan bound instead of re-reading
+  `block(ref)->bytes`. A string block at the arena tail whose `bytes` is flipped to 4096 after
+  validation can no longer be scanned ~960 B past the end of the mapping. (`nxtaktd.cpp`,
+  `pool.h`.)
+
+- **F6 (fixed).** Three changes in the client: `SamplePool::validRef` now checks the self-mixed
+  block magic (`kPoolBlockMagic ^ ref`), so an interior/forged offset into live sample data is no
+  longer accepted as a `PoolBlock`; `insertFree`/`normalize` gained the `if (!b) break;` null guard
+  the other free-list walkers already had; and `alloc()` reads its just-carved (magic-not-yet-set)
+  block through a direct pointer rather than `blockAt()`, since it is the trusted producer, not an
+  untrusted-offset consumer. A forged `EvBlockRetired` echo is now a no-op — `confirmRetired`
+  already gates on `state == Retiring`, and the magic check closes the interior-pointer path.
+
+- **F7 (fixed).** `pumpCommands`/`pumpMidi`/`pumpEvents` drain at most one ring capacity per tick
+  (a producer that refills as fast as the daemon drains no longer livelocks the pump, so the
+  heartbeat keeps beating). `retiring_` is capped at `kMaxRetiring` (8192) with a drop-oldest,
+  counted, log-once policy — a flooding peer costs itself a client-side pool leak, not a dead
+  daemon.
+
+- **F8 (fixed).** Both pre-emptive `reapIfStale` calls are deleted — the one before the daemon's
+  control-region `create()` and the one before `SamplePool::create()` — leaving `create()`'s
+  EEXIST reap (which runs *after* a failed `O_EXCL`, the correctly-guarded form) as the only reaper,
+  the same rule the client already obeyed. The pool's liveness key is fixed by having an adopter
+  re-stamp ownership: `ShmRegion::adoptCreator()` (new) writes the current pid + start-ticks, and
+  `SamplePool::attach` calls it, so `reapIfStale` keys on the *live adopter*, not the original
+  (possibly dead) creator. A live, adopted pool no longer reads as an orphan. The unused
+  `PoolHeader::creatorPid` field is left as-is; the fix lives in the `ShmHeader` key `reapIfStale`
+  already consults.
+
+- **F10 (fixed).** `pumpPool` reads `ControlHeader::poolName` with a bounded `memcpy` + explicit
+  terminator instead of `snprintf("%s", …)`, so a peer-written field with no NUL cannot be read
+  past its 96 bytes. (`nxtaktd.cpp`.)
+
+## Tests added
+
+- `tests/daemon_test.cpp` **§10b** (`testHostileClips`): `frames = 2^62` refused; `clipBpm`
+  inf/NaN refused; denormal `clipBpm = 1e-320` refused; a block with a wild `bytes = 2^40` refused
+  ("block extends past the end of the arena"); daemon survives every one and the next valid clip
+  installs, plays and retires. **§10c** (`testCommandFloodHeartbeat`): a background thread floods
+  the command ring while the heartbeat is required to keep advancing (property, not tick-rate), the
+  ring recovers, and a fresh command is accepted afterwards.
+- `tests/ipc_test.cpp` **§6** (`testForgedRetirement`): a forged `EvBlockRetired` at an interior
+  64-aligned offset of live (denormal-filled) sample data is fed through `EngineClient::observe`;
+  the free list, live count and real block are asserted intact and a subsequent alloc works, with a
+  positive control that a genuinely-`Retiring` block is still retired by its own echo. **§7**
+  (`testAdoptedPoolLiveness`): a child creates a pool and is `SIGKILL`ed; the parent adopts it
+  (re-stamping the key); `reapIfStale` is asserted to leave the live adopted pool alone.
+- Two pre-existing flakes were also de-flaked (independently confirmed on HEAD): the post-exit
+  `/dev/shm` absence checks now poll with a bounded timeout instead of asserting instantaneously
+  (the daemon unlinks then exits, and `waitFor` can return before the unlink is visible), and the
+  plugin-scan heartbeat assertion no longer requires a fixed tick count — it gates the strict,
+  scan-duration-proportional check on the scan actually being slow and otherwise asserts a
+  plugin-independent liveness floor, so it is green whether the runner has 410 LV2 bundles or zero.
+
+## Threat model & limitations (F5, F9, F11 — documented, not "fixed")
+
+The framing at the top of this document holds: **both regions are `0600` and same-uid, so there is
+no confidentiality or integrity boundary here — a process that can write a region can also
+`shm_unlink` it.** No finding is a privilege escalation. The property being defended is
+**fail-closed behaviour**: a hostile or *buggy* peer must produce a refusal, never a fault on the
+audio or pump thread. F1–F4, F6, F7 restore that property; the following are its acknowledged
+edges, defended only as far as the same-uid model allows.
+
+- **F5 — the pool handshake is unauthenticated and first-writer-wins (NOT closed).** The control
+  region carries the pool *name*, which any same-uid process can publish, and the daemon maps
+  exactly one pool per lifetime. There is no in-band identity to distinguish the real GUI from an
+  attacker, because there is no socket to pass an fd over. The real fix is the deferred
+  `memfd_create` + `SCM_RIGHTS` migration (§3.2), which removes the name from the protocol
+  entirely. Until then this is a same-uid DoS / delivery-vehicle, not an escalation, and the
+  validation hardened above (F3/F4/F6) means that even an attacker-supplied pool cannot produce an
+  out-of-bounds *access* — only a refusal or a same-uid denial of service.
+
+- **F9 — `ftruncate` → SIGBUS (NOT closed; known).** `F_SEAL_SHRINK` is unavailable on a plain
+  `shm_open` object, so any same-uid process can `shm_open(O_RDWR)` the pool and shrink it, faulting
+  the daemon's mapping on the next page access. `sealed()` already reports the unsealed state
+  honestly. The real fix is again the memfd + `SCM_RIGHTS` path (future wave); there is no cheap
+  in-model defence, because the same uid that can shrink it can also unlink it.
+
+- **F11 — liveness/lifecycle fields are peer-writable (documentation).** `ShmHeader::creatorPid`/
+  `creatorStartTicks`, `ControlHeader::shutdown`, and the heartbeats all live in peer-writable
+  memory, so **every liveness decision in the protocol is attacker-steerable** — a hostile writer
+  can forge "alive", "dead", "shutting down", or "stale" in either direction. This is not an
+  escalation (that writer can `shm_unlink` outright), and the pid-plus-start-ticks discipline still
+  correctly defends against the *different* problem of pid reuse by a crashed-and-respawned peer;
+  it must simply not be read as defending against a hostile writer. F8's `adoptCreator` moves the
+  liveness *key* to the correct process but does not — and in this model cannot — make it
+  tamper-proof.
+
+The one-line summary: after this wave, a hostile or buggy peer that feeds the daemon or the GUI
+bad scalars, offsets, sizes, retirement echoes, or command floods gets a **refusal or a bounded
+same-uid DoS**, never an out-of-bounds access or an audio-thread fault. Confidentiality, integrity,
+and shrink-safety across the same-uid boundary remain out of scope until the socket/memfd
+migration.

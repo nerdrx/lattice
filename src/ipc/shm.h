@@ -424,6 +424,21 @@ public:
     const char* error() const  { return err_; }
     bool        isCreator() const { return unlink_; }
     bool        isReadOnly() const { return readOnly_; }
+
+    // Re-stamp the liveness identity to the calling process. A region that is
+    // designed to outlive its creator and be adopted by a replacement (the
+    // sample pool, §4.3) keys reapIfStale() on ShmHeader::creatorPid — but that
+    // still named the ORIGINAL, now-dead creator, so a live adopted region read
+    // as stale and could be unlinked out from under its new owner (F8b). An
+    // adopter calls this after a successful writable attach() so the liveness
+    // key follows ownership. No-op on a read-only mapping (the daemon, which
+    // must not write the pool) and before any mapping exists.
+    void adoptCreator() {
+        if (!base_ || readOnly_) return;
+        ShmHeader* h = header();
+        h->creatorPid        = (i32)::getpid();
+        h->creatorStartTicks = procStartTicks((i32)::getpid());
+    }
     bool        sealed() const    { return sealed_; }
     size_t      totalBytes() const { return bytes_; }
     size_t      payloadBytes() const { return bytes_ ? bytes_ - kPayloadOffset : 0; }

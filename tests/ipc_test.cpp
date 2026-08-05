@@ -11,11 +11,14 @@
 //
 //   g++ -std=c++20 -O2 -Wall -Wextra tests/ipc_test.cpp -o ipc_test -lrt -lpthread
 #include "../src/ipc/shm.h"
+#include "../src/ipc/pool.h"
+#include "../src/ipc/client.h"
 
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include <dirent.h>
 #include <signal.h>
@@ -163,6 +166,15 @@ static int countNxTaktShm() {
         if (std::strstr(e->d_name, "nxtakt")) { ++n; note("leftover /dev/shm/%s", e->d_name); }
     ::closedir(d);
     return n;
+}
+
+// Does a POSIX shm object by this name exist? Accepts both the "/name" and
+// "name" spellings, matching how the region layer normalises them.
+static bool shmExistsPool(const char* name) {
+    const char* body = (name && *name == '/') ? name + 1 : name;
+    char path[128];
+    std::snprintf(path, sizeof path, "/dev/shm/%s", body ? body : "");
+    return ::access(path, F_OK) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +391,7 @@ static bool evtOk(const WireEvt& e, u64 seq) {
     state->engineState.store(ipc::SharedState::StateRunning, std::memory_order_relaxed);
 
     u64  sent = 0, seen = 0, badOrder = 0, badPayload = 0, spins = 0;
+    u64  lastBlock = 0;
     const u64 deadline = ipc::monotonicNs() + kTimeoutNs;
     WireCmd c{};
 
@@ -391,8 +404,16 @@ static bool evtOk(const WireEvt& e, u64 seq) {
             ++seen;
         }
 
-        // Stand in for Engine::publish(): one stamp per "block".
-        if ((seen & 0x3ff) == 0) {
+        // Stand in for Engine::publish(): one stamp per "block" of 1024
+        // commands. Keyed on CROSSING a block boundary, not on `seen` landing
+        // exactly on a multiple of 1024: the inner pop-loop above drains in
+        // gulps under load (the parent runs far ahead), so `seen` can leap past
+        // a boundary without ever equalling it — and a coincidence-based
+        // `(seen & 0x3ff) == 0` then never fires, leaving playing/beat at their
+        // init values. Crossing-based stamping publishes once per block whatever
+        // the gulp size, so the parent always observes a live playhead.
+        if (seen / 1024 != lastBlock) {
+            lastBlock = seen / 1024;
             state->beat.store((f64)seen / 24000.0, std::memory_order_relaxed);
             state->playing.store(1, std::memory_order_relaxed);
             state->stampHeartbeat();
@@ -572,6 +593,143 @@ static void testStaleReap() {
 }
 
 // ---------------------------------------------------------------------------
+// 6. F6 — a forged EvBlockRetired must not corrupt the client's free list
+// ---------------------------------------------------------------------------
+//
+// The daemon echoes EvBlockRetired back to say "the engine can no longer reach
+// this block". A hostile (or buggy) peer can push the same event with a ref
+// that points into live sample data: as f32 bit patterns, near-silent audio is
+// full of offsets whose reinterpreted PoolBlock header reads state=Retiring,
+// live=0, refs=0 — exactly the shape confirmRetired() used to act on. The fix
+// is the self-mixed block magic in validRef(): an interior offset is not a
+// block, so blockAt() returns null and the free list is never touched.
+
+static void testForgedRetirement() {
+    banner("6. a forged EvBlockRetired cannot corrupt the client free list (F6)");
+    char session[32];
+    std::snprintf(session, sizeof session, "ipc-forge-%d", (int)::getpid());
+
+    // Register the pool name for the crash/atexit cleanup path so a mid-test
+    // failure cannot leave it in /dev/shm.
+    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "nxtakt-pool-%s", session);
+
+    ipc::EngineClient c;
+    if (!c.createPool(session, 4u << 20)) { CHECK(false, "createPool: %s", c.error()); return; }
+    ipc::SamplePool& p = c.pool();
+
+    // Fill with a denormal ~ near-silence: the audit's "qualifying offset"
+    // pattern, so the forged header genuinely looks retirement-shaped.
+    std::vector<f32> dc((size_t)4096 * 2, 4.2e-45f);
+    const u64 a = c.poolWrite(dc.data(), 4096, 2, 48000.0, 1);
+    CHECK(a != 0, "a real sample block at %llu", (unsigned long long)a);
+    if (!a) { c.closePool(); return; }
+
+    const u32 freeLen0 = p.freeListLength();
+    const u64 live0    = p.liveBlocks();
+
+    // An interior, 64-aligned offset of the block's own data, under the bump —
+    // the dangerous case bounds-only validation used to accept.
+    const u64 forged = a + 1024;
+    CHECK(forged % ipc::kPoolAlign == 0 && forged < p.bump(),
+          "the forged ref is 64-aligned and under the bump (the dangerous case)");
+
+    ipc::WireEvent e{};
+    e.type = ipc::EvBlockRetired;
+    e.ref  = forged;
+    CHECK(c.observe(e), "observe() consumes the forged echo as a protocol event");
+
+    // Nothing moved: free list, live count, and the real block are all intact.
+    CHECK(p.freeListLength() == freeLen0,
+          "the free list is unchanged (%u == %u)", p.freeListLength(), freeLen0);
+    CHECK(p.liveBlocks() == live0,
+          "the live-block count is unchanged (%llu == %llu)",
+          (unsigned long long)p.liveBlocks(), (unsigned long long)live0);
+    CHECK(p.stateOf(a) == ipc::BlockQuiescent,
+          "the real block is untouched (%s)", ipc::poolStateName(p.stateOf(a)));
+
+    // The allocator still works and hands back a usable block.
+    const u64 b = c.poolWrite(dc.data(), 1024, 2, 48000.0, 2);
+    CHECK(b != 0 && b != a, "a subsequent alloc still works (%llu)", (unsigned long long)b);
+    CHECK(b && p.data<f32>(b) != nullptr, "and the block is usable");
+
+    // Positive control: a genuinely-Retiring block IS retired by its own echo,
+    // so the magic check did not break the real path.
+    const u64 g = c.poolWrite(dc.data(), 512, 2, 48000.0, 3);
+    CHECK(g != 0, "a third block to retire for real (%llu)", (unsigned long long)g);
+    p.markLive(g);         // a clip cell points here
+    p.markDisplaced(g);    // it stopped pointing here -> Retiring
+    CHECK(p.stateOf(g) == ipc::BlockRetiring, "the real block is Retiring (%s)",
+          ipc::poolStateName(p.stateOf(g)));
+    ipc::WireEvent ge{};
+    ge.type = ipc::EvBlockRetired;
+    ge.ref  = g;
+    c.observe(ge);
+    CHECK(p.stateOf(g) == ipc::BlockQuiescent,
+          "its own echo retires it correctly (%s)", ipc::poolStateName(p.stateOf(g)));
+
+    c.poolRelease(a);
+    c.poolRelease(b);
+    c.poolRelease(g);
+    c.closePool();
+    CHECK(!shmExistsPool(session), "the forge-test pool is unlinked");
+    gShmNameAlt[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// 7. F8 — an adopted pool is not reaped when its ORIGINAL creator dies
+// ---------------------------------------------------------------------------
+//
+// The pool is designed to outlive its creator: a crashed GUI leaves it behind
+// and a replacement adopts it. reapIfStale() keys liveness on
+// ShmHeader::creatorPid, which used to keep naming the dead original — so a
+// live, adopted pool read as an orphan and could be unlinked out from under its
+// new owner. adoptCreator() (called from SamplePool::attach) moves the liveness
+// key to the adopting process, so the pool reads as alive.
+
+static void testAdoptedPoolLiveness() {
+    banner("7. an adopted pool survives a reap-check after its creator dies (F8)");
+    char pool[48];
+    std::snprintf(pool, sizeof pool, "nxtakt-ipc-adopt-%d", (int)::getpid());
+    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "%s", pool);   // crash-safe cleanup
+
+    std::fflush(stdout);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ipc::SamplePool sp;
+        if (!sp.create(pool, 2u << 20)) ::_exit(1);
+        std::vector<f32> dc((size_t)1024 * 2, 0.5f);
+        sp.writeSamples(dc.data(), 1024, 2, 48000.0, 1);
+        sp.abandon();                // detach WITHOUT unlink: leave it behind
+        for (;;) ::pause();          // SIGKILLed below; region persists
+    }
+    if (pid < 0) { CHECK(false, "fork failed"); return; }
+
+    // Parent adopts the pool the child created (this re-stamps the liveness key).
+    ipc::SamplePool mine;
+    const bool up = mine.attach(pool, 3000);
+    CHECK(up, "adopted the child's pool%s%s", up ? "" : ": ", up ? "" : mine.error());
+    const u64 childBump = mine.bump();
+
+    // The original creator is now provably gone.
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, nullptr, 0);
+
+    // Pre-fix, this reaped a live adopted pool. Now the key is us, and we live.
+    CHECK(!ipc::ShmRegion::reapIfStale(pool),
+          "reapIfStale() leaves the adopted pool alone (the key is now this process)");
+    CHECK(shmExistsPool(pool), "the pool region still exists in /dev/shm");
+    CHECK(mine.valid(), "and our mapping is still valid");
+    CHECK(mine.bump() == childBump && childBump > ipc::kPoolArenaOffset,
+          "the block the child wrote survived (bump %llu)", (unsigned long long)childBump);
+
+    // We adopted (unlink_ == false), so unlink explicitly to keep /dev/shm clean.
+    mine.close();
+    ipc::ShmRegion::forceUnlink(pool);
+    CHECK(!shmExistsPool(pool), "and it unlinks cleanly on the way out");
+    gShmNameAlt[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // survives fork() without duplicating output
@@ -586,8 +744,10 @@ int main() {
     testBackpressure();
     testCrossProcess();
     testStaleReap();
+    testForgedRetirement();
+    testAdoptedPoolLiveness();
 
-    banner("6. /dev/shm is clean");
+    banner("8. /dev/shm is clean");
     cleanupShm();
     const int leftover = countNxTaktShm();
     CHECK(leftover == 0, "no nxtakt region left in /dev/shm (found %d)", leftover);
