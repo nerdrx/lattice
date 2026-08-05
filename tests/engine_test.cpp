@@ -81,7 +81,7 @@ struct Host {
     size_t run(i64 frames) {
         const size_t mark = outL.size();
         for (i64 done = 0; done < frames; done += block) {
-            e.process(bl.data(), br.data(), block);
+            e.process(nullptr, nullptr, bl.data(), br.data(), block);
             outL.insert(outL.end(), bl.begin(), bl.end());
             outR.insert(outR.end(), br.begin(), br.end());
         }
@@ -420,7 +420,7 @@ static void testFiniteOutput() {
         // Move the tempo around so the warp ratio and grain hop keep changing.
         if (i % 500 == 0) h.e.pushCommand([&]{
             Command c; c.type = Cmd::SetTempo; c.x = 60.0 + (f64)(i % 7) * 37.5; return c; }());
-        h.e.process(bl.data(), br.data(), kBlock);
+        h.e.process(nullptr, nullptr, bl.data(), br.data(), kBlock);
         for (int j = 0; j < kBlock; ++j) {
             if (!std::isfinite(bl[(size_t)j]) || !std::isfinite(br[(size_t)j])) allFinite = false;
             const f32 m = std::max(std::fabs(bl[(size_t)j]), std::fabs(br[(size_t)j]));

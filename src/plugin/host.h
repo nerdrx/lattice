@@ -20,7 +20,10 @@
 
 namespace lat {
 
-enum class PluginFormat : int { LV2 = 0, CLAP, VST3 };
+// Internal = Lattice's own stock devices. They implement PluginInstance like
+// any other backend, so they inherit the browser, knobs, bypass, chains and
+// persistence without special cases anywhere else.
+enum class PluginFormat : int { LV2 = 0, CLAP, VST3, Internal };
 enum class PluginKind   : int { Effect = 0, Instrument, Unknown };
 
 const char* formatName(PluginFormat f);
@@ -67,6 +70,13 @@ public:
     // long. Aliasing (in[c] == out[c]) is allowed. Never allocates or locks.
     virtual void process(const f32* const* in, f32* const* out, int channels, int nframes) = 0;
 
+    // REALTIME. Raw MIDI (status + up to two data bytes), delivered by the
+    // engine before this block's process(); `frameOffset` is the sample
+    // position within that block. Default no-op so effects ignore it; note-
+    // capable backends (CLAP note events, LV2 atom sequences, internal
+    // instruments) override. Same rules as process(): no allocation, no locks.
+    virtual void midi(const u8* data, int len, int frameOffset) { (void)data; (void)len; (void)frameOffset; }
+
     virtual int              paramCount() const = 0;
     virtual const ParamInfo& paramInfo(int i) const = 0;
     virtual f32              getParam(int i) const = 0;
@@ -89,7 +99,8 @@ public:
 namespace detail {
     void scanLV2(std::vector<PluginDesc>& out);
     std::unique_ptr<PluginInstance> instantiateLV2(const PluginDesc& d, f64 sampleRate, int maxBlock);
-    // TODO(clap): void scanCLAP(std::vector<PluginDesc>&);
+    void scanInternal(std::vector<PluginDesc>& out);
+    std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d, f64 sampleRate, int maxBlock);
     // TODO(vst3): void scanVST3(std::vector<PluginDesc>&);
 }
 

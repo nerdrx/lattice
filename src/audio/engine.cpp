@@ -330,7 +330,10 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
     }
 }
 
-void Engine::process(f32* outL, f32* outR, int nframes) {
+void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int nframes) {
+    // Input capture and monitoring land with the recording wave; until then
+    // the capture buffers are accepted and ignored.
+    (void)inL; (void)inR;
     const auto t0 = std::chrono::steady_clock::now();
 
     drainCommands();

@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
     f64 sumSq = 0.0;
     for (i64 done = 0; done < total; done += block) {
         const int n = (int)std::min<i64>(block, total - done);
-        eng.process(l.data(), r.data(), n);
+        eng.process(nullptr, nullptr, l.data(), r.data(), n);
         for (int i = 0; i < n; ++i) {
             inter.push_back(l[i]);
             inter.push_back(r[i]);

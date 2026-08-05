@@ -18,6 +18,10 @@
 namespace lat {
 
 struct ClipModel {
+    // Stable identity. UIDs never change once assigned and are serialized, so
+    // undo, set-diff, automation targets and collaboration can reference an
+    // entity across moves and renames. 0 = unassigned (Session::newUid()).
+    u64 uid = 0;
     SampleRef sample;
     std::string name;
     // Source file. Authoritative for save/load: it survives a missing sample,
@@ -31,6 +35,10 @@ struct ClipModel {
     f64  lengthBeats = 4.0;
     i64  loopStart = 0, loopEnd = 0;
     int  quantumIdx = -1;              // -1 => follow the global quantum
+    // Generative scheduling, mirrored into RtClip (see engine.h Follow).
+    f64  prob = 1.0;
+    Follow followAction = Follow::None;
+    f64  followBeats = 0.0;            // 0 => the clip's own length
     bool valid() const { return sample != nullptr; }
 };
 
@@ -38,16 +46,32 @@ struct ClipModel {
 // borrows it through the RtChain currently published to the engine, so it may
 // only be destroyed after that chain has come back via Ev::ChainRetired.
 struct DeviceModel {
+    u64 uid = 0;
     PluginDesc desc;
     std::unique_ptr<PluginInstance> inst;
     bool bypass = false;
 };
 
+// A device as it sits in a saved set: no instance, just what's needed to
+// rebuild one. The project layer reads/writes ONLY this passive form; the App
+// materializes savedDevices -> devices (instantiate, apply params, publish)
+// after load and serializes devices -> savedDevices before save. That keeps
+// plugin instantiation out of src/core entirely.
+struct SavedDevice {
+    u64 uid = 0;
+    std::string uri;                   // PluginDesc::uri
+    std::string name;                  // display fallback if the plugin is gone
+    bool bypass = false;
+    std::vector<std::pair<u32, f32>> params;   // (ParamInfo::id, value)
+};
+
 struct TrackModel {
+    u64 uid = 0;
     std::string name = "Track";
     int   colorIdx = 0;
     ClipModel slots[kMaxScenes];
     std::vector<DeviceModel> devices;   // makes TrackModel move-only
+    std::vector<SavedDevice> savedDevices;
     f32   fader = 0.85f;               // 0..1, mapped through faderToGain
     f32   pan   = 0.f;                 // -1..1
     bool  mute = false, solo = false, arm = false;
@@ -55,6 +79,7 @@ struct TrackModel {
 };
 
 struct SceneModel {
+    u64 uid = 0;
     std::string name;
     f64 tempo = 0.0;                   // 0 => no tempo change on launch
 };
@@ -62,6 +87,10 @@ struct SceneModel {
 struct Session {
     std::vector<TrackModel> tracks;
     std::vector<SceneModel> scenes;
+    // Monotonic UID source for every entity in this set. Serialized, so IDs
+    // stay unique across save/load. Assign at creation; never reuse.
+    u64 nextUid = 1;
+    u64 newUid() { return nextUid++; }
     f64  tempo = 120.0;
     int  sigNum = 4, sigDen = 4;
     int  quantumIdx = 4;               // index into kQuantumBeats -> "1 Bar"

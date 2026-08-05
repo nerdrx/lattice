@@ -15,6 +15,11 @@ namespace lat {
 
 enum class Warp : int { Off = 0, Repitch = 1, Beats = 2 };
 
+// What a clip does when it has played `followBeats` (0 = its own length).
+enum class Follow : int { None = 0, Stop, Again, Next, Previous, First, Random };
+inline constexpr const char* kFollowNames[] = {"None", "Stop", "Again", "Next", "Prev", "First", "Random"};
+inline constexpr int kFollowCount = 7;
+
 // Clip slot state as seen by the UI.
 enum class SlotState : int { Empty = 0, Stopped, Queued, Playing, StopQueued };
 
@@ -33,7 +38,21 @@ struct RtClip {
     int  warp         = (int)Warp::Beats;
     bool loop         = true;
     int  quantumIdx   = -1;        // -1 => follow global quantum
+    // Generative scheduling. `prob` gates each launch (a skipped launch keeps
+    // whatever was playing); the follow action fires after `followBeats` of
+    // playback and schedules like any user launch, quantum included.
+    f64  prob         = 1.0;       // 0..1 launch probability
+    int  followAction = (int)Follow::None;
+    f64  followBeats  = 0.0;       // 0 => the clip's own lengthBeats
     bool valid        = false;
+};
+
+// Raw MIDI into the engine, pushed from a reader thread via pushMidi(). The
+// engine forwards each block's worth to note-capable devices on armed tracks
+// through PluginInstance::midi().
+struct MidiMsg {
+    u8  status = 0, d1 = 0, d2 = 0, pad = 0;
+    i32 frame  = 0;                // offset hint within the current block
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +83,16 @@ enum class Cmd : u32 {
     MasterVol,
     ClipGain, ClipWarp, ClipLoop,
     SetChain,                          // a = track, p = RtChain* (null clears)
+
+    // Recording. RecordSlot toggles: first send queues a quantized record
+    // start into slot (a=track, b=slot, p=GUI-owned f32* interleaved stereo
+    // capture buffer, x=capacity in FRAMES); a second send to the same slot
+    // queues a quantized stop. The engine appends input into the buffer and
+    // never frees it; when recording ends it comes back via Ev::RecordFinished
+    // and the GUI turns it into a clip. Buffers must stay alive until then.
+    // Overdub (wave 3) will re-enter the same buffer mixing instead of
+    // appending — nothing in this contract precludes that.
+    RecordSlot,
 };
 
 struct Command {
@@ -75,7 +104,10 @@ struct Command {
 };
 
 enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportStopped,
-                      ChainRetired /* a = track, p = the RtChain* now safe to free */ };
+                      ChainRetired,   // a = track, p = the RtChain* now safe to free
+                      RecordStarted,  // a = track, b = slot, x = beat it began
+                      RecordFinished  // a = track, b = slot, x = frames written, p = the buffer
+                    };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
 // Global launch quantum choices, in beats. Index 0 is "None".
@@ -88,10 +120,13 @@ inline constexpr int kQuantumCount = 10;
 class Engine {
 public:
     void prepare(f64 sampleRate, int maxBlock);
-    void process(f32* outL, f32* outR, int nframes);   // audio thread only
+    // Audio thread only. `inL`/`inR` are the capture buffers and may be null
+    // when the backend has no input; recording and input monitoring read them.
+    void process(const f32* inL, const f32* inR, f32* outL, f32* outR, int nframes);
 
     bool pushCommand(const Command& c) { return cmds_.push(c); }   // GUI thread
     bool popEvent(Event& e)            { return evts_.pop(e); }    // GUI thread
+    bool pushMidi(const MidiMsg& m)    { return midi_.push(m); }   // MIDI reader thread
 
     // --- polled by the GUI ---------------------------------------------
     std::atomic<f64>  beat{0.0};            // absolute beats since transport start
@@ -104,6 +139,9 @@ public:
     std::atomic<f64>  clipPhase[kMaxTracks]{};    // 0..1 through the running clip
     std::atomic<f32>  meterL[kMaxTracks]{}, meterR[kMaxTracks]{};
     std::atomic<f32>  masterMeterL{0.f}, masterMeterR{0.f};
+    // Recording state per track: 0 idle, 1 queued, 2 recording; slot index.
+    std::atomic<int>  recState[kMaxTracks]{};
+    std::atomic<int>  recSlotIdx[kMaxTracks]{};
 
     f64 sampleRate() const { return sr_; }
 
@@ -137,6 +175,15 @@ private:
         const RtChain* chain = nullptr;
         f32 fxL[kMaxBlock]{};
         f32 fxR[kMaxBlock]{};
+
+        // Recording into a GUI-owned interleaved stereo buffer (see the
+        // Cmd::RecordSlot contract). The engine appends and never frees.
+        f32* recBuf = nullptr;
+        i64  recCap = 0;             // capacity in frames
+        i64  recLen = 0;             // frames written so far
+        int  recSlot = -1;           // target slot, -1 when idle
+        int  recPhase = 0;           // 0 idle, 1 queued start, 2 recording, 3 queued stop
+        f64  recFireBeat = 0.0;
     };
 
     void  drainCommands();
@@ -165,6 +212,7 @@ private:
 
     Ring<Command, 1024> cmds_;
     Ring<Event, 1024>   evts_;
+    Ring<MidiMsg, 1024> midi_;
 };
 
 } // namespace lat

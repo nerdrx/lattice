@@ -29,6 +29,12 @@ using SampleRef = std::shared_ptr<SampleBuffer>;
 // Loads and resamples to `engineRate`. Returns null on failure.
 SampleRef loadSample(const std::string& path, f64 engineRate);
 
+// Wraps a just-recorded interleaved stereo buffer (already at engine rate) in
+// a SampleBuffer: copies the data, builds peaks, and derives lengthBeats from
+// the session tempo instead of guessing. GUI thread.
+SampleRef sampleFromRecording(const f32* interleaved, i64 frames, f64 engineRate,
+                              f64 sessionBpm, const std::string& name);
+
 // Live's loop-tempo heuristic: assume the file is a whole number of bars
 // (favouring powers of two) and pick the reading that lands nearest 120 BPM.
 void guessLoopTempo(f64 durationSec, int sigNum, f64* outBpm, f64* outBeats);

@@ -65,7 +65,7 @@ private:
         auto* self = (JackBackend*)arg;
         auto* l = (f32*)jack_port_get_buffer(self->outL_, n);
         auto* r = (f32*)jack_port_get_buffer(self->outR_, n);
-        self->engine_->process(l, r, (int)n);
+        self->engine_->process(nullptr, nullptr, l, r, (int)n);
         return 0;
     }
     static int srCb(jack_nframes_t n, void* arg) {
@@ -143,7 +143,7 @@ private:
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 
         while (run_.load(std::memory_order_relaxed)) {
-            engine_->process(l_.data(), r_.data(), bs_);
+            engine_->process(nullptr, nullptr, l_.data(), r_.data(), bs_);
             for (int i = 0; i < bs_; ++i) { inter_[i * 2] = l_[i]; inter_[i * 2 + 1] = r_[i]; }
             const snd_pcm_sframes_t w = snd_pcm_writei(pcm_, inter_.data(), (snd_pcm_uframes_t)bs_);
             if (w < 0) {

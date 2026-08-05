@@ -288,7 +288,7 @@ void WasapiBackend::run() {
 
         for (UINT32 done = 0; done < frames; ) {
             const UINT32 n = (frames - done < (UINT32)bs_) ? frames - done : (UINT32)bs_;
-            engine_->process(l_.data(), r_.data(), (int)n);
+            engine_->process(nullptr, nullptr, l_.data(), r_.data(), (int)n);
             writeOut(dst + (size_t)done * frameBytes_, n);
             done += n;
         }
