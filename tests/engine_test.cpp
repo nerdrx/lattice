@@ -82,6 +82,12 @@ struct Host {
         c.p = (void*)buf; c.x = (f64)cap;
         e.pushCommand(c);
     }
+    // The MIDI take: same payload shape, but the capacity counts NOTES.
+    void pushRecMidi(int track, int slot, RtNote* buf, i64 cap) {
+        Command c; c.type = Cmd::RecordMidiSlot; c.a = track; c.b = slot;
+        c.p = (void*)buf; c.x = (f64)cap;
+        e.pushCommand(c);
+    }
     void pushMidi(u8 status, u8 d1, u8 d2, i32 frame = 0) {
         MidiMsg m; m.status = status; m.d1 = d1; m.d2 = d2; m.frame = frame;
         e.pushMidi(m);
@@ -1367,6 +1373,724 @@ static void testMidiRouting() {
 }
 
 // ---------------------------------------------------------------------------
+// 13. MIDI clip playback
+// ---------------------------------------------------------------------------
+
+// A note-capable device that logs every message with the *absolute* frame it
+// arrived on. process() runs once per block and always after that block's
+// notes, so the number of completed process() calls is the index of the block
+// a note belongs to — which is what turns a block-relative offset back into an
+// absolute position without the engine having to tell us anything.
+class NoteSink : public PluginInstance {
+public:
+    explicit NoteSink(int blockSize) : blk_(blockSize) {
+        d_.kind = PluginKind::Instrument;
+        evs.reserve(8192);
+    }
+
+    struct Msg { i64 frame; u8 status, pitch, vel; };
+    std::vector<Msg> evs;
+    int blocks = 0;
+
+    void reset() { evs.clear(); }
+
+    bool prepare(f64, int) override { return true; }
+    void process(const f32* const*, f32* const*, int, int) override { ++blocks; }
+    void midi(const u8* d, int len, int off) override {
+        evs.push_back({(i64)blocks * (i64)blk_ + off, d[0],
+                       (u8)(len > 1 ? d[1] : 0), (u8)(len > 2 ? d[2] : 0)});
+    }
+
+    int              paramCount() const override   { return 0; }
+    const ParamInfo& paramInfo(int) const override { static ParamInfo p; return p; }
+    f32              getParam(int) const override  { return 0.f; }
+    void             setParam(int, f32) override   {}
+    const PluginDesc& desc() const override        { return d_; }
+    void             setBypassed(bool b) override  { bypassed_ = b; }
+    bool             bypassed() const override     { return bypassed_; }
+
+private:
+    PluginDesc d_;
+    int  blk_ = 0;
+    bool bypassed_ = false;
+};
+
+static bool isOn(const NoteSink::Msg& m)  { return (m.status & 0xF0) == 0x90 && m.vel > 0; }
+static bool isOff(const NoteSink::Msg& m) { return !isOn(m); }
+
+// Every note-on must be answered by a note-off on the same pitch, and nothing
+// may be left held at the end. A clip that hands an instrument a note it never
+// takes back is the one failure this whole path exists to prevent.
+static bool notesBalanced(const std::vector<NoteSink::Msg>& evs) {
+    int held[128] = {};
+    for (const NoteSink::Msg& m : evs) {
+        if (isOn(m)) ++held[m.pitch];
+        else if (--held[m.pitch] < 0) return false;
+    }
+    for (int i = 0; i < 128; ++i) if (held[i]) return false;
+    return true;
+}
+
+static RtClip mkMidiClip(const std::vector<RtNote>& notes, f64 lengthBeats, bool loop) {
+    RtClip c;
+    c.notes       = notes.data();
+    c.noteCount   = (int)notes.size();
+    c.isMidi      = true;
+    c.lengthBeats = lengthBeats;
+    c.loop        = loop;
+    c.gain        = 1.f;
+    c.quantumIdx  = -1;
+    c.valid       = true;
+    return c;
+}
+
+// The clip every case below uses: one beat long, a note on the downbeat and one
+// on the off-beat, both a 1/4 beat long. At 120 BPM that is on/off at frames
+// 0 / 6000 / 12000 / 18000 of every 24000-frame lap.
+static std::vector<RtNote> twoNoteClip() {
+    std::vector<RtNote> n(2);
+    n[0].beat = 0.0; n[0].len = 0.25; n[0].pitch = 60; n[0].vel = 100;
+    n[1].beat = 0.5; n[1].len = 0.25; n[1].pitch = 64; n[1].vel = 90;
+    return n;
+}
+
+// a. the notes come out where the grid says they should, lap after lap
+static void midiClipTiming() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto notes = twoNoteClip();
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.setClip(0, 0, mkMidiClip(notes, 1.0, /*loop*/true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 4);                         // four laps
+
+    CHECK((int)sink.evs.size() == 16,
+          "four laps of a 2-note clip deliver 16 messages (%d)", (int)sink.evs.size());
+    CHECK(notesBalanced(sink.evs), "every note-on is answered by a note-off");
+
+    // Absolute frames, computed from the grid rather than from the engine.
+    bool timingOk = sink.evs.size() == 16;
+    i64 worst = 0;
+    u8  expectPitch[4] = {60, 60, 64, 64};
+    i64 expectOff[4]   = {0, 6000, 12000, 18000};
+    for (int lap = 0; lap < 4 && timingOk; ++lap)
+        for (int k = 0; k < 4; ++k) {
+            const NoteSink::Msg& m = sink.evs[(size_t)(lap * 4 + k)];
+            const i64 want = (i64)lap * kBeat120 + expectOff[k];
+            const i64 d = std::llabs((long long)(m.frame - want));
+            if (d > worst) worst = d;
+            if (d > 1 || m.pitch != expectPitch[k] || (k % 2 == 0 ? !isOn(m) : !isOff(m)))
+                timingOk = false;
+        }
+    CHECK(timingOk, "on/off pairs land within +/-1 frame of the grid over four laps "
+                    "(worst error %lld frames)", (long long)worst);
+    CHECK(sink.evs.size() == 16 && sink.evs[4].frame == kBeat120,
+          "the lap-1 downbeat is exactly one beat in: frame %lld (expected %lld)",
+          sink.evs.size() == 16 ? (long long)sink.evs[4].frame : -1, (long long)kBeat120);
+
+    // The UI must not need a special case for MIDI.
+    CHECK(h.e.slotState[0].load() == (int)SlotState::Playing,
+          "a MIDI clip reports SlotState::Playing like any other (%d)", h.e.slotState[0].load());
+    CHECK(h.e.activeSlot[0].load() == 0, "and names its slot (%d)", h.e.activeSlot[0].load());
+    const f64 ph = h.e.clipPhase[0].load();
+    CHECK(ph >= 0.0 && ph < 1.0, "clipPhase is beatPos/lengthBeats, in range (%.4f)", ph);
+
+    // No audio ever leaves a MIDI clip; the sink is silent by construction, so
+    // anything in the output would be the clip itself leaking.
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-6f,
+          "a MIDI clip renders no audio of its own -> %.3g", (double)tailLevel(h.outL));
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// b. stopping a clip delivers the note-offs it still owes
+static void midiClipStopFlushes() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto notes = twoNoteClip();
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(2);                              // 512 frames: note 60 is sounding
+
+    CHECK(sink.evs.size() == 1 && isOn(sink.evs[0]) && sink.evs[0].pitch == 60,
+          "one note is held part-way into the clip (%d messages)", (int)sink.evs.size());
+
+    h.push(Cmd::StopTrack, 0);
+    h.runBlocks(2);
+    CHECK(sink.evs.size() == 2 && isOff(sink.evs[1]) && sink.evs[1].pitch == 60,
+          "stopping the track releases it immediately, well before its own note-off "
+          "(%d messages)", (int)sink.evs.size());
+    CHECK(sink.evs.size() >= 2 && sink.evs[1].frame < 3 * (i64)h.block,
+          "the flush happens on the stop, not at the note's scheduled end "
+          "(frame %lld, note ends at 6000)",
+          sink.evs.size() >= 2 ? (long long)sink.evs[1].frame : -1);
+    CHECK(notesBalanced(sink.evs), "nothing is left hanging after the stop");
+    CHECK(h.e.slotState[0].load() == (int)SlotState::Stopped,
+          "and the slot reports Stopped (%d)", h.e.slotState[0].load());
+
+    // The transport stopping has to do the same thing, from a clean launch.
+    sink.reset();
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(2);
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(2);
+    CHECK(notesBalanced(sink.evs) && sink.evs.size() == 2,
+          "stopping the transport releases the sounding note too (%d messages)",
+          (int)sink.evs.size());
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// c. switching clips flushes; only a *replaced notes array* is retired
+static void midiClipSwitchAndRetire() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto notes = twoNoteClip();
+    auto other = twoNoteClip();                  // a different array, same content
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    // Both slots point at the *same* note array, which is what an unedited
+    // duplicate looks like: switching between them retires nothing.
+    h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+    h.setClip(0, 1, mkMidiClip(notes, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(2);
+    drainEvents(h.e);
+
+    h.push(Cmd::LaunchClip, 0, 1);               // switch mid-note
+    h.runBlocks(2);
+    std::vector<Event> evs = drainEvents(h.e);
+    CHECK(countEvents(evs, Ev::NotesRetired) == 0,
+          "switching to a clip that shares the note array retires nothing (%d)",
+          countEvents(evs, Ev::NotesRetired));
+    // The outgoing note is released on the switch frame, and the incoming clip
+    // starts its own lap there: off then on, both at ~512.
+    CHECK(sink.evs.size() == 3 && isOff(sink.evs[1]) && sink.evs[1].pitch == 60 &&
+          sink.evs[1].frame <= 2 * (i64)h.block + 1,
+          "the outgoing clip's note-off went out on the switch (%d messages, "
+          "second at frame %lld)", (int)sink.evs.size(),
+          sink.evs.size() > 1 ? (long long)sink.evs[1].frame : -1);
+    CHECK(sink.evs.size() == 3 && isOn(sink.evs[2]),
+          "and the incoming clip started its own note there");
+    CHECK(h.e.activeSlot[0].load() == 1, "and slot 1 is now playing (%d)",
+          h.e.activeSlot[0].load());
+
+    // Repushing the playing slot with a *new* array hands the old one back.
+    h.setClip(0, 1, mkMidiClip(other, 1.0, true));
+    h.runBlocks(2);
+    evs = drainEvents(h.e);
+    const Event* ret = findEvent(evs, Ev::NotesRetired);
+    CHECK(countEvents(evs, Ev::NotesRetired) == 1,
+          "replacing the notes of a playing clip retires exactly one array (%d)",
+          countEvents(evs, Ev::NotesRetired));
+    CHECK(ret && ret->p == (void*)notes.data(),
+          "and it is the old pointer (%p, expected %p)",
+          ret ? ret->p : nullptr, (void*)notes.data());
+    CHECK(notesBalanced(sink.evs), "with no note left hanging across the swap");
+
+    // Clearing the slot retires the array it was carrying, once.
+    h.push(Cmd::ClearClip, 0, 1);
+    h.runBlocks(2);
+    evs = drainEvents(h.e);
+    const Event* cl = findEvent(evs, Ev::NotesRetired);
+    CHECK(countEvents(evs, Ev::NotesRetired) == 1 && cl && cl->p == (void*)other.data(),
+          "ClearClip retires the cleared array once (%d, %p, expected %p)",
+          countEvents(evs, Ev::NotesRetired), cl ? cl->p : nullptr, (void*)other.data());
+    CHECK(notesBalanced(sink.evs), "and releases whatever it was sounding");
+    CHECK(countEvents(evs, Ev::ClipStopped) == 1,
+          "a cleared MIDI clip reports ClipStopped exactly once (%d)",
+          countEvents(evs, Ev::ClipStopped));
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// d. a MIDI clip launches on the grid like any other
+static void midiClipQuantizedLaunch() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto notes = twoNoteClip();
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.setChain(0, &chain);
+    h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120 * 2);                         // land mid-bar
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBar120);
+
+    CHECK(!sink.evs.empty(), "the quantized launch eventually delivered notes (%d)",
+          (int)sink.evs.size());
+    CHECK(!sink.evs.empty() && isOn(sink.evs[0]) && sink.evs[0].pitch == 60,
+          "the first message is the clip's downbeat note-on");
+    CHECK(!sink.evs.empty() && std::llabs((long long)(sink.evs[0].frame - kBar120)) <= 1,
+          "a mid-bar launch puts it on the bar line: frame %lld (expected %lld)",
+          sink.evs.empty() ? -1 : (long long)sink.evs[0].frame, (long long)kBar120);
+    // Balance is only meaningful once nothing is still sounding, and the stop
+    // is on the same 1-bar grid the launch was.
+    h.push(Cmd::StopTrack, 0);
+    h.run(kBar120);
+    CHECK(notesBalanced(sink.evs), "and the laps that follow stay balanced (%d messages)",
+          (int)sink.evs.size());
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// e. a launched clip plays whatever the arm button says, and a note that
+//    straddles the loop point is neither lost nor doubled
+static void midiClipArmAndWrap() {
+    {
+        Host h; h.init();
+        NoteSink sink(h.block);
+        RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+        auto notes = twoNoteClip();
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setChain(0, &chain);
+        h.push(Cmd::TrackArm, 0, 0);             // explicitly disarmed
+        h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(kBeat120 - h.block);               // one lap, stopping short of the wrap
+        CHECK(sink.evs.size() == 4,
+              "an unarmed track still plays its clip: arm gates live input only (%d)",
+              (int)sink.evs.size());
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+    {
+        // A note that starts at 0.75 and runs 0.5 beats ends at 1.25, a quarter
+        // beat into the next lap.
+        Host h; h.init();
+        NoteSink sink(h.block);
+        RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+        std::vector<RtNote> notes(1);
+        notes[0].beat = 0.75; notes[0].len = 0.5; notes[0].pitch = 55; notes[0].vel = 100;
+
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setChain(0, &chain);
+        h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+        h.push(Cmd::LaunchClip, 0, 0);
+        // Three note-ons (18000, 42000, 66000) and three offs (30000, 54000,
+        // 78000); stopping at 3.5 beats keeps the fourth lap's note out of it.
+        h.run(kBeat120 * 3 + kBeat120 / 2);
+
+        CHECK(sink.evs.size() == 6,
+              "three laps of one note that crosses the wrap deliver 6 messages (%d)",
+              (int)sink.evs.size());
+        CHECK(notesBalanced(sink.evs), "each one is released exactly once");
+        bool ok = sink.evs.size() == 6;
+        for (int lap = 0; lap < 3 && ok; ++lap) {
+            const i64 wantOn  = (i64)lap * kBeat120 + 18000;
+            const i64 wantOff = wantOn + 12000;   // 0.5 beat later, past the wrap
+            if (std::llabs((long long)(sink.evs[(size_t)(lap * 2)].frame - wantOn)) > 1) ok = false;
+            if (std::llabs((long long)(sink.evs[(size_t)(lap * 2 + 1)].frame - wantOff)) > 1) ok = false;
+        }
+        CHECK(ok, "a note-off owed across the loop point still lands 0.5 beats after "
+                  "its note-on, lap after lap");
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+}
+
+// f. the generative machinery is voice-level, so it works on MIDI unchanged
+static void midiClipFollowAndProb() {
+    {
+        Host h; h.init();
+        NoteSink sink(h.block);
+        RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+        std::vector<RtNote> lo(1), hi(1);
+        lo[0].beat = 0.0; lo[0].len = 0.25; lo[0].pitch = 60; lo[0].vel = 100;
+        hi[0].beat = 0.0; hi[0].len = 0.25; hi[0].pitch = 72; hi[0].vel = 100;
+
+        RtClip a = mkMidiClip(lo, 1.0, true);
+        a.followAction = (int)Follow::Next;
+        a.followBeats  = 1.0;
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setChain(0, &chain);
+        h.setClip(0, 0, a);
+        h.setClip(0, 1, mkMidiClip(hi, 1.0, true));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(kBeat120 * 2);
+
+        CHECK(h.e.activeSlot[0].load() == 1,
+              "Follow::Next moves a MIDI clip on like any other (activeSlot %d)",
+              h.e.activeSlot[0].load());
+        bool sawHi = false;
+        i64 hiFrame = -1;
+        for (const NoteSink::Msg& m : sink.evs)
+            if (isOn(m) && m.pitch == 72 && !sawHi) { sawHi = true; hiFrame = m.frame; }
+        CHECK(sawHi && std::llabs((long long)(hiFrame - kBeat120)) <= 1,
+              "and the follow clip's first note lands on the follow beat: frame %lld "
+              "(expected %lld)", (long long)hiFrame, (long long)kBeat120);
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+    {
+        Host h; h.init();
+        NoteSink sink(h.block);
+        RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+        std::vector<RtNote> lo(1), hi(1);
+        lo[0].beat = 0.0; lo[0].len = 0.25; lo[0].pitch = 60; lo[0].vel = 100;
+        hi[0].beat = 0.0; hi[0].len = 0.25; hi[0].pitch = 72; hi[0].vel = 100;
+
+        RtClip never = mkMidiClip(hi, 1.0, true);
+        never.prob = 0.0;
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setChain(0, &chain);
+        h.setClip(0, 0, mkMidiClip(lo, 1.0, true));
+        h.setClip(0, 1, never);
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(kBeat120);
+        for (int k = 0; k < 16; ++k) { h.push(Cmd::LaunchClip, 0, 1); h.run(2000); }
+
+        CHECK(h.e.activeSlot[0].load() == 0,
+              "a prob = 0 MIDI clip never launches over 16 tries (activeSlot %d)",
+              h.e.activeSlot[0].load());
+        bool sawHi = false;
+        for (const NoteSink::Msg& m : sink.evs) if (m.pitch == 72) sawHi = true;
+        CHECK(!sawHi, "and none of its notes ever reached the instrument");
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+}
+
+static void testMidiClips() {
+    banner("13. MIDI clip playback");
+    note("a MIDI clip renders no audio: it delivers notes to the track's");
+    note("note-capable devices before the chain runs, offs at the wrap included.");
+    midiClipTiming();
+    midiClipStopFlushes();
+    midiClipSwitchAndRetire();
+    midiClipQuantizedLaunch();
+    midiClipArmAndWrap();
+    midiClipFollowAndProb();
+}
+
+// ---------------------------------------------------------------------------
+// 14. MIDI recording
+// ---------------------------------------------------------------------------
+
+// The take's beat clock: at 120 BPM a beat is 24000 frames, so an absolute
+// frame converts straight to a take-relative beat once the start is known.
+static f64 relBeat(i64 absFrame, i64 startFrame) {
+    return (f64)(absFrame - startFrame) / (f64)kBeat120;
+}
+
+// a. a quantized take, paired notes, an unpaired one, and the sort order
+static void midiRecTake() {
+    Host h; h.init();
+    std::vector<RtNote> take(64);
+    for (RtNote& n : take) { n.beat = -1.0; n.len = -1.0; n.pitch = 0; n.vel = 0; }
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.push(Cmd::TrackArm, 0, 1);
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120 * 2);                         // land mid-bar
+    h.pushRecMidi(0, 0, take.data(), 64);
+    h.run(kBeat120 * 3);                         // cross the bar line, take running
+
+    std::vector<Event> evs = drainEvents(h.e);
+    const Event* started = findEvent(evs, Ev::RecordStarted);
+    CHECK(started != nullptr, "a mid-bar RecordMidiSlot produces Ev::RecordStarted");
+    CHECK(started && std::fabs(started->x - 4.0) < 1e-6,
+          "the take begins on the bar line, beat %.6f (expected 4.0)",
+          started ? started->x : -1.0);
+    CHECK(h.e.recState[0].load() == 2 && h.e.recSlotIdx[0].load() == 0,
+          "a MIDI take publishes the same state as an audio one (%d / %d)",
+          h.e.recState[0].load(), h.e.recSlotIdx[0].load());
+
+    // Note A opens first and closes last; note B is wholly inside it. They land
+    // in the buffer in *off* order, so only sorting puts A back in front.
+    const i64 onA = (i64)h.outL.size();  h.pushMidi(0x90, 60, 100); h.run(kBeat120 / 2);
+    const i64 onB = (i64)h.outL.size();  h.pushMidi(0x90, 64,  90); h.run(kBeat120 / 2);
+    const i64 offB = (i64)h.outL.size(); h.pushMidi(0x80, 64,   0); h.run(kBeat120 / 2);
+    const i64 offA = (i64)h.outL.size(); h.pushMidi(0x80, 60,   0); h.run(kBeat120 / 2);
+    // And one that is never released: it has to be closed at the boundary.
+    const i64 onC = (i64)h.outL.size();  h.pushMidi(0x90, 67,  80); h.run(kBeat120 / 2);
+
+    const f64 atToggle = (f64)h.outL.size() / (f64)kBeat120;
+    const f64 boundary = std::ceil(atToggle / 4.0 - 1e-9) * 4.0;   // nextQuantum, 1 Bar
+    h.pushRecMidi(0, 0, take.data(), 64);        // toggle: stop on the next bar
+    h.run(kBar120 * 2);
+
+    evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    CHECK(fin != nullptr, "the toggle produces Ev::MidiRecordFinished");
+    CHECK(countEvents(evs, Ev::RecordFinished) == 0,
+          "and not the audio event (%d)", countEvents(evs, Ev::RecordFinished));
+    CHECK(fin && fin->a == 0 && fin->b == 0 && fin->p == (void*)take.data(),
+          "it names track 0 slot 0 and hands back the GUI's buffer (%d/%d, %p vs %p)",
+          fin ? fin->a : -1, fin ? fin->b : -1, fin ? fin->p : nullptr, (void*)take.data());
+    CHECK(fin && (int)fin->x == 3, "three notes were captured (%d)",
+          fin ? (int)fin->x : -1);
+    CHECK(h.e.recState[0].load() == 0, "and the track is idle again (%d)",
+          h.e.recState[0].load());
+
+    // The take started on the bar line, which is frame 96000 at 120 BPM.
+    const i64 start = kBar120;
+    const f64 tol = 1e-4;                        // ~2.4 frames
+    CHECK(take[0].pitch == 60 && take[1].pitch == 64 && take[2].pitch == 67,
+          "the buffer is sorted by start beat, not by the order notes closed "
+          "(%d %d %d, expected 60 64 67)", take[0].pitch, take[1].pitch, take[2].pitch);
+    CHECK(std::fabs(take[0].beat - relBeat(onA, start)) < tol,
+          "note 60 starts at beat %.5f (expected %.5f)", take[0].beat, relBeat(onA, start));
+    CHECK(std::fabs(take[0].len - relBeat(offA, onA)) < tol,
+          "and lasts %.5f beats, from its own note-off (expected %.5f)",
+          take[0].len, relBeat(offA, onA));
+    CHECK(std::fabs(take[1].beat - relBeat(onB, start)) < tol &&
+          std::fabs(take[1].len - relBeat(offB, onB)) < tol,
+          "note 64 is %.5f + %.5f (expected %.5f + %.5f)",
+          take[1].beat, take[1].len, relBeat(onB, start), relBeat(offB, onB));
+    CHECK(take[0].vel == 100 && take[1].vel == 90 && take[2].vel == 80,
+          "velocities survive the round trip (%d %d %d)",
+          take[0].vel, take[1].vel, take[2].vel);
+    CHECK(std::fabs(take[2].beat - relBeat(onC, start)) < tol,
+          "the unpaired note starts where it was played, beat %.5f (expected %.5f)",
+          take[2].beat, relBeat(onC, start));
+    CHECK(std::fabs(take[2].beat + take[2].len - (boundary - 4.0)) < tol,
+          "and is closed at the stop boundary: ends at %.5f (expected %.5f)",
+          take[2].beat + take[2].len, boundary - 4.0);
+    CHECK(take[3].pitch == 0 && take[3].vel == 0,
+          "nothing was written past the last note (%d)", take[3].pitch);
+}
+
+// b. a full buffer ends the take, exactly as it does for audio
+static void midiRecCapacity() {
+    Host h; h.init();
+    std::vector<RtNote> take(2);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                  // None: start at once
+    h.push(Cmd::TrackArm, 0, 1);
+    h.pushRecMidi(0, 0, take.data(), 2);
+    h.runBlocks(1);
+
+    for (int k = 0; k < 4; ++k) {
+        h.pushMidi(0x90, (u8)(60 + k), 100);
+        h.runBlocks(4);
+        h.pushMidi(0x80, (u8)(60 + k), 0);
+        h.runBlocks(4);
+    }
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    CHECK(fin != nullptr, "a full note buffer auto-stops the take");
+    CHECK(fin && (int)fin->x == 2, "it stops exactly at capacity: %d notes (expected 2)",
+          fin ? (int)fin->x : -1);
+    CHECK(take[0].pitch == 60 && take[1].pitch == 61,
+          "the two notes it kept are the first two played (%d %d)",
+          take[0].pitch, take[1].pitch);
+    CHECK(h.e.recState[0].load() == 0, "and the track is idle (%d)", h.e.recState[0].load());
+}
+
+// c. hand-over to a second slot, and cancelling a take that never began
+static void midiRecHandoverAndCancel() {
+    {
+        Host h; h.init();
+        std::vector<RtNote> takeA(64), takeB(64);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);              // 1 Bar
+        h.push(Cmd::TrackArm, 0, 1);
+        h.pushRecMidi(0, 0, takeA.data(), 64);   // starts at beat 0
+        h.runBlocks(1);
+        h.pushMidi(0x90, 60, 100);
+        h.run(kBeat120);
+        h.pushMidi(0x80, 60, 0);
+        h.run(kBeat120);                         // mid-bar
+        drainEvents(h.e);
+
+        h.pushRecMidi(0, 1, takeB.data(), 64);   // different slot: hands over
+        h.run(kBar120);
+        std::vector<Event> evs = drainEvents(h.e);
+        const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+        CHECK(fin != nullptr, "switching slots finishes the running MIDI take");
+        CHECK(fin && fin->b == 0 && fin->p == (void*)takeA.data() && (int)fin->x == 1,
+              "the finished take is slot 0's, with its buffer and its one note "
+              "(%d, %p, %d)", fin ? fin->b : -1, fin ? fin->p : nullptr,
+              fin ? (int)fin->x : -1);
+        CHECK(countEvents(evs, Ev::RecordStarted) == 1,
+              "the new take starts on the same boundary (%d RecordStarted)",
+              countEvents(evs, Ev::RecordStarted));
+        CHECK(h.e.recSlotIdx[0].load() == 1 && h.e.recState[0].load() == 2,
+              "the track is now recording slot %d in state %d (expected 1 / 2)",
+              h.e.recSlotIdx[0].load(), h.e.recState[0].load());
+
+        // The second take is a MIDI take too, and stamps from the new boundary.
+        const i64 onFrame = (i64)h.outL.size();
+        h.pushMidi(0x90, 72, 100);
+        h.run(kBeat120 / 2);
+        h.pushMidi(0x80, 72, 0);
+        h.run(kBeat120 / 2);
+        h.push(Cmd::SetPlaying, 0);              // stop: ends the take on the spot
+        h.runBlocks(1);
+        evs = drainEvents(h.e);
+        const Event* fin2 = findEvent(evs, Ev::MidiRecordFinished);
+        CHECK(fin2 && fin2->b == 1 && (int)fin2->x == 1,
+              "the handed-over take captured its own note (%d, %d notes)",
+              fin2 ? fin2->b : -1, fin2 ? (int)fin2->x : -1);
+        CHECK(takeB[0].pitch == 72 &&
+              std::fabs(takeB[0].beat - relBeat(onFrame, kBar120)) < 1e-4,
+              "stamped against the hand-over boundary: beat %.5f (expected %.5f)",
+              takeB[0].beat, relBeat(onFrame, kBar120));
+    }
+    {
+        Host h; h.init();
+        std::vector<RtNote> take(16);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(kBeat120);
+        h.pushRecMidi(0, 0, take.data(), 16);    // queued for the bar line
+        h.runBlocks(1);
+        CHECK(h.e.recState[0].load() == 1, "a queued MIDI take reports recState 1 (%d)",
+              h.e.recState[0].load());
+        h.pushRecMidi(0, 0, take.data(), 16);    // toggle before it begins
+        h.run(kBar120 * 2);
+        const std::vector<Event> evs = drainEvents(h.e);
+        CHECK(countEvents(evs, Ev::RecordStarted) == 0 &&
+              countEvents(evs, Ev::MidiRecordFinished) == 0,
+              "cancelling it is silent: no start, no finish (%d/%d)",
+              countEvents(evs, Ev::RecordStarted),
+              countEvents(evs, Ev::MidiRecordFinished));
+        CHECK(h.e.recState[0].load() == 0, "and the track is idle (%d)",
+              h.e.recState[0].load());
+    }
+}
+
+// d. monitoring keeps working while a take runs
+static void midiRecMonitors() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    std::vector<RtNote> take(16);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.pushRecMidi(0, 0, take.data(), 16);
+    h.runBlocks(1);
+    h.pushMidi(0x90, 60, 100);
+    h.run(kBeat120 / 2);
+    h.pushMidi(0x80, 60, 0);
+    h.run(kBeat120 / 2);
+
+    CHECK(sink.evs.size() == 2,
+          "live notes still reach the instrument while recording them (%d)",
+          (int)sink.evs.size());
+    CHECK(sink.evs.size() == 2 && isOn(sink.evs[0]) && isOff(sink.evs[1]),
+          "and arrive as the on/off pair that was played");
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+static void testMidiRecording() {
+    banner("14. MIDI recording");
+    note("RecordMidiSlot shares the whole toggle/quantize/hand-over machine with");
+    note("RecordSlot; only what lands in the buffer differs. Unpaired notes are");
+    note("closed at the stop boundary and the buffer stays sorted by start beat.");
+    midiRecTake();
+    midiRecCapacity();
+    midiRecHandoverAndCancel();
+    midiRecMonitors();
+}
+
+// ---------------------------------------------------------------------------
+// 15. note retirement under a playing clip
+// ---------------------------------------------------------------------------
+
+static void testNoteRetirement() {
+    banner("15. note retirement while the clip is playing");
+    note("editing in the piano roll republishes the clip under a running voice:");
+    note("the old array must come back exactly once, with nothing left sounding.");
+
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+
+    // Each array holds one long note, so a repush almost always lands while a
+    // note is sounding — which is the case that leaves an instrument stuck.
+    std::vector<RtNote> a(1), b(1), c(1);
+    a[0].beat = 0.0; a[0].len = 0.5; a[0].pitch = 60; a[0].vel = 100;
+    b[0].beat = 0.0; b[0].len = 0.5; b[0].pitch = 72; b[0].vel = 100;
+    c[0].beat = 0.0; c[0].len = 0.5; c[0].pitch = 48; c[0].vel = 100;
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.setClip(0, 0, mkMidiClip(a, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 2);
+    drainEvents(h.e);
+
+    // Repush mid-note, twice, so a stale cursor or a missed flush shows up.
+    h.setClip(0, 0, mkMidiClip(b, 1.0, true));
+    h.run(kBeat120 * 2);
+    std::vector<Event> evs = drainEvents(h.e);
+    const Event* r1 = findEvent(evs, Ev::NotesRetired);
+    CHECK(countEvents(evs, Ev::NotesRetired) == 1,
+          "the first repush retires exactly one array (%d)",
+          countEvents(evs, Ev::NotesRetired));
+    CHECK(r1 && r1->p == (void*)a.data(), "and it is array A (%p, expected %p)",
+          r1 ? r1->p : nullptr, (void*)a.data());
+    CHECK(countEvents(evs, Ev::ClipStopped) == 0,
+          "the voice kept playing through the edit (%d ClipStopped)",
+          countEvents(evs, Ev::ClipStopped));
+    CHECK(h.e.activeSlot[0].load() == 0, "and the slot is still the active one (%d)",
+          h.e.activeSlot[0].load());
+
+    h.setClip(0, 0, mkMidiClip(c, 1.0, true));
+    h.run(kBeat120 * 2);
+    evs = drainEvents(h.e);
+    const Event* r2 = findEvent(evs, Ev::NotesRetired);
+    CHECK(countEvents(evs, Ev::NotesRetired) == 1 && r2 && r2->p == (void*)b.data(),
+          "the second retires array B, once (%d, %p, expected %p)",
+          countEvents(evs, Ev::NotesRetired), r2 ? r2->p : nullptr, (void*)b.data());
+
+    h.push(Cmd::StopTrack, 0);
+    h.runBlocks(2);
+    CHECK(notesBalanced(sink.evs),
+          "across both edits every note-on was released (%d messages)",
+          (int)sink.evs.size());
+
+    // All three pitches must have sounded: the replacement takes effect for the
+    // rest of the lap rather than waiting for the next one.
+    bool saw60 = false, saw72 = false, saw48 = false;
+    for (const NoteSink::Msg& m : sink.evs) {
+        if (!isOn(m)) continue;
+        if (m.pitch == 60) saw60 = true;
+        if (m.pitch == 72) saw72 = true;
+        if (m.pitch == 48) saw48 = true;
+    }
+    CHECK(saw60 && saw72 && saw48,
+          "each array played while it was installed (60:%d 72:%d 48:%d)",
+          saw60, saw72, saw48);
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -1383,6 +2107,9 @@ int main() {
     testRecording();
     testFollowActions();
     testMidiRouting();
+    testMidiClips();
+    testMidiRecording();
+    testNoteRetirement();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

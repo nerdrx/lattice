@@ -42,8 +42,16 @@ make config   # show detected Wayland protocols
 - **Audio recording**: arm a track, click an empty slot — quantized start and
   stop on the launch grid, takes come back as warped clips at the session
   tempo, with pre-chain input monitoring.
-- **MIDI in**: ALSA-sequencer port (`aconnect <source> <Lattice:in>`), routed
-  per-block to note-capable devices on armed tracks.
+- **MIDI in**: ALSA-sequencer port (`aconnect <source> <Lattice:in>`) plus an
+  FL-Studio-style computer keyboard (Ctrl+Shift+K; Z-row and Q-row are two
+  octaves, PgUp/PgDn shifts), routed per-block to note-capable devices on
+  armed tracks — with Live-style auto-arm on select.
+- **MIDI clips + piano roll**: double-click an empty slot on an instrument
+  track for a pattern; fold, 1/16 grid, drag/resize/delete, velocity lane,
+  live playhead. Sample-accurate playback with no stuck notes across loop
+  wraps and clip switches. MIDI takes record into slots on the launch grid.
+  Notes serialize as plain `note <beat> <len> <pitch> <vel>` lines — a melody
+  is a diffable text block.
 - **Generative clips**: launch probability and follow actions (Stop / Again /
   Next / Prev / First / Random), scheduled through the same quantized path and
   deterministic under offline render.
@@ -60,7 +68,8 @@ make config   # show detected Wayland protocols
 - Arrangement View is a navigable placeholder — no recording or timeline edits.
 - No undo, no automation (the parameter address space is reserved:
   `docs/PARAM-ADDRESS.md`), no sends/returns, no time-signature changes, no
-  overdub, no MIDI clips (notes route live to instruments only).
+  overdub. The offline renderer does not yet materialize plugins, so MIDI
+  clips render silent outside the app.
 - The engine/GUI process split is designed and transport-tested but not yet
   integrated.
 - Windows backends are written but have never been compiled or run — see
