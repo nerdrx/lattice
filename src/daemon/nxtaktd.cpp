@@ -1,4 +1,4 @@
-// latticed — the Lattice engine daemon.
+// nxtaktd — the NxTakt engine daemon.
 //
 // Phase 1 of the process split (docs/PROCESS-SPLIT.md §6, brought forward from
 // phase 4): a headless process that owns an Engine and an audio backend and
@@ -7,7 +7,7 @@
 // yet, so this binary is currently exercised by tests/daemon_test.cpp and by
 // hand.
 //
-//   latticed [--session NAME] [--driver null|auto|jack|alsa]
+//   nxtaktd [--session NAME] [--driver null|auto|jack|alsa]
 //            [--rate HZ] [--block FRAMES] [--verbose]
 //
 // THE ONE PLACE A NUMBER BECOMES A POINTER
@@ -217,11 +217,12 @@ struct Options {
 
 void usage() {
     std::printf(
-        "latticed — the Lattice engine daemon\n"
+        "nxtaktd — the NxTakt engine daemon\n"
         "\n"
-        "  --session NAME     session id; the control region is /lattice-engine-NAME\n"
-        "                     (default: $LATTICE_SESSION, else \"default\")\n"
-        "  --driver KIND      null | auto | jack | alsa   (default: $LATTICE_AUDIO, else auto)\n"
+        "  --session NAME     session id; the control region is /nxtakt-engine-NAME\n"
+        "                     (default: $NXTAKT_SESSION, else \"default\")\n"
+        "  --driver KIND      null | auto | jack | alsa   (default: $NXTAKT_AUDIO, else auto)\n"
+        "                     ($LATTICE_SESSION / $LATTICE_AUDIO are still read too)\n"
         "                     null renders at block cadence with no audio device\n"
         "  --rate HZ          null driver sample rate (default 48000)\n"
         "  --block FRAMES     null driver block size   (default 256)\n"
@@ -275,7 +276,7 @@ public:
         ipc::ShmRegion::reapIfStale(gRegionName);
         if (!region_.create(gRegionName, ipc::control::kBytes, ipc::control::kHash)) {
             LOGE("cannot create the control region: %s", region_.error());
-            LOGE("another latticed may already own session '%s'", opt_.session);
+            LOGE("another nxtaktd may already own session '%s'", opt_.session);
             return 1;
         }
         gOwnsRegion = 1;
@@ -295,7 +296,7 @@ public:
         map_.state->engineState.store(ipc::SharedState::StateRunning, std::memory_order_relaxed);
         map_.hdr->init((i32)::getpid(), nullDriver_ != nullptr, driverName_);
         region_.publishReady();
-        LOGI("latticed ready: session '%s', region %s, %.0f Hz / %d frames, driver %s",
+        LOGI("nxtaktd ready: session '%s', region %s, %.0f Hz / %d frames, driver %s",
              opt_.session, gRegionName, sr_, block_, driverName_);
 
         // 4. Serve.
@@ -380,7 +381,7 @@ private:
 
     bool startDriver() {
         const char* want = opt_.driver;
-        if (!want) want = ::getenv("LATTICE_AUDIO");   // same knob the GUI honours
+        if (!want) want = env("AUDIO");   // same knob the GUI honours
 
         if (want && !std::strcmp(want, "null")) {
             nullDriver_ = std::make_unique<NullDriver>();
@@ -844,7 +845,7 @@ private:
     // "GUI thread" in that file means "the one non-realtime thread that owns
     // this object", and here that is the pump, briefly delegated.
     //
-    // §3.6 asks for a short-lived `lattice-scan` *child process*, so that a
+    // §3.6 asks for a short-lived `nxtakt-scan` *child process*, so that a
     // plugin which segfaults during discovery takes down neither the GUI nor
     // the engine. That is strictly better and it is still deferred: it needs a
     // way to ship the catalog back, which is the socket.
@@ -1683,7 +1684,7 @@ private:
     // -- shutdown -----------------------------------------------------------
 
     int shutdown() {
-        LOGI("latticed stopping (session '%s')", opt_.session);
+        LOGI("nxtaktd stopping (session '%s')", opt_.session);
 
         // Tell whoever is attached before anything stops moving, so a client
         // polling the state block sees "stopping", not "wedged".
@@ -1731,7 +1732,7 @@ private:
         gOwnsRegion = 0;
         map_.clear();
         region_.close();                 // creator: unlinks the name
-        LOGI("latticed stopped, region unlinked");
+        LOGI("nxtaktd stopped, region unlinked");
         return 0;
     }
 
@@ -1821,7 +1822,7 @@ private:
 
 int main(int argc, char** argv) {
     lat::Options o;
-    if (const char* s = ::getenv("LATTICE_SESSION")) o.session = s;
+    if (const char* s = lat::env("SESSION")) o.session = s;
     if (!lat::parseArgs(argc, argv, o)) return 2;
 
     lat::Daemon d(o);

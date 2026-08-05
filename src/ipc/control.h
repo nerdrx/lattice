@@ -1,4 +1,4 @@
-// Lattice IPC — the control region: what actually travels between latticed and
+// NxTakt IPC — the control region: what actually travels between nxtaktd and
 // the GUI, and where it lives inside a ShmRegion.
 //
 // shm.h is the transport (a validated mapping and an SPSC ring); this header is
@@ -137,7 +137,7 @@ enum : u32 {
     // ref = a pool offset the engine can no longer reach; a, b = the clip cell
     // it was displaced from; flags = PoolKind*. **The only thing that
     // authorises a free.** See the free-after-confirm rule in pool.h and the
-    // proof it rests on in src/daemon/latticed.cpp.
+    // proof it rests on in src/daemon/nxtaktd.cpp.
     EvBlockRetired    = kDaemonEventBase + 4,
 
     // The daemon has mapped the pool named in ControlHeader; ref = the epoch,
@@ -638,7 +638,7 @@ struct ControlHeader {
     // answers in poolAttachedEpoch.
     // 96 bytes, matching ShmRegion's own name limit: a truncated region name
     // would be a name the daemon could not open, or worse, could.
-    char poolName[96];                  // client -> daemon, e.g. /lattice-pool-foo
+    char poolName[96];                  // client -> daemon, e.g. /nxtakt-pool-foo
     std::atomic<u64> poolBytes;         // client: payload bytes of that region
     std::atomic<u64> poolEpoch;         // client: +1 per published pool, 0 = none
     std::atomic<u64> poolAttachedEpoch; // daemon: the epoch it has mapped, 0 = none
@@ -729,7 +729,7 @@ inline constexpr size_t kBytes   = kParams + kParamTableBytes;
 // capacities and the protocol version.
 inline constexpr u32 kHash =
     hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
-        fnv1a("lattice.control.v3"),
+        fnv1a("nxtakt.control.v3"),   // renamed seed: see the note at pool::kHash
         (u64)kBytes), (u64)kState), (u64)kCmds), (u64)kEvts), (u64)kMidi), (u64)kClips),
         (u64)kDevices), (u64)kParams),
         (u64)(sizeof(WireCommand) * 65536 + sizeof(WireEvent) * 256 + sizeof(WireMidi))),
@@ -742,7 +742,7 @@ inline constexpr u32 kHash =
 // The default region name for a session. POSIX shm names are one path
 // component, so the session id is pasted in rather than nested.
 inline void controlRegionName(const char* session, char* out, size_t cap) {
-    std::snprintf(out, cap, "/lattice-engine-%s", (session && *session) ? session : "default");
+    std::snprintf(out, cap, "/nxtakt-engine-%s", (session && *session) ? session : "default");
 }
 // The pool's name lives in pool.h (poolRegionName) because the pool is not part
 // of the control protocol: the GUI could hand the daemon any name it likes

@@ -1,4 +1,4 @@
-# Porting Lattice
+# Porting NxTakt
 
 Linux is the primary target. Windows is secondary. As of the `windows-cross`
 CI job the **engine is tested on Windows** — the real test suite, cross-built
@@ -143,7 +143,7 @@ sysroot. **Use vcpkg.** The reasoning is almost entirely about one library:
   that already carry it in `Libs.private`.
 * **It cross-builds on Linux with the same toolchain CI already has.** The
   `x64-mingw-static` triplet targets `x86_64-w64-mingw32`, so one apt install
-  covers both the dependency build and Lattice itself. No Windows runner, no
+  covers both the dependency build and NxTakt itself. No Windows runner, no
   second CI image.
 * **It needs almost no build-system change.** `Makefile.mingw` already takes a
   `WIN_DEPS=/path/to/sysroot` with `include/` and `lib/` under it, which is
@@ -151,7 +151,7 @@ sysroot. **Use vcpkg.** The reasoning is almost entirely about one library:
   hardcoded `-lsndfile -lsamplerate` for
   `PKG_CONFIG_LIBDIR=$(WIN_DEPS)/lib/pkgconfig x86_64-w64-mingw32-pkg-config
   --libs --static sndfile samplerate` is a two-line change, and is what picks
-  up the FLAC/ogg/vorbis/opus closure automatically. Lattice has no CMake,
+  up the FLAC/ogg/vorbis/opus closure automatically. NxTakt has no CMake,
   which is the usual reason to reach for
   vcpkg — here it is being used as a plain cross-build recipe collection, which
   it is perfectly good at.

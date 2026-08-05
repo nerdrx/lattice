@@ -1,4 +1,4 @@
-# Lattice — Windows cross build
+# NxTakt — Windows cross build
 #
 # One job. It cross-compiles the headless subset with mingw-w64 and then
 # actually runs the engine test suite under Wine, so "the Windows build works"
@@ -250,7 +250,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lattice-windows-x64-headless
+          name: nxtakt-windows-x64-headless
           path: |
             build-mingw/engine_test.exe
             build-mingw/obj/src/ui/window_win32.o

@@ -1,4 +1,4 @@
-// Lattice IPC — the sample pool: the session region the GUI owns and the
+// NxTakt IPC — the sample pool: the session region the GUI owns and the
 // engine reads.
 //
 // This is the header that makes `RtClip::data` cross a process boundary
@@ -13,7 +13,7 @@
 //
 // OWNERSHIP IS DELIBERATELY ASYMMETRIC
 // ------------------------------------
-// The control region is created by `latticed` and dies with it. The pool is the
+// The control region is created by `nxtaktd` and dies with it. The pool is the
 // other way round: **the GUI creates it, the GUI unlinks it, and it outlives
 // engine restarts.** That is not a stylistic choice, it is the feature — §4.4's
 // "republish is not a reload" only works if killing the engine leaves the
@@ -21,7 +21,7 @@
 // same region and the same offsets still name the same samples. Concretely:
 //
 //   creator   the GUI (or a test, or a future headless controller)
-//   name      /lattice-pool-<session>
+//   name      /nxtakt-pool-<session>
 //   writer    the GUI, and only the GUI: allocation, free-list surgery, sample
 //             data, block metadata. Single-writer is what keeps this lock-free
 //             without any cleverness.
@@ -195,8 +195,8 @@ static_assert(offsetof(WireNote, vel)   == offsetof(RtNote, vel));
 // `magic` is mixed with the block's own data offset and is the *last* field
 // written when a block is handed out. Both properties are load-bearing:
 //
-//   mixed  — a valid magic proves not just "a Lattice block lives here" but
-//            "a Lattice block whose data starts at exactly the offset you
+//   mixed  — a valid magic proves not just "an NxTakt block lives here" but
+//            "an NxTakt block whose data starts at exactly the offset you
 //            asked about". A stale offset from a previous allocation, or one
 //            that lands mid-block, fails immediately instead of yielding a
 //            self-consistent header describing somebody else's samples.
@@ -278,13 +278,18 @@ struct PoolHeader {
 // ---------------------------------------------------------------------------
 
 inline void poolRegionName(const char* session, char* out, size_t cap) {
-    std::snprintf(out, cap, "/lattice-pool-%s", (session && *session) ? session : "default");
+    std::snprintf(out, cap, "/nxtakt-pool-%s", (session && *session) ? session : "default");
 }
 
 namespace pool {
+// The seed string is part of the hash, so the rename changed kHash. That is
+// deliberate and costs nothing: the hash only has to make two peers agree on
+// a layout, both peers are built from this header, and a region never
+// outlives the processes sharing it. The `.v1` suffix is the pool protocol
+// version and is unchanged -- the wire format did not move, only its name.
 inline constexpr u32 kHash =
     hashMix(hashMix(hashMix(hashMix(
-        fnv1a("lattice.pool.v1"),
+        fnv1a("nxtakt.pool.v1"),
         (u64)sizeof(PoolHeader)), (u64)sizeof(PoolBlock)),
         (u64)(sizeof(WireNote) * 65536 + kPoolArenaOffset)),
         (u64)kPoolVersion);
@@ -383,7 +388,7 @@ inline bool poolValidate(const u8* base, size_t payloadBytes, const PoolHeader* 
 // reading a block that has been handed to something else.
 //
 // What the echo actually proves is on the daemon's side of the boundary
-// (src/daemon/latticed.cpp, "retirement"): the displacing command has been
+// (src/daemon/nxtaktd.cpp, "retirement"): the displacing command has been
 // handed to Engine::pushCommand, no other clip cell still names the offset, and
 // the audio thread has since run drainCommands() — after which no voice can
 // reach the old data, because a voice holds `&clips_[t][s]` and that cell now
@@ -443,7 +448,7 @@ public:
         }
         hdr_ = region_.at<PoolHeader>(0);
         if (!hdr_ || hdr_->magic != kPoolMagic || hdr_->version != kPoolVersion) {
-            setErr("%s: not a Lattice sample pool (magic/version)", name);
+            setErr("%s: not an NxTakt sample pool (magic/version)", name);
             region_.close();
             hdr_ = nullptr;
             return false;
@@ -886,7 +891,7 @@ public:
         }
         const PoolHeader* h = (const PoolHeader*)region_.payload();
         if (h->magic != kPoolMagic || h->version != kPoolVersion) {
-            setErr("%s: not a Lattice sample pool (magic 0x%016llx, version %u)",
+            setErr("%s: not an NxTakt sample pool (magic 0x%016llx, version %u)",
                    name, (unsigned long long)h->magic, h->version);
             region_.close();
             return false;

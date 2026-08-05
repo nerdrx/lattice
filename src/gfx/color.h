@@ -1,4 +1,4 @@
-// Colour type plus the Lattice palette, tuned against Live's dark theme.
+// Colour type plus the NxTakt palette, tuned against Live's dark theme.
 #pragma once
 #include "../core/common.h"
 

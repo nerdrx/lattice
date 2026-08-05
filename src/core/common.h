@@ -1,4 +1,4 @@
-// Lattice — core types and helpers.
+// NxTakt — core types and helpers.
 #pragma once
 #include <cstdint>
 #include <cstddef>
@@ -7,6 +7,14 @@
 #include <string>
 #include <algorithm>
 
+// The namespace stays `lat` after the Lattice -> NxTakt rename. It is an
+// abbreviation, not the product name: it appears on every declaration in the
+// codebase and in no user-visible string, no file format, no protocol and no
+// installed artifact. Renaming it would rewrite every file in src/, tests/ and
+// tools/ to change nothing a user or another program can observe, and would
+// bury the parts of this pass that actually matter -- the format header and
+// the device URIs -- in five hundred files of noise. If it is ever revisited,
+// it is a mechanical pass of its own, on a quiet tree, and not before.
 namespace lat {
 
 using u8  = uint8_t;  using u16 = uint16_t; using u32 = uint32_t; using u64 = uint64_t;
@@ -39,6 +47,21 @@ inline f32 gainToFader(f32 g) {
     const f32 n = clampv((db + 70.f) / 70.f, 0.f, 1.f);
     return std::pow(n, 1.f / 2.2f) * 0.85f;
 }
+
+// Environment knobs, read under both spellings. The product was called Lattice
+// before it was called NxTakt, and someone's shell profile, .desktop file or
+// CI script still exports the old names; silently ignoring them would look
+// like the knob had stopped working. Pass the bare suffix — env("AUDIO") reads
+// NXTAKT_AUDIO first and falls back to LATTICE_AUDIO. New spelling always
+// wins, so a profile that exports both is not ambiguous.
+//
+// Returns nullptr when neither is set, so it drops straight into the
+// `if (const char* s = env("SCALE"))` shape getenv was used in. The returned
+// pointer is environ-owned, exactly as getenv's is.
+//
+// GUI/startup thread only: getenv is not safe against a concurrent setenv, and
+// nothing realtime reads configuration anyway.
+const char* env(const char* suffix);
 
 void logImpl(const char* lvl, const char* fmt, ...);
 #define LOGI(...) ::lat::logImpl("info", __VA_ARGS__)

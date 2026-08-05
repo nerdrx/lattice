@@ -32,10 +32,43 @@ namespace {
 // number gates nothing on the read side beyond the upper bound. The
 // alternative -- rejecting v3 keys inside a file that calls itself v1 -- would
 // only punish someone who hand-edited the header, and buys no safety: an old
-// Lattice already refuses every one of those keys, so no half-understood file
+// build already refuses every one of those keys, so no half-understood file
 // can be read either way. Saving always writes the current version.
+//
+// THE HEADER WORD IS THE MAGIC. There is no separate signature: the first
+// token of the first line both identifies the format and carries the version.
+// The product was called Lattice through versions 1..4, so that token was
+// `lattice`; it is `nxtakt` from the rename on. Both spellings name the SAME
+// format in the SAME version space (1..4 and counting) -- the rename did not
+// fork the format, and a `nxtakt 4` file is byte-identical to the `lattice 4`
+// file it replaced apart from that one word.
+//
+// So: the writer emits `nxtakt <version>`, and the reader accepts either word,
+// forever. Not for a deprecation window -- forever. Every set a user has ever
+// saved says `lattice`, those files are their work, and there is no upgrade
+// step they could be expected to run. Dropping the old spelling would turn
+// every one of them into "not a project file", which is the single worst thing
+// a DAW can say about a file that is in fact perfectly readable.
+//
+// Deliberately NOT done: rewriting the caller's file on load, or keeping the
+// word that was read so a re-save preserves it. Load-and-save flips the header
+// to the new spelling, and that is the only thing it flips. See
+// kHeaderWord/isHeaderWord below.
 constexpr int kFormatVersion = 4;
 constexpr int kMinFormatVersion = 1;
+
+// What saveProject writes. Reading accepts this and every spelling in
+// kLegacyHeaderWords.
+constexpr const char* kHeaderWord = "nxtakt";
+// Every word that has ever meant "this is a project file". Append-only: a
+// spelling may never be removed from this list.
+constexpr const char* kLegacyHeaderWords[] = { "lattice" };
+
+bool isHeaderWord(const std::string& k) {
+    if (k == kHeaderWord) return true;
+    for (const char* w : kLegacyHeaderWords) if (k == w) return true;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // number formatting
@@ -475,7 +508,7 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     std::string o;
     o.reserve(4096);
 
-    o += "lattice " + std::to_string(kFormatVersion) + "\n";
+    o += std::string(kHeaderWord) + " " + std::to_string(kFormatVersion) + "\n";
     kn(o, "", "tempo",     fmtF64(clTempo(s.tempo)));
     kn(o, "", "sig",       std::to_string(clSig(s.sigNum)) + " " + std::to_string(clSig(s.sigDen)));
     kn(o, "", "quantum",   std::to_string(clQuantum(s.quantumIdx)));
@@ -635,7 +668,10 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         Scan sc(rest);
 
         if (!sawHeader) {
-            if (key != "lattice") return fail("not a lattice project (expected 'lattice <version>')");
+            // Either spelling, same version space. See kHeaderWord.
+            if (!isHeaderWord(key))
+                return fail("not a project file (expected 'nxtakt <version>', "
+                            "or 'lattice <version>' from before the rename)");
             int v = 0;
             if (!sc.integer(v)) return fail("missing format version");
             if (v < kMinFormatVersion || v > kFormatVersion)

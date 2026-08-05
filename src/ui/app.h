@@ -772,7 +772,7 @@ private:
     bool restoreEntry(const UndoEntry& e);
     void clearUndo();                            // a fresh set has no history
     void cancelTakes(const char* why);           // stop + discard every take in flight
-    // Headless verification hook (LATTICE_DEBUG_UNDO). Nothing can click a
+    // Headless verification hook (NXTAKT_DEBUG_UNDO). Nothing can click a
     // fader inside gamescope, and the restore path is the part of this feature
     // a screenshot cannot check -- so it is driven from here instead, against
     // whatever set was loaded, with a live engine and real plugins.

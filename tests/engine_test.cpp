@@ -3240,7 +3240,7 @@ static void testDrains() {
 // ---------------------------------------------------------------------------
 
 int main() {
-    std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
+    std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
 
     testQuantizedLaunch();
     testQuantumNone();

@@ -1,7 +1,7 @@
-// Lattice IPC — the client side of the control region.
+// NxTakt IPC — the client side of the control region.
 //
 // EngineClient is what the GUI will hold instead of an Engine& once phase 4
-// lands (docs/PROCESS-SPLIT.md §6): attach to a running latticed, push
+// lands (docs/PROCESS-SPLIT.md §6): attach to a running nxtaktd, push
 // commands, drain events, read the polled state block, and notice when the
 // engine stops answering. It is written now, ahead of the GUI adopting it, so
 // that the daemon has a real second peer in the tests rather than a bespoke
@@ -9,7 +9,7 @@
 //
 // Deliberately dependency-light: core/, audio/engine.h for the enums, and
 // libc. No GUI headers, no audio libraries, nothing that needs a link order.
-// A control surface, a headless test, or `lattice-ctl` can all include this
+// A control surface, a headless test, or `nxtakt-ctl` can all include this
 // and cost nothing.
 //
 // Threading contract, unchanged from the in-process one it replaces:
@@ -218,7 +218,7 @@ public:
     // the ownership asymmetry §3.1 calls for and it is what makes "samples
     // survive an engine restart" true rather than aspirational — see pool.h.
 
-    // Creates /lattice-pool-<session>. Independent of attach(): a GUI decodes
+    // Creates /nxtakt-pool-<session>. Independent of attach(): a GUI decodes
     // its project while it is still waiting for a daemon to come up, and the
     // pool is where it decodes *into*.
     bool createPool(const char* session, size_t payloadBytes = kDefaultPoolBytes) {

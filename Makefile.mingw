@@ -1,4 +1,4 @@
-# Lattice — Windows cross build (mingw-w64), HEADLESS subset.
+# NxTakt — Windows cross build (mingw-w64), HEADLESS subset.
 #
 #   make -f Makefile.mingw config           show toolchain + what was detected
 #   make -f Makefile.mingw                  build everything below
@@ -22,7 +22,7 @@
 #
 # What this deliberately does NOT build
 # -------------------------------------
-#   The GUI (build/lattice). It needs freetype, glew, sndfile and samplerate as
+#   The GUI (build/nxtakt). It needs freetype, glew, sndfile and samplerate as
 #   Windows libraries, none of which apt ships cross-built, and src/ui/app.cpp
 #   plus src/gfx/font.cpp are still POSIX-only. See docs/PORTING.md.
 #

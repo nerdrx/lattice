@@ -1,16 +1,16 @@
-# Lattice — native Linux DAW
+# NxTakt — native Linux DAW
 #
-#   make            release build   -> build/lattice
+#   make            release build   -> build/nxtakt
 #   make debug      -O0 -g3 + asserts
 #   make run        build and launch
 #   make clean
 #
 # Wayland is the primary window backend; X11 is kept as a runtime fallback.
-# Force one with LATTICE_BACKEND=wayland|x11 at run time.
+# Force one with NXTAKT_BACKEND=wayland|x11 at run time.
 
 CXX      ?= g++
 CC       ?= gcc
-BIN      := build/lattice
+BIN      := build/nxtakt
 GEN      := build/gen
 
 PKGS     := jack alsa sndfile samplerate gl x11 xcursor freetype2 fontconfig lilv-0
@@ -90,7 +90,7 @@ ifneq ($(HAVE_WAYLAND),1)
 SRC := $(filter-out src/ui/window_wayland.cpp,$(SRC))
 endif
 # src/daemon is a separate program with its own main(); it is built by the
-# build/latticed rule below and must never be swept into the GUI's link.
+# build/nxtaktd rule below and must never be swept into the GUI's link.
 SRC := $(filter-out src/daemon/%,$(SRC))
 
 OBJ := $(patsubst src/%.cpp,build/obj/%.o,$(SRC))
@@ -205,8 +205,8 @@ build/ipc_test: tests/ipc_test.cpp src/ipc/shm.h
 # layer, and no GUI. Phase 3 is where src/plugin joins the link: the daemon
 # owns every PluginInstance now, so it needs the backends (lilv for LV2, dl for
 # CLAP) that phases 1 and 2 could do without. Still no GUI, no window system and
-# no sndfile — latticed renders, it does not decode or draw.
-DAEMON_SRC := src/daemon/latticed.cpp src/audio/engine.cpp src/audio/backend.cpp \
+# no sndfile — nxtaktd renders, it does not decode or draw.
+DAEMON_SRC := src/daemon/nxtaktd.cpp src/audio/engine.cpp src/audio/backend.cpp \
               src/core/common.cpp \
               src/plugin/host.cpp src/plugin/lv2_host.cpp src/plugin/clap_host.cpp \
               src/plugin/internal_devices.cpp
@@ -214,13 +214,13 @@ DAEMON_CF  := -std=c++20 -O2 $(WARN) -Ivendor/clap/include \
               $(shell pkg-config --cflags jack alsa lilv-0)
 DAEMON_LD  := $(shell pkg-config --libs jack alsa lilv-0) -ldl -lrt -lpthread -lm
 
-build/latticed: $(DAEMON_SRC) $(IPC_H) src/audio/engine.h src/audio/backend.h src/plugin/host.h
+build/nxtaktd: $(DAEMON_SRC) $(IPC_H) src/audio/engine.h src/audio/backend.h src/plugin/host.h
 	@mkdir -p build
 	$(CXX) $(DAEMON_CF) $(DAEMON_SRC) -o $@ $(DAEMON_LD)
 
-# daemon_test spawns ./build/latticed, so the binary is a build dependency of
+# daemon_test spawns ./build/nxtaktd, so the binary is a build dependency of
 # the test rather than something the test is trusted to find.
-build/daemon_test: tests/daemon_test.cpp $(IPC_H) src/audio/engine.h build/latticed
+build/daemon_test: tests/daemon_test.cpp $(IPC_H) src/audio/engine.h build/nxtaktd
 	@mkdir -p build
 	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
 
@@ -230,8 +230,8 @@ test: build/engine_test build/ipc_test build/daemon_test build/render build/gen_
 	./build/engine_test
 	./build/ipc_test
 	./build/daemon_test
-	./build/gen_demo /tmp/lattice-selftest >/dev/null
-	./build/render /tmp/lattice-selftest/demo.lattice /tmp/lattice-selftest/render.wav --scene 2 --bars 2
+	./build/gen_demo /tmp/nxtakt-selftest >/dev/null
+	./build/render /tmp/nxtakt-selftest/demo.lattice /tmp/nxtakt-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3
 	@echo "ALL CHECKS PASSED"
 

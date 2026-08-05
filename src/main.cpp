@@ -1,4 +1,4 @@
-// Lattice — a native, session-first DAW for Linux.
+// NxTakt — a native, session-first DAW for Linux.
 #include "ui/app.h"
 #include <clocale>
 #include <csignal>
@@ -12,14 +12,15 @@
 
 static void usage() {
     std::printf(
-        "Lattice — session-first DAW\n"
+        "NxTakt — session-first DAW\n"
         "\n"
-        "  lattice [project.lattice]\n"
+        "  nxtakt [project.lattice]\n"
         "\n"
         "Environment:\n"
-        "  LATTICE_BACKEND=wayland|x11   force a window backend\n"
-        "  LATTICE_AUDIO=jack|alsa       force an audio backend\n"
-        "  LATTICE_SCALE=1.5             override UI scale\n"
+        "  NXTAKT_BACKEND=wayland|x11    force a window backend\n"
+        "  NXTAKT_AUDIO=jack|alsa        force an audio backend\n"
+        "  NXTAKT_SCALE=1.5              override UI scale\n"
+        "  (the pre-rename LATTICE_* spellings are still read; NXTAKT_* wins)\n"
         "\n"
         "Keys:\n"
         "  Space          play / stop            Esc      stop all clips\n"
@@ -82,7 +83,7 @@ int main(int argc, char** argv) {
     // no business on main's stack.
     auto app = std::make_unique<lat::App>();
     if (!app->init(argc, argv)) {
-        std::fprintf(stderr, "lattice: failed to start\n");
+        std::fprintf(stderr, "nxtakt: failed to start\n");
         return 1;
     }
     app->run();

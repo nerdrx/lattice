@@ -1,6 +1,6 @@
-# Splitting Lattice into an engine process and a GUI process
+# Splitting NxTakt into an engine process and a GUI process
 
-Status: **phase 3 shipped — `latticed` hosts the plugins (§11).**
+Status: **phase 3 shipped — `nxtaktd` hosts the plugins (§11).**
 Wave 1 landed the transport (`src/ipc/shm.h`, `tests/ipc_test.cpp`) and this
 document; wave 2 landed the daemon and a scalar control plane (§9); wave 3
 landed the sample pool, the clip table and protocol v2 (§10); wave 4 moved the
@@ -205,7 +205,7 @@ process split — the plugin has to move (§3.6).
 
 ```
   ┌─────────────────────────────┐            ┌──────────────────────────────┐
-  │ lattice   (GUI client)      │            │ latticed  (engine daemon)    │
+  │ nxtakt    (GUI client)      │            │ nxtaktd   (engine daemon)    │
   │                             │            │                              │
   │  Window / Renderer / Ui     │            │  AudioBackend (JACK/ALSA)    │
   │  Session model (strings,    │            │  Engine  (RT thread)         │
@@ -215,7 +215,7 @@ process split — the plugin has to move (§3.6).
   └───────┬─────────────┬───────┘            └───────┬───────────────┬──────┘
           │             │                            │               │
           │      ┌──────┴────────────────────────────┴──────┐        │
-          │      │ control region  (shm, created by latticed)│        │
+          │      │ control region  (shm, created by nxtaktd) │        │
           │      │   SharedState │ cmd ring │ evt ring       │        │
           │      └───────────────────────────────────────────┘        │
           │                                                            │
@@ -227,7 +227,7 @@ process split — the plugin has to move (§3.6).
 
 Two regions, not one, because their lifetimes genuinely differ:
 
-- The **control region** lives exactly as long as the engine. `latticed` creates
+- The **control region** lives exactly as long as the engine. `nxtaktd` creates
   it, initialises the rings and `SharedState`, calls `publishReady()`, and
   unlinks it on exit. If the engine dies the region is stale and the next
   daemon reaps it (`ShmRegion::reapIfStale`).
@@ -248,7 +248,7 @@ carry a file path, a plugin URI, a project, or an error string, and stretching
 them to do so (chunked string messages) would be a mistake.
 
 So there is a second channel: an `AF_UNIX` `SOCK_SEQPACKET` socket at
-`$XDG_RUNTIME_DIR/lattice/engine-<session>.sock`. It carries:
+`$XDG_RUNTIME_DIR/nxtakt/engine-<session>.sock`. It carries:
 
 - the handshake (versions, build ids, the control region's name),
 - file descriptors via `SCM_RIGHTS` (the session region, once it is a `memfd`),
@@ -430,14 +430,14 @@ system with lilv; it is slow and it crashes on bad plugins. It runs in the
 daemon and the catalog is shipped to the GUI over the socket
 (`PluginDesc` is all strings, so it never belongs in a ring). Better still, and
 cheap once we are already spawning processes: run the scan in a short-lived
-`lattice-scan` child so a plugin that segfaults during discovery takes down
+`nxtakt-scan` child so a plugin that segfaults during discovery takes down
 neither the GUI nor the engine. That is the standard arrangement and it is
 strictly easier after the split than before.
 
 **Plugin editor windows are the one genuinely hard part.** Native LV2/CLAP UIs
 must run in the process that owns the instance, i.e. the daemon, and then be
 embedded into the GUI's window — X11 `XEmbed` or a Wayland subsurface across a
-process boundary. Lattice currently draws only its own generic knob UI from
+process boundary. NxTakt currently draws only its own generic knob UI from
 `ParamInfo`, which keeps working unchanged through the param table (§3.7), so
 this is deferred to phase 5 and does not block anything.
 
@@ -492,13 +492,13 @@ over the socket with the `Ev::DeviceReady`.
 
 ```
 GUI start
-  ├─ compute session id + socket path ($XDG_RUNTIME_DIR/lattice/engine-<id>.sock)
+  ├─ compute session id + socket path ($XDG_RUNTIME_DIR/nxtakt/engine-<id>.sock)
   ├─ connect()
   │    ├─ success ────────────────────► handshake (§4.2), attach, done
   │    └─ ENOENT / ECONNREFUSED
-  │         ├─ ShmRegion::reapIfStale("/lattice-engine-<id>")   (crash orphan)
+  │         ├─ ShmRegion::reapIfStale("/nxtakt-engine-<id>")   (crash orphan)
   │         ├─ unlink a stale socket inode
-  │         ├─ posix_spawn("latticed", ...)
+  │         ├─ posix_spawn("nxtaktd", ...)
   │         └─ retry connect() with a 2 s deadline
   └─ on failure: report "could not start the audio engine: <reason>" and offer
      to run in-process (the phase-1..3 code path stays compiled in)
@@ -522,14 +522,14 @@ Three layers, deliberately:
    `ipc_test` section 2 asserts exactly this.
 2. **Protocol**: over the socket, both sides exchange `kShmVersion` plus a build
    id. This exists so the failure can be *explained*: "engine is protocol v3,
-   this build speaks v2 — restart the engine with `lattice --restart-engine`"
+   this build speaks v2 — restart the engine with `nxtakt --restart-engine`"
    beats a silent refusal to attach.
 3. **Audio format**: the daemon reports `sampleRate`/`blockSize` in the
    handshake. The GUI resamples on load, so it must know the rate before it
    decodes anything.
 
 Policy: **no compatibility window within a release.** The daemon ships in the
-same binary as the GUI (`lattice --engine`, or a separate `latticed` built from
+same binary as the GUI (`nxtakt --engine`, or a separate `nxtaktd` built from
 the same tree), so a version mismatch means a half-upgraded install, and the
 right response is to restart the engine, not to negotiate. Bump `kShmVersion`
 on every layout change; the layout hash catches the times we forget.
@@ -557,7 +557,7 @@ Reattach:
    `adoptOwnership()` once the daemon has confirmed it is the sole client — so
    the unlink obligation transfers and the region is not leaked forever.
 3. It reloads the project from the GUI's own journal
-   (`$XDG_RUNTIME_DIR/lattice/session-<id>.lattice`, written by the existing
+   (`$XDG_RUNTIME_DIR/nxtakt/session-<id>.lattice`, written by the existing
    `saveProject` on every mutation — cheap, it is line-oriented text).
 4. It walks `BlockDesc[]` and matches blocks to clips by
    `key = hash(path, size, mtime)`. Matched clips **do not reload from disk**
@@ -594,10 +594,10 @@ than a lost session.
 
 **Recovery**:
 
-1. `ShmRegion::reapIfStale("/lattice-engine-<id>")` — the crashed daemon left
+1. `ShmRegion::reapIfStale("/nxtakt-engine-<id>")` — the crashed daemon left
    its control region behind. This is the crash-orphan case
    `ipc_test` section 5 exercises with a real `SIGKILL`.
-2. Respawn `latticed`, attach to the new control region.
+2. Respawn `nxtaktd`, attach to the new control region.
 3. Republish the session. The sample pool is in the *session* region and the GUI
    created it, so **samples survive an engine restart** — republish is not a
    reload. Concretely: `memcpy` the clip table, push the chain table, push
@@ -674,18 +674,18 @@ pointer crosses the boundary; the GUI no longer owns anything the audio thread
 touches. Risk: medium (async instantiation changes UI flow: an "instantiating…"
 device state has to exist).
 
-**Phase 4 — actually split.** New `src/main_engine.cpp` → `latticed`: creates
+**Phase 4 — actually split.** New `src/main_engine.cpp` → `nxtaktd`: creates
 the control region, opens the backend, runs `Engine`, serves the socket. The GUI
 learns to spawn/attach. Because phases 1–3 removed every pointer, this phase is
 build system + lifecycle, not protocol. Ship behind
-`LATTICE_ENGINE=inproc|daemon`, default `inproc`, until it has real hours on it.
+`NXTAKT_ENGINE=inproc|daemon`, default `inproc`, until it has real hours on it.
 Deliverable: a GUI crash no longer stops the audio. Risk: medium, concentrated
 entirely in lifecycle.
 
 **Phase 5 — hardening and the good parts.** Crash recovery both directions
 (§4.3, §4.4), out-of-process plugin scanning, the eventfd doorbell for a
 low-power idle mode, plugin editor window embedding, and the things the split
-unlocks: headless `latticed` with no GUI at all, a second UI attached for
+unlocks: headless `nxtaktd` with no GUI at all, a second UI attached for
 control-surface duty, remote control.
 
 ---
@@ -756,7 +756,7 @@ GUI (§4.3).
 Wave 2 built the daemon rather than the in-process shm swap. That is a
 deliberate reordering of §6: the doc's phase 1 rewires `App`/`Engine` onto
 `ShmSpscRing` inside one process, and its phase 4 splits the processes. We did
-the *lifecycle* first — `latticed` exists, creates the control region, and
+the *lifecycle* first — `nxtaktd` exists, creates the control region, and
 serves a real second process — with the protocol restricted to the eighteen
 commands that already cross cleanly. The reason is that the risky half of the
 split turned out to be lifecycle (who creates, who unlinks, who notices a
@@ -767,12 +767,12 @@ and still the shipping path.
 
 ### What exists now
 
-- **`src/daemon/latticed.cpp`** — the engine daemon.
-  - `latticed [--session NAME] [--driver null|auto|jack|alsa] [--rate HZ]
-    [--block FRAMES] [--verbose]`. The region is `/lattice-engine-<session>`;
-    the session defaults to `$LATTICE_SESSION`, then `"default"`.
+- **`src/daemon/nxtaktd.cpp`** — the engine daemon.
+  - `nxtaktd [--session NAME] [--driver null|auto|jack|alsa] [--rate HZ]
+    [--block FRAMES] [--verbose]`. The region is `/nxtakt-engine-<session>`;
+    the session defaults to `$NXTAKT_SESSION`, then `"default"`.
   - Owns an `Engine` and either a real backend via `createBackend()` (honouring
-    `LATTICE_AUDIO`, same knob the GUI uses) or the **null driver**: no audio
+    `NXTAKT_AUDIO`, same knob the GUI uses) or the **null driver**: no audio
     device, one thread calling `Engine::process(nullptr, nullptr, l, r, 256)`
     against `CLOCK_MONOTONIC` at block cadence. Jitter is expected and
     irrelevant; what the null driver guarantees is the *average* rate, because
@@ -812,7 +812,7 @@ and still the shipping path.
   path, a 3000-command burst that must be deferred rather than dropped, `SIGKILL`
   → `alive()` false → orphan reaped → respawn, `SIGTERM` → exit 0 → `/dev/shm`
   clean. Runs under `make test`; clean under ASan+UBSan.
-- **`Makefile`** — `build/latticed` (daemon + `engine.cpp` + `backend.cpp` +
+- **`Makefile`** — `build/nxtaktd` (daemon + `engine.cpp` + `backend.cpp` +
   `common.cpp`, no GUI and no plugin sources: `engine.cpp`'s use of
   `PluginInstance` is header-only virtual dispatch) and `build/daemon_test`,
   both in `test`. `src/daemon` is filtered out of the GUI app's `SRC` sweep.
@@ -911,7 +911,7 @@ In order, each step leaving the tree green:
    and `RtClip::data` = `pool_ + poolRef` resolved at command-drain time with a
    bounds check against the committed size. Un-refuse `SetClip`/`ClearClip`.
    ASan soak: add and remove clips under playback.
-4. **Point the GUI at `EngineClient` behind `LATTICE_ENGINE=inproc|daemon`,
+4. **Point the GUI at `EngineClient` behind `NXTAKT_ENGINE=inproc|daemon`,
    default `inproc`.** `App` keeps its `Engine` for the in-process path; the
    daemon path spawns/attaches per §4.1. This is where the "GUI crash no longer
    stops the audio" claim first becomes true, and it needs real hours before it
@@ -924,7 +924,7 @@ unchanged.
 
 ## 10. Phase 2 shipped — the sample pool
 
-`latticed` can play clips. A clip's audio is decoded (or, in the tests,
+`nxtaktd` can play clips. A clip's audio is decoded (or, in the tests,
 synthesised) into a shared region the *client* owns, published as a `u64` byte
 offset, translated back into a `const f32*` by the daemon, and rendered by an
 `Engine` in another process. `src/audio` is still untouched, `src/ui` is still
@@ -971,7 +971,7 @@ specific message rather than reading a clip table that is not there.
 - **`src/ipc/shm.h`** — three additive changes, no layout change:
   `attach(..., readOnly)`, `create(..., seal)` with `trySeal()`/`sealed()`, and
   `release()` (detach without unlinking, for a hand-off).
-- **`src/daemon/latticed.cpp`** — `pumpPool()`, `translateClip()`, the clip
+- **`src/daemon/nxtaktd.cpp`** — `pumpPool()`, `translateClip()`, the clip
   shadow table, and the retirement queue.
 - **`tests/daemon_test.cpp`** — 200 checks, thirteen sections.
 
@@ -979,7 +979,7 @@ specific message rather than reading a clip table that is not there.
 
 | | |
 |---|---|
-| name | `/lattice-pool-<session>` |
+| name | `/nxtakt-pool-<session>` |
 | creator | the **client**, and the client unlinks it |
 | daemon | attaches `PROT_READ`, once per process lifetime |
 | size | fixed at create, default 256 MiB, sparse |
@@ -1104,7 +1104,7 @@ needs `Engine` to publish a drain counter: two lines in `src/audio`, and the
 first thing phase 3 should take.
 
 > **Superseded by §11.5.** Phase 3 took it. `Engine::drains` exists,
-> `latticed` retires on the counter, and the deadline is now reachable only
+> `nxtaktd` retires on the counter, and the deadline is now reachable only
 > against an engine that does not count — a state the daemon latches and
 > publishes as `ControlHeader::drainsExact` rather than leaving to inference.
 > The exact rule is `drains >= k + 2` where `k` is read *after* the displacing
@@ -1200,7 +1200,7 @@ the refusals left nothing broken behind them.
 ### 10.7 Test coverage
 
 `tests/daemon_test.cpp`, 200 checks, all against a real spawned
-`latticed --driver null`:
+`nxtaktd --driver null`:
 
 | § | what |
 |---|---|
@@ -1240,7 +1240,7 @@ and the test sanitised. `make test` is green end to end (252 + 54 + 200).
 
 ## 11. Phase 3 shipped — the plugins move in
 
-`latticed` links `src/plugin` and owns every `PluginInstance` in the system. A
+`nxtaktd` links `src/plugin` and owns every `PluginInstance` in the system. A
 client names a plugin by URI; the daemon scans, instantiates, prepares, builds
 an `RtChain` out of *its own* instances and hands it to its `Engine`. What comes
 back is a device id and a table row. **No pointer crosses the boundary in either
@@ -1258,7 +1258,7 @@ on landed in parallel, against the frozen `engine.h`.
 
 ### 11.1 What exists now
 
-- **`src/daemon/latticed.cpp`** — the device layer.
+- **`src/daemon/nxtaktd.cpp`** — the device layer.
   - `PluginRegistry`, scanned lazily on the first device command, on a thread of
     its own (§11.6). `PluginInstance` instantiation, preparation and destruction
     on the pump thread.
@@ -1281,7 +1281,7 @@ on landed in parallel, against the frozen `engine.h`.
 - **`src/ipc/client.h`** — `addDevice`/`removeDevice`/`moveDevice`/`setBypass`/
   `scanPlugins`, `setDeviceParam`, `readDevice` into a `DeviceMirror`, and the
   slot-generation bookkeeping that guards a stale param write.
-- **`Makefile`** — `build/latticed` links `src/plugin/*.cpp` plus `lilv-0` and
+- **`Makefile`** — `build/nxtaktd` links `src/plugin/*.cpp` plus `lilv-0` and
   `-ldl`. Still no GUI, no window system, no sndfile.
 - **`tests/daemon_test.cpp`** — 300 checks, fifteen sections.
 
@@ -1497,7 +1497,7 @@ between device commands and scalar commands is not preserved across the scan
 window — a `LaunchClip` can overtake a queued `AddDevice` — which is a few
 milliseconds of dry audio and is documented rather than defended.
 
-§3.6 asks for the scan in a short-lived `lattice-scan` **child process**, so a
+§3.6 asks for the scan in a short-lived `nxtakt-scan` **child process**, so a
 plugin that segfaults during discovery takes down neither the GUI nor the
 engine. That is strictly better and it is still deferred: it needs a way to ship
 the catalog back, which is the socket.
@@ -1541,13 +1541,13 @@ the catalog back, which is the socket.
 ### 11.8 Test coverage
 
 `tests/daemon_test.cpp`, 300 checks, all against a real spawned
-`latticed --driver null`:
+`nxtaktd --driver null`:
 
 | § | what |
 |---|---|
 | 1–5 | phase 1's: handshake, beat clock, metronome/master through rendered audio, refusals, a 3000-command burst |
 | 6–10 | phase 2's: the pool, a DC clip measured at the meter, retirement, MIDI clips, seven bad offsets |
-| **11** | **devices.** Lazy scan (410 plugins, 4.3 s) with the heartbeat advancing throughout; `AddDevice "lattice:saturator"` on track 0; the metadata row parsed into the client mirror — 3 params, `Drive` dB [0..36] flagged logarithmic, `Output` [-24..24], `Mix` [0..1] def 1; the URI blob freed by its echo; a 0.2 DC clip measured dry at 0.2000, driven to 0.4621 by a **param-table write**, back to 0.2000 under `SetBypass`, up again when it is cleared, and back to 0.2000 after `RemoveDevice` — with the displaced chain and its instance freed only after the proof; insert-at-position, `MoveDevice`, and the positional shifts the table reports; a garbage URI answered with `EvDeviceFailed{RejectUnknownUri}` and its blob retired anyway; `RemoveDevice` on an empty slot answered with `RejectBadDevice`; a saturator on **return 0** and on the **master**, both retiring through the same proof; `eventsDropped == 0`, because `Ev::ChainRetired` is consumed and not dropped |
+| **11** | **devices.** Lazy scan (410 plugins, 4.3 s) with the heartbeat advancing throughout; `AddDevice "lattice:saturator"` on track 0 — deliberately the PRE-RENAME URI, so the permanent `lattice:` -> `nxtakt:` alias is exercised on every run, and the metadata row is asserted to come back carrying the canonical `nxtakt:saturator`; the metadata row parsed into the client mirror — 3 params, `Drive` dB [0..36] flagged logarithmic, `Output` [-24..24], `Mix` [0..1] def 1; the URI blob freed by its echo; a 0.2 DC clip measured dry at 0.2000, driven to 0.4621 by a **param-table write**, back to 0.2000 under `SetBypass`, up again when it is cleared, and back to 0.2000 after `RemoveDevice` — with the displaced chain and its instance freed only after the proof; insert-at-position, `MoveDevice`, and the positional shifts the table reports; a garbage URI answered with `EvDeviceFailed{RejectUnknownUri}` and its blob retired anyway; `RemoveDevice` on an empty slot answered with `RejectBadDevice`; a saturator on **return 0** and on the **master**, both retiring through the same proof; `eventsDropped == 0`, because `Ev::ChainRetired` is consumed and not dropped |
 | **12** | **exact retirement.** `drainsExact == 1`; a block displaced and confirmed quiescent in **8.2 ms with no sleep in the loop**, within **one** rendered block, with the drain counter observed to advance by ≥ 2 — the `k+2` proof, measured |
 | **13** | `SIGKILL` **with a device loaded**: the pool survives, the block is still `Live`, samples intact, key still matches; the orphan control region reaped; respawn, pool re-announced, `republishClips()`, same offset, same 0.5 at the meter; **devices did not survive and the daemon says so** (`devicesLive == 0`, the table row free, the client's generation record dropped); re-`AddDevice` on the fresh engine works, metadata comes back, and a param write shapes 0.5 DC to 0.4621 |
 | 14 | `SIGTERM`: control region unlinked, pool still there, nothing else in `/dev/shm`; `closePool()` unlinks it |
@@ -1559,7 +1559,7 @@ no runtime error. `/dev/shm` clean after every run.
 
 ### 11.9 Still deferred
 
-- **Plugin editor windows** (§3.6). Lattice draws its own generic knob UI from
+- **Plugin editor windows** (§3.6). NxTakt draws its own generic knob UI from
   `ParamInfo`, which keeps working unchanged through the param table, so this is
   phase 5 and blocks nothing.
 - **Out-of-process scanning** (§11.6): a crash in a third-party bundle during

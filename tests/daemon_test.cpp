@@ -1,6 +1,6 @@
 // Engine-daemon tests.
 //
-// Spawns a real ./build/latticed in --driver null mode, attaches to its control
+// Spawns a real ./build/nxtaktd in --driver null mode, attaches to its control
 // region with ipc::EngineClient, and exercises the whole boundary from the
 // outside: version handshake, scalar commands, the polled state block, the
 // refusal of every pointer-carrying command, engine death by SIGKILL, and clean
@@ -18,7 +18,7 @@
 // daemon is a separate process, which is the entire point.
 //
 //   g++ -std=c++20 -O2 -Wall -Wextra tests/daemon_test.cpp -o daemon_test -lrt -lpthread
-//   (and ./build/latticed must exist — the Makefile makes it a dependency)
+//   (and ./build/nxtaktd must exist — the Makefile makes it a dependency)
 #include "../src/ipc/client.h"
 
 #include <cmath>
@@ -72,7 +72,7 @@ static void note(const char* fmt, ...) {
 // in /dev/shm; an orphan of either kind would make the *next* run take a
 // recovery path and mask the bug that caused it.
 
-static const char* gDaemonPath = "./build/latticed";
+static const char* gDaemonPath = "./build/nxtaktd";
 static char        gSession[64] = {};
 static char        gRegion[128] = {};
 static char        gPool[128]   = {};
@@ -106,17 +106,17 @@ static void armCleanup() {
     for (int s : {SIGINT, SIGTERM, SIGSEGV, SIGABRT, SIGBUS, SIGPIPE}) ::signal(s, fatalSignal);
 }
 
-// Lattice regions currently in /dev/shm, excluding `allow` (a leading '/' is
+// NxTakt regions currently in /dev/shm, excluding `allow` (a leading '/' is
 // tolerated, since that is how region names are spelled everywhere else).
 // Anything counted is also printed: a leaked region is a bug report, not a
 // number.
-static int countLatticeShm(const char* allow = nullptr) {
+static int countNxTaktShm(const char* allow = nullptr) {
     const char* skip = (allow && *allow == '/') ? allow + 1 : allow;
     DIR* d = ::opendir("/dev/shm");
     if (!d) return -1;
     int n = 0;
     while (dirent* e = ::readdir(d)) {
-        if (!std::strstr(e->d_name, "lattice")) continue;
+        if (!std::strstr(e->d_name, "nxtakt")) continue;
         if (skip && !std::strcmp(e->d_name, skip)) continue;
         ++n;
         note("leftover /dev/shm/%s", e->d_name);
@@ -301,7 +301,7 @@ static void resetMixer(ipc::EngineClient& c) {
 // ---------------------------------------------------------------------------
 
 static bool testHandshake(ipc::EngineClient& c, pid_t& daemon) {
-    banner("1. spawn latticed --driver null and shake hands");
+    banner("1. spawn nxtaktd --driver null and shake hands");
 
     daemon = spawnDaemon(gSession);
     CHECK(daemon > 0, "fork/exec %s (pid %d)", gDaemonPath, (int)daemon);
@@ -1187,9 +1187,17 @@ static void testDevices(ipc::EngineClient& c) {
     // -- AddDevice -----------------------------------------------------------
     const u64 added0 = h.devicesAdded.load();
     u32 sat = 0;
+    // Deliberately the PRE-RENAME uri, and the only place in this file that
+    // still uses it. A GUI replaying a set saved before the Lattice -> NxTakt
+    // rename sends exactly this string over the wire, so the daemon has to keep
+    // resolving it forever (the alias table in PluginRegistry::find). The
+    // device-table assertion below then proves it publishes the CANONICAL uri
+    // straight back, which is what stops the old spelling propagating into
+    // anything saved from here on.
     const bool got = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1, "lattice:saturator",
                                       sat, 5000);
-    CHECK(got, "AddDevice 'lattice:saturator' on track 0 -> device %u", sat);
+    CHECK(got, "AddDevice with the pre-rename uri 'lattice:saturator' still resolves"
+               " -> device %u", sat);
     if (!got) return;
     CHECK(h.devicesAdded.load() == added0 + 1, "one device added (%llu)",
           (unsigned long long)h.devicesAdded.load());
@@ -1202,7 +1210,9 @@ static void testDevices(ipc::EngineClient& c) {
     ipc::DeviceMirror d;
     const bool read = c.readDevice(sat, d);
     CHECK(read, "the device table row parses into the client's own mirror");
-    CHECK(read && d.uri == "lattice:saturator", "uri '%s'", read ? d.uri.c_str() : "");
+    CHECK(read && d.uri == "nxtakt:saturator",
+          "and the table publishes the canonical uri, not the alias it was asked"
+          " for ('%s')", read ? d.uri.c_str() : "");
     CHECK(read && d.name == "Saturator", "name '%s'", read ? d.name.c_str() : "");
     CHECK(read && d.target == ipc::DevTargetTrack && d.targetIdx == 0 && d.chainPos == 0,
           "on %s %d at position %d", read ? ipc::devTargetName(d.target) : "?",
@@ -1303,7 +1313,7 @@ static void testDevices(ipc::EngineClient& c) {
 
     // -- a second device, and MoveDevice ------------------------------------
     u32 sat2 = 0;
-    const bool got2 = addDeviceAndWait(c, ipc::DevTargetTrack, 0, 0, "lattice:saturator",
+    const bool got2 = addDeviceAndWait(c, ipc::DevTargetTrack, 0, 0, "nxtakt:saturator",
                                        sat2, 5000);
     CHECK(got2 && sat2 != sat, "a second saturator inserted at position 0 -> device %u", sat2);
     if (got2) {
@@ -1392,7 +1402,7 @@ static void testDevices(ipc::EngineClient& c) {
     // all, which is a property of the daemon either way.
     u32 ret = 0;
     const bool retAdded = addDeviceAndWait(c, ipc::DevTargetReturn, 0, -1,
-                                           "lattice:saturator", ret, 5000);
+                                           "nxtakt:saturator", ret, 5000);
     CHECK(retAdded, "AddDevice saturator on return 0 -> device %u", ret);
     if (retAdded) {
         CHECK(c.readDevice(ret, d) && d.target == ipc::DevTargetReturn && d.targetIdx == 0,
@@ -1411,7 +1421,7 @@ static void testDevices(ipc::EngineClient& c) {
 
     u32 mas = 0;
     const bool masAdded = addDeviceAndWait(c, ipc::DevTargetMaster, 0, -1,
-                                           "lattice:saturator", mas, 5000);
+                                           "nxtakt:saturator", mas, 5000);
     CHECK(masAdded, "AddDevice saturator on the master -> device %u", mas);
     if (masAdded) {
         CHECK(c.readDevice(mas, d) && d.target == ipc::DevTargetMaster,
@@ -1545,7 +1555,7 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
     // afterwards is re-adding the device to a fresh engine.
     u32 preKillDevice = 0;
     const bool hadDevice = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1,
-                                            "lattice:saturator", preKillDevice, 10000);
+                                            "nxtakt:saturator", preKillDevice, 10000);
     CHECK(hadDevice, "a saturator on track 0 before the kill (device %u)", preKillDevice);
     CHECK(c.header().devicesLive.load() == 1, "one device live (%llu)",
           (unsigned long long)c.header().devicesLive.load());
@@ -1598,7 +1608,7 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
 
     // Respawn on the same session, from scratch.
     daemon = spawnDaemon(gSession);
-    CHECK(daemon > 0, "respawn latticed (pid %d)", (int)daemon);
+    CHECK(daemon > 0, "respawn nxtaktd (pid %d)", (int)daemon);
     const bool back = c.attach(gSession, 5000);
     CHECK(back, "attach to the replacement%s%s", back ? "" : ": ", back ? "" : c.error());
     if (!back) return;
@@ -1663,7 +1673,7 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
     // from scratch.
     u32 fresh = 0;
     const bool readded = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1,
-                                          "lattice:saturator", fresh, kScanTimeoutMs);
+                                          "nxtakt:saturator", fresh, kScanTimeoutMs);
     CHECK(readded, "re-AddDevice on the replacement engine -> device %u", fresh);
     if (readded) {
         ipc::DeviceMirror d;
@@ -1730,7 +1740,7 @@ static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
     // running session" impossible, which is the feature §4.3 is built on.
     CHECK(!shmExists(gRegion), "the control region is unlinked");
     CHECK(shmExists(gPool), "and the pool is still there — it is the session's, not the engine's");
-    const int strays = countLatticeShm(gPool);
+    const int strays = countNxTaktShm(gPool);
     CHECK(strays == 0, "nothing else is left in /dev/shm (%d)", strays);
 
     c.detach();
@@ -1748,20 +1758,23 @@ static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc > 1) gDaemonPath = argv[1];
+    // NXTAKTD, with the pre-rename LATTICED still honoured: a developer's
+    // shell or a CI job may still export it. The new spelling wins.
     if (const char* p = ::getenv("LATTICED")) gDaemonPath = p;
+    if (const char* p = ::getenv("NXTAKTD"))  gDaemonPath = p;
 
     std::snprintf(gSession, sizeof gSession, "dtest-%d", (int)::getpid());
     ipc::controlRegionName(gSession, gRegion, sizeof gRegion);
     ipc::poolRegionName(gSession, gPool, sizeof gPool);
     armCleanup();
 
-    std::printf("lattice daemon tests  (shm v%u, protocol v%u, pool v%u, region %zu B)\n",
+    std::printf("nxtakt daemon tests  (shm v%u, protocol v%u, pool v%u, region %zu B)\n",
                 ipc::kShmVersion, ipc::kProtocolVersion, ipc::kPoolVersion,
                 ipc::control::kBytes);
     std::printf("daemon: %s   session: %s\n", gDaemonPath, gSession);
 
     if (::access(gDaemonPath, X_OK) != 0) {
-        std::printf("  FAIL  %s is not executable — build it first (make build/latticed)\n",
+        std::printf("  FAIL  %s is not executable — build it first (make build/nxtaktd)\n",
                     gDaemonPath);
         return 1;
     }
@@ -1786,8 +1799,8 @@ int main(int argc, char** argv) {
 
     banner("15. /dev/shm is clean");
     cleanup();
-    const int leftover = countLatticeShm();
-    CHECK(leftover == 0, "no lattice region left in /dev/shm (found %d)", leftover);
+    const int leftover = countNxTaktShm();
+    CHECK(leftover == 0, "no nxtakt region left in /dev/shm (found %d)", leftover);
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

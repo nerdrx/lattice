@@ -1,4 +1,4 @@
-// Lattice's own stock devices.
+// NxTakt's own stock devices.
 //
 // These are ordinary PluginInstance implementations, so they ride the browser,
 // the device strip, bypass, parameter persistence and the chain scheduler with
@@ -23,8 +23,36 @@ namespace lat {
 namespace detail {
 namespace {
 
-constexpr const char* kSaturatorUri = "lattice:saturator";
-constexpr const char* kPulseUri     = "lattice:pulse";
+// Device URIs. These are not decoration: a saved set stores the URI verbatim
+// and asks the registry for it again on load, so a URI is a permanent public
+// identifier the moment one set has been written with it.
+//
+// The scheme was `lattice:` before the rename and is `nxtakt:` after it. The
+// canonical spelling -- the one the descriptor carries, and therefore the one
+// serializeDevices writes into every new save -- is the new one. The old one
+// stays a resolvable ALIAS forever, because every set saved before the rename
+// names its devices by it. Resolution happens in two places, and both are
+// required:
+//
+//   * PluginRegistry::find (host.cpp) maps an alias to the canonical
+//     descriptor. This is what a project load and a daemon AddDevice go
+//     through, so it is what makes an old set materialise its devices.
+//   * instantiateInternal, below, accepts either spelling directly, so a
+//     PluginDesc that came from an old project file (rather than from the
+//     registry) still loads.
+//
+// Loading an old set and re-saving it therefore rewrites `lattice:pulse` to
+// `nxtakt:pulse` -- the descriptor won, as it must, since the registry only
+// ever hands back canonical descriptors. That is a one-way upgrade of the
+// user's file, and it is safe precisely because the alias never expires: the
+// upgraded file is readable by nothing older, but the un-upgraded one stays
+// readable by everything newer.
+constexpr const char* kSaturatorUri = "nxtakt:saturator";
+constexpr const char* kPulseUri     = "nxtakt:pulse";
+
+// Pre-rename spellings. Append-only; an entry may never be removed.
+constexpr const char* kSaturatorUriLegacy = "lattice:saturator";
+constexpr const char* kPulseUriLegacy     = "lattice:pulse";
 
 // Denormals cost hundreds of cycles per operation on x86 when they leak into a
 // feedback path (the one-pole filter state, a decaying envelope). We do not
@@ -452,7 +480,7 @@ PluginDesc saturatorDesc() {
     d.format     = PluginFormat::Internal;
     d.uri        = kSaturatorUri;
     d.name       = "Saturator";
-    d.vendor     = "Lattice";
+    d.vendor     = "NxTakt";
     d.category   = "Distortion";
     d.kind       = PluginKind::Effect;
     d.audioIn    = 2;
@@ -467,7 +495,7 @@ PluginDesc pulseDesc() {
     d.format     = PluginFormat::Internal;
     d.uri        = kPulseUri;
     d.name       = "Pulse";
-    d.vendor     = "Lattice";
+    d.vendor     = "NxTakt";
     d.category   = "Instrument";
     d.kind       = PluginKind::Instrument;
     d.audioIn    = 0;
@@ -488,9 +516,14 @@ void scanInternal(std::vector<PluginDesc>& out) {
 
 std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
                                                     f64 sampleRate, int maxBlock) {
+    // Both spellings, always: see the note at kSaturatorUri. A descriptor that
+    // came from a pre-rename project file rather than from the registry still
+    // arrives here carrying `lattice:`.
     std::unique_ptr<PluginInstance> inst;
-    if (d.uri == kSaturatorUri)  inst = std::make_unique<Saturator>(saturatorDesc());
-    else if (d.uri == kPulseUri) inst = std::make_unique<Pulse>(pulseDesc());
+    if (d.uri == kSaturatorUri || d.uri == kSaturatorUriLegacy)
+        inst = std::make_unique<Saturator>(saturatorDesc());
+    else if (d.uri == kPulseUri || d.uri == kPulseUriLegacy)
+        inst = std::make_unique<Pulse>(pulseDesc());
     else {
         LOGE("internal: unknown device %s", d.uri.c_str());
         return nullptr;

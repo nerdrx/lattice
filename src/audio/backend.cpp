@@ -22,7 +22,7 @@ public:
     bool start(Engine& e) override {
         engine_ = &e;
         jack_status_t st;
-        client_ = jack_client_open("Lattice", JackNoStartServer, &st);
+        client_ = jack_client_open("NxTakt", JackNoStartServer, &st);
         if (!client_) return false;
 
         sr_ = (f64)jack_get_sample_rate(client_);

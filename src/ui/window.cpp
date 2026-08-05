@@ -6,7 +6,7 @@ namespace lat {
 
 bool Window::create(const char* title, int w, int h) {
 #if defined(_WIN32)
-    // One backend, no probing: LATTICE_BACKEND has nothing to select between,
+    // One backend, no probing: NXTAKT_BACKEND has nothing to select between,
     // so it is deliberately ignored rather than silently half-honoured.
     if (IWindowBackend* b = createWin32Backend()) {
         if (b->create(title, w, h, &in_)) {
@@ -19,7 +19,7 @@ bool Window::create(const char* title, int w, int h) {
     LOGE("no usable window backend");
     return false;
 #else
-    const char* force = std::getenv("LATTICE_BACKEND");
+    const char* force = env("BACKEND");   // NXTAKT_BACKEND, or LATTICE_BACKEND
     const bool wantWayland = force ? std::strcmp(force, "wayland") == 0
                                    : std::getenv("WAYLAND_DISPLAY") != nullptr;
     const bool wantX11 = force ? std::strcmp(force, "x11") == 0 : true;

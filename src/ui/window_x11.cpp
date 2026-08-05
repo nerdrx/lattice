@@ -50,7 +50,7 @@ int mapKey(KeySym ks) {
 }
 
 f32 detectDpiScale(Display* dpy) {
-    if (const char* s = std::getenv("LATTICE_SCALE")) {
+    if (const char* s = env("SCALE")) {          // NXTAKT_SCALE / LATTICE_SCALE
         const f32 v = (f32)std::atof(s);
         if (v > 0.4f && v < 5.f) return v;
     }

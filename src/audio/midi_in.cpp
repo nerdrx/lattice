@@ -80,7 +80,7 @@ bool MidiInput::start(Engine& e) {
         LOGW("MIDI in: no ALSA sequencer (%s)", snd_strerror(err));
         return false;
     }
-    snd_seq_set_client_name(seq, "Lattice");
+    snd_seq_set_client_name(seq, "NxTakt");
 
     const int port = snd_seq_create_simple_port(
         seq, "in",
@@ -102,7 +102,7 @@ bool MidiInput::start(Engine& e) {
 
     // Nothing is auto-connected on purpose; tell the user where to point their
     // controller instead of grabbing every keyboard on the system.
-    LOGI("MIDI in: ALSA sequencer \"Lattice:in\" at %d:%d  (aconnect <source> %d:%d)",
+    LOGI("MIDI in: ALSA sequencer \"NxTakt:in\" at %d:%d  (aconnect <source> %d:%d)",
          client_, port_, client_, port_);
     return true;
 }

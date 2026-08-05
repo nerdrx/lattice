@@ -33,6 +33,25 @@
 // Saving always writes the current version; versions 1 through 4 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
+//
+// NAMING, after the Lattice -> NxTakt rename:
+//
+//   * The header word is `nxtakt` on write and `nxtakt` OR `lattice` on read,
+//     forever. It doubles as the format's magic, so this is what keeps every
+//     already-saved set loadable. The full argument is at kHeaderWord in
+//     project.cpp.
+//   * The file EXTENSION stays `.lattice`. This is a deliberate hold, not an
+//     oversight. The extension is not a compatibility problem the way the
+//     header word is -- the loader never looks at it -- but changing it is a
+//     user-facing problem: it splits a user's own set folder into two
+//     extensions with no way to tell which build wrote which, it invalidates
+//     whatever file-manager association and shell glob they have built up, and
+//     it means `open recent` and muscle memory stop agreeing. A rename pass is
+//     the wrong moment to spend that. If it does move (`.nxt` is the obvious
+//     candidate), the change is: write the new extension, keep opening both,
+//     and offer the new one as the default in the save dialog only.
+//     Tracked as open; nothing in the codebase depends on the decision either
+//     way, because nothing dispatches on the extension.
 #pragma once
 #include "common.h"
 #include <string>

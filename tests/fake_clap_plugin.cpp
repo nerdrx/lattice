@@ -23,9 +23,9 @@ const char* const kFeatures[] = {
 
 const clap_plugin_descriptor_t kDesc = {
     CLAP_VERSION_INIT,
-    "com.lattice.test.gain",
-    "Lattice Test Gain",
-    "Lattice",
+    "com.nxtakt.test.gain",
+    "NxTakt Test Gain",
+    "NxTakt",
     "", "", "",
     "1.0.0",
     "Test fixture: a gain stage.",

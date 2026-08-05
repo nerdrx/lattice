@@ -121,7 +121,7 @@ inline constexpr size_t kEvts   = ipc::alignUp(kCmds   + CmdRing::bytes(),      
 inline constexpr size_t kBytes  = kEvts + EvtRing::bytes();
 
 inline constexpr u32 kHash =
-    ipc::hashMix(ipc::hashMix(ipc::hashMix(ipc::fnv1a("lattice.ipc_test.v1"),
+    ipc::hashMix(ipc::hashMix(ipc::hashMix(ipc::fnv1a("nxtakt.ipc_test.v1"),
                  (u64)kBytes), (u64)CmdRing::capacity()), (u64)sizeof(WireCmd));
 }
 
@@ -155,12 +155,12 @@ static void armCleanup() {
     for (int s : {SIGINT, SIGTERM, SIGSEGV, SIGABRT, SIGBUS, SIGPIPE}) ::signal(s, fatalSignal);
 }
 
-static int countLatticeShm() {
+static int countNxTaktShm() {
     DIR* d = ::opendir("/dev/shm");
     if (!d) return -1;
     int n = 0;
     while (dirent* e = ::readdir(d))
-        if (std::strstr(e->d_name, "lattice")) { ++n; note("leftover /dev/shm/%s", e->d_name); }
+        if (std::strstr(e->d_name, "nxtakt")) { ++n; note("leftover /dev/shm/%s", e->d_name); }
     ::closedir(d);
     return n;
 }
@@ -244,7 +244,7 @@ static void testRegionBasics() {
     }
     {
         ipc::ShmRegion bad;
-        CHECK(!bad.attach("lattice-does-not-exist-xyz", layout::kHash, ipc::kShmVersion, 20),
+        CHECK(!bad.attach("nxtakt-does-not-exist-xyz", layout::kHash, ipc::kShmVersion, 20),
               "attaching to a missing region times out cleanly (%s)", bad.error());
     }
     {
@@ -535,7 +535,7 @@ static void testStaleReap() {
     // A child creates a region and is killed with SIGKILL — no destructor, no
     // unlink. This is exactly the engine-crash case.
     char orphan[64];
-    std::snprintf(orphan, sizeof orphan, "lattice-ipc-orphan-%d", (int)::getpid());
+    std::snprintf(orphan, sizeof orphan, "nxtakt-ipc-orphan-%d", (int)::getpid());
     std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "%s", orphan);
 
     std::fflush(stdout);
@@ -575,11 +575,11 @@ static void testStaleReap() {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // survives fork() without duplicating output
-    std::printf("lattice ipc tests  (protocol v%u, %zu-byte region, %u-slot rings)\n",
+    std::printf("nxtakt ipc tests  (protocol v%u, %zu-byte region, %u-slot rings)\n",
                 ipc::kShmVersion, layout::kBytes, CmdRing::capacity());
 
-    std::snprintf(gShmName,    sizeof gShmName,    "lattice-ipc-test-%d",     (int)::getpid());
-    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "lattice-ipc-test-%d-alt", (int)::getpid());
+    std::snprintf(gShmName,    sizeof gShmName,    "nxtakt-ipc-test-%d",     (int)::getpid());
+    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "nxtakt-ipc-test-%d-alt", (int)::getpid());
     armCleanup();
 
     testRegionBasics();
@@ -589,8 +589,8 @@ int main() {
 
     banner("6. /dev/shm is clean");
     cleanupShm();
-    const int leftover = countLatticeShm();
-    CHECK(leftover == 0, "no lattice region left in /dev/shm (found %d)", leftover);
+    const int leftover = countNxTaktShm();
+    CHECK(leftover == 0, "no nxtakt region left in /dev/shm (found %d)", leftover);
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

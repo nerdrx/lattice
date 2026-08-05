@@ -20,7 +20,7 @@
 
 namespace lat {
 
-// Internal = Lattice's own stock devices. They implement PluginInstance like
+// Internal = NxTakt's own stock devices. They implement PluginInstance like
 // any other backend, so they inherit the browser, knobs, bypass, chains and
 // persistence without special cases anywhere else.
 enum class PluginFormat : int { LV2 = 0, CLAP, VST3, Internal };
@@ -119,6 +119,12 @@ public:
     void scan();
 
     const std::vector<PluginDesc>& plugins() const { return plugins_; }
+
+    // Exact URI first, then the permanent alias table in host.cpp: a set saved
+    // before the Lattice -> NxTakt rename names its stock devices `lattice:*`
+    // and must keep resolving to the `nxtakt:*` descriptors forever. Returns
+    // the CANONICAL descriptor either way, so whatever the caller saves next
+    // carries the current spelling.
     const PluginDesc* find(const std::string& uri) const;
 
     // GUI thread. Returns null if the plugin failed to load or activate.

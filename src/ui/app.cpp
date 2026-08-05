@@ -87,7 +87,7 @@ static bool isAudioFile(const std::string& n) {
 }
 
 // Case-insensitive substring test. Used by the plugin filter and by the
-// LATTICE_DEBUG_ADDFX hook, both of which match on what the user typed rather
+// NXTAKT_DEBUG_ADDFX hook, both of which match on what the user typed rather
 // than on an exact name.
 static bool icontains(const std::string& hay, const std::string& needle) {
     if (needle.empty()) return true;
@@ -103,7 +103,7 @@ static bool icontains(const std::string& hay, const std::string& needle) {
 // ---------------------------------------------------------------------------
 
 bool App::init(int argc, char** argv) {
-    if (!win_.create("Lattice", 1360, 860)) return false;
+    if (!win_.create("NxTakt", 1360, 860)) return false;
     if (!rend_.init()) return false;
 
     const f32 s = win_.dpiScale();
@@ -122,7 +122,7 @@ bool App::init(int argc, char** argv) {
     ui_.fBold = &fBold_;
     ui_.fBig = &fBig_;
 
-    audio_ = createBackend(engine_, getenv("LATTICE_AUDIO"));
+    audio_ = createBackend(engine_, env("AUDIO"));
     if (!audio_) {
         LOGW("no audio backend available - running silent");
         engine_.prepare(48000.0, 1024);
@@ -166,17 +166,17 @@ bool App::init(int argc, char** argv) {
     }
     status_ = "Ready";
 
-    // Headless verification hook. With LATTICE_DEBUG_ADDFX=<substring> set, the
+    // Headless verification hook. With NXTAKT_DEBUG_ADDFX=<substring> set, the
     // first scanned plugin whose name matches is loaded onto track 0 and the
     // DEVICES tab is opened, so tools/headless_test.sh can screenshot a
     // populated device chain without anything driving the mouse.
-    if (const char* want = getenv("LATTICE_DEBUG_ADDFX")) {
+    if (const char* want = env("DEBUG_ADDFX")) {
         ensurePluginScan();
         const PluginDesc* hit = nullptr;
         for (const PluginDesc& d : registry_.plugins())
             if (icontains(d.name, want)) { hit = &d; break; }
         if (!hit) {
-            LOGW("LATTICE_DEBUG_ADDFX: no plugin matching \"%s\"", want);
+            LOGW("NXTAKT_DEBUG_ADDFX: no plugin matching \"%s\"", want);
         } else if (!ses_.tracks.empty()) {
             selTrack_ = 0;
             devOwner_ = 0;
@@ -191,13 +191,13 @@ bool App::init(int argc, char** argv) {
     // across the whole mix, which is what a master chain is for. It also parks
     // the DEVICES tab on the master, so a screenshot shows the one part of the
     // chain-owner selection nothing inside gamescope can click on.
-    if (const char* want = getenv("LATTICE_DEBUG_MASTERFX")) {
+    if (const char* want = env("DEBUG_MASTERFX")) {
         ensurePluginScan();
         const PluginDesc* hit = nullptr;
         for (const PluginDesc& d : registry_.plugins())
             if (icontains(d.name, want)) { hit = &d; break; }
         if (!hit) {
-            LOGW("LATTICE_DEBUG_MASTERFX: no plugin matching \"%s\"", want);
+            LOGW("NXTAKT_DEBUG_MASTERFX: no plugin matching \"%s\"", want);
         } else {
             selectChainOwner(kOwnMaster);
             addDevice(kOwnMaster, *hit);
@@ -206,9 +206,9 @@ bool App::init(int argc, char** argv) {
     }
 
     // The other headless hook: undo cannot be clicked inside gamescope, so
-    // LATTICE_DEBUG_UNDO drives the restore path here instead. See
+    // NXTAKT_DEBUG_UNDO drives the restore path here instead. See
     // debugUndoSelfTest, and note that it puts the set back as it found it.
-    if (getenv("LATTICE_DEBUG_UNDO")) debugUndoSelfTest();
+    if (env("DEBUG_UNDO")) debugUndoSelfTest();
 
     LOGI("backend: %s   audio: %s", win_.backendName(), audio_ ? audio_->name() : "none");
     return true;
@@ -1067,7 +1067,7 @@ static std::string stagingPath() {
     const char* rt = getenv("XDG_RUNTIME_DIR");
     const std::string dir = (rt && *rt) ? rt : "/tmp";
     char buf[64];
-    snprintf(buf, sizeof buf, "/lattice-undo-%d.lattice", (int)getpid());
+    snprintf(buf, sizeof buf, "/nxtakt-undo-%d.lattice", (int)getpid());
     return dir + buf;
 }
 
@@ -3417,7 +3417,7 @@ void App::drawPluginBrowser(const Rect& r) {
         if (hot && in.pressed[0]) pluginSel_ = pi;
         // Double-click loads, matching how the file browser drops a sample.
         // The entry is taken here rather than inside addDevice, which
-        // init() also calls through the LATTICE_DEBUG_ADDFX hook: nothing that
+        // init() also calls through the NXTAKT_DEBUG_ADDFX hook: nothing that
         // happens while the app is starting up belongs in the history.
         if (hot && in.dblClick) {
             undoPoint("add device");

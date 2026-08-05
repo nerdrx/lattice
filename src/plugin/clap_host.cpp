@@ -139,7 +139,7 @@ std::unordered_map<std::string, Entry>& entryCache() {
 // instance, hence static; it carries no host_data because nothing it exposes
 // needs per-instance state.
 const clap_host_t kProbeHost = {
-    CLAP_VERSION_INIT, nullptr, "Lattice", "Lattice", "", "1.0",
+    CLAP_VERSION_INIT, nullptr, "NxTakt", "NxTakt", "", "1.0",
     hostGetExtension, hostRequestRestart, hostRequestProcess, hostRequestCallback,
 };
 

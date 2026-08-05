@@ -548,7 +548,7 @@ bool WaylandBackend::create(const char* title, int w, int h, Input* in) {
     toplevel_ = xdg_surface_get_toplevel(xsurf_);
     xdg_toplevel_add_listener(toplevel_, &kTopL, this);
     xdg_toplevel_set_title(toplevel_, title);
-    xdg_toplevel_set_app_id(toplevel_, "org.lattice.Lattice");
+    xdg_toplevel_set_app_id(toplevel_, "org.nxtakt.NxTakt");
     xdg_toplevel_set_min_size(toplevel_, 900, 560);
 
 #if LAT_HAVE_XDG_DECORATION

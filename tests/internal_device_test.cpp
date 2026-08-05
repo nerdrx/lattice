@@ -87,14 +87,76 @@ static std::string lower(std::string s) {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-rename device URIs
+//
+// Every set saved before the Lattice -> NxTakt rename names its stock devices
+// `lattice:*`. Those files are the user's work and will never be migrated, so
+// the alias is permanent and this section is the thing that stops a careless
+// cleanup from deleting it. The three properties that matter:
+//
+//   1. the alias resolves at all;
+//   2. it resolves to the SAME descriptor the canonical URI does -- not a
+//      second, subtly different copy;
+//   3. the descriptor it returns carries the CANONICAL uri, which is what
+//      makes a load-then-save quietly upgrade the file (serializeDevices
+//      writes desc().uri).
+//
+// Plus: a descriptor that never went through the registry -- exactly what a
+// project loader builds when it has only the saved uri -- still instantiates.
+// ---------------------------------------------------------------------------
+
+static void testLegacyUris(PluginRegistry& reg) {
+    banner("pre-rename URI aliases (lattice: -> nxtakt:)");
+
+    struct { const char* legacy; const char* canonical; } kPairs[] = {
+        { "lattice:saturator", "nxtakt:saturator" },
+        { "lattice:pulse",     "nxtakt:pulse"     },
+    };
+
+    for (const auto& p : kPairs) {
+        const PluginDesc* viaLegacy = reg.find(p.legacy);
+        const PluginDesc* viaNew    = reg.find(p.canonical);
+        CHECK(viaLegacy != nullptr, "registry still resolves '%s'", p.legacy);
+        CHECK(viaNew != nullptr, "registry resolves '%s'", p.canonical);
+        if (!viaLegacy || !viaNew) continue;
+
+        CHECK(viaLegacy == viaNew, "'%s' and '%s' are the same descriptor",
+              p.legacy, p.canonical);
+        CHECK(viaLegacy->uri == p.canonical,
+              "'%s' resolves to a descriptor carrying the canonical uri ('%s')",
+              p.legacy, viaLegacy->uri.c_str());
+
+        auto inst = reg.instantiate(*viaLegacy, kSR, kBlock);
+        CHECK(inst != nullptr, "'%s' instantiates", p.legacy);
+        if (inst)
+            CHECK(inst->desc().uri == p.canonical,
+                  "the instance reports the canonical uri, so a re-save upgrades it");
+
+        // The project-loader shape: a descriptor assembled from a saved uri
+        // that never came out of the registry. instantiateInternal has to
+        // accept the old spelling directly for this to work.
+        PluginDesc fromFile = *viaLegacy;
+        fromFile.uri = p.legacy;
+        auto direct = reg.instantiate(fromFile, kSR, kBlock);
+        CHECK(direct != nullptr, "a stale descriptor carrying '%s' instantiates", p.legacy);
+        if (direct)
+            CHECK(direct->desc().uri == p.canonical,
+                  "and it too rebuilds its descriptor as '%s'", p.canonical);
+    }
+
+    CHECK(reg.find("lattice:no-such-device") == nullptr,
+          "the alias does not invent devices that never existed");
+}
+
+// ---------------------------------------------------------------------------
 // Saturator
 // ---------------------------------------------------------------------------
 
 static void testSaturator(PluginRegistry& reg) {
     banner("Saturator");
 
-    const PluginDesc* d = reg.find("lattice:saturator");
-    CHECK(d != nullptr, "registry finds lattice:saturator");
+    const PluginDesc* d = reg.find("nxtakt:saturator");
+    CHECK(d != nullptr, "registry finds nxtakt:saturator");
     if (!d) return;
     CHECK(d->format == PluginFormat::Internal && d->kind == PluginKind::Effect,
           "descriptor: internal effect, %d in / %d out", d->audioIn, d->audioOut);
@@ -198,8 +260,8 @@ static f32 runFor(PluginInstance& p, Buf& out, int blocks, bool* allFinite = nul
 static void testPulse(PluginRegistry& reg) {
     banner("Pulse");
 
-    const PluginDesc* d = reg.find("lattice:pulse");
-    CHECK(d != nullptr, "registry finds lattice:pulse");
+    const PluginDesc* d = reg.find("nxtakt:pulse");
+    CHECK(d != nullptr, "registry finds nxtakt:pulse");
     if (!d) return;
     CHECK(d->kind == PluginKind::Instrument && d->hasMidiIn && d->audioOut == 2,
           "descriptor: internal instrument, midi in, %d out", d->audioOut);
@@ -360,7 +422,7 @@ static void testHostedInstrument(PluginRegistry& reg, PluginFormat fmt, const ch
 static void testInternalLatency(PluginRegistry& reg) {
     banner("latency: internal devices");
 
-    for (const char* uri : { "lattice:saturator", "lattice:pulse" }) {
+    for (const char* uri : { "nxtakt:saturator", "nxtakt:pulse" }) {
         const PluginDesc* d = reg.find(uri);
         CHECK(d != nullptr, "%s: in the registry", uri);
         if (!d) continue;
@@ -465,6 +527,7 @@ int main() {
     CHECK(firstNonInternal < 0 || firstNonInternal == internals,
           "internal devices sort to the front of the list");
 
+    testLegacyUris(reg);
     testSaturator(reg);
     testPulse(reg);
     testInternalLatency(reg);

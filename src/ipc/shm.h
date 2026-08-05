@@ -1,4 +1,4 @@
-// Lattice IPC — POSIX shared memory transport for the engine/GUI process split.
+// NxTakt IPC — POSIX shared memory transport for the engine/GUI process split.
 //
 // This header is the wire layer and nothing else: it knows how to hand a block
 // of memory to two processes and how to move POD messages across it in one
@@ -22,7 +22,7 @@
 // also keeps src/ipc out of the app's `find src -name '*.cpp'` build.
 //
 // Everything here is Linux-specific (shm_open, /proc for liveness). That is
-// fine: Lattice is a native Linux DAW. The Windows port in backend_win32.cpp
+// fine: NxTakt is a native Linux DAW. The Windows port in backend_win32.cpp
 // would need a CreateFileMapping twin, not a portability shim here.
 #pragma once
 #include "../core/common.h"
@@ -51,6 +51,12 @@ namespace lat::ipc {
 
 // "LTC_SHM1" — a byte pattern that is not plausibly the start of anything else
 // somebody might leave in /dev/shm under a colliding name.
+//
+// Left as "LTC_" through the NxTakt rename (as were kPoolMagic and
+// kPoolBlockMagic in pool.h). It is eight raw bytes chosen to be improbable,
+// not a name anyone reads: it is never printed except as hex, never parsed,
+// and never written to disk. Changing it would buy nothing and would only make
+// the constant disagree with every comment and hexdump that quotes it.
 inline constexpr u64 kShmMagic = 0x4C54435F53484D31ull;
 
 // Bump on ANY change to ShmHeader, ShmSpscRing or SharedStateT layout, or to
@@ -182,13 +188,13 @@ static_assert(std::atomic<u64>::is_always_lock_free, "64-bit shared atomics must
 //
 // Creator sequence:
 //     ShmRegion r;
-//     r.create("/lattice-engine-1000", bytes, kLayoutHash);
+//     r.create("/nxtakt-engine-1000", bytes, kLayoutHash);
 //     ...build the rings and state block inside r...
 //     r.publishReady();          // release barrier: attachers may now look
 //
 // Attacher sequence:
 //     ShmRegion r;
-//     r.attach("/lattice-engine-1000", kLayoutHash, kShmVersion, /*timeoutMs*/2000);
+//     r.attach("/nxtakt-engine-1000", kLayoutHash, kShmVersion, /*timeoutMs*/2000);
 //     ...map the same offsets...
 //
 // The two-step create/publishReady exists because an attacher that mapped a
@@ -378,7 +384,7 @@ public:
 
     // Stale-region cleanup hook. Returns true if `name` named an orphan and it
     // was removed. Safe to call at daemon startup, from a crash handler, or
-    // from a "lattice --clean-shm" maintenance path.
+    // from a "nxtakt --clean-shm" maintenance path.
     static bool reapIfStale(const char* name) {
         char nm[kNameMax];
         if (!normalize(name, nm, sizeof nm)) return false;
@@ -450,7 +456,7 @@ private:
     }
 
     // POSIX requires a leading slash and no others; accept both spellings from
-    // callers so config files can say "lattice-engine" or "/lattice-engine".
+    // callers so config files can say "nxtakt-engine" or "/nxtakt-engine".
     static bool normalize(const char* name, char* out, size_t cap) {
         if (!name || !*name) return false;
         const char* body = (*name == '/') ? name + 1 : name;
@@ -471,7 +477,7 @@ private:
 
     bool validate(const ShmHeader* h, size_t total, u32 layoutHash, u32 version) {
         if (h->magic != kShmMagic) {
-            setErr("%s: bad magic 0x%016llx (not a Lattice region)",
+            setErr("%s: bad magic 0x%016llx (not an NxTakt region)",
                    name_, (unsigned long long)h->magic);
             return false;
         }

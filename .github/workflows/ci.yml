@@ -1,4 +1,4 @@
-# Lattice CI
+# NxTakt CI
 #
 # Two jobs:
 #   test         build everything (GUI included) and run the headless suite
@@ -85,8 +85,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: lattice-linux-x64
-          path: build/lattice
+          name: nxtakt-linux-x64
+          path: build/nxtakt
           retention-days: 14
           if-no-files-found: error
 
@@ -129,7 +129,7 @@ jobs:
       # artifact, so every push shows its numbers.
       #
       # Nothing changed here when the demo grew its keys track: scenes 1-3 carry
-      # a MIDI pattern played by Lattice's own Pulse synth, and render
+      # a MIDI pattern played by NxTakt's own Pulse synth, and render
       # materializes it from the set like the app does. The stats block gains a
       # "devices:" line naming what each track loaded, so a scene that went
       # quiet because a plugin failed to instantiate is visible in the summary
@@ -183,7 +183,7 @@ jobs:
       - name: Upload rendered audio
         uses: actions/upload-artifact@v4
         with:
-          name: lattice-demo-audio
+          name: nxtakt-demo-audio
           path: demo-out/
           retention-days: 14
           if-no-files-found: error

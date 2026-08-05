@@ -1,11 +1,11 @@
 // Generates a demo set: four 2-bar loops at 120 BPM, a fifth track that plays
-// Lattice's own Pulse synth from a MIDI pattern, and a .lattice project that
+// NxTakt's own Pulse synth from a MIDI pattern, and a .lattice project that
 // ties them together. Doubles as an end-to-end check of the whole chain --
 // sndfile write -> loadSample -> Session -> saveProject -- and, because the
 // keys track has no audio file behind it, of devices and MIDI clips surviving
 // a round trip.
 //
-//   build/gen_demo [outdir]      (default ~/Music/Lattice Demo)
+//   build/gen_demo [outdir]      (default ~/Music/NxTakt Demo)
 #include "../src/ui/app.h"
 #include "../src/core/project.h"
 #include <sndfile.h>
@@ -48,7 +48,7 @@ static int beatFrames() { return (int)(kSR * 60.0 / kBpm); }
 static constexpr int   kKeysTrack  = 4;
 static constexpr int   kKeysColor  = 2;
 static constexpr f64   kMelodyBeats = 4.0;
-static const char*     kPulseUri   = "lattice:pulse";
+static const char*     kPulseUri   = "nxtakt:pulse";
 
 struct DemoNote { f64 beat, len; u8 pitch, vel; };
 // A3 C4 E4 D4 | C4 A3 G3 E3 -- the same line the hand-written jam set plays.
@@ -135,7 +135,7 @@ static std::vector<f32> makeChord() {
 
 int main(int argc, char** argv) {
     std::string home = getenv("HOME") ? getenv("HOME") : ".";
-    std::string dir = argc > 1 ? argv[1] : (home + "/Music/Lattice Demo");
+    std::string dir = argc > 1 ? argv[1] : (home + "/Music/NxTakt Demo");
     mkdir((home + "/Music").c_str(), 0755);
     mkdir(dir.c_str(), 0755);
 
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     // Build a session that puts each loop on its own track, and stack a couple
     // of scenes so scene launch has something to do.
     Session s;
-    s.name = "Lattice Demo";
+    s.name = "NxTakt Demo";
     s.tempo = kBpm;
     s.tracks.resize(5);                    // four loops plus the keys track
     s.scenes.resize(4);

@@ -76,8 +76,8 @@ struct WglFns {
     WglSwapIntervalFn         swapInterval      = nullptr;
 };
 
-constexpr const wchar_t* kClassName = L"LatticeWindow";
-constexpr const wchar_t* kBootClassName = L"LatticeWglBootstrap";
+constexpr const wchar_t* kClassName = L"NxTaktWindow";
+constexpr const wchar_t* kBootClassName = L"NxTaktWglBootstrap";
 
 // GCC warns about casting FARPROC to a concrete signature; the void* hop is the
 // blessed way to shut it up without disabling the warning globally.

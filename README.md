@@ -45,7 +45,7 @@ pull request, generate a set from a script.
 No allocation, no locks, no pointers into GUI memory: the interface reaches the
 engine through a lock-free command ring and a block of atomics. Launches are
 split inside the buffer, so a clip starts on the exact frame of its quantum
-rather than at the top of the next block. `latticed` already runs that engine
+rather than at the top of the next block. `nxtaktd` already runs that engine
 as its own process, playing clips out of a shared-memory sample pool.
 
 ### CI plays what it builds
@@ -72,7 +72,7 @@ the audio.
 | **Buses** | Post-fader sends into four return chains and a master chain, with plugin delay compensation aligning every parallel path into the master sum. |
 | **Generative clips** | Launch probability and follow actions (Stop / Again / Next / Prev / First / Random), scheduled through the same quantised path and deterministic under offline render. |
 | **Undo** | Snapshot history over the project serializer — including the audio of unsaved takes. Gestures coalesce into one entry per drag. |
-| **Engine daemon** | `latticed` hosts the transport and the sample pool in its own process, over shared-memory SPSC rings with crash-orphan reaping. |
+| **Engine daemon** | `nxtaktd` hosts the transport and the sample pool in its own process, over shared-memory SPSC rings with crash-orphan reaping. |
 | **Windows** | The headless engine cross-builds with mingw-w64 and its test suite runs under Wine on every push. |
 
 <p align="center">
@@ -88,16 +88,11 @@ make tools              # gen_demo, render, pitch_check, plugin_scan
 make config             # show detected Wayland protocols
 
 build/gen_demo ~/Music/Demo    # write a four-scene demo set
-build/lattice ~/Music/Demo/demo.lattice
+build/nxtakt ~/Music/Demo/demo.lattice
 ```
 
 Audio comes up on JACK if it is running — playback *and* capture auto-connected
-— and falls back to ALSA. `LATTICE_AUDIO=alsa` forces the fallback.
-
-> The product is **NxTakt**. The source tree still spells the old name: the
-> binary is `build/lattice`, sets are `.lattice`, the daemon is `latticed` and
-> the environment variables are `LATTICE_*`. That rename lands in its own wave;
-> until it does, this page names the commands as they actually are.
+— and falls back to ALSA. `NXTAKT_AUDIO=alsa` forces the fallback.
 
 ## Under the hood
 
@@ -129,7 +124,7 @@ Audio comes up on JACK if it is running — playback *and* capture auto-connecte
 - Arrangement View is a navigable placeholder — no recording, no timeline edits.
 - No automation, no time-signature changes.
 - VST3 is not started (licensing).
-- The GUI still runs its own in-process engine; `latticed` is not yet the
+- The GUI still runs its own in-process engine; `nxtaktd` is not yet the
   shipping path.
 - The Windows window and audio backends compile under a Windows-targeting
   compiler but have never driven a real window station or audio endpoint.
@@ -165,10 +160,14 @@ gamescope exposes its own Wayland socket. Both paths are worth testing.
 
 | Variable | Effect |
 |---|---|
-| `LATTICE_BACKEND` | `wayland` or `x11` — force a window backend |
-| `LATTICE_AUDIO` | `jack` or `alsa` — force an audio backend |
-| `LATTICE_SCALE` | override UI scale, e.g. `1.5` |
+| `NXTAKT_BACKEND` | `wayland` or `x11` — force a window backend |
+| `NXTAKT_AUDIO` | `jack` or `alsa` — force an audio backend |
+| `NXTAKT_SCALE` | override UI scale, e.g. `1.5` |
 | `CLAP_PATH` | extra CLAP search paths |
+
+The pre-rename `LATTICE_*` spellings are still read as a fallback, and sets
+saved before the rename still load — they keep the `.lattice` extension, which
+has not changed.
 
 ## Dependencies
 
@@ -192,7 +191,7 @@ src/audio/    engine (RT), sample loading, JACK/ALSA/WASAPI backends
 src/gfx/      batched SDF renderer, FreeType atlas, palette
 src/ui/       window backends (Wayland/X11/Win32), widgets, app + views
 src/ipc/      shared-memory rings, control region, sample pool
-src/daemon/   latticed, the engine as its own process
+src/daemon/   nxtaktd, the engine as its own process
 src/plugin/   format-agnostic host, LV2 and CLAP backends
 tools/        gen_demo, render, pitch_check, plugin_scan, headless_test.sh
 tests/        engine, ipc, daemon, internal devices, fake CLAP plugin

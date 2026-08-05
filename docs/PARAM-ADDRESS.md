@@ -34,7 +34,7 @@ s:4/launch                  (reserved) scene-launch trigger target
   yields a *new* uid; dangling addresses resolve to nothing and must fail
   soft (a MIDI mapping to a deleted device is silently inert, never a crash).
 - Addresses are ASCII, no spaces, `/`-separated — safe for the text project
-  format, OSC paths (`/lattice/t:7/vol`), and log lines as-is.
+  format, OSC paths (`/nxtakt/t:7/vol`), and log lines as-is.
 - `ParamInfo::id` is the plugin backend's stable identifier (LV2 port index,
   CLAP param id). It survives sessions for the same plugin version; a plugin
   update that renumbers params invalidates mappings, which is the plugin's

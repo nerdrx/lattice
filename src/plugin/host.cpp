@@ -1,6 +1,7 @@
 // Registry and per-format dispatch. Everything here is GUI-thread only.
 #include "host.h"
 #include <algorithm>
+#include <cstring>
 
 namespace lat {
 
@@ -62,9 +63,41 @@ void PluginRegistry::scan() {
     LOGI("plugin scan: %zu plugins", plugins_.size());
 }
 
+// URI aliases. One entry per scheme the project format has ever written for a
+// plugin we still ship; the value is the scheme that means the same thing now.
+//
+// Only `lattice:` -> `nxtakt:` today, from the rename. Stock devices are named
+// in every saved set by URI (see internal_devices.cpp), so this table is what
+// keeps a set written before the rename able to find its own devices. It is
+// append-only and permanent: a row may never be deleted, because the files it
+// serves are the user's, they are not going to be migrated, and there is no
+// version of "your Saturator is gone" that is acceptable.
+//
+// A scheme swap rather than a per-URI table so a device added later inherits
+// the compatibility for free -- and it is safe to apply blindly because
+// `lattice:` was never a scheme any third-party LV2 or CLAP plugin used; it
+// only ever named our own.
+namespace {
+struct UriAlias { const char* from; const char* to; };
+constexpr UriAlias kUriAliases[] = {
+    { "lattice:", "nxtakt:" },
+};
+} // namespace
+
 const PluginDesc* PluginRegistry::find(const std::string& uri) const {
     for (const PluginDesc& d : plugins_)
         if (d.uri == uri) return &d;
+
+    // Exact match failed. Retry once per alias, so an old set resolves to the
+    // canonical descriptor -- which is what the caller then instantiates and
+    // what serializeDevices later writes back, upgrading the URI in place.
+    for (const UriAlias& a : kUriAliases) {
+        const size_t n = std::strlen(a.from);
+        if (uri.compare(0, n, a.from) != 0) continue;
+        const std::string canonical = std::string(a.to) + uri.substr(n);
+        for (const PluginDesc& d : plugins_)
+            if (d.uri == canonical) return &d;
+    }
     return nullptr;
 }
 
