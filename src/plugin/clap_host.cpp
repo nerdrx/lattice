@@ -1,9 +1,9 @@
 // CLAP backend.
 //
 // Scope of what we support today:
-//   * clap.audio-ports (float32 / data32 only), clap.params, clap.note-ports
-//     (read at scan time so the browser can flag MIDI inputs; we do not feed
-//     note events yet — the engine has no note path).
+//   * clap.audio-ports (float32 / data32 only), clap.params, clap.note-ports.
+//     MIDI handed to midi() is translated into note/MIDI events on the
+//     plugin's first note input port, in whichever dialect that port prefers.
 //   * host extensions offered to plugins: clap.log and clap.thread-check.
 //     Everything else returns null, which is always a legal answer.
 //   * parameter changes travel as CLAP_EVENT_PARAM_VALUE through in_events.
@@ -366,6 +366,7 @@ public:
         // straight copy: growing buffers here would mean allocating on the
         // audio thread, so we refuse instead. Same rule as the LV2 backend.
         if (bypassed_ || !processing_ || nframes > maxBlock_ || outChans_ == 0) {
+            midiCount_ = 0;                   // events belong to this block only
             passthrough(in, out, channels, nframes);
             return;
         }
@@ -384,7 +385,7 @@ public:
             else     std::memset(inPtrs_[(size_t)p], 0, bytes);
         }
 
-        drainParamQueue();
+        buildEventList();
 
         for (clap_audio_buffer_t& b : inBufs_)  b.constant_mask = 0;
         for (clap_audio_buffer_t& b : outBufs_) b.constant_mask = 0;
@@ -419,6 +420,20 @@ public:
             if (!out[c]) continue;
             std::memcpy(out[c], outPtrs_[(size_t)(c < outChans_ ? c : 0)], bytes);
         }
+    }
+
+    // REALTIME. Buffered into a fixed array and turned into CLAP events at the
+    // top of the next process(). midi() and process() are both audio-thread
+    // only and midi() is documented to run first for the block, so unlike the
+    // GUI-to-audio parameter path this needs no ring and no atomics — a plain
+    // array plus a count is correct.
+    void midi(const u8* data, int len, int frameOffset) override {
+        if (!data || len < 1 || len > 3) return;
+        if (midiCount_ >= kMaxMidiEvents) return;      // dropped, not grown
+        MidiMsg& m = midi_[midiCount_++];
+        m.len = (u8)len;
+        for (int i = 0; i < 3; ++i) m.data[i] = i < len ? data[i] : 0;
+        m.frame = frameOffset < 0 ? 0 : (u32)frameOffset;
     }
 
     int              paramCount() const override     { return (int)params_.size(); }
@@ -456,11 +471,24 @@ public:
 
 private:
     struct ParamMsg { u32 index; f32 value; };
+    // Raw MIDI as the engine hands it over: status plus up to two data bytes.
+    struct MidiMsg { u8 data[3]; u8 len; u32 frame; };
 
     // Bounded because process() may not allocate. 256 gestures per block is far
-    // more than a human or a UI redraw can produce.
-    static constexpr int kQueueSize  = 256;
-    static constexpr int kMaxEvents  = kQueueSize;
+    // more than a human or a UI redraw can produce, and the same goes for notes.
+    static constexpr int kQueueSize     = 256;
+    static constexpr int kMaxMidiEvents = 256;
+    static constexpr int kMaxEvents     = kQueueSize + kMaxMidiEvents;
+
+    // in_events is one flat, time-ordered list, so every event type shares one
+    // array. The members overlap on clap_event_header_t, which the spec
+    // guarantees is the first field of every event struct.
+    union Event {
+        clap_event_header_t      header;
+        clap_event_param_value_t param;
+        clap_event_note_t        note;
+        clap_event_midi_t        midi;
+    };
 
     static void passthrough(const f32* const* in, f32* const* out, int channels, int nframes) {
         const size_t bytes = (size_t)nframes * sizeof(f32);
@@ -480,7 +508,7 @@ private:
     static const clap_event_header_t* CLAP_ABI evGet(const clap_input_events_t* list, uint32_t i) {
         const ClapInstance* self = (const ClapInstance*)list->ctx;
         if (i >= self->eventCount_) return nullptr;
-        return &self->events_[i].header;
+        return &self->events_[i].header;   // union member; see Event
     }
     // We accept and drop: there is no param-feedback path to the GUI yet, and
     // returning false would make well-behaved plugins retry every block.
@@ -488,13 +516,17 @@ private:
         return true;
     }
 
-    // REALTIME.
-    void drainParamQueue() {
+    // REALTIME. Builds this block's in_events list. Parameters go first at time
+    // 0 and note traffic follows in arrival order, which keeps the list sorted
+    // by time as the spec demands (a MIDI frame offset is never negative, and
+    // out-of-order offsets from the caller are clamped rather than trusted).
+    void buildEventList() {
         eventCount_ = 0;
+
         ParamMsg m;
         while (eventCount_ < (uint32_t)kMaxEvents && queue_.pop(m)) {
             if (m.index >= paramIds_.size()) continue;
-            clap_event_param_value_t& e = events_[eventCount_++];
+            clap_event_param_value_t& e = events_[eventCount_++].param;
             e.header.size     = sizeof(clap_event_param_value_t);
             e.header.time     = 0;            // whole-block resolution for now
             e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
@@ -508,6 +540,54 @@ private:
             e.key             = -1;
             e.value           = (double)m.value;
         }
+
+        uint32_t lastFrame = 0;
+        for (int i = 0; i < midiCount_ && eventCount_ < (uint32_t)kMaxEvents; ++i) {
+            const MidiMsg& msg = midi_[i];
+            if (msg.frame > lastFrame) lastFrame = msg.frame;
+            emitMidi(msg, lastFrame);
+        }
+        midiCount_ = 0;
+    }
+
+    // REALTIME. Note on/off become CLAP note events when the plugin's note port
+    // speaks that dialect, because they carry the full 0..1 velocity resolution
+    // and a note_id; ports that only speak MIDI get the raw bytes. Everything
+    // else (CC, pitch bend, aftertouch) has no CLAP equivalent we model, so it
+    // always travels as CLAP_EVENT_MIDI.
+    void emitMidi(const MidiMsg& msg, uint32_t frame) {
+        const u8 status  = (u8)(msg.data[0] & 0xF0u);
+        const int16_t ch = (int16_t)(msg.data[0] & 0x0Fu);
+        const bool isNoteOn  = status == 0x90 && msg.len >= 3 && msg.data[2] > 0;
+        const bool isNoteOff = status == 0x80 || (status == 0x90 && !isNoteOn);
+
+        if (noteDialectClap_ && (isNoteOn || isNoteOff) && msg.len >= 2) {
+            clap_event_note_t& e = events_[eventCount_++].note;
+            e.header.size     = sizeof(clap_event_note_t);
+            e.header.time     = frame;
+            e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            e.header.type     = isNoteOn ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF;
+            e.header.flags    = 0;
+            // -1 note_id means "match by port/channel/key", which is what a MIDI
+            // source without note ids gives us.
+            e.note_id    = -1;
+            e.port_index = notePort_;
+            e.channel    = ch;
+            e.key        = (int16_t)(msg.data[1] & 0x7Fu);
+            e.velocity   = isNoteOn ? (double)(msg.data[2] & 0x7Fu) / 127.0 : 0.0;
+            return;
+        }
+
+        clap_event_midi_t& e = events_[eventCount_++].midi;
+        e.header.size     = sizeof(clap_event_midi_t);
+        e.header.time     = frame;
+        e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        e.header.type     = CLAP_EVENT_MIDI;
+        e.header.flags    = 0;
+        e.port_index      = (uint16_t)(notePort_ < 0 ? 0 : notePort_);
+        e.data[0]         = msg.data[0];
+        e.data[1]         = msg.len > 1 ? msg.data[1] : 0;
+        e.data[2]         = msg.len > 2 ? msg.data[2] : 0;
     }
 
     void teardown() {
@@ -524,6 +604,9 @@ private:
         inStore_.clear(); outStore_.clear();
         inChans_ = outChans_ = 0;
         eventCount_ = 0;
+        midiCount_ = 0;
+        notePort_ = -1;
+        noteDialectClap_ = false;
         steady_ = 0;
     }
 
@@ -576,6 +659,26 @@ private:
         // authoritative.
         desc_.audioIn  = inChans_;
         desc_.audioOut = outChans_;
+
+        buildNotePort();
+    }
+
+    // Which port do we send notes to, and in which dialect? Port 0 is the only
+    // one we use: nothing upstream distinguishes note destinations yet.
+    void buildNotePort() {
+        notePort_ = -1;
+        noteDialectClap_ = false;
+
+        const auto* np = (const clap_plugin_note_ports_t*)plug_->get_extension(plug_, CLAP_EXT_NOTE_PORTS);
+        if (!np || !np->count || !np->get || np->count(plug_, true) == 0) return;
+
+        clap_note_port_info_t info{};
+        if (!np->get(plug_, 0, true, &info)) return;
+        notePort_ = 0;
+        // preferred_dialect is advisory and some plugins leave it at 0, so the
+        // supported mask is what actually decides.
+        noteDialectClap_ = (info.supported_dialects & CLAP_NOTE_DIALECT_CLAP) != 0;
+        desc_.hasMidiIn  = true;
     }
 
     void buildParams() {
@@ -650,8 +753,12 @@ private:
     std::vector<f32>       values_;
 
     Ring<ParamMsg, kQueueSize> queue_;
-    clap_event_param_value_t   events_[kMaxEvents]{};
+    Event                      events_[kMaxEvents]{};
     uint32_t                   eventCount_ = 0;
+    MidiMsg                    midi_[kMaxMidiEvents]{};
+    int                        midiCount_ = 0;
+    int16_t                    notePort_ = -1;      // -1 = plugin takes no notes
+    bool                       noteDialectClap_ = false;
     clap_input_events_t        inEvents_{};
     clap_output_events_t       outEvents_{};
 

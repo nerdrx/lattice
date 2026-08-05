@@ -2,9 +2,10 @@
 //
 // Scope of what we support today:
 //   * audio in/out ports, control input/output ports
-//   * atom ports are connected to owned scratch buffers so instruments and
-//     MIDI-aware effects instantiate without crashing, but we do not feed them
-//     events yet (the engine has no note path). TODO: wire MIDI in.
+//   * atom ports are connected to owned scratch buffers. MIDI arriving through
+//     midi() is forged into a real atom:Sequence on every atom input port that
+//     declares midi:MidiEvent support, so instruments actually play. Atom
+//     *outputs* are still discarded: nothing downstream consumes notes yet.
 //   * features: urid:map, urid:unmap, options:options, log:log,
 //     buf-size:boundedBlockLength. A plugin whose *required* feature list
 //     contains anything else is logged and skipped rather than loaded and
@@ -23,6 +24,7 @@
 
 #include <lilv/lilv.h>
 #include <lv2/atom/atom.h>
+#include <lv2/atom/util.h>
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
 #include <lv2/log/log.h>
@@ -278,13 +280,14 @@ public:
         // straight copy. Growing buffers here would mean allocating on the
         // audio thread, so we refuse instead.
         if (bypassed_ || !inst_ || nframes > maxBlock_) {
+            midiCount_ = 0;                     // events belong to this block only
             passthrough(in, out, channels, nframes);
             return;
         }
 
         const int nIn  = (int)audioIn_.size();
         const int nOut = (int)audioOut_.size();
-        if (nOut == 0) { passthrough(in, out, channels, nframes); return; }
+        if (nOut == 0) { midiCount_ = 0; passthrough(in, out, channels, nframes); return; }
 
         const size_t bytes = (size_t)nframes * sizeof(f32);
 
@@ -299,7 +302,14 @@ public:
         }
 
         resetAtomBuffers();
+        forgeMidi();
         lilv_instance_run(inst_, (uint32_t)nframes);
+        // The plugin has consumed this block's events. Emptying the sequences
+        // now (rather than only before the next run) means a plugin that peeks
+        // at its input port outside run() never sees stale notes, and a missed
+        // process() call cannot replay them.
+        midiCount_ = 0;
+        resetAtomBuffers();
 
         // Pull the outputs back. A mono plugin (1 out) on a stereo track is
         // run once on channel 0 and its output is copied to both channels;
@@ -309,6 +319,19 @@ public:
             const f32* src = audioOut_[c < nOut ? c : 0];
             std::memcpy(out[c], src, bytes);
         }
+    }
+
+    // REALTIME. Queued into a fixed array; forgeMidi() turns it into an atom
+    // sequence just before run(). midi() and process() are both audio-thread
+    // only and midi() is documented to run first for the block, so a plain
+    // array plus a count needs no synchronisation.
+    void midi(const u8* data, int len, int frameOffset) override {
+        if (!data || len < 1 || len > (int)sizeof(MidiMsg::data)) return;
+        if (midiCount_ >= kMaxMidiEvents) return;      // dropped, not grown
+        MidiMsg& m = midi_[midiCount_++];
+        m.len = (u8)len;
+        for (int i = 0; i < len; ++i) m.data[i] = data[i];
+        m.frame = frameOffset < 0 ? 0 : (u32)frameOffset;
     }
 
     int              paramCount() const override        { return (int)params_.size(); }
@@ -335,6 +358,17 @@ public:
 
 private:
     static constexpr size_t kAtomBufBytes = 8192;
+    // One block's worth of note traffic. A human plus an arpeggiator cannot
+    // produce 256 messages in 5 ms; anything beyond that is a runaway sender and
+    // dropping is better than allocating on the audio thread.
+    static constexpr int kMaxMidiEvents = 256;
+
+    // Raw MIDI as the engine hands it over: status plus up to two data bytes.
+    struct MidiMsg {
+        u8  data[3];
+        u8  len;
+        u32 frame;
+    };
 
     static void passthrough(const f32* const* in, f32* const* out, int channels, int nframes) {
         const size_t bytes = (size_t)nframes * sizeof(f32);
@@ -358,6 +392,8 @@ private:
         audioOut_.clear();
         atomIn_.clear();
         atomOut_.clear();
+        midiPorts_.clear();
+        midiCount_ = 0;
         audioStore_.clear();
         cvStore_.clear();
         atomStore_.clear();
@@ -370,6 +406,8 @@ private:
         const uint32_t n = lilv_plugin_get_num_ports(plug_);
         slots_.assign(n, PortSlot{});
         ctrl_.assign(n, 0.f);
+        midiPorts_.clear();
+        midiCount_ = 0;
 
         int nAudioIn = 0, nAudioOut = 0, nCv = 0, nAtomIn = 0, nAtomOut = 0;
         for (uint32_t i = 0; i < n; ++i) {
@@ -390,6 +428,8 @@ private:
                        lilv_port_is_a(plug_, port, w.eventPort)) {
                 s.kind = isIn ? PortKind::AtomIn : PortKind::AtomOut;
                 s.slot = isIn ? nAtomIn++ : nAtomOut++;
+                if (isIn && lilv_port_supports_event(plug_, port, w.midiEvent))
+                    midiPorts_.push_back(s.slot);
             } else {
                 // Unknown port type. Still needs a non-null connection or the
                 // plugin may dereference it, so park it on a CV-sized buffer.
@@ -416,8 +456,19 @@ private:
         for (int i = 0; i < nAtomOut; ++i)
             atomOut_[(size_t)i] = atomStore_.data() + (size_t)(nAtomIn + i) * kAtomBufBytes;
 
-        seqUrid_ = urids().map(LV2_ATOM__Sequence);
+        // Mapped here, at instantiation time, because forgeMidi() runs on the
+        // audio thread and the URID store takes a mutex.
+        seqUrid_   = urids().map(LV2_ATOM__Sequence);
         chunkUrid_ = urids().map(LV2_ATOM__Chunk);
+        midiUrid_  = urids().map(LV2_MIDI__MidiEvent);
+
+        // A few plugins declare a single atom input without spelling out
+        // midi:MidiEvent support in their Turtle. If that is the only atom input
+        // there is, it is the MIDI port by elimination; guessing beats being
+        // silent, and a plugin that really wanted patch messages only will
+        // ignore an event type it does not know.
+        if (midiPorts_.empty() && nAtomIn == 1 && desc_.hasMidiIn)
+            midiPorts_.push_back(0);
         // The descriptor may have been produced by an older scan; keep the
         // authoritative counts from the actual instance.
         desc_.audioIn  = nAudioIn;
@@ -532,6 +583,41 @@ private:
         }
     }
 
+    // REALTIME. Appends this block's messages to every MIDI-capable atom input
+    // port as LV2_Atom_Events. The port already holds an empty, valid sequence
+    // (resetAtomBuffers ran first), so this only has to grow atom.size and lay
+    // events out behind the header. Events must be in non-decreasing time
+    // order, which is enforced here rather than trusted from the caller.
+    void forgeMidi() {
+        if (midiCount_ == 0 || midiPorts_.empty()) return;
+
+        for (int slot : midiPorts_) {
+            u8* buf = atomIn_[(size_t)slot];
+            LV2_Atom_Sequence* seq = (LV2_Atom_Sequence*)buf;
+            u32 size = seq->atom.size;                 // == sizeof(body) when empty
+            u32 lastFrame = 0;
+
+            for (int i = 0; i < midiCount_; ++i) {
+                const MidiMsg& m = midi_[i];
+                const u32 pad  = lv2_atom_pad_size(m.len);
+                const u32 need = (u32)sizeof(LV2_Atom_Event) + pad;
+                if (sizeof(LV2_Atom) + size + need > kAtomBufBytes) break;
+
+                if (m.frame > lastFrame) lastFrame = m.frame;
+                LV2_Atom_Event* ev = (LV2_Atom_Event*)(buf + sizeof(LV2_Atom) + size);
+                ev->time.frames = lastFrame;
+                ev->body.size   = m.len;
+                ev->body.type   = midiUrid_;
+                std::memcpy(ev + 1, m.data, m.len);
+                // Pad bytes are part of the event but never read; zero them so a
+                // strict plugin scanning the buffer sees nothing but the events.
+                if (pad > m.len) std::memset((u8*)(ev + 1) + m.len, 0, pad - m.len);
+                size += need;
+            }
+            seq->atom.size = size;
+        }
+    }
+
     PluginDesc        desc_;
     const LilvPlugin* plug_ = nullptr;
     LilvInstance*     inst_ = nullptr;
@@ -550,7 +636,10 @@ private:
     std::vector<f32*> audioIn_, audioOut_;
     std::vector<u8*>  atomIn_, atomOut_;
 
-    LV2_URID seqUrid_ = 0, chunkUrid_ = 0;
+    LV2_URID seqUrid_ = 0, chunkUrid_ = 0, midiUrid_ = 0;
+    std::vector<int> midiPorts_;                 // atomIn_ slots that take MIDI
+    MidiMsg midi_[kMaxMidiEvents]{};
+    int     midiCount_ = 0;
 
     LV2_URID_Map   map_{};
     LV2_URID_Unmap unmap_{};

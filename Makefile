@@ -179,7 +179,7 @@ build/render: tools/render.cpp $(CORE_SRC)
 build/pitch_check: tools/pitch_check.cpp
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS)
-build/plugin_scan: tools/plugin_scan.cpp src/plugin/host.cpp src/plugin/lv2_host.cpp src/plugin/clap_host.cpp src/core/common.cpp
+build/plugin_scan: tools/plugin_scan.cpp src/plugin/host.cpp src/plugin/lv2_host.cpp src/plugin/clap_host.cpp src/plugin/internal_devices.cpp src/core/common.cpp
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS)
 build/engine_test: tests/engine_test.cpp src/audio/engine.cpp src/core/common.cpp
