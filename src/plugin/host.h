@@ -81,6 +81,30 @@ public:
     virtual const ParamInfo& paramInfo(int i) const = 0;
     virtual f32              getParam(int i) const = 0;
 
+    // REALTIME. The automation path: called from inside the audio callback,
+    // before this block's process(), to apply a value the engine computed from
+    // a clip envelope.
+    //
+    // A separate entry point from setParam(), not a relaxation of it, because
+    // the callers differ in the one way that matters: setParam() is the ONLY
+    // writer on the non-realtime side and may therefore use a single-producer
+    // queue — which is exactly what the CLAP backend does. A second producer on
+    // that queue would be a data race, so a backend whose parameter path is a
+    // queue must give the audio thread a path of its own.
+    //
+    // Returns false when this backend has no realtime parameter path. The
+    // engine then marks the lane inert, emits Ev::AutoLaneInert once so the UI
+    // can grey it, and never calls again for that published set. A silently
+    // ignored lane would be the worst outcome: the envelope is drawn, the sound
+    // does not move, and nothing says why.
+    //
+    // Same rules as process(): no allocation, no locks, no exceptions.
+    virtual bool setParamRT(int i, f32 v) { (void)i; (void)v; return false; }
+
+    // getParam() is realtime-safe to call: a plain load in every backend in the
+    // tree. The engine needs it to remember what a parameter was before an
+    // envelope took it over, so it can be restored when playback stops.
+
     // GUI thread, concurrent with process(). Backends store parameters as
     // plain floats that the plugin reads once per run(), so a torn read is
     // impossible on every architecture we target and a stale read costs at

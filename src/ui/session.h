@@ -29,6 +29,34 @@ struct NoteModel {
     u8  pitch = 60, vel = 100;
 };
 
+// One breakpoint in an envelope, in clip-relative beats. `curve` is reserved
+// and must be 0 for now: the segment to the next point is linear. It is a byte
+// because the shapes worth having are an enumeration (linear, ease, S, hold)
+// rather than a continuum, and a byte costs nothing where a second control
+// point would double the wire form for a feature nobody has asked for.
+struct AutoPoint {
+    f64 beat  = 0.0;
+    f32 value = 0.f;                  // in the target's own units
+    u8  curve = 0;
+    u8  pad[3] = {};
+};
+
+// One address's worth of automation inside one clip.
+//
+// The address is kept as TEXT, never as a resolved target — PARAM-ADDRESS.md's
+// "resolution lives GUI-side" applied here. A lane naming a device that is not
+// loaded today survives a save/load intact, exactly as ClipModel::path survives
+// a missing sample. Resolution happens at publish time and is thrown away on
+// every structural change.
+struct AutoLane {
+    std::string address;              // canonical, see docs/PARAM-ADDRESS.md
+    std::vector<AutoPoint> points;    // sorted by beat, unique beats
+    bool enabled = true;              // Live's "deactivate envelope"
+};
+
+inline constexpr int kMaxClipLanes      = 16;    // == kMaxRtAutoLanes
+inline constexpr int kMaxClipAutoPoints = 4096;  // total across a clip's lanes
+
 struct ClipModel {
     // Stable identity. UIDs never change once assigned and are serialized, so
     // undo, set-diff, automation targets and collaboration can reference an
@@ -36,6 +64,7 @@ struct ClipModel {
     u64 uid = 0;
     ClipKind kind = ClipKind::Audio;
     std::vector<NoteModel> notes;      // Midi clips only; kept sorted by beat
+    std::vector<AutoLane>  envelopes;  // clip automation; audio and MIDI alike
     SampleRef sample;
     std::string name;
     // Source file. Authoritative for save/load: it survives a missing sample,

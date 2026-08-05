@@ -34,6 +34,68 @@ struct RtNote {
     u8  pitch = 60, vel = 100;
 };
 
+// ---------------------------------------------------------------------------
+// Automation. Full design and rationale: docs/AUTOMATION.md.
+//
+// The rule the whole feature hangs on: the engine NEVER writes an automated
+// value into the field it is automating. Track::vol stays the user's value and
+// an envelope produces an effective gain beside it, which is why stopping,
+// overriding, undoing and saving all need no cleanup. Device parameters are
+// the one documented exception — a plugin has a single storage slot and no
+// notion of "effective" — and that is exactly why they carry a restore
+// obligation when playback stops.
+// ---------------------------------------------------------------------------
+
+// What an envelope automates. The engine switches on this; nothing else does.
+enum class AutoTarget : i32 {
+    None = 0,
+    TrackVol,       // Track::vol,        transform Fader
+    TrackPan,       // Track::pan,        transform Direct
+    TrackSend,      // Track::send[index], Direct
+    DeviceParam,    // chain[devSlot] parameter `index`, Direct
+    // Reserved, in this order, so the numbering never moves:
+    // ClipGain, MasterVol, ReturnVol, TrackMute.
+};
+
+// How a stored value becomes the value the engine uses. The model stores what
+// the UI edits, and for the volume fader that is a 0..1 fader position rather
+// than a gain — so the mapping lives here, as data, and neither side needs a
+// second copy of faderToGain's inverse.
+enum class AutoXform : i32 { Direct = 0, Fader = 1 };
+
+struct RtAutoPoint {                  // 16 B
+    f64 beat = 0.0;
+    f32 value = 0.f;                  // in the target's own units
+    u8  curve = 0;                    // reserved; 0 = linear to the next point
+    u8  pad[3] = {};
+};
+
+struct RtAutoLane {
+    i32 target  = (i32)AutoTarget::None;
+    i32 index   = 0;                  // return index / device param index
+    i32 devSlot = -1;                 // chain position, -1 for engine scalars
+    i32 xform   = (i32)AutoXform::Direct;
+    i32 first = 0, count = 0;         // window into RtAutoSet::points
+    f32 lo = 0.f, hi = 1.f;           // clamp, resolved GUI-side from ParamInfo
+    u32 flags = 0;
+};
+
+inline constexpr u32 kAutoOverridden = 1u << 0;   // user grabbed the control
+inline constexpr u32 kAutoInert      = 1u << 1;   // no realtime path for it
+inline constexpr int kMaxRtAutoLanes = 16;
+
+// One allocation, always: `points` addresses memory inside this same block,
+// immediately past the struct. Two allocations would need two retirement
+// events or a rule about which implies the other, and the RtNote protocol is
+// only simple because there is exactly one pointer per slot. A replaced set
+// travels back via Ev::AutosRetired before it may be freed.
+struct RtAutoSet {
+    const RtAutoPoint* points = nullptr;
+    RtAutoLane lanes[kMaxRtAutoLanes] = {};
+    int laneCount = 0;
+    int pointCount = 0;
+};
+
 // Realtime view of a clip. The GUI fills one of these and ships it across;
 // the audio thread only reads. `data` points into a SampleBuffer the GUI
 // keeps alive for the lifetime of the session; `notes` follows the RtNote
@@ -65,6 +127,10 @@ struct RtClip {
     const RtNote* notes = nullptr;
     int  noteCount    = 0;
     bool isMidi       = false;
+
+    // Clip envelopes. Same lifetime protocol as `notes`: GUI-owned, engine
+    // borrows, a displaced set returns via Ev::AutosRetired before it is freed.
+    const RtAutoSet* autos = nullptr;
 
     bool valid        = false;
 };
@@ -152,7 +218,9 @@ enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportSto
                       RecordStarted,  // a = track, b = slot, x = beat it began
                       RecordFinished, // a = track, b = slot, x = frames written, p = the buffer
                       NotesRetired,   // p = the RtNote* array now safe to free
-                      MidiRecordFinished // a = track, b = slot, x = note count, p = the buffer
+                      MidiRecordFinished, // a = track, b = slot, x = note count, p = the buffer
+                      AutosRetired,   // p = the RtAutoSet* now safe to free
+                      AutoLaneInert   // a = track, b = slot, x = lane index
                     };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
