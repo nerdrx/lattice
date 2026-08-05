@@ -53,12 +53,14 @@ int main(int argc, char** argv) {
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 #endif
 
-    lat::App app;
-    if (!app.init(argc, argv)) {
+    // Heap-allocated: Engine carries per-track fx scratch (~2 MB), which has
+    // no business on main's stack.
+    auto app = std::make_unique<lat::App>();
+    if (!app->init(argc, argv)) {
         std::fprintf(stderr, "lattice: failed to start\n");
         return 1;
     }
-    app.run();
-    app.shutdown();
+    app->run();
+    app->shutdown();
     return 0;
 }

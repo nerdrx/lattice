@@ -155,6 +155,7 @@ int main(int argc, char** argv) {
             if (!on) continue;
             ClipModel& m = s.tracks[t].slots[sc];
             m.sample = sb;
+            m.path = path;
             m.name = loops[t].name;
             m.colorIdx = loops[t].color;
             m.clipBpm = kBpm;                 // we know it exactly, no guessing

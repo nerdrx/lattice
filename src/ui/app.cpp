@@ -202,6 +202,7 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
 
     ClipModel& m = ses_.tracks[track].slots[slot];
     m.sample = sb;
+    m.path = path;
     m.name = sb->name;
     const size_t dot = m.name.find_last_of('.');
     if (dot != std::string::npos) m.name = m.name.substr(0, dot);
@@ -230,7 +231,7 @@ void App::addTrack() {
     snprintf(buf, sizeof buf, "%zu Audio", ses_.tracks.size() + 1);
     t.name = buf;
     t.colorIdx = (int)(ses_.tracks.size() * 3 + 4) % pal::clipColorCount;
-    ses_.tracks.push_back(t);
+    ses_.tracks.push_back(std::move(t));   // TrackModel is move-only (devices)
     pushTrack((int)ses_.tracks.size() - 1);
 }
 

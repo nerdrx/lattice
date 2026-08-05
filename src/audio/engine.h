@@ -36,6 +36,26 @@ struct RtClip {
     bool valid        = false;
 };
 
+// ---------------------------------------------------------------------------
+// Device chains.
+//
+// A track's chain as the audio thread sees it. The GUI builds an RtChain on
+// its own heap, fills it, and ships the pointer across via Cmd::SetChain. The
+// audio thread only ever swaps the pointer; it never mutates, frees, or
+// follows a chain after replacing it. The *previous* pointer travels back in
+// an Ev::ChainRetired event, and only on receiving that may the GUI free the
+// chain struct and any PluginInstances it removed. Until then both chains and
+// every instance they reference must stay alive.
+// ---------------------------------------------------------------------------
+class PluginInstance;                  // src/plugin/host.h; RT-safe process()
+
+inline constexpr int kMaxChainFx = 8;
+
+struct RtChain {
+    PluginInstance* fx[kMaxChainFx] = {};   // in processing order; nulls skipped
+    int count = 0;
+};
+
 enum class Cmd : u32 {
     SetPlaying, SetTempo, SetQuantum, SetMetronome,
     LaunchClip, StopTrack, LaunchScene, StopAll,
@@ -43,17 +63,20 @@ enum class Cmd : u32 {
     TrackVol, TrackPan, TrackMute, TrackSolo, TrackArm,
     MasterVol,
     ClipGain, ClipWarp, ClipLoop,
+    SetChain,                          // a = track, p = RtChain* (null clears)
 };
 
 struct Command {
     Cmd    type = Cmd::SetPlaying;
     i32    a = 0, b = 0;
     f64    x = 0.0;
+    void*  p = nullptr;                // SetChain payload
     RtClip clip{};
 };
 
-enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportStopped };
-struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; };
+enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportStopped,
+                      ChainRetired /* a = track, p = the RtChain* now safe to free */ };
+struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
 // Global launch quantum choices, in beats. Index 0 is "None".
 inline constexpr f64 kQuantumBeats[] = {0.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125};
@@ -104,6 +127,16 @@ private:
         Voice voice;                 // the clip currently launched
         Voice prev;                  // outgoing clip, fading out across a switch
         f32  mL = 0.f, mR = 0.f;
+
+        // Device chain (see RtChain protocol above) and the pre-mix scratch
+        // this track's clips render into. Signal flow per block:
+        //   voices (clip gain + declick) -> fx chain -> vol/pan/mute/solo
+        //   -> meters -> master sum.
+        // Chains with count > 0 must run every block, playing or not, so
+        // reverb tails and monitoring survive the transport stopping.
+        const RtChain* chain = nullptr;
+        f32 fxL[kMaxBlock]{};
+        f32 fxR[kMaxBlock]{};
     };
 
     void  drainCommands();

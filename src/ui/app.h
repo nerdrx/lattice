@@ -7,6 +7,7 @@
 #include "../audio/engine.h"
 #include "../audio/sample.h"
 #include "../audio/backend.h"
+#include "../plugin/host.h"
 #include "../gfx/renderer.h"
 #include "widgets.h"
 #include "window.h"
@@ -19,6 +20,9 @@ namespace lat {
 struct ClipModel {
     SampleRef sample;
     std::string name;
+    // Source file. Authoritative for save/load: it survives a missing sample,
+    // so a set whose media is offline does not silently lose the reference.
+    std::string path;
     int  colorIdx = 0;
     f32  gain = 1.0f;
     Warp warp = Warp::Beats;
@@ -30,10 +34,20 @@ struct ClipModel {
     bool valid() const { return sample != nullptr; }
 };
 
+// One loaded plugin on a track. The instance is GUI-owned; the audio thread
+// borrows it through the RtChain currently published to the engine, so it may
+// only be destroyed after that chain has come back via Ev::ChainRetired.
+struct DeviceModel {
+    PluginDesc desc;
+    std::unique_ptr<PluginInstance> inst;
+    bool bypass = false;
+};
+
 struct TrackModel {
     std::string name = "Track";
     int   colorIdx = 0;
     ClipModel slots[kMaxScenes];
+    std::vector<DeviceModel> devices;   // makes TrackModel move-only
     f32   fader = 0.85f;               // 0..1, mapped through faderToGain
     f32   pan   = 0.f;                 // -1..1
     bool  mute = false, solo = false, arm = false;
@@ -126,6 +140,23 @@ private:
     Font     fSmall_, fBody_, fBold_, fBig_;
     Engine   engine_;
     std::unique_ptr<AudioBackend> audio_;
+
+    // --- plugin hosting -------------------------------------------------
+    // Chain lifecycle: publishChain(t) heap-allocates an RtChain from
+    // ses_.tracks[t].devices, sends it via Cmd::SetChain, and moves the
+    // previously published pointer into retiring_ together with any
+    // instances the new chain no longer references. pumpEngineEvents()
+    // frees a retiring_ entry when its Ev::ChainRetired arrives. Nothing is
+    // freed on any other path while the audio thread runs.
+    PluginRegistry registry_;
+    bool registryScanned_ = false;
+    struct RetiredChain {
+        const RtChain* chain = nullptr;
+        std::vector<std::unique_ptr<PluginInstance>> dying;
+    };
+    std::vector<RetiredChain> retiring_;
+    const RtChain* published_[kMaxTracks] = {};
+    void publishChain(int track);
 
     Session  ses_;
     MainView view_ = MainView::Session;
