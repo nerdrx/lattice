@@ -99,7 +99,11 @@ void enablePerMonitorDpi() {
     if (auto f = dllProc<SetCtxFn>(user32(), "SetProcessDpiAwarenessContext")) {
         // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Spelled out
         // as a literal so we do not depend on the SDK version's windef.h.
-        if (f((HANDLE)-4)) return;
+        // Via INT_PTR: a bare (HANDLE)-4 is an int-to-64-bit-pointer cast, which
+        // is implementation-defined and warns under -Wint-to-pointer-cast on
+        // some targets. Widening to pointer size first makes the sign extension
+        // explicit and the value exactly 0xFFFF'FFFF'FFFF'FFFC.
+        if (f((HANDLE)(INT_PTR)-4)) return;
     }
     if (auto f = dllProc<SetAwareFn>(user32(), "SetProcessDPIAware")) f();
 }
@@ -160,6 +164,26 @@ int mapKey(UINT vk) {
     if (ch >= 32 && ch <= 126)
         return (ch >= 'A' && ch <= 'Z') ? (int)(ch - 'A' + 'a') : (int)ch;
     return KeyNone;
+}
+
+// Physical key position for Input::scanDown, which is indexed by Linux evdev
+// scancode. The lParam of WM_KEYDOWN/WM_KEYUP carries the PS/2 Set-1 make code
+// in bits 16..23, and for the whole main block Set-1 and evdev agree exactly
+// (1..0 = 0x02..0x0B, Q = 0x10, A = 0x1E, Z = 0x2C, space = 0x39) because
+// evdev's keycode table was derived from Set 1 in the first place. That is the
+// only region the computer-MIDI piano cares about, so no translation table.
+//
+// Bit 24 is the extended flag: those keys (arrows, Home/End, right Ctrl/Alt,
+// numpad Enter, the Windows keys) reuse main-block make codes with an E0
+// prefix, so 0x1C would arrive both as Enter and as numpad Enter. They are
+// never piano keys, so the cheapest correct answer is to drop them entirely
+// rather than fold them onto a key someone might be holding.
+//
+// Returns -1 when there is nothing usable to record.
+int scanCode(LPARAM lp) {
+    if ((lp >> 24) & 1) return -1;              // extended (E0/E1 prefixed)
+    const int sc = (int)((lp >> 16) & 0xFF);
+    return (sc > 0 && sc < 256) ? sc : -1;      // 0 = injected/synthetic event
 }
 
 void appendUtf8(std::string& out, const wchar_t* w, int n) {
@@ -536,6 +560,7 @@ LRESULT Win32Backend::handle(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             in_->keyDown[k] = true;
             in_->keyPressed[k] = true;   // auto-repeat included, as on X11
         }
+        if (const int sc = scanCode(lp); sc >= 0) in_->scanDown[sc] = true;
         syncMods();
         // Sys keys fall through so Alt+F4 and Alt+Space keep working.
         if (m == WM_SYSKEYDOWN) break;
@@ -546,6 +571,7 @@ LRESULT Win32Backend::handle(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_SYSKEYUP: {
         const int k = mapKey((UINT)wp);
         if (k > 0 && k < KeyCount) in_->keyDown[k] = false;
+        if (const int sc = scanCode(lp); sc >= 0) in_->scanDown[sc] = false;
         syncMods();
         if (m == WM_SYSKEYUP) break;
         return 0;
@@ -578,6 +604,7 @@ LRESULT Win32Backend::handle(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS:
         // Keys released while we were not focused never generate WM_KEYUP.
         std::memset(in_->keyDown, 0, sizeof in_->keyDown);
+        std::memset(in_->scanDown, 0, sizeof in_->scanDown);
         std::memset(in_->down, 0, sizeof in_->down);
         in_->mods = 0;
         haveLast_ = false;

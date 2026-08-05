@@ -1,113 +1,192 @@
-# Lattice — Windows cross build (mingw-w64).
+# Lattice — Windows cross build (mingw-w64), HEADLESS subset.
 #
-#   make -f Makefile.mingw          release -> build/win/lattice.exe
-#   make -f Makefile.mingw debug    -O0 -g3
-#   make -f Makefile.mingw config   show what was detected
+#   make -f Makefile.mingw config           show toolchain + what was detected
+#   make -f Makefile.mingw                  build everything below
+#   make -f Makefile.mingw check            build, then run the suite under wine
+#   make -f Makefile.mingw verify-sources   prove the file lists match Makefile
 #   make -f Makefile.mingw clean
 #
-# The Linux Makefile is untouched and remains the source of truth for the
-# native build. This file only differs in three places: the toolchain, the
-# platform source filter, and how third-party headers are found (there is no
-# system pkg-config on a Windows target, so see WIN_DEPS below).
+# What this builds
+# ----------------
+#   build-mingw/engine_test.exe        the full 199-check engine suite, linked
+#                                      fully static so `wine engine_test.exe`
+#                                      needs no DLLs next to it.
+#   build-mingw/obj/src/ui/window_win32.o        compile-only, never linked.
+#   build-mingw/obj/src/audio/backend_win32.o
+#                                      The point is to put a Windows-targeting
+#                                      compiler in
+#                                      front of the two hand-written Win32
+#                                      translation units on every push, so they
+#                                      cannot rot silently the way they did
+#                                      while they were unbuildable.
+#
+# What this deliberately does NOT build
+# -------------------------------------
+#   The GUI (build/lattice). It needs freetype, glew, sndfile and samplerate as
+#   Windows libraries, none of which apt ships cross-built, and src/ui/app.cpp
+#   plus src/gfx/font.cpp are still POSIX-only. See docs/PORTING.md.
+#
+#   src/ipc/*. tests/ipc_test.cpp is built on POSIX shared memory (shm_open,
+#   mmap, ftruncate, process-shared pthread mutexes). There is no thin shim for
+#   that on Win32 -- it is CreateFileMappingW/MapViewOfFile plus named mutexes,
+#   i.e. a second implementation of src/ipc/shm.h, not a build fix. Out of
+#   scope here, and excluded on purpose rather than by accident.
+#
+#   tools/render.exe. Wants libsndfile + libsamplerate for Windows; see the
+#   optional target at the bottom.
+#
+# The Linux Makefile is untouched and stays the source of truth for the native
+# build. `make -f Makefile.mingw verify-sources` mechanically checks that the
+# two agree about which files make up engine_test and about the warning flags,
+# so the lists cannot drift apart unnoticed.
 
 CROSS    ?= x86_64-w64-mingw32
 CXX      := $(CROSS)-g++
-CC       := $(CROSS)-gcc
-BIN      := build/win/lattice.exe
-OBJDIR   := build/winobj
-GEN      := build/gen
+BUILD    := build-mingw
+OBJDIR   := $(BUILD)/obj
 
-# ---- dependencies ---------------------------------------------------------
-# Preferred: a cross pkg-config (mingw-w64-pkg-config on Arch, or
-# PKG_CONFIG_LIBDIR pointed at an MSYS2 mingw64 sysroot).
-# Fallback: a hand-populated sysroot at $(WIN_DEPS) holding the four libraries
-# that have no Windows system equivalent — freetype, glew, libsndfile,
-# libsamplerate — as include/ and lib/ trees.
-PKGCONFIG ?= $(shell command -v $(CROSS)-pkg-config 2>/dev/null)
-WIN_DEPS  ?= third_party/win32
-PKGS      := freetype2 glew sndfile samplerate
+# ---- sources --------------------------------------------------------------
+# Must stay identical to the `build/engine_test:` rule in Makefile.
+TEST_SRC := tests/engine_test.cpp src/audio/engine.cpp src/core/common.cpp
 
-# GLEW static avoids shipping glew32.dll; flip to 0 if you link the import lib.
-GLEW_STATIC ?= 1
-
-ifneq ($(PKGCONFIG),)
-DEP_CF := $(shell $(PKGCONFIG) --cflags $(PKGS))
-DEP_LD := $(shell $(PKGCONFIG) --libs $(PKGS))
-else
-DEP_CF := -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/freetype2
-DEP_LD := -L$(WIN_DEPS)/lib -lfreetype -lsndfile -lsamplerate
-ifeq ($(GLEW_STATIC),1)
-DEP_LD += -lglew32s
-else
-DEP_LD += -lglew32
-endif
-endif
-
-ifeq ($(GLEW_STATIC),1)
-DEP_CF += -DGLEW_STATIC
-endif
-
-# opengl32/gdi32 -> window_win32.cpp; ole32 -> COM in backend_win32.cpp;
-# avrt -> MMCSS "Pro Audio"; ksuser/winmm -> multimedia GUIDs and timers that
-# some sndfile/driver paths still pull in.
-SYSLIBS := -lopengl32 -lgdi32 -lole32 -lavrt -lksuser -lwinmm
+# Compiled, never linked.
+WIN_ONLY_SRC := src/ui/window_win32.cpp src/audio/backend_win32.cpp
+WIN_ONLY_OBJ := $(patsubst %.cpp,$(OBJDIR)/%.o,$(WIN_ONLY_SRC))
 
 # ---- flags ----------------------------------------------------------------
-# _WIN32_WINNT 0x0A00: WASAPI needs >= Vista, the per-monitor-v2 DPI entry
-# points need the Windows 10 headers. The runtime lookups are still dynamic.
-WINDEFS  := -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00
+# Kept character-for-character in step with Makefile's WARN; verify-sources
+# fails the build if the two ever diverge.
 WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
-CXXFLAGS := -std=c++20 -fno-math-errno $(WARN) $(WINDEFS) $(DEP_CF) -I$(GEN) -MMD -MP
-CFLAGS   := -std=c11 -w $(WINDEFS) $(DEP_CF) -I$(GEN) -MMD -MP
 
-# -mwindows: GUI subsystem, no console window.
-# -static-libgcc/-static-libstdc++: the .exe runs without the mingw runtime DLLs.
-LDFLAGS  := -mwindows -static-libgcc -static-libstdc++
-LDLIBS   := $(DEP_LD) $(SYSLIBS)
+# _WIN32_WINNT 0x0A00: WASAPI needs >= Vista and the per-monitor-v2 DPI entry
+# points need the Windows 10 headers. Both are still looked up at run time.
+#
+# __USE_MINGW_ANSI_STDIO=1 is not cosmetic. Without it printf resolves to
+# msvcrt's implementation, which does not understand %zu and is inconsistent
+# about %lld -- and tests/engine_test.cpp prints frame counts with %lld and
+# buffer offsets with %zu in the text of ~30 assertions. Getting that wrong
+# would not fail the suite, it would quietly print garbage next to PASS.
+# -std=c++20 (rather than gnu++20) defines __STRICT_ANSI__, which already flips
+# this on in current mingw-w64 headers; saying it explicitly makes the build
+# independent of that detail.
+WINDEFS  := -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 \
+            -D__USE_MINGW_ANSI_STDIO=1
+
+CXXFLAGS := -std=c++20 -fno-math-errno $(WARN) $(WINDEFS) -Ivendor/clap/include -MMD -MP
 
 ifeq ($(MAKECMDGOALS),debug)
   CXXFLAGS += -O0 -g3 -fno-omit-frame-pointer -DLAT_DEBUG=1
-  CFLAGS   += -O0 -g3
-  LDFLAGS  := $(filter-out -mwindows,$(LDFLAGS))   # keep stdout for LOG*
 else
   CXXFLAGS += -O2 -g -DNDEBUG
-  CFLAGS   += -O2 -g
 endif
 
-# ---- sources --------------------------------------------------------------
-# The Windows TUs are picked up by the same find; they guard themselves with
-# #if defined(_WIN32) so they are also harmless in the Linux build.
-SRC := $(shell find src -name '*.cpp' | sort)
-SRC := $(filter-out src/ui/window_x11.cpp,$(SRC))
-SRC := $(filter-out src/ui/window_wayland.cpp,$(SRC))
-SRC := $(filter-out src/audio/backend.cpp,$(SRC))
+# -mconsole: engine_test writes its results to stdout; the GUI subsystem would
+# throw them away. Fully static so the .exe runs in a bare wineprefix with no
+# libstdc++-6.dll / libgcc_s_seh-1.dll / libwinpthread-1.dll beside it.
+#
+# --stack is load bearing, not defensive. sizeof(lat::Engine) is ~2.35 MB (the
+# realtime path never allocates, so every per-track buffer is a fixed-size
+# member) and tests/engine_test.cpp declares `Host h;` -- which embeds one by
+# value -- as a local in roughly thirty test functions. Linux gives a thread
+# 8 MB of stack and nobody ever noticed; a PE gets 2 MB of stack reserve by
+# default under mingw-w64, and Windows itself defaults to 1 MB, so the very
+# first test overflows and the process dies with a plain access violation
+# somewhere inside Engine::prepare. Reproduce the same crash natively with
+# `ulimit -s 2048; ./build/engine_test`. 16 MB is generous for one Engine plus
+# the check framework, and costs nothing: it is reserve, not commit.
+LDFLAGS  := -mconsole -static-libgcc -static-libstdc++ -static \
+            -Wl,--stack,16777216
 
-OBJ := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(SRC))
-DEP := $(OBJ:.o=.d)
+TEST_OBJ := $(patsubst %.cpp,$(OBJDIR)/%.o,$(TEST_SRC))
+DEP      := $(TEST_OBJ:.o=.d) $(WIN_ONLY_OBJ:.o=.d)
 
-.PHONY: all debug clean config
+EXE      := $(BUILD)/engine_test.exe
 
-all: $(BIN)
-debug: $(BIN)
+.PHONY: all debug check clean config verify-sources winobjs
 
+all: $(EXE) winobjs
+debug: all
+
+winobjs: $(WIN_ONLY_OBJ)
+
+# Everything a failing CI log needs, in one place, before anything is compiled.
 config:
-	@echo "toolchain   : $(CXX)"
-	@echo "pkg-config  : $(if $(PKGCONFIG),$(PKGCONFIG),none - using $(WIN_DEPS))"
-	@echo "glew static : $(GLEW_STATIC)"
-	@echo "sources     : $(words $(SRC)) files"
-	@echo "dep cflags  : $(DEP_CF)"
-	@echo "dep libs    : $(DEP_LD)"
+	@echo "cross prefix   : $(CROSS)"
+	@echo "compiler       : $(CXX)"
+	@command -v $(CXX) >/dev/null || \
+	  { echo "*** $(CXX) not found -- install mingw-w64"; exit 1; }
+	@$(CXX) --version | head -1 | sed 's/^/compiler ver   : /'
+	@echo "target         : $$($(CXX) -dumpmachine)"
+	@$(CXX) -v 2>&1 | grep -i 'thread model' | sed 's/^/thread model   : /'
+	@echo "test sources   : $(TEST_SRC)"
+	@echo "compile-only   : $(WIN_ONLY_SRC)"
+	@echo "cxxflags       : $(CXXFLAGS)"
+	@echo "ldflags        : $(LDFLAGS)"
 
-$(BIN): $(OBJ)
+$(EXE): $(TEST_OBJ)
 	@mkdir -p $(dir $@)
-	$(CXX) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+	$(CXX) $(TEST_OBJ) -o $@ $(LDFLAGS)
 	@echo "  ->  $@"
 
-$(OBJDIR)/%.o: src/%.cpp
+$(OBJDIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# Runs exactly the binary CI runs. WINEDEBUG=-all keeps wine's fixme spam out
+# of the test output; the suite's own exit code decides pass/fail.
+check: all
+	WINEDEBUG=-all wine ./$(EXE)
+
+# ---- consistency with the native Makefile ---------------------------------
+# Two things can drift silently: which files engine_test is made of, and which
+# warnings are on. Both are cheap to assert, so assert them instead of trusting
+# a comment. CI runs this before the build.
+verify-sources:
+	@mkdir -p $(BUILD)
+	@grep -E '^build/engine_test:' Makefile \
+	  | sed 's/^[^:]*://' | tr ' ' '\n' | sed '/^$$/d' | sort > $(BUILD)/.src-native
+	@printf '%s\n' $(TEST_SRC) | sort > $(BUILD)/.src-cross
+	@diff -u $(BUILD)/.src-native $(BUILD)/.src-cross || { \
+	  echo "*** engine_test sources differ between Makefile and Makefile.mingw"; \
+	  exit 1; }
+	@echo "engine_test sources match Makefile: $(TEST_SRC)"
+	@grep -E '^WARN[[:space:]]*:=' Makefile       | sed 's/.*:=[[:space:]]*//' > $(BUILD)/.warn-native
+	@grep -E '^WARN[[:space:]]*:=' Makefile.mingw | sed 's/.*:=[[:space:]]*//' > $(BUILD)/.warn-cross
+	@diff -u $(BUILD)/.warn-native $(BUILD)/.warn-cross || { \
+	  echo "*** WARN flags differ between Makefile and Makefile.mingw"; \
+	  exit 1; }
+	@echo "WARN matches Makefile: $(WARN)"
+	@for f in $(TEST_SRC) $(WIN_ONLY_SRC) $(RENDER_SRC); do \
+	  test -f "$$f" || { echo "*** missing source: $$f"; exit 1; }; \
+	done
+	@echo "every referenced source exists"
+
 clean:
-	rm -rf $(OBJDIR) build/win
+	rm -rf $(BUILD)
+
+# ---- optional: the deviceless render tool ---------------------------------
+# Stretch goal, off by default and not part of `all`. tools/render.cpp pulls in
+# src/audio/sample.cpp, which needs libsndfile and libsamplerate built for
+# Windows. Debian/Ubuntu cross-build neither, so this needs a hand-populated
+# sysroot:
+#
+#   make -f Makefile.mingw WIN_DEPS=/path/to/sysroot build-mingw/render.exe
+#
+# with $(WIN_DEPS)/{include,lib} holding sndfile.h / samplerate.h and their
+# import or static libraries. Unlike engine_test.exe this one is not -static: a
+# static libsndfile drags in FLAC/ogg/vorbis/opus/mpg123 and the link order
+# stops being something a makefile can guess.
+WIN_DEPS ?=
+RENDER_SRC := tools/render.cpp src/core/common.cpp src/core/project.cpp \
+              src/audio/sample.cpp src/audio/engine.cpp
+
+$(BUILD)/render.exe: $(RENDER_SRC)
+	@test -n "$(WIN_DEPS)" || { \
+	  echo "render.exe needs WIN_DEPS=/path/to/win32/sysroot (sndfile+samplerate)"; \
+	  exit 1; }
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(WIN_DEPS)/include $(RENDER_SRC) -o $@ \
+	  -mconsole -static-libgcc -static-libstdc++ \
+	  -L$(WIN_DEPS)/lib -lsndfile -lsamplerate
 
 -include $(DEP)

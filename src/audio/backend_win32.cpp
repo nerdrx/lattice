@@ -23,6 +23,12 @@
 
 #include <windows.h>
 #include <objbase.h>
+// mmreg.h explicitly, and before the WASAPI headers: WIN32_LEAN_AND_MEAN keeps
+// mmsystem.h out of windows.h, and whether audioclient.h drags mmreg.h in by
+// itself differs between the Windows SDK and mingw-w64. WAVEFORMATEXTENSIBLE
+// and the WAVE_FORMAT_* tags used by classify() live there, so ask for it
+// directly. The header is idempotent, so this is free where it was already in.
+#include <mmreg.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <avrt.h>

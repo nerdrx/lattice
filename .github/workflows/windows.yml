@@ -1,0 +1,238 @@
+# Lattice — Windows cross build
+#
+# One job. It cross-compiles the headless subset with mingw-w64 and then
+# actually runs the engine test suite under Wine, so "the Windows build works"
+# stops being a claim about a compiler and starts being a claim about
+# behaviour: the same 199 assertions the Linux job checks, executed by a
+# Windows binary.
+#
+# Scope is deliberately narrow -- see the header of Makefile.mingw. The GUI is
+# not built (no Windows freetype/glew/sndfile/samplerate in apt, and app.cpp /
+# font.cpp are still POSIX-only) and src/ipc is not built (POSIX shm). What is
+# covered:
+#
+#   engine_test.exe                 built, then RUN under wine
+#   src/ui/window_win32.cpp         compiled by a Windows-targeting compiler
+#   src/audio/backend_win32.cpp     compiled by a Windows-targeting compiler
+#
+# The last two are compile-only on purpose: they need a real audio endpoint and
+# a real window station, neither of which a runner has. Compiling them still
+# catches the entire class of bug that made this port unbuildable for months --
+# code written against the Win32 API by eye, never once seen by a compiler.
+#
+# ci.yml (Linux) is untouched and independent; a failure here does not mask one
+# there.
+name: Windows cross
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Same policy as ci.yml: a second push to a branch cancels the run it replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cross:
+    name: windows-cross
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      # Wine, pinned fully non-interactive:
+      #   WINEDEBUG=-all       drop the fixme/err chatter so the only thing on
+      #                        stdout is the suite's own output
+      #   WINEARCH=win64       the binary is x86-64; a win32 prefix cannot load
+      #                        it, and we deliberately do not install wine32
+      #   WINEDLLOVERRIDES     disables the Mono and Gecko bootstrap. Without
+      #                        this, the first wine invocation pops a GUI
+      #                        installer dialog and the job hangs until timeout
+      #   WINEPREFIX           a scratch prefix, so nothing depends on whatever
+      #                        ~/.wine the image may or may not carry
+      WINEDEBUG: -all
+      WINEARCH: win64
+      WINEDLLOVERRIDES: mscoree,mshtml=
+      WINEPREFIX: ${{ runner.temp }}/wineprefix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # mingw-w64 pulls gcc-mingw-w64-x86-64 and g++-mingw-w64-x86-64 with the
+      # matching headers and PE binutils. wine64 is the package name on 22.04;
+      # on 24.04 it was merged into `wine`, so try one and fall back. Only the
+      # 64-bit loader is needed -- nothing here is 32-bit, so no i386 foreign
+      # architecture and no wine32.
+      - name: Install mingw-w64 and wine
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          sudo apt-get install -y --no-install-recommends wine64 \
+            || sudo apt-get install -y --no-install-recommends wine
+
+      # Debian/Ubuntu ship two mingw toolchains that differ in thread model.
+      # The win32 one had no std::thread before GCC 13, and src/audio/
+      # backend_win32.cpp uses std::thread for the WASAPI render thread. The
+      # posix variant has always had it, and -static links libwinpthread in, so
+      # nothing is shipped alongside the .exe either way. Best effort: if the
+      # alternative is not registered on this image, the default is used and the
+      # version dump below records which one that was.
+      - name: Prefer the posix thread model
+        run: |
+          set -uxo pipefail
+          for t in gcc g++; do
+            alt="/usr/bin/x86_64-w64-mingw32-$t-posix"
+            [ -x "$alt" ] && sudo update-alternatives --set "x86_64-w64-mingw32-$t" "$alt" || true
+          done
+          true
+
+      # Everything a future failure will want to know, printed before anything
+      # can go wrong. If the toolchain is missing this step is where the job
+      # dies, with an obvious message, instead of somewhere inside make.
+      - name: Toolchain versions
+        run: |
+          set -euo pipefail
+          echo "::group::mingw-w64"
+          x86_64-w64-mingw32-g++ --version | head -1
+          echo "target       : $(x86_64-w64-mingw32-g++ -dumpmachine)"
+          # || true throughout: these are diagnostics. The build steps below
+          # are what decide whether the toolchain is usable, and a grep that
+          # happens to miss on some future image must not be the thing that
+          # fails the job.
+          x86_64-w64-mingw32-g++ -v 2>&1 | grep -i 'thread model' || true
+          x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a || true
+          echo "::endgroup::"
+          echo "::group::wine"
+          wine --version
+          echo "WINEARCH=$WINEARCH  WINEPREFIX=$WINEPREFIX"
+          echo "::endgroup::"
+          # Informational only, never fatal. libsndfile/libsamplerate for
+          # Windows are what stand between this job and cross-building
+          # tools/render.cpp (and, with freetype and glew, the GUI), so record
+          # on every run whether apt has grown them.
+          echo "::group::cross-built audio libs in apt (informational)"
+          apt-cache search --names-only 'mingw' | grep -iE 'sndfile|samplerate|freetype|glew' \
+            || echo "none packaged -- render.exe and the GUI still need a vendored sysroot"
+          echo "::endgroup::"
+
+      # Asserts that Makefile.mingw and the native Makefile still agree about
+      # which files make up engine_test and about the warning flags, and that
+      # every path either one references exists. Cheap, and it is the only
+      # thing stopping the two builds from silently testing different code.
+      - name: Verify source lists against the native Makefile
+        run: make -f Makefile.mingw verify-sources
+
+      - name: Show cross-build configuration
+        run: make -f Makefile.mingw config
+
+      # Builds engine_test.exe and compiles (never links) the two Win32 TUs.
+      - name: Cross-build
+        run: make -f Makefile.mingw -j"$(nproc)"
+
+      # Two properties worth asserting rather than assuming:
+      #
+      #  * SizeOfStackReserve. sizeof(lat::Engine) is ~2.35 MB and the tests put
+      #    one on the stack per test function; mingw's default PE reserve is
+      #    2 MB, so without -Wl,--stack the binary dies in the first test with a
+      #    bare access violation. Checking the header here means that failure
+      #    shows up as "the flag stopped working", not as a mystery crash.
+      #  * DLL imports. -static should leave only OS DLLs. If libstdc++-6.dll or
+      #    libwinpthread-1.dll appear, the .exe is not self-contained and the
+      #    artifact is useless to anyone who downloads it.
+      - name: Inspect the PE
+        run: |
+          set -euo pipefail
+          file build-mingw/engine_test.exe
+          echo "::group::headers"
+          x86_64-w64-mingw32-objdump -p build-mingw/engine_test.exe \
+            | grep -iE 'subsystem|stack|magic' || true
+          echo "::endgroup::"
+          echo "::group::imported DLLs"
+          x86_64-w64-mingw32-objdump -p build-mingw/engine_test.exe \
+            | grep -i 'DLL Name' | sort -u || true
+          echo "::endgroup::"
+          if x86_64-w64-mingw32-objdump -p build-mingw/engine_test.exe \
+               | grep -iE 'DLL Name.*(libstdc\+\+|libgcc_s|libwinpthread)'; then
+            echo "::error::engine_test.exe is not statically linked"
+            exit 1
+          fi
+          # objdump prints the field as bare hex. No strtonum(): the runners'
+          # /usr/bin/awk is mawk, which does not have it.
+          hex=$(x86_64-w64-mingw32-objdump -p build-mingw/engine_test.exe \
+            | awk '/SizeOfStackReserve/ { print $2; exit }')
+          if [ -z "$hex" ]; then
+            echo "::error::could not read SizeOfStackReserve from the PE header"
+            exit 1
+          fi
+          reserve=$((16#$hex))
+          echo "stack reserve: $reserve bytes (0x$hex)"
+          if [ "$reserve" -lt 4194304 ]; then
+            echo "::error::stack reserve $reserve is too small for sizeof(Engine); -Wl,--stack was dropped"
+            exit 1
+          fi
+
+      # Create the prefix in its own step so a wine bootstrap failure is not
+      # reported as a test failure. wineserver -w blocks until the background
+      # services have finished writing the prefix; without it the next step can
+      # race the registry being built.
+      - name: Initialise the wine prefix
+        run: |
+          set -euo pipefail
+          wineboot --init
+          wineserver -w
+          echo "prefix ready: $WINEPREFIX"
+
+      # The point of the whole job. Same binary, same assertions as the Linux
+      # suite, executed by Windows code. Three independent gates, because each
+      # catches something the others do not: the exit status (a failed CHECK),
+      # "0 failed" in the output (a test that reported failure but somehow
+      # exited 0), and a floor on the pass count (a run that died partway and
+      # never printed a summary at all -- which is exactly how the missing
+      # stack reserve manifested).
+      - name: Run the engine suite under wine
+        run: |
+          set -euo pipefail
+          wine ./build-mingw/engine_test.exe 2>wine-stderr.txt | tee engine_test-wine.txt
+          echo "::group::wine stderr"
+          cat wine-stderr.txt
+          echo "::endgroup::"
+
+          grep -q '0 failed' engine_test-wine.txt || {
+            echo "::error::the suite reported failures under wine"
+            exit 1
+          }
+          passed=$(sed -n 's/^\([0-9]\+\) passed.*/\1/p' engine_test-wine.txt)
+          echo "checks passed under wine: ${passed:-none}"
+          if [ "${passed:-0}" -lt 199 ]; then
+            echo "::error::expected at least 199 checks, got ${passed:-0} -- the run was truncated"
+            exit 1
+          fi
+          {
+            echo "### Engine suite under Wine"
+            echo ""
+            echo "\`$(wine --version)\` ran \`engine_test.exe\`: **${passed} checks passed, 0 failed**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # always(), because a .exe that failed under wine is the one you most want
+      # to download and poke at. Hence `warn` rather than `error`: on an early
+      # failure some of these paths legitimately do not exist yet, and the job
+      # has already reported the real problem.
+      - name: Upload Windows binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-windows-x64-headless
+          path: |
+            build-mingw/engine_test.exe
+            build-mingw/obj/src/ui/window_win32.o
+            build-mingw/obj/src/audio/backend_win32.o
+            engine_test-wine.txt
+          retention-days: 14
+          if-no-files-found: warn
