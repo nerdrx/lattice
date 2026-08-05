@@ -260,6 +260,19 @@ void App::releaseAllChains() {
 // thing in this file.
 void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
     const bool restoring = restore != nullptr;
+    // A recording pass in flight names a track, a slot and a clip uid in the
+    // session that is about to stop existing. Cancelled rather than finished:
+    // finishing would run the simplification over a vector that is one move
+    // away from being freed, and the points it has already written are part of
+    // the session going out -- which, if this is an undo, is the state being
+    // deliberately thrown away. The undo entry it took at its start is the one
+    // that describes it, and that is already on the stack.
+    autoRecCancel();
+    // "The engine gave up on this lane" is a fact about instances that are being
+    // retired and clips that are being replaced. Nothing in the incoming set has
+    // been published yet, so nothing in it can be inert.
+    inertAutos_.clear();
+    autoNoClipHint_ = false;
     // 1. Instances the incoming session names and this one is already running.
     //    Harvested before releaseAllChains, which would otherwise hand every
     //    instance to the retirement flow and destroy it. Anything NOT taken

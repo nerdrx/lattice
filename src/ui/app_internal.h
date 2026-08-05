@@ -10,6 +10,8 @@
 #include "app.h"
 #include <chrono>
 #include <string>
+#include <vector>
+#include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
@@ -96,5 +98,205 @@ inline bool icontains(const std::string& hay, const std::string& needle) {
         if (strncasecmp(hay.c_str() + i, needle.c_str(), needle.size()) == 0) return true;
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// Canonical parameter addresses — docs/PARAM-ADDRESS.md, docs/AUTOMATION.md §4.1
+//
+// The design puts this in src/core/address.{h,cpp} so that MIDI-learn, OSC and
+// the undo system can reach it too. It lives here for now because automation is
+// its first and only consumer and src/core is owned elsewhere this wave; the
+// names are inside `addr` precisely so a later src/core/address.h declaring
+// lat::parseAddress / lat::formatAddress can land beside it and this can be
+// deleted in one edit, with no collision in between.
+//
+//   address   := scope ( "/" segment )*
+//   scope     := "master" | "t:" UID | "s:" UID
+//   segment   := "vol" | "pan" | "mute" | "solo" | "arm" | "send:" INDEX
+//              | "dev:" UID "/p:" PARAMID
+//              | "clip:" UID "/" clipfield
+//
+// `send:` is the one addition AUTOMATION.md §4.1 asks for (indexed, because the
+// return buses are a fixed array). It is spelled as a Field of its own rather
+// than as the doc's reserved `sendIndex` on an otherwise fieldless address, so
+// that a switch over Field is exhaustive and a send can never be mistaken for a
+// scope-only address.
+//
+// format(parse(x)) == x for every well-formed x: the project format writes back
+// the string it was given, so a normalizing round trip would break byte-stable
+// save / load / save.
+// ---------------------------------------------------------------------------
+namespace addr {
+
+struct Parsed {
+    enum class Scope { Master, Track, Scene } scope = Scope::Master;
+    u64 scopeUid = 0;                 // track or scene uid; 0 for master
+    enum class Field {
+        None, Vol, Pan, Mute, Solo, Arm,
+        Send,                         // sendIndex
+        DeviceParam,                  // devUid + paramId
+        ClipField,                    // clipUid + clipField
+        SceneLaunch
+    } field = Field::None;
+    u64 devUid = 0;   u32 paramId = 0;
+    u64 clipUid = 0;  int clipField = 0;
+    int sendIndex = -1;
+};
+
+// Indexed by Parsed::clipField, and the order is the grammar's.
+inline const char* const kClipFields[] = {"gain", "prob", "follow", "followBeats", "warp", "loop"};
+inline constexpr int kClipFieldCount = 6;
+
+// Strict decimal u64: no sign, no space, no empty string, no overflow. A lenient
+// parse here would make two different texts mean the same address, which is the
+// one thing the round-trip property cannot survive.
+inline bool parseUid(const char* b, const char* e, u64& out) {
+    if (b == e) return false;
+    u64 v = 0;
+    for (const char* p = b; p != e; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        const u64 d = (u64)(*p - '0');
+        if (v > (~0ull - d) / 10ull) return false;
+        v = v * 10ull + d;
+    }
+    out = v;
+    return true;
+}
+
+// True on a well-formed address. False means malformed *structure* — the caller
+// treats that as "no lane" and, at load time, as a failed parse (§7.2); it never
+// means "names something that is not here", which is a resolution result and is
+// deliberately not this function's business.
+inline bool parse(const std::string& s, Parsed& out) {
+    out = Parsed{};
+    std::vector<std::string> seg;
+    for (size_t i = 0;;) {
+        const size_t j = s.find('/', i);
+        seg.push_back(s.substr(i, j == std::string::npos ? std::string::npos : j - i));
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+    for (const std::string& t : seg) if (t.empty()) return false;
+
+    const std::string& s0 = seg[0];
+    if (s0 == "master") {
+        out.scope = Parsed::Scope::Master;
+    } else if (s0.compare(0, 2, "t:") == 0) {
+        out.scope = Parsed::Scope::Track;
+        if (!parseUid(s0.data() + 2, s0.data() + s0.size(), out.scopeUid)) return false;
+    } else if (s0.compare(0, 2, "s:") == 0) {
+        out.scope = Parsed::Scope::Scene;
+        if (!parseUid(s0.data() + 2, s0.data() + s0.size(), out.scopeUid)) return false;
+    } else {
+        return false;
+    }
+
+    if (seg.size() == 2) {
+        const std::string& f = seg[1];
+        if      (f == "vol")  out.field = Parsed::Field::Vol;
+        else if (f == "pan")  out.field = Parsed::Field::Pan;
+        else if (f == "mute") out.field = Parsed::Field::Mute;
+        else if (f == "solo") out.field = Parsed::Field::Solo;
+        else if (f == "arm")  out.field = Parsed::Field::Arm;
+        else if (f == "launch" && out.scope == Parsed::Scope::Scene)
+            out.field = Parsed::Field::SceneLaunch;
+        else if (f.compare(0, 5, "send:") == 0) {
+            u64 v = 0;
+            if (!parseUid(f.data() + 5, f.data() + f.size(), v) || v > 63) return false;
+            out.field = Parsed::Field::Send;
+            out.sendIndex = (int)v;
+        } else return false;
+        return true;
+    }
+    if (seg.size() == 3) {
+        if (seg[1].compare(0, 4, "dev:") == 0 && seg[2].compare(0, 2, "p:") == 0) {
+            u64 pid = 0;
+            if (!parseUid(seg[1].data() + 4, seg[1].data() + seg[1].size(), out.devUid)) return false;
+            if (!parseUid(seg[2].data() + 2, seg[2].data() + seg[2].size(), pid)) return false;
+            if (pid > 0xffffffffull) return false;
+            out.field = Parsed::Field::DeviceParam;
+            out.paramId = (u32)pid;
+            return true;
+        }
+        if (seg[1].compare(0, 5, "clip:") == 0) {
+            if (!parseUid(seg[1].data() + 5, seg[1].data() + seg[1].size(), out.clipUid)) return false;
+            for (int k = 0; k < kClipFieldCount; ++k) {
+                if (seg[2] != kClipFields[k]) continue;
+                out.field = Parsed::Field::ClipField;
+                out.clipField = k;
+                return true;
+            }
+        }
+        return false;
+    }
+    // A scope on its own names no value, and four segments name nothing at all.
+    return false;
+}
+
+inline std::string format(const Parsed& p) {
+    char buf[48];
+    std::string s;
+    switch (p.scope) {
+    case Parsed::Scope::Master: s = "master"; break;
+    case Parsed::Scope::Track:
+        snprintf(buf, sizeof buf, "t:%llu", (unsigned long long)p.scopeUid); s = buf; break;
+    case Parsed::Scope::Scene:
+        snprintf(buf, sizeof buf, "s:%llu", (unsigned long long)p.scopeUid); s = buf; break;
+    }
+    switch (p.field) {
+    case Parsed::Field::None: break;               // parse() never produces one
+    case Parsed::Field::Vol:  s += "/vol";  break;
+    case Parsed::Field::Pan:  s += "/pan";  break;
+    case Parsed::Field::Mute: s += "/mute"; break;
+    case Parsed::Field::Solo: s += "/solo"; break;
+    case Parsed::Field::Arm:  s += "/arm";  break;
+    case Parsed::Field::SceneLaunch: s += "/launch"; break;
+    case Parsed::Field::Send:
+        snprintf(buf, sizeof buf, "/send:%d", p.sendIndex); s += buf; break;
+    case Parsed::Field::DeviceParam:
+        snprintf(buf, sizeof buf, "/dev:%llu/p:%u", (unsigned long long)p.devUid, p.paramId);
+        s += buf; break;
+    case Parsed::Field::ClipField:
+        snprintf(buf, sizeof buf, "/clip:%llu/", (unsigned long long)p.clipUid);
+        s += buf;
+        s += kClipFields[clampv(p.clipField, 0, kClipFieldCount - 1)];
+        break;
+    }
+    return s;
+}
+
+// The three an automation lane can actually name, spelled once so the editor,
+// the recorder and the self-test cannot disagree about a separator.
+inline std::string trackField(u64 trackUid, const char* field) {
+    Parsed p;
+    p.scope = Parsed::Scope::Track;
+    p.scopeUid = trackUid;
+    if      (!strcmp(field, "vol")) p.field = Parsed::Field::Vol;
+    else if (!strcmp(field, "pan")) p.field = Parsed::Field::Pan;
+    else if (!strcmp(field, "mute")) p.field = Parsed::Field::Mute;
+    else if (!strcmp(field, "solo")) p.field = Parsed::Field::Solo;
+    else                             p.field = Parsed::Field::Arm;
+    return format(p);
+}
+
+inline std::string trackSend(u64 trackUid, int idx) {
+    Parsed p;
+    p.scope = Parsed::Scope::Track;
+    p.scopeUid = trackUid;
+    p.field = Parsed::Field::Send;
+    p.sendIndex = idx;
+    return format(p);
+}
+
+inline std::string deviceParam(u64 trackUid, u64 devUid, u32 paramId) {
+    Parsed p;
+    p.scope = Parsed::Scope::Track;
+    p.scopeUid = trackUid;
+    p.field = Parsed::Field::DeviceParam;
+    p.devUid = devUid;
+    p.paramId = paramId;
+    return format(p);
+}
+
+} // namespace addr
 
 } // namespace lat

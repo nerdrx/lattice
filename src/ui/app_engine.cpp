@@ -10,6 +10,7 @@
 #include "../gfx/gl.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -50,6 +51,217 @@ void App::publishNotes(int track, int slot, const RtNote* fresh) {
     if (old && old != fresh) retiringNotes_.push_back(old);
 }
 
+// ---------------------------------------------------------------------------
+// automation: address resolution and publishing   (docs/AUTOMATION.md §4, §2.5)
+//
+// The model keeps a lane's address as TEXT and nothing else. Resolution to the
+// hot fields the engine switches on happens HERE, at publish time, and is thrown
+// away again on the next publish -- which is why §4.3's rule can afford to be
+// blunt ("whenever a track's chain is republished, republish the envelopes of
+// every clip on that track") instead of maintaining a dependency map with an
+// invalidation problem.
+//
+// An address that resolves to nothing publishes NO lane. It is not an error and
+// it is not repaired: PARAM-ADDRESS.md's "dangling addresses resolve to nothing
+// and must fail soft" is the same promise ClipModel::path makes for a missing
+// sample and DeviceModel::lostParams makes for a missing plugin. The clip plays,
+// the envelope is still in the file, and installing the plugin brings it back.
+// ---------------------------------------------------------------------------
+
+bool App::resolveAutoLane(int track, const std::string& address, RtAutoLane& out) const {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return false;
+    addr::Parsed p;
+    if (!addr::parse(address, p)) return false;
+
+    // Scope check (§4.2 step 2): a clip envelope may only automate its own
+    // track's mixer and its own track's devices. `master/...` and another
+    // track's address parse cleanly and resolve to nothing, which is exactly
+    // what the restriction is supposed to feel like from here.
+    const TrackModel& t = ses_.tracks[track];
+    if (p.scope != addr::Parsed::Scope::Track || p.scopeUid != t.uid) return false;
+
+    out = RtAutoLane{};
+    switch (p.field) {
+    case addr::Parsed::Field::Vol:
+        // The model stores the fader POSITION, not a gain (§2.3), so the
+        // mapping travels as data and the engine needs no table of which
+        // target means which curve.
+        out.target = (i32)AutoTarget::TrackVol;
+        out.xform  = (i32)AutoXform::Fader;
+        out.lo = 0.f; out.hi = 1.f;
+        return true;
+    case addr::Parsed::Field::Pan:
+        out.target = (i32)AutoTarget::TrackPan;
+        out.xform  = (i32)AutoXform::Direct;
+        out.lo = -1.f; out.hi = 1.f;
+        return true;
+    case addr::Parsed::Field::Send:
+        if (p.sendIndex < 0 || p.sendIndex >= kMaxReturns) return false;
+        out.target = (i32)AutoTarget::TrackSend;
+        out.index  = p.sendIndex;
+        out.xform  = (i32)AutoXform::Direct;
+        out.lo = 0.f; out.hi = 1.f;
+        return true;
+    case addr::Parsed::Field::DeviceParam: {
+        // Two lookups, and the second one is the one people get wrong. `devSlot`
+        // is the device's position in the PUBLISHED RtChain, which is not its
+        // index in `devices`: publishChain() skips every device whose instance is
+        // null (the plugin was missing when the set loaded) and stops at
+        // kMaxChainFx. This loop counts the same way, deliberately line for line,
+        // because a devSlot that disagrees with the chain automates the wrong
+        // plugin -- a silent, audible, untraceable wrong answer.
+        const DeviceModel* dev = nullptr;
+        int chainSlot = -1, n = 0;
+        for (const DeviceModel& d : t.devices) {
+            if (!d.inst) continue;                 // no instance -> no chain slot
+            if (n >= kMaxChainFx) break;
+            if (d.uid == p.devUid) { dev = &d; chainSlot = n; break; }
+            ++n;
+        }
+        if (!dev) return false;                    // deleted, or its plugin is gone
+        const int pc = dev->inst->paramCount();
+        int idx = -1;
+        for (int i = 0; i < pc; ++i)
+            if (dev->inst->paramInfo(i).id == p.paramId) { idx = i; break; }
+        if (idx < 0) return false;                 // the plugin renumbered its params
+        const ParamInfo& info = dev->inst->paramInfo(idx);
+        out.target  = (i32)AutoTarget::DeviceParam;
+        out.index   = idx;
+        out.devSlot = chainSlot;
+        out.xform   = (i32)AutoXform::Direct;
+        // The engine clamps to these, so a stale envelope cannot drive a
+        // parameter out of the range the plugin declares today. A backend that
+        // reports them the wrong way round would otherwise clamp everything to
+        // one value.
+        out.lo = std::min(info.min, info.max);
+        out.hi = std::max(info.min, info.max);
+        return true;
+    }
+    // Reserved by AutoTarget but not implemented: mute/solo/arm (TrackMute),
+    // clip fields (ClipGain), scene launch. They parse, and they publish
+    // nothing, which is the same fail-soft an unknown device gets.
+    case addr::Parsed::Field::Mute:
+    case addr::Parsed::Field::Solo:
+    case addr::Parsed::Field::Arm:
+    case addr::Parsed::Field::ClipField:
+    case addr::Parsed::Field::SceneLaunch:
+    case addr::Parsed::Field::None:
+    default:
+        return false;
+    }
+}
+
+// The points array starts immediately past the struct, so the struct's size has
+// to leave it aligned. It does on every ABI in the tree (RtAutoSet is 8-aligned
+// and a whole number of 8s long), and this says so out loud rather than leaving
+// it to be discovered by a bus error on the first machine where it is not.
+static_assert(sizeof(RtAutoSet) % alignof(RtAutoPoint) == 0,
+              "RtAutoPoint[] follows RtAutoSet inside one allocation");
+
+const RtAutoSet* App::buildAutos(int track, int slot) {
+    const ClipModel& m = ses_.tracks[track].slots[slot];
+    if (!m.valid() || m.envelopes.empty()) return nullptr;
+
+    // Resolve first, allocate second: the number of lanes that survive
+    // resolution is what decides whether there is anything to allocate at all.
+    RtAutoLane lanes[kMaxRtAutoLanes];
+    i32 modelLane[kMaxRtAutoLanes];
+    int laneCount = 0, pointCount = 0;
+    for (size_t i = 0; i < m.envelopes.size() && laneCount < kMaxRtAutoLanes; ++i) {
+        const AutoLane& L = m.envelopes[i];
+        // A deactivated lane and an empty one are both UI state rather than
+        // content: neither has anything to apply, and an empty lane evaluates to
+        // the fallback anyway (§2.4), so publishing one buys nothing.
+        if (!L.enabled || L.points.empty()) continue;
+        RtAutoLane rl;
+        if (!resolveAutoLane(track, L.address, rl)) continue;
+        int n = (int)L.points.size();
+        if (pointCount + n > kMaxClipAutoPoints) {
+            n = kMaxClipAutoPoints - pointCount;
+            LOGW("clip '%s' has more than %d automation points - the tail of '%s' "
+                 "will not be applied", m.name.c_str(), kMaxClipAutoPoints, L.address.c_str());
+        }
+        if (n <= 0) break;
+        rl.first = pointCount;
+        rl.count = n;
+        rl.flags = 0;
+        lanes[laneCount] = rl;
+        modelLane[laneCount] = (i32)i;
+        ++laneCount;
+        pointCount += n;
+    }
+    if (laneCount == 0) return nullptr;
+
+    // ONE allocation. Two -- a lane array and a point array -- would need two
+    // retirement events, or a rule about which one implies the other; the RtNote
+    // protocol is only simple because there is exactly one pointer per slot.
+    const size_t bytes = sizeof(RtAutoSet) + (size_t)pointCount * sizeof(RtAutoPoint);
+    char* mem = new (std::nothrow) char[bytes];
+    if (!mem) {
+        status_ = "Out of memory - automation not updated";
+        return nullptr;
+    }
+    RtAutoSet* set = new (mem) RtAutoSet();
+    RtAutoPoint* pts = (RtAutoPoint*)(mem + sizeof(RtAutoSet));
+
+    int w = 0;
+    for (int l = 0; l < laneCount; ++l) {
+        const AutoLane& L = m.envelopes[modelLane[l]];
+        for (int k = 0; k < lanes[l].count; ++k) {
+            const AutoPoint& src = L.points[(size_t)k];
+            // Copied in MODEL ORDER, not sorted (§4.2 step 5): the editor and the
+            // recorder hold the sorted invariant, and the publisher preserving
+            // what it is given is the same rule the file format follows, so a
+            // hand-shuffled file evaluates to something ugly rather than to
+            // something undefined. Non-finite values are the one thing replaced,
+            // because a NaN beat is not ugly, it is a hang in a linear scan.
+            pts[w].beat  = std::isfinite(src.beat) ? std::max(0.0, src.beat) : 0.0;
+            pts[w].value = std::isfinite(src.value) ? src.value : 0.f;
+            pts[w].curve = src.curve;
+            ++w;
+        }
+        set->lanes[l] = lanes[l];
+    }
+    set->points     = pts;
+    set->laneCount  = laneCount;
+    set->pointCount = pointCount;
+
+    AutoBlock b;
+    b.mem = mem;
+    b.set = set;
+    b.clipUid = m.uid;
+    b.modelLane.assign(modelLane, modelLane + laneCount);
+    autoBlocks_.v.push_back(std::move(b));
+    return set;
+}
+
+void App::dropAutos(const RtAutoSet* set) {
+    if (!set) return;
+    for (size_t i = 0; i < autoBlocks_.v.size(); ++i) {
+        if (autoBlocks_.v[i].set != set) continue;
+        delete[] autoBlocks_.v[i].mem;
+        autoBlocks_.v.erase(autoBlocks_.v.begin() + (long)i);
+        return;
+    }
+    LOGW("dropAutos for an unknown set %p - leaking it rather than freeing a "
+         "pointer we do not own", (const void*)set);
+}
+
+void App::publishAutos(int track, int slot, const RtAutoSet* fresh) {
+    const RtAutoSet* old = publishedAutos_[track][slot];
+    publishedAutos_[track][slot] = fresh;
+    // Verbatim publishNotes: the engine only announces a *replaced* set, and only
+    // when it differs from the incoming one, so an entry that would never be
+    // announced must not be queued for a retirement that will never arrive.
+    if (old && old != fresh) retiringAutos_.push_back(old);
+}
+
+bool App::autoLaneInert(u64 clipUid, const std::string& address) const {
+    for (const InertAuto& a : inertAutos_)
+        if (a.clipUid == clipUid && a.address == address) return true;
+    return false;
+}
+
 void App::pushClip(int track, int slot) {
     Command c;
     c.type = Cmd::SetClip;
@@ -72,14 +284,24 @@ void App::pushClip(int track, int slot) {
         }
     }
 
+    // The envelopes, resolved and flattened into their one allocation. Same
+    // timing as the notes and for the same reason: the engine reads the set for
+    // as long as it holds the clip, so it cannot be the GUI's live vectors, and
+    // it has to exist before anything is sent. Returns null for a clip with no
+    // publishable lane, which is the ordinary case.
+    const RtAutoSet* autos = buildAutos(track, slot);
+
     if (!m.valid()) {
         c.type = Cmd::ClearClip;
         if (!engine_.pushCommand(c)) {
             LOGW("command ring full - slot %d/%d not cleared", track, slot);
+            dropAutos(autos);
             return;
         }
-        // A cleared MIDI slot retires its notes exactly like a replaced one.
+        // A cleared MIDI slot retires its notes exactly like a replaced one, and
+        // its envelopes with them.
         publishNotes(track, slot, nullptr);
+        publishAutos(track, slot, nullptr);
         clipLive_[track][slot] = false;
         return;
     }
@@ -105,18 +327,23 @@ void App::pushClip(int track, int slot) {
     rc.prob         = m.prob;
     rc.followAction = (int)m.followAction;
     rc.followBeats  = m.followBeats;
+    // Envelopes are not gated on clip kind: an audio clip's lane is a wave-8 UI
+    // change and not a format or protocol one, so the plumbing carries it now.
+    rc.autos        = autos;
     rc.valid        = true;
     c.clip = rc;
     if (!engine_.pushCommand(c)) {
-        // The engine never saw the array, so it is still solely ours and the
-        // slot keeps whatever it was already playing.
+        // The engine never saw either allocation, so both are still solely ours
+        // and the slot keeps whatever it was already playing.
         LOGW("command ring full - slot %d/%d not updated", track, slot);
         delete[] fresh;
+        dropAutos(autos);
         return;
     }
     // Unconditional, not only for MIDI clips: a slot that just turned into an
     // audio clip still has an old note array to hand back.
     publishNotes(track, slot, fresh);
+    publishAutos(track, slot, autos);
     clipLive_[track][slot] = true;
 }
 
@@ -162,7 +389,7 @@ void App::releaseStaleSlots() {
     for (int t = 0; t < kMaxTracks; ++t) {
         for (int s = 0; s < kMaxScenes; ++s) {
             if (t < nt && s < ns) continue;
-            if (!clipLive_[t][s] && !publishedNotes_[t][s]) continue;
+            if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s]) continue;
             Command c;
             c.type = Cmd::ClearClip;
             c.a = t; c.b = s;
@@ -174,11 +401,21 @@ void App::releaseStaleSlots() {
             }
             clipLive_[t][s] = false;
             publishNotes(t, s, nullptr);
+            publishAutos(t, s, nullptr);
         }
     }
 }
 
 void App::pumpEngineEvents() {
+    // A recording pass ends when the thing driving it lets go. Ui::endFrame()
+    // drops `active` on mouse-up, so by the time this runs -- first thing in the
+    // next frame() -- the gesture that owned the pass is already gone, and this
+    // is the earliest moment the simplification can run. A pass started with an
+    // explicit gesture id (the self-test) is ended the same way; nothing here
+    // runs during a synchronous test, which is why that pass survives to be
+    // ended by hand.
+    if (autoRec_.active() && autoRec_.gesture != ui_.active) autoRecFinish();
+
     Event e;
     while (engine_.popEvent(e)) {
         if (e.type == Ev::ChainRetired) {
@@ -242,6 +479,57 @@ void App::pumpEngineEvents() {
             retiringNotes_.erase(it);
             continue;
         }
+        if (e.type == Ev::AutosRetired) {
+            // The audio thread has stopped reading this set. Third instance of
+            // the same handshake (chains, note arrays, now envelopes) and the
+            // same refusal to free a pointer we have no record of owning.
+            //
+            // The free is `delete[]` on the char[] the set was placement-new'd
+            // into -- see AutoBlock in app.h and buildAutos above, which is the
+            // other half of this bargain: one allocation, one pointer, one
+            // delete[], and the RtAutoPoint array inside the same block.
+            const RtAutoSet* old = (const RtAutoSet*)e.p;
+            if (!old) continue;
+            auto it = retiringAutos_.begin();
+            for (; it != retiringAutos_.end(); ++it) if (*it == old) break;
+            if (it == retiringAutos_.end()) {
+                LOGW("AutosRetired for an unknown set %p - leaking it rather than "
+                     "freeing a pointer we do not own", (const void*)old);
+                continue;
+            }
+            retiringAutos_.erase(it);
+            dropAutos(old);
+            continue;
+        }
+        if (e.type == Ev::AutoLaneInert) {
+            // §3.4: the backend behind this lane has no realtime parameter path,
+            // so the engine has given up on it and will not call again for this
+            // published set. A silently ignored lane would be the worst of both
+            // worlds -- the envelope is drawn, the sound does not move, nothing
+            // says why -- so it is recorded here and the editor greys it.
+            //
+            // `x` is the lane's index in the PUBLISHED array, which is not its
+            // index in ClipModel::envelopes: a lane that resolved to nothing was
+            // never published. AutoBlock::modelLane is the map, kept for exactly
+            // this one question.
+            const int t = e.a, s = e.b, li = (int)e.x;
+            if (t < 0 || t >= kMaxTracks || s < 0 || s >= kMaxScenes) continue;
+            const RtAutoSet* set = publishedAutos_[t][s];
+            if (!set) continue;
+            const AutoBlock* blk = nullptr;
+            for (const AutoBlock& b : autoBlocks_.v) if (b.set == set) { blk = &b; break; }
+            if (!blk || li < 0 || li >= (int)blk->modelLane.size()) continue;
+            if (t >= (int)ses_.tracks.size() || s >= (int)ses_.scenes.size()) continue;
+            const ClipModel& m = ses_.tracks[t].slots[s];
+            if (m.uid != blk->clipUid) continue;          // the slot moved on
+            const int mi = blk->modelLane[(size_t)li];
+            if (mi < 0 || mi >= (int)m.envelopes.size()) continue;
+            const std::string& address = m.envelopes[(size_t)mi].address;
+            if (autoLaneInert(m.uid, address)) continue;  // said once, not per set
+            inertAutos_.push_back(InertAuto{m.uid, address});
+            status_ = "Automation inert: " + address + " has no realtime path";
+            continue;
+        }
         // Everything else is reserved for undo hooks; the UI polls atomics for
         // transport and clip state.
     }
@@ -255,6 +543,10 @@ void App::setTempo(f64 bpm) {
 
 void App::togglePlay() {
     const bool p = engine_.playing.load();
+    // A recording pass is a statement about beats that are about to stop
+    // advancing, so it ends here rather than being left open across the stop and
+    // resumed against a beat several bars away.
+    if (p) autoRecFinish();
     send(Cmd::SetPlaying, p ? 0 : 1);
     status_ = p ? "Stopped" : "Playing";
 }
@@ -527,5 +819,253 @@ void App::finishMidiRecording(const Event& e) {
     pendingRecs_.erase(it);
 }
 
+// ---------------------------------------------------------------------------
+// automation recording   (docs/AUTOMATION.md §5)
+//
+// While Automation Arm is lit and the transport is playing, a gesture on an
+// automatable control writes into the envelope of the clip playing on that
+// control's track. The controls themselves are elsewhere (the mixer strip, the
+// device parameter grid); all they do is call autoCapture() with the address
+// they represent and the value they just wrote into the model. Everything that
+// is actually subtle -- which clip, which beat, how many points, what a second
+// pass over the same span means, and how it all folds into one undo entry --
+// is decided here, once.
+// ---------------------------------------------------------------------------
+
+// The value resolution below which two samples of a gesture are the same
+// gesture: 1/1024 of the target's range, which is finer than any control the UI
+// draws. It is both the online threshold and the Douglas-Peucker tolerance, and
+// deliberately the same number for both -- a point the first stage thought worth
+// keeping and the second thought worth dropping would be a contradiction.
+static constexpr f32 kAutoValueEpsFrac = 1.f / 1024.f;
+// The longest a pass may go without writing anything down. It is not there to
+// capture the shape -- a held control has no shape -- it is there so that punch
+// (§5.3) has a span to erase: holding a knob still for two laps must leave a
+// flat envelope, and it only can if the pass keeps stating where it has been.
+static constexpr f64 kAutoMinSpacing = 1.0 / 64.0;
+
+// Douglas-Peucker over p[a..b] inclusive, measuring the vertical distance from
+// the chord (beat is the x axis, value the y). Marks the points worth keeping.
+// A linear fade -- the single most common automation gesture there is --
+// collapses to its two endpoints, and so does a held control.
+static void autoDouglasPeucker(const std::vector<AutoPoint>& p, int a, int b,
+                               f32 tol, std::vector<char>& keep) {
+    if (b <= a + 1) return;
+    const f64 x0 = p[(size_t)a].beat, x1 = p[(size_t)b].beat;
+    const f64 y0 = p[(size_t)a].value, y1 = p[(size_t)b].value;
+    const f64 dx = x1 - x0;
+    f64 worst = -1.0;
+    int wi = -1;
+    for (int i = a + 1; i < b; ++i) {
+        const f64 t = dx > 1e-12 ? (p[(size_t)i].beat - x0) / dx : 0.0;
+        const f64 d = std::fabs((f64)p[(size_t)i].value - (y0 + (y1 - y0) * t));
+        if (d > worst) { worst = d; wi = i; }
+    }
+    if (wi < 0 || worst <= (f64)tol) return;
+    keep[(size_t)wi] = 1;
+    autoDouglasPeucker(p, a, wi, tol, keep);
+    autoDouglasPeucker(p, wi, b, tol, keep);
+}
+
+void App::toggleAutoArm() {
+    autoArm_ = !autoArm_;
+    if (!autoArm_) autoRecFinish();
+    autoNoClipHint_ = false;
+    status_ = autoArm_ ? "Automation arm on - move a control while a clip plays"
+                       : "Automation arm off";
+}
+
+void App::autoCapture(const std::string& address, f32 value, u64 gesture) {
+    if (!autoArm_ || !engine_.playing.load()) return;
+
+    // Which track: the address says so. Resolving it here as well as at publish
+    // time is not duplication -- it is the same question ("does this name
+    // anything today?") asked at the moment the answer decides whether there is
+    // anything to record onto, and it is what supplies the range the epsilon is
+    // a fraction of.
+    addr::Parsed p;
+    if (!addr::parse(address, p) || p.scope != addr::Parsed::Scope::Track) return;
+    int track = -1;
+    for (size_t i = 0; i < ses_.tracks.size(); ++i)
+        if (ses_.tracks[i].uid == p.scopeUid) { track = (int)i; break; }
+    if (track < 0) return;
+    RtAutoLane resolved;
+    if (!resolveAutoLane(track, address, resolved)) return;
+
+    // Which clip: the one playing on that track, and only while it is actually
+    // playing (§5.1). Queued, stopping and stopped all mean there is no
+    // clip-relative beat to stamp against.
+    const int slot = engine_.activeSlot[track].load();
+    if (slot < 0 || slot >= (int)ses_.scenes.size() ||
+        engine_.slotState[track].load() != (int)SlotState::Playing) {
+        // Latched, like kbdNoArmHint_: the state holds until the user launches
+        // something, and saying it every frame of a fader drag would bury the
+        // rest of the status bar.
+        if (!autoNoClipHint_) {
+            autoNoClipHint_ = true;
+            status_ = "Automation arm: no clip playing on " + ses_.tracks[track].name;
+        }
+        return;
+    }
+    autoNoClipHint_ = false;
+
+    ClipModel& m = ses_.tracks[track].slots[slot];
+    if (!m.valid()) return;
+    const f64 len = m.lengthBeats > 0.0 ? m.lengthBeats : 4.0;
+    // The same number §3.1 evaluates the envelope against, which is the whole
+    // point of stamping from clipPhase rather than from a GUI-side clock: the
+    // round trip through the atomic costs one block, and one block is well under
+    // a tenth of the shortest deliberate gesture a hand makes.
+    const f64 beat = clampv(engine_.clipPhase[track].load(), 0.0, 1.0) * len;
+
+    // The gesture a pass is keyed on. A widget owns ui_.active for the whole of
+    // a drag, which is exactly the span a pass should be. A caller with no widget
+    // behind it (a key, a test) gets a sentinel instead of 0, because a pass
+    // keyed on 0 could never be told apart from "no widget owns the mouse" and
+    // would therefore never be ended by the tick in pumpEngineEvents.
+    static const u64 kAutoRecGesture = uiId(UiArrowGesture, 0, 7);
+    const u64 g = gesture ? gesture : (ui_.active ? ui_.active : kAutoRecGesture);
+
+    // --- start of a pass ---------------------------------------------------
+    if (!autoRec_.active() || autoRec_.gesture != g || autoRec_.track != track ||
+        autoRec_.slot != slot || autoRec_.clipUid != m.uid || autoRec_.address != address) {
+        autoRecFinish();                       // whatever was running is over
+
+        // §5.4: ONE undo entry for the whole pass, taken before the envelope
+        // moves. The widget that called us has already taken its own entry for
+        // the same gesture (undoPointWith, with the pre-edit model value), so
+        // this coalesces into it and the pass costs one snapshot -- containing
+        // the envelope as it was, which is what "undo the recording" has to
+        // mean. A caller that took no entry gets one here instead.
+        const std::string what = "automation: " + address;
+        undoPoint(what.c_str(), g);
+
+        int lane = -1;
+        for (size_t i = 0; i < m.envelopes.size(); ++i)
+            if (m.envelopes[i].address == address) { lane = (int)i; break; }
+        if (lane < 0) {
+            if ((int)m.envelopes.size() >= kMaxClipLanes) {
+                status_ = "Clip already has " + std::to_string(kMaxClipLanes) + " envelopes";
+                return;
+            }
+            AutoLane fresh;
+            fresh.address = address;
+            m.envelopes.push_back(std::move(fresh));
+            lane = (int)m.envelopes.size() - 1;
+        }
+        autoRec_ = AutoRec{};
+        autoRec_.gesture = g;
+        autoRec_.track = track;
+        autoRec_.slot = slot;
+        autoRec_.clipUid = m.uid;
+        autoRec_.address = address;
+        autoRec_.lane = lane;
+        autoRec_.lo = resolved.lo;
+        autoRec_.hi = resolved.hi;
+    }
+
+    AutoLane& L = m.envelopes[(size_t)autoRec_.lane];
+    L.enabled = true;                          // recording into it re-enables it
+    const f32 eps = std::max(1e-7f, (autoRec_.hi - autoRec_.lo) * kAutoValueEpsFrac);
+    const bool first = autoRec_.lastBeat < 0.0;
+    const bool wrapped = !first && beat < autoRec_.lastBeat;
+
+    // --- stage one of the thinning (§5.2) ----------------------------------
+    if (!first && !wrapped &&
+        std::fabs(value - autoRec_.lastValue) <= eps &&
+        (beat - autoRec_.lastBeat) <= kAutoMinSpacing) return;
+
+    // --- punch (§5.3) ------------------------------------------------------
+    // A pass REPLACES the envelope over the beat span it covered: everything in
+    // (lastAppendBeat, beat] goes before the new point is inserted. The first
+    // append of a gesture erases nothing -- there is no previous append to span
+    // from -- so a gesture that starts mid-envelope leaves the material before it
+    // intact and produces a step at its start, exactly as Live does.
+    //
+    // Erasing only ever touches points AFTER this pass's own, because ours all
+    // sit at or before lastBeat and the vector is sorted; the span indices below
+    // therefore survive it. A wrap is the one case where that is not true, so
+    // the span is closed there and a new one begins on the far side.
+    if (!first) {
+        const auto inPunch = [&](const AutoPoint& q) {
+            return wrapped ? (q.beat > autoRec_.lastBeat || q.beat <= beat)
+                           : (q.beat > autoRec_.lastBeat && q.beat <= beat);
+        };
+        // The point at `beat` itself is replaced rather than duplicated, which is
+        // also what keeps beats unique.
+        L.points.erase(std::remove_if(L.points.begin(), L.points.end(), inPunch),
+                       L.points.end());
+        if (wrapped) { autoRec_.spanFirst = -1; autoRec_.spanCount = 0; }
+    } else {
+        for (size_t i = 0; i < L.points.size(); ++i) {
+            if (std::fabs(L.points[i].beat - beat) >= 1e-9) continue;
+            L.points.erase(L.points.begin() + (long)i);
+            break;
+        }
+    }
+
+    // Total points across the clip, which is the bound the wire form declares.
+    // A ceiling a human cannot reach by hand and a recording pass only reaches
+    // if the thinning has failed, so hitting it is a bug report rather than a
+    // limitation (§2.1) -- but it is still a ceiling, and the pass stops writing
+    // at it rather than growing an array the engine will not accept.
+    size_t total = 0;
+    for (const AutoLane& q : m.envelopes) total += q.points.size();
+    if (total >= (size_t)kMaxClipAutoPoints) {
+        status_ = "Clip is at its automation point limit";
+        return;
+    }
+
+    // Insert in beat order. After the punch above this is always the position
+    // immediately past the pass's last point, so the span stays contiguous.
+    size_t at = L.points.size();
+    for (size_t i = 0; i < L.points.size(); ++i)
+        if (L.points[i].beat > beat) { at = i; break; }
+    AutoPoint np;
+    np.beat = beat;
+    np.value = clampv(value, autoRec_.lo, autoRec_.hi);
+    L.points.insert(L.points.begin() + (long)at, np);
+
+    if (autoRec_.spanFirst < 0) { autoRec_.spanFirst = (int)at; autoRec_.spanCount = 1; }
+    else                          ++autoRec_.spanCount;
+    autoRec_.lastBeat = beat;
+    autoRec_.lastValue = np.value;
+
+    // The engine is playing this clip, so the new point has to reach it now --
+    // and a republish is also §4.3's "any recorded point" re-resolution trigger.
+    pushClip(track, slot);
+}
+
+void App::autoRecFinish() {
+    if (!autoRec_.active()) { autoRec_ = AutoRec{}; return; }
+    const int track = autoRec_.track, slot = autoRec_.slot;
+    const int spanFirst = autoRec_.spanFirst, spanCount = autoRec_.spanCount;
+    const f32 tol = std::max(1e-7f, (autoRec_.hi - autoRec_.lo) * kAutoValueEpsFrac);
+    const int lane = autoRec_.lane;
+    const u64 clipUid = autoRec_.clipUid;
+    autoRec_ = AutoRec{};                      // cleared first: nothing below re-enters
+
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
+    ClipModel& m = ses_.tracks[track].slots[slot];
+    if (m.uid != clipUid || lane < 0 || lane >= (int)m.envelopes.size()) return;
+    std::vector<AutoPoint>& pts = m.envelopes[(size_t)lane].points;
+    if (spanCount < 3 || spanFirst < 0 || spanFirst + spanCount > (int)pts.size()) return;
+
+    // Stage two (§5.2): only the span THIS pass wrote is simplified. Points that
+    // were already in the lane are never touched by a pass that did not cross
+    // them, which is what makes a punch a local edit rather than a rewrite.
+    const int a = spanFirst, b = spanFirst + spanCount - 1;
+    std::vector<char> keep(pts.size(), 0);
+    keep[(size_t)a] = keep[(size_t)b] = 1;
+    autoDouglasPeucker(pts, a, b, tol, keep);
+    std::vector<AutoPoint> out;
+    out.reserve(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i)
+        if ((int)i < a || (int)i > b || keep[i]) out.push_back(pts[i]);
+    if (out.size() == pts.size()) return;      // nothing to collapse, nothing to push
+    pts.swap(out);
+    pushClip(track, slot);
+}
 
 } // namespace lat

@@ -22,6 +22,9 @@ namespace lat {
 // first. App therefore holds it behind a unique_ptr and defines its destructor
 // out of line, in the one .cpp that has both definitions.
 class PianoRoll;
+// Same reason, and the roll's other argument: the plain view of what a clip's
+// envelopes may name (pianoroll.h). Only ever passed by reference from here.
+struct AutoTargets;
 
 class App {
 public:
@@ -456,6 +459,150 @@ private:
     // a screenshot cannot check -- so it is driven from here instead, against
     // whatever set was loaded, with a live engine and real plugins.
     void debugUndoSelfTest();
+
+    // =======================================================================
+    // AUTOMATION: publish / retire / record   (docs/AUTOMATION.md §2.5, §4, §5)
+    //
+    // One block, appended whole, so it can be moved or merged in one piece.
+    // Everything here is GUI thread. The editor half of the feature (the lane
+    // view, the chooser, the override affordances) owns no state in here.
+    // =======================================================================
+
+    // One published automation set: the single allocation it lives in, the clip
+    // it was built for, and the published-lane -> model-lane map.
+    //
+    // The allocation is a char[] holding a placement-new'd RtAutoSet followed by
+    // its RtAutoPoint array, exactly as §2.2 specifies: `points` addresses memory
+    // inside the same block, so the whole set is one new[] and one delete[] and
+    // the retirement protocol has exactly one pointer to talk about. The reaper
+    // in pumpEngineEvents() and the publisher in buildAutos() are the two halves
+    // of that bargain and sit next to each other in app_engine.cpp.
+    //
+    // `modelLane` exists only to answer Ev::AutoLaneInert, which addresses a lane
+    // by its index in the *published* array — which is not its index in
+    // ClipModel::envelopes, because a lane that resolves to nothing publishes no
+    // lane at all.
+    struct AutoBlock {
+        char* mem = nullptr;
+        const RtAutoSet* set = nullptr;
+        u64 clipUid = 0;
+        std::vector<i32> modelLane;
+    };
+    // Owns every automation allocation that is still alive: the ones the engine
+    // currently holds, and the ones waiting for their Ev::AutosRetired. Freed by
+    // this destructor rather than by a line in shutdown() because App is
+    // destroyed after shutdown() has joined the audio thread, which is the same
+    // moment shutdown() frees the note arrays and for the same reason — and
+    // because a destructor cannot be forgotten by a later edit to shutdown().
+    struct AutoBlocks {
+        std::vector<AutoBlock> v;
+        AutoBlocks() = default;
+        AutoBlocks(const AutoBlocks&) = delete;
+        AutoBlocks& operator=(const AutoBlocks&) = delete;
+        ~AutoBlocks() { for (AutoBlock& b : v) delete[] b.mem; }
+    };
+    AutoBlocks autoBlocks_;
+    // Exactly the RtNote protocol (publishedNotes_/retiringNotes_ above): the
+    // set the engine holds for a slot, and the ones it has displaced and not yet
+    // announced. An entry is freed when its Ev::AutosRetired arrives and never on
+    // any other path while the audio thread runs — an envelope can be edited, and
+    // recorded into, while its clip is playing.
+    const RtAutoSet* publishedAutos_[kMaxTracks][kMaxScenes] = {};
+    std::vector<const RtAutoSet*> retiringAutos_;
+
+    // Lanes the engine gave up on (§3.4: the backend has no realtime parameter
+    // path). Runtime only — not serialized, not in the undo snapshot, cleared
+    // when the session is replaced. Keyed by (clip uid, address) rather than by
+    // a flag on AutoLane because session.h is the model the project format
+    // writes, and "the engine refused this today" is not something a file says.
+    struct InertAuto { u64 clipUid = 0; std::string address; };
+    std::vector<InertAuto> inertAutos_;
+
+    // Automation Arm (§5.1). Live's latching control: while it is lit and the
+    // transport is playing, a gesture on an automatable control writes into the
+    // envelope of the clip playing on that control's track. The control-bar
+    // button that toggles it lives in app_chrome.cpp; this is the state it
+    // toggles and the gate every capture consults.
+    //
+    // Not to be confused with autoArmed_ above, which is the exclusive
+    // record-arm that follows the selection. Different feature, unlucky names.
+    bool autoArm_ = false;
+    // Latched "there is nothing playing to record into", exactly like
+    // kbdNoArmHint_: the state holds until the user does something about it, and
+    // re-saying it every frame would bury everything else.
+    bool autoNoClipHint_ = false;
+
+    // The recording pass in flight. One pass = one continuous gesture on one
+    // control = one undo entry (§5.4) and one Douglas-Peucker span (§5.2).
+    struct AutoRec {
+        u64  gesture = 0;             // ui_.active at the start; 0 = no pass
+        int  track = -1, slot = -1;
+        u64  clipUid = 0;             // the clip the pass is writing into
+        std::string address;
+        int  lane = -1;               // index into ClipModel::envelopes
+        f64  lastBeat = -1.0;         // beat of the last append; <0 = none yet
+        f32  lastValue = 0.f;
+        int  spanFirst = -1;          // this pass's first point, for the DP pass
+        int  spanCount = 0;
+        f32  lo = 0.f, hi = 1.f;      // the target's range, which sets the epsilon
+        bool active() const { return lane >= 0; }
+    };
+    AutoRec autoRec_;
+
+    // Publish-time resolution (§4.2). Fills the hot fields of `out` — target,
+    // index, devSlot, xform, lo, hi — from the lane's TEXT address. False means
+    // the address names nothing on this track *today*: malformed, another
+    // track's, a deleted device, a plugin that is not loaded, a parameter id the
+    // plugin no longer has, or a field with no AutoTarget yet. The lane is then
+    // simply not published; the model keeps its text and the clip still works.
+    bool resolveAutoLane(int track, const std::string& address, RtAutoLane& out) const;
+    // Builds the one allocation for a slot's envelopes and registers it in
+    // autoBlocks_. Null when the clip publishes no lanes at all.
+    const RtAutoSet* buildAutos(int track, int slot);
+    // Undoes buildAutos when the command that would have carried the set never
+    // reached the engine, so nothing ever borrowed it.
+    void dropAutos(const RtAutoSet* set);
+    // Hands `fresh` (which may be null) to publishedAutos_[track][slot] and moves
+    // whatever was there into retiringAutos_. The RtNote protocol verbatim; only
+    // called once the engine has accepted the clip carrying `fresh`.
+    void publishAutos(int track, int slot, const RtAutoSet* fresh);
+    // True while the engine has told us this lane has no realtime path.
+    bool autoLaneInert(u64 clipUid, const std::string& address) const;
+
+    void toggleAutoArm();
+    // THE CAPTURE API. Called by the widgets that own automatable controls —
+    // they live in app_session.cpp and app_devices.cpp, which this half does not
+    // own; see the report for the exact call sites. `value` is in the target's
+    // own units (§2.3), i.e. whatever the widget just wrote into the model.
+    // Everything else — whether a pass is running, which clip is playing, which
+    // beat, thinning, punch, the undo point — is decided here.
+    void autoCapture(const std::string& address, f32 value, u64 gesture = 0);
+    // Ends the pass in flight: runs the Douglas-Peucker simplification over the
+    // span it wrote and republishes. Called when the gesture lets go, when the
+    // transport stops and when the arm is switched off.
+    void autoRecFinish();
+    // Drops the pass without touching the model. For the paths where the model
+    // it was writing into has already gone (adoptSession).
+    void autoRecCancel() { autoRec_ = AutoRec{}; }
+
+    // === automation UI (wave 7d, the EDITOR half) — APPEND-ONLY BLOCK ======
+    // The lane view owns almost no App state: the arm flag, the capture entry
+    // point, the inert list and the address spellings all live in the publish /
+    // record block above, and this half calls into them. What is left is the
+    // one thing only the editor needs — the plain view of what a clip may
+    // automate, handed to PianoRoll each frame (docs/AUTOMATION.md §6.5) — and
+    // the headless hook that stands in for a mouse nothing can drive.
+    //
+    // Declared against a forward-declared AutoTargets: pianoroll.h includes
+    // THIS header, so it cannot be included from here; the definition, in
+    // app_detail.cpp, sees the complete type.
+    void buildAutoTargets(int track, const ClipModel& clip, AutoTargets& out) const;
+    // Headless verification hook (NXTAKT_DEBUG_AUTOLANE), in the shape of the
+    // NXTAKT_DEBUG_ADDFX one: nothing can click a selector inside gamescope, so
+    // the first CLIP-tab frame seeds the selected clip with an envelope and
+    // puts the lane on it. Once per run, and only when the variable is set.
+    bool autoDebugSeeded_ = false;
+    // === end automation UI block ============================================
 
     // per-frame UI feedback
     std::string status_;

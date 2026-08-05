@@ -306,6 +306,50 @@ void App::debugUndoSelfTest() {
         LOGW("undo self-test: no MIDI clip in this set - notes not exercised");
     }
 
+    // A clip envelope. Nothing here is new undo machinery and that is the point
+    // (AUTOMATION.md §5.4): the envelope lives in ClipModel, ClipModel is what
+    // the project writer serializes, and an undo entry IS the project text -- so
+    // if the writer carries envelopes, this round-trips with no snapshot change
+    // at all, and if it does not, `step` says the edit changed nothing and the
+    // lane has to be taken back by hand. Either outcome is informative; only the
+    // first is a pass.
+    {
+        int et = -1, esl = -1;
+        for (int t = 0; t < (int)ses_.tracks.size() && et < 0; ++t)
+            for (int s = 0; s < (int)ses_.scenes.size(); ++s)
+                if (ses_.tracks[t].slots[s].valid()) { et = t; esl = s; break; }
+        if (et >= 0) {
+            const std::string address = addr::trackField(ses_.tracks[et].uid, "vol");
+            const bool ran = step("clip envelope", [&] {
+                ClipModel& m = ses_.tracks[et].slots[esl];
+                const ClipModel was = m;
+                AutoLane lane;
+                lane.address = address;
+                AutoPoint p0, p1;
+                p0.beat = 0.0;                        p0.value = 0.2f;
+                p1.beat = std::max(1.0, m.lengthBeats * 0.5); p1.value = 0.9f;
+                lane.points.push_back(p0);
+                lane.points.push_back(p1);
+                m.envelopes.push_back(std::move(lane));
+                undoPointWith("clip envelope", m, was);
+                pushClip(et, esl);
+            });
+            if (!ran) {
+                // The writer cannot express an envelope yet, so there was nothing
+                // for the undo to take back and the lane is still there. A
+                // self-test must not leave the session it borrowed in a state the
+                // user did not ask for.
+                ClipModel& m = ses_.tracks[et].slots[esl];
+                if (!m.envelopes.empty() && m.envelopes.back().address == address)
+                    m.envelopes.pop_back();
+                pushClip(et, esl);
+                LOGW("undo self-test: the project format does not carry envelopes yet");
+            }
+        } else {
+            LOGW("undo self-test: no clip in this set - envelopes not exercised");
+        }
+    }
+
     // Devices: a parameter (rebound instance, value re-applied) and a removal
     // (instance retired, then instantiated again from the registry).
     int dt = -1;
