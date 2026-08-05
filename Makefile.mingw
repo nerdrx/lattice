@@ -1,0 +1,113 @@
+# Lattice — Windows cross build (mingw-w64).
+#
+#   make -f Makefile.mingw          release -> build/win/lattice.exe
+#   make -f Makefile.mingw debug    -O0 -g3
+#   make -f Makefile.mingw config   show what was detected
+#   make -f Makefile.mingw clean
+#
+# The Linux Makefile is untouched and remains the source of truth for the
+# native build. This file only differs in three places: the toolchain, the
+# platform source filter, and how third-party headers are found (there is no
+# system pkg-config on a Windows target, so see WIN_DEPS below).
+
+CROSS    ?= x86_64-w64-mingw32
+CXX      := $(CROSS)-g++
+CC       := $(CROSS)-gcc
+BIN      := build/win/lattice.exe
+OBJDIR   := build/winobj
+GEN      := build/gen
+
+# ---- dependencies ---------------------------------------------------------
+# Preferred: a cross pkg-config (mingw-w64-pkg-config on Arch, or
+# PKG_CONFIG_LIBDIR pointed at an MSYS2 mingw64 sysroot).
+# Fallback: a hand-populated sysroot at $(WIN_DEPS) holding the four libraries
+# that have no Windows system equivalent — freetype, glew, libsndfile,
+# libsamplerate — as include/ and lib/ trees.
+PKGCONFIG ?= $(shell command -v $(CROSS)-pkg-config 2>/dev/null)
+WIN_DEPS  ?= third_party/win32
+PKGS      := freetype2 glew sndfile samplerate
+
+# GLEW static avoids shipping glew32.dll; flip to 0 if you link the import lib.
+GLEW_STATIC ?= 1
+
+ifneq ($(PKGCONFIG),)
+DEP_CF := $(shell $(PKGCONFIG) --cflags $(PKGS))
+DEP_LD := $(shell $(PKGCONFIG) --libs $(PKGS))
+else
+DEP_CF := -I$(WIN_DEPS)/include -I$(WIN_DEPS)/include/freetype2
+DEP_LD := -L$(WIN_DEPS)/lib -lfreetype -lsndfile -lsamplerate
+ifeq ($(GLEW_STATIC),1)
+DEP_LD += -lglew32s
+else
+DEP_LD += -lglew32
+endif
+endif
+
+ifeq ($(GLEW_STATIC),1)
+DEP_CF += -DGLEW_STATIC
+endif
+
+# opengl32/gdi32 -> window_win32.cpp; ole32 -> COM in backend_win32.cpp;
+# avrt -> MMCSS "Pro Audio"; ksuser/winmm -> multimedia GUIDs and timers that
+# some sndfile/driver paths still pull in.
+SYSLIBS := -lopengl32 -lgdi32 -lole32 -lavrt -lksuser -lwinmm
+
+# ---- flags ----------------------------------------------------------------
+# _WIN32_WINNT 0x0A00: WASAPI needs >= Vista, the per-monitor-v2 DPI entry
+# points need the Windows 10 headers. The runtime lookups are still dynamic.
+WINDEFS  := -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00
+WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+CXXFLAGS := -std=c++20 -fno-math-errno $(WARN) $(WINDEFS) $(DEP_CF) -I$(GEN) -MMD -MP
+CFLAGS   := -std=c11 -w $(WINDEFS) $(DEP_CF) -I$(GEN) -MMD -MP
+
+# -mwindows: GUI subsystem, no console window.
+# -static-libgcc/-static-libstdc++: the .exe runs without the mingw runtime DLLs.
+LDFLAGS  := -mwindows -static-libgcc -static-libstdc++
+LDLIBS   := $(DEP_LD) $(SYSLIBS)
+
+ifeq ($(MAKECMDGOALS),debug)
+  CXXFLAGS += -O0 -g3 -fno-omit-frame-pointer -DLAT_DEBUG=1
+  CFLAGS   += -O0 -g3
+  LDFLAGS  := $(filter-out -mwindows,$(LDFLAGS))   # keep stdout for LOG*
+else
+  CXXFLAGS += -O2 -g -DNDEBUG
+  CFLAGS   += -O2 -g
+endif
+
+# ---- sources --------------------------------------------------------------
+# The Windows TUs are picked up by the same find; they guard themselves with
+# #if defined(_WIN32) so they are also harmless in the Linux build.
+SRC := $(shell find src -name '*.cpp' | sort)
+SRC := $(filter-out src/ui/window_x11.cpp,$(SRC))
+SRC := $(filter-out src/ui/window_wayland.cpp,$(SRC))
+SRC := $(filter-out src/audio/backend.cpp,$(SRC))
+
+OBJ := $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(SRC))
+DEP := $(OBJ:.o=.d)
+
+.PHONY: all debug clean config
+
+all: $(BIN)
+debug: $(BIN)
+
+config:
+	@echo "toolchain   : $(CXX)"
+	@echo "pkg-config  : $(if $(PKGCONFIG),$(PKGCONFIG),none - using $(WIN_DEPS))"
+	@echo "glew static : $(GLEW_STATIC)"
+	@echo "sources     : $(words $(SRC)) files"
+	@echo "dep cflags  : $(DEP_CF)"
+	@echo "dep libs    : $(DEP_LD)"
+
+$(BIN): $(OBJ)
+	@mkdir -p $(dir $@)
+	$(CXX) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
+	@echo "  ->  $@"
+
+$(OBJDIR)/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(OBJDIR) build/win
+
+-include $(DEP)

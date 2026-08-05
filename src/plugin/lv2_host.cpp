@@ -1,0 +1,658 @@
+// LV2 backend, built on lilv.
+//
+// Scope of what we support today:
+//   * audio in/out ports, control input/output ports
+//   * atom ports are connected to owned scratch buffers so instruments and
+//     MIDI-aware effects instantiate without crashing, but we do not feed them
+//     events yet (the engine has no note path). TODO: wire MIDI in.
+//   * features: urid:map, urid:unmap, options:options, log:log,
+//     buf-size:boundedBlockLength. A plugin whose *required* feature list
+//     contains anything else is logged and skipped rather than loaded and
+//     crashed (worker:schedule and state:loadDefaultState are the common ones).
+//
+// Realtime rules: process() only memcpy/memsets into buffers allocated in
+// prepare(), then calls lilv_instance_run(). Nothing here allocates, locks or
+// throws once prepare() has returned.
+//
+// Known third-party hazard: Calf corrupts process-wide state when one of its
+// instances is torn down, so freeing several Calf plugins in a row and then
+// running another one can crash inside Calf. This reproduces in a plain lilv
+// program with none of our code in the picture. pinPluginLibrary() below
+// removes the dlclose half of the problem; the rest is Calf's.
+#include "host.h"
+
+#include <lilv/lilv.h>
+#include <lv2/atom/atom.h>
+#include <lv2/buf-size/buf-size.h>
+#include <lv2/core/lv2.h>
+#include <lv2/log/log.h>
+#include <lv2/midi/midi.h>
+#include <lv2/options/options.h>
+#include <lv2/parameters/parameters.h>
+#include <lv2/port-props/port-props.h>
+#include <lv2/units/units.h>
+#include <lv2/urid/urid.h>
+
+#include <dlfcn.h>
+
+#include <cstdarg>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <unordered_map>
+
+namespace lat {
+namespace detail {
+namespace {
+
+// --- URID map --------------------------------------------------------------
+// Shared by every instance so URIDs stay comparable across plugins, which the
+// spec requires. Mapping happens at instantiate time; plugins that map during
+// run() are rare and would take the mutex, so we deliberately pre-map the URIs
+// we need before activation.
+struct UridStore {
+    std::mutex mtx;
+    std::deque<std::string> uris;                     // deque: element addresses are stable
+    std::unordered_map<std::string, LV2_URID> index;
+
+    LV2_URID map(const char* uri) {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = index.find(uri);
+        if (it != index.end()) return it->second;
+        uris.emplace_back(uri);
+        const LV2_URID id = (LV2_URID)uris.size();     // 0 is reserved as "no URID"
+        index.emplace(uris.back(), id);
+        return id;
+    }
+    const char* unmap(LV2_URID id) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (id == 0 || id > uris.size()) return nullptr;
+        return uris[id - 1].c_str();
+    }
+};
+
+UridStore& urids() { static UridStore s; return s; }
+
+LV2_URID uridMapFn(LV2_URID_Map_Handle, const char* uri)      { return urids().map(uri); }
+const char* uridUnmapFn(LV2_URID_Unmap_Handle, LV2_URID id)   { return urids().unmap(id); }
+
+int logVprintfFn(LV2_Log_Handle, LV2_URID, const char* fmt, va_list ap) {
+    char msg[1024];
+    const int n = vsnprintf(msg, sizeof msg, fmt, ap);
+    // Plugins tend to append their own newline; strip it so our log stays tidy.
+    size_t len = strlen(msg);
+    while (len && (msg[len - 1] == '\n' || msg[len - 1] == '\r')) msg[--len] = 0;
+    if (len) LOGI("lv2: %s", msg);
+    return n;
+}
+int logPrintfFn(LV2_Log_Handle h, LV2_URID type, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = logVprintfFn(h, type, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+// --- world -----------------------------------------------------------------
+// lilv_world_load_all() walks every bundle on the system and takes on the
+// order of a second, so the world is created once and kept for the process
+// lifetime. It is intentionally never freed: LilvPlugin pointers held by live
+// instances must outlive any static destruction order we could arrange.
+struct World {
+    LilvWorld* world = nullptr;
+    const LilvPlugins* plugins = nullptr;
+
+    LilvNode *audioPort = nullptr, *controlPort = nullptr, *cvPort = nullptr;
+    LilvNode *atomPort = nullptr, *eventPort = nullptr;
+    LilvNode *inputPort = nullptr, *outputPort = nullptr;
+    LilvNode *midiEvent = nullptr, *instrument = nullptr;
+    LilvNode *toggled = nullptr, *integer = nullptr, *enumeration = nullptr;
+    LilvNode *sampleRateProp = nullptr, *logarithmic = nullptr;
+    LilvNode *unitsUnit = nullptr, *unitsSymbol = nullptr;
+
+    void init() {
+        world = lilv_world_new();
+        lilv_world_load_all(world);
+        plugins = lilv_world_get_all_plugins(world);
+
+        auto n = [this](const char* uri) { return lilv_new_uri(world, uri); };
+        audioPort      = n(LILV_URI_AUDIO_PORT);
+        controlPort    = n(LILV_URI_CONTROL_PORT);
+        cvPort         = n(LILV_URI_CV_PORT);
+        atomPort       = n(LILV_URI_ATOM_PORT);
+        eventPort      = n(LILV_URI_EVENT_PORT);
+        inputPort      = n(LILV_URI_INPUT_PORT);
+        outputPort     = n(LILV_URI_OUTPUT_PORT);
+        midiEvent      = n(LILV_URI_MIDI_EVENT);
+        instrument     = n(LV2_CORE__InstrumentPlugin);
+        toggled        = n(LV2_CORE__toggled);
+        integer        = n(LV2_CORE__integer);
+        enumeration    = n(LV2_CORE__enumeration);
+        sampleRateProp = n(LV2_CORE__sampleRate);
+        logarithmic    = n(LV2_PORT_PROPS__logarithmic);
+        unitsUnit      = n(LV2_UNITS__unit);
+        unitsSymbol    = n(LV2_UNITS__symbol);
+    }
+};
+
+World& world() {
+    static World w;
+    static std::once_flag once;
+    std::call_once(once, [] { w.init(); });
+    return w;
+}
+
+// Features we can actually honour. Anything else in a plugin's *required*
+// list means we cannot host it correctly, so we skip it at scan time.
+bool featureSupported(const char* uri) {
+    static const char* kOk[] = {
+        LV2_URID__map, LV2_URID__unmap, LV2_OPTIONS__options,
+        LV2_LOG__log, LV2_BUF_SIZE__boundedBlockLength,
+    };
+    for (const char* s : kOk)
+        if (strcmp(s, uri) == 0) return true;
+    return false;
+}
+
+// Returns the URI of the first unsupported required feature, or empty.
+std::string unsupportedRequiredFeature(const LilvPlugin* p) {
+    std::string bad;
+    LilvNodes* feats = lilv_plugin_get_required_features(p);
+    if (feats) {
+        LILV_FOREACH (nodes, i, feats) {
+            const LilvNode* f = lilv_nodes_get(feats, i);
+            const char* uri = lilv_node_is_uri(f) ? lilv_node_as_uri(f) : nullptr;
+            if (!uri) { bad = "<non-uri feature>"; break; }
+            if (!featureSupported(uri)) { bad = uri; break; }
+        }
+        lilv_nodes_free(feats);
+    }
+    return bad;
+}
+
+std::string nodeString(const LilvNode* n) {
+    return (n && lilv_node_is_string(n)) ? std::string(lilv_node_as_string(n)) : std::string();
+}
+
+// lilv_instance_free() dlclose()s the plugin binary. That is fatal for any
+// plugin whose dependency chain owns live threads: Calf pulls in libgomp, whose
+// worker pool never exits, so unmapping the library leaves those threads
+// executing freed pages and the process dies inside dlclose. Pinning the
+// library with RTLD_NODELETE before instantiation keeps the mapping alive for
+// the process lifetime; the refcount lilv drops is simply no longer the last
+// one. Cost is bounded — one mapping per distinct plugin binary ever loaded.
+void pinPluginLibrary(const LilvPlugin* p) {
+    const LilvNode* lib = lilv_plugin_get_library_uri(p);
+    if (!lib || !lilv_node_is_uri(lib)) return;
+    char* path = lilv_file_uri_parse(lilv_node_as_uri(lib), nullptr);
+    if (!path) return;
+
+    static std::mutex mtx;
+    static std::unordered_map<std::string, void*> pinned;
+    std::lock_guard<std::mutex> lk(mtx);
+    if (pinned.find(path) == pinned.end())
+        pinned.emplace(path, dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE));
+    lilv_free(path);
+}
+
+// Port ranges are routinely written as bare integers in Turtle ("lv2:maximum 15"),
+// which lilv reports as xsd:integer, not float. Accept both or half the ranges
+// on the system silently fall back to 0..1.
+bool nodeFloat(const LilvNode* n, f32& out) {
+    if (!n) return false;
+    if (lilv_node_is_float(n) || lilv_node_is_int(n)) { out = (f32)lilv_node_as_float(n); return true; }
+    if (lilv_node_is_bool(n)) { out = lilv_node_as_bool(n) ? 1.f : 0.f; return true; }
+    return false;
+}
+
+// Where each LV2 port index points once we have connected it.
+enum class PortKind : u8 { Ignored, ControlIn, ControlOut, AudioIn, AudioOut, Cv, AtomIn, AtomOut };
+struct PortSlot {
+    PortKind kind = PortKind::Ignored;
+    int      slot = 0;      // index into the buffer vector for that kind
+};
+
+// --- instance --------------------------------------------------------------
+class Lv2Instance final : public PluginInstance {
+public:
+    Lv2Instance(const PluginDesc& d, const LilvPlugin* p) : desc_(d), plug_(p) {}
+
+    ~Lv2Instance() override { teardown(); }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        teardown();
+        if (maxBlock <= 0) maxBlock = kMaxBlock;
+        sr_ = sampleRate;
+        maxBlock_ = maxBlock;
+
+        buildPorts();
+        buildParams();
+
+        // Options must outlive the instance: some plugins keep the pointer.
+        const LV2_URID uInt   = urids().map(LV2_ATOM__Int);
+        const LV2_URID uFloat = urids().map(LV2_ATOM__Float);
+        blockOpt_ = (i32)maxBlock_;
+        minBlockOpt_ = 1;
+        seqOpt_ = (i32)kAtomBufBytes;
+        srOpt_ = (f32)sr_;
+        options_ = {
+            { LV2_OPTIONS_INSTANCE, 0, urids().map(LV2_BUF_SIZE__maxBlockLength),
+              sizeof(i32), uInt, &blockOpt_ },
+            { LV2_OPTIONS_INSTANCE, 0, urids().map(LV2_BUF_SIZE__minBlockLength),
+              sizeof(i32), uInt, &minBlockOpt_ },
+            { LV2_OPTIONS_INSTANCE, 0, urids().map(LV2_BUF_SIZE__sequenceSize),
+              sizeof(i32), uInt, &seqOpt_ },
+            { LV2_OPTIONS_INSTANCE, 0, urids().map(LV2_PARAMETERS__sampleRate),
+              sizeof(f32), uFloat, &srOpt_ },
+            { LV2_OPTIONS_INSTANCE, 0, 0, 0, 0, nullptr },
+        };
+
+        map_   = { nullptr, uridMapFn };
+        unmap_ = { nullptr, uridUnmapFn };
+        log_   = { nullptr, logPrintfFn, logVprintfFn };
+
+        fMap_     = { LV2_URID__map, &map_ };
+        fUnmap_   = { LV2_URID__unmap, &unmap_ };
+        fLog_     = { LV2_LOG__log, &log_ };
+        fOptions_ = { LV2_OPTIONS__options, options_.data() };
+        fBounded_ = { LV2_BUF_SIZE__boundedBlockLength, nullptr };
+        const LV2_Feature* feats[] = { &fMap_, &fUnmap_, &fLog_, &fOptions_, &fBounded_, nullptr };
+
+        pinPluginLibrary(plug_);
+        inst_ = lilv_plugin_instantiate(plug_, sr_, feats);
+        if (!inst_) {
+            LOGE("lv2: instantiate failed for %s", desc_.uri.c_str());
+            return false;
+        }
+
+        connectPorts();
+        lilv_instance_activate(inst_);
+        return true;
+    }
+
+    // REALTIME. See the class comment: memcpy + run, nothing else.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+
+        // Bypass, a dead instance, or an oversized block all degrade to a
+        // straight copy. Growing buffers here would mean allocating on the
+        // audio thread, so we refuse instead.
+        if (bypassed_ || !inst_ || nframes > maxBlock_) {
+            passthrough(in, out, channels, nframes);
+            return;
+        }
+
+        const int nIn  = (int)audioIn_.size();
+        const int nOut = (int)audioOut_.size();
+        if (nOut == 0) { passthrough(in, out, channels, nframes); return; }
+
+        const size_t bytes = (size_t)nframes * sizeof(f32);
+
+        // Feed the plugin's inputs. A plugin input with no matching track
+        // channel gets channel 0 duplicated (stereo plugin on a mono source);
+        // with no input at all it gets silence (instruments).
+        for (int p = 0; p < nIn; ++p) {
+            const f32* src = nullptr;
+            if (in) src = (p < channels) ? in[p] : in[0];
+            if (src) std::memcpy(audioIn_[p], src, bytes);
+            else     std::memset(audioIn_[p], 0, bytes);
+        }
+
+        resetAtomBuffers();
+        lilv_instance_run(inst_, (uint32_t)nframes);
+
+        // Pull the outputs back. A mono plugin (1 out) on a stereo track is
+        // run once on channel 0 and its output is copied to both channels;
+        // this is the documented behaviour, not a second instance.
+        for (int c = 0; c < channels; ++c) {
+            if (!out[c]) continue;
+            const f32* src = audioOut_[c < nOut ? c : 0];
+            std::memcpy(out[c], src, bytes);
+        }
+    }
+
+    int              paramCount() const override        { return (int)params_.size(); }
+    const ParamInfo& paramInfo(int i) const override    { return params_[(size_t)i]; }
+
+    f32 getParam(int i) const override {
+        if (i < 0 || i >= (int)paramPort_.size()) return 0.f;
+        return ctrl_[(size_t)paramPort_[(size_t)i]];
+    }
+
+    // GUI thread, concurrent with process(). The plugin reads this float once
+    // per run(); a plain store is atomic in practice for a 4-byte aligned
+    // float on every target we build for, and the worst case is that the
+    // change lands one block later. No lock, so the audio thread never waits.
+    void setParam(int i, f32 v) override {
+        if (i < 0 || i >= (int)paramPort_.size()) return;
+        const ParamInfo& pi = params_[(size_t)i];
+        ctrl_[(size_t)paramPort_[(size_t)i]] = clampv(v, pi.min, pi.max);
+    }
+
+    const PluginDesc& desc() const override { return desc_; }
+    void setBypassed(bool b) override       { bypassed_ = b; }
+    bool bypassed() const override          { return bypassed_; }
+
+private:
+    static constexpr size_t kAtomBufBytes = 8192;
+
+    static void passthrough(const f32* const* in, f32* const* out, int channels, int nframes) {
+        const size_t bytes = (size_t)nframes * sizeof(f32);
+        for (int c = 0; c < channels; ++c) {
+            if (!out[c]) continue;
+            const f32* src = in ? in[c] : nullptr;
+            if (src == out[c]) continue;              // in-place: already correct
+            if (src) std::memcpy(out[c], src, bytes);
+            else     std::memset(out[c], 0, bytes);
+        }
+    }
+
+    void teardown() {
+        if (inst_) {
+            lilv_instance_deactivate(inst_);
+            lilv_instance_free(inst_);
+            inst_ = nullptr;
+        }
+        slots_.clear();
+        audioIn_.clear();
+        audioOut_.clear();
+        atomIn_.clear();
+        atomOut_.clear();
+        audioStore_.clear();
+        cvStore_.clear();
+        atomStore_.clear();
+    }
+
+    // Classify every port and size the buffers. Buffers are allocated once and
+    // never resized afterwards, so the pointers we hand to lilv stay valid.
+    void buildPorts() {
+        World& w = world();
+        const uint32_t n = lilv_plugin_get_num_ports(plug_);
+        slots_.assign(n, PortSlot{});
+        ctrl_.assign(n, 0.f);
+
+        int nAudioIn = 0, nAudioOut = 0, nCv = 0, nAtomIn = 0, nAtomOut = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            const LilvPort* port = lilv_plugin_get_port_by_index(plug_, i);
+            const bool isIn  = lilv_port_is_a(plug_, port, w.inputPort);
+            const bool isOut = lilv_port_is_a(plug_, port, w.outputPort);
+            PortSlot s;
+            if (lilv_port_is_a(plug_, port, w.audioPort)) {
+                s.kind = isIn ? PortKind::AudioIn : PortKind::AudioOut;
+                s.slot = isIn ? nAudioIn++ : nAudioOut++;
+            } else if (lilv_port_is_a(plug_, port, w.controlPort)) {
+                s.kind = isIn ? PortKind::ControlIn : PortKind::ControlOut;
+                s.slot = (int)i;
+            } else if (lilv_port_is_a(plug_, port, w.cvPort)) {
+                s.kind = PortKind::Cv;
+                s.slot = nCv++;
+            } else if (lilv_port_is_a(plug_, port, w.atomPort) ||
+                       lilv_port_is_a(plug_, port, w.eventPort)) {
+                s.kind = isIn ? PortKind::AtomIn : PortKind::AtomOut;
+                s.slot = isIn ? nAtomIn++ : nAtomOut++;
+            } else {
+                // Unknown port type. Still needs a non-null connection or the
+                // plugin may dereference it, so park it on a CV-sized buffer.
+                s.kind = PortKind::Cv;
+                s.slot = nCv++;
+                (void)isOut;
+            }
+            slots_[i] = s;
+        }
+
+        const size_t frames = (size_t)maxBlock_;
+        audioStore_.assign((size_t)(nAudioIn + nAudioOut) * frames, 0.f);
+        cvStore_.assign((size_t)nCv * frames, 0.f);
+        atomStore_.assign((size_t)(nAtomIn + nAtomOut) * kAtomBufBytes, 0);
+
+        audioIn_.resize((size_t)nAudioIn);
+        audioOut_.resize((size_t)nAudioOut);
+        for (int i = 0; i < nAudioIn; ++i)  audioIn_[(size_t)i]  = audioStore_.data() + (size_t)i * frames;
+        for (int i = 0; i < nAudioOut; ++i) audioOut_[(size_t)i] = audioStore_.data() + (size_t)(nAudioIn + i) * frames;
+        atomIn_.resize((size_t)nAtomIn);
+        atomOut_.resize((size_t)nAtomOut);
+        for (int i = 0; i < nAtomIn; ++i)
+            atomIn_[(size_t)i] = atomStore_.data() + (size_t)i * kAtomBufBytes;
+        for (int i = 0; i < nAtomOut; ++i)
+            atomOut_[(size_t)i] = atomStore_.data() + (size_t)(nAtomIn + i) * kAtomBufBytes;
+
+        seqUrid_ = urids().map(LV2_ATOM__Sequence);
+        chunkUrid_ = urids().map(LV2_ATOM__Chunk);
+        // The descriptor may have been produced by an older scan; keep the
+        // authoritative counts from the actual instance.
+        desc_.audioIn  = nAudioIn;
+        desc_.audioOut = nAudioOut;
+    }
+
+    // Control input ports become ParamInfo entries, in port order.
+    void buildParams() {
+        World& w = world();
+        params_.clear();
+        paramPort_.clear();
+        for (uint32_t i = 0; i < (uint32_t)slots_.size(); ++i) {
+            if (slots_[i].kind != PortKind::ControlIn) {
+                if (slots_[i].kind == PortKind::ControlOut) ctrl_[i] = 0.f;
+                continue;
+            }
+            const LilvPort* port = lilv_plugin_get_port_by_index(plug_, i);
+
+            ParamInfo pi;
+            pi.id = i;
+            LilvNode* nm = lilv_port_get_name(plug_, port);
+            pi.name = nodeString(nm);
+            lilv_node_free(nm);
+            if (pi.name.empty()) pi.name = nodeString(lilv_port_get_symbol(plug_, port));
+
+            LilvNode *dn = nullptr, *mn = nullptr, *xn = nullptr;
+            lilv_port_get_range(plug_, port, &dn, &mn, &xn);
+            nodeFloat(mn, pi.min);
+            nodeFloat(xn, pi.max);
+            if (!nodeFloat(dn, pi.def)) pi.def = pi.min;
+            lilv_node_free(dn); lilv_node_free(mn); lilv_node_free(xn);
+
+            pi.isBool = lilv_port_has_property(plug_, port, w.toggled);
+            pi.isInt  = lilv_port_has_property(plug_, port, w.integer) ||
+                        lilv_port_has_property(plug_, port, w.enumeration);
+            pi.isLogarithmic = lilv_port_has_property(plug_, port, w.logarithmic);
+
+            // lv2:sampleRate on a port means its range is expressed as a
+            // fraction of the sample rate, so scale it now that we know sr_.
+            if (lilv_port_has_property(plug_, port, w.sampleRateProp)) {
+                pi.min *= (f32)sr_; pi.max *= (f32)sr_; pi.def *= (f32)sr_;
+            }
+            if (pi.isBool) { pi.min = 0.f; pi.max = 1.f; }
+            if (!(pi.max > pi.min)) pi.max = pi.min + 1.f;   // degenerate metadata
+            pi.def = clampv(pi.def, pi.min, pi.max);
+            pi.unit = portUnit(port);
+
+            ctrl_[i] = pi.def;
+            paramPort_.push_back((int)i);
+            params_.push_back(std::move(pi));
+        }
+        desc_.paramCount = (int)params_.size();
+    }
+
+    std::string portUnit(const LilvPort* port) const {
+        World& w = world();
+        std::string sym;
+        LilvNodes* units = lilv_port_get_value(plug_, port, w.unitsUnit);
+        if (units) {
+            const LilvNode* u = lilv_nodes_get_first(units);
+            if (u) {
+                LilvNode* s = lilv_world_get(w.world, u, w.unitsSymbol, nullptr);
+                sym = nodeString(s);
+                lilv_node_free(s);
+                // A bare unit URI with no symbol (units:db etc.) still has a
+                // usable tail, e.g. ".../units#db" -> "db".
+                if (sym.empty() && lilv_node_is_uri(u)) {
+                    const std::string uri = lilv_node_as_uri(u);
+                    const size_t h = uri.find_last_of("#/");
+                    if (h != std::string::npos) sym = uri.substr(h + 1);
+                }
+            }
+            lilv_nodes_free(units);
+        }
+        return sym;
+    }
+
+    void connectPorts() {
+        const size_t frames = (size_t)maxBlock_;
+        for (uint32_t i = 0; i < (uint32_t)slots_.size(); ++i) {
+            const PortSlot& s = slots_[i];
+            void* buf = nullptr;
+            switch (s.kind) {
+                case PortKind::ControlIn:
+                case PortKind::ControlOut: buf = &ctrl_[i]; break;
+                case PortKind::AudioIn:    buf = audioIn_[(size_t)s.slot]; break;
+                case PortKind::AudioOut:   buf = audioOut_[(size_t)s.slot]; break;
+                case PortKind::Cv:         buf = cvStore_.data() + (size_t)s.slot * frames; break;
+                case PortKind::AtomIn:     buf = atomIn_[(size_t)s.slot]; break;
+                case PortKind::AtomOut:    buf = atomOut_[(size_t)s.slot]; break;
+                case PortKind::Ignored:    break;
+            }
+            lilv_instance_connect_port(inst_, i, buf);
+        }
+        resetAtomBuffers();
+    }
+
+    // REALTIME. Inputs must present an empty but valid Sequence; outputs must
+    // advertise their capacity in atom.size before every run().
+    void resetAtomBuffers() {
+        for (u8* p : atomIn_) {
+            LV2_Atom_Sequence* seq = (LV2_Atom_Sequence*)p;
+            seq->atom.size = sizeof(LV2_Atom_Sequence_Body);
+            seq->atom.type = seqUrid_;
+            seq->body.unit = 0;
+            seq->body.pad  = 0;
+        }
+        for (u8* p : atomOut_) {
+            LV2_Atom_Sequence* seq = (LV2_Atom_Sequence*)p;
+            seq->atom.size = (uint32_t)(kAtomBufBytes - sizeof(LV2_Atom));
+            seq->atom.type = chunkUrid_;
+        }
+    }
+
+    PluginDesc        desc_;
+    const LilvPlugin* plug_ = nullptr;
+    LilvInstance*     inst_ = nullptr;
+
+    f64 sr_ = 48000.0;
+    int maxBlock_ = kMaxBlock;
+    bool bypassed_ = false;
+
+    std::vector<PortSlot>  slots_;
+    std::vector<f32>       ctrl_;        // one float per port index; control ports point here
+    std::vector<ParamInfo> params_;
+    std::vector<int>       paramPort_;   // param index -> LV2 port index
+
+    std::vector<f32> audioStore_, cvStore_;
+    std::vector<u8>  atomStore_;
+    std::vector<f32*> audioIn_, audioOut_;
+    std::vector<u8*>  atomIn_, atomOut_;
+
+    LV2_URID seqUrid_ = 0, chunkUrid_ = 0;
+
+    LV2_URID_Map   map_{};
+    LV2_URID_Unmap unmap_{};
+    LV2_Log_Log    log_{};
+    std::vector<LV2_Options_Option> options_;
+    i32 blockOpt_ = 0, minBlockOpt_ = 0, seqOpt_ = 0;
+    f32 srOpt_ = 0.f;
+    LV2_Feature fMap_{}, fUnmap_{}, fLog_{}, fOptions_{}, fBounded_{};
+};
+
+} // namespace
+
+// --- scan ------------------------------------------------------------------
+void scanLV2(std::vector<PluginDesc>& out) {
+    World& w = world();
+    if (!w.plugins) { LOGW("lv2: no plugins collection"); return; }
+
+    int skipped = 0;
+    LILV_FOREACH (plugins, it, w.plugins) {
+        const LilvPlugin* p = lilv_plugins_get(w.plugins, it);
+        const LilvNode* uriNode = lilv_plugin_get_uri(p);
+        if (!uriNode) continue;
+        const std::string uri = lilv_node_as_uri(uriNode);
+
+        const std::string bad = unsupportedRequiredFeature(p);
+        if (!bad.empty()) {
+            LOGW("lv2: skipping %s (requires %s)", uri.c_str(), bad.c_str());
+            ++skipped;
+            continue;
+        }
+
+        PluginDesc d;
+        d.format = PluginFormat::LV2;
+        d.uri    = uri;
+
+        LilvNode* nameNode = lilv_plugin_get_name(p);
+        d.name = nodeString(nameNode);
+        lilv_node_free(nameNode);
+        if (d.name.empty()) d.name = uri;
+
+        LilvNode* author = lilv_plugin_get_author_name(p);
+        d.vendor = nodeString(author);
+        lilv_node_free(author);
+
+        const LilvPluginClass* cls = lilv_plugin_get_class(p);
+        bool isInstrumentClass = false;
+        if (cls) {
+            d.category = nodeString(lilv_plugin_class_get_label(cls));
+            const LilvNode* cu = lilv_plugin_class_get_uri(cls);
+            isInstrumentClass = cu && lilv_node_is_uri(cu) &&
+                                strcmp(lilv_node_as_uri(cu), LV2_CORE__InstrumentPlugin) == 0;
+        }
+
+        const uint32_t n = lilv_plugin_get_num_ports(p);
+        for (uint32_t i = 0; i < n; ++i) {
+            const LilvPort* port = lilv_plugin_get_port_by_index(p, i);
+            const bool isIn = lilv_port_is_a(p, port, w.inputPort);
+            if (lilv_port_is_a(p, port, w.audioPort)) {
+                if (isIn) ++d.audioIn; else ++d.audioOut;
+            } else if (lilv_port_is_a(p, port, w.controlPort)) {
+                if (isIn) ++d.paramCount;
+            } else if (isIn && (lilv_port_is_a(p, port, w.atomPort) ||
+                                lilv_port_is_a(p, port, w.eventPort))) {
+                if (lilv_port_supports_event(p, port, w.midiEvent)) d.hasMidiIn = true;
+            }
+        }
+
+        if (isInstrumentClass || (d.hasMidiIn && d.audioIn == 0 && d.audioOut > 0))
+            d.kind = PluginKind::Instrument;
+        else if (d.audioIn > 0 || d.audioOut > 0)
+            d.kind = PluginKind::Effect;
+        else
+            d.kind = PluginKind::Unknown;
+
+        out.push_back(std::move(d));
+    }
+    LOGI("lv2: %zu usable, %d skipped", out.size(), skipped);
+}
+
+std::unique_ptr<PluginInstance> instantiateLV2(const PluginDesc& d, f64 sampleRate, int maxBlock) {
+    World& w = world();
+    if (!w.plugins) return nullptr;
+
+    LilvNode* uri = lilv_new_uri(w.world, d.uri.c_str());
+    if (!uri) return nullptr;
+    const LilvPlugin* p = lilv_plugins_get_by_uri(w.plugins, uri);
+    lilv_node_free(uri);
+    if (!p) {
+        LOGE("lv2: %s not found (rescan needed?)", d.uri.c_str());
+        return nullptr;
+    }
+
+    const std::string bad = unsupportedRequiredFeature(p);
+    if (!bad.empty()) {
+        LOGE("lv2: refusing %s, requires %s", d.uri.c_str(), bad.c_str());
+        return nullptr;
+    }
+
+    auto inst = std::make_unique<Lv2Instance>(d, p);
+    if (!inst->prepare(sampleRate, maxBlock)) return nullptr;
+    return inst;
+}
+
+} // namespace detail
+} // namespace lat
