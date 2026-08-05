@@ -22,9 +22,26 @@ constexpr f32 trackHeadH  = 21.f;
 constexpr f32 slotH       = 21.f;
 constexpr f32 sceneColW   = 96.f;
 constexpr f32 masterW     = 92.f;
-constexpr f32 mixerH      = 152.f;
+// A return bus has no clips and no M/S/arm, so its strip is barely wider than
+// a fader and a meter side by side.
+constexpr f32 returnW     = 54.f;
+// Tall enough for the M/S/arm row, the 2x2 send grid, pan, and a fader with
+// enough travel left to mix with. The clip grid gives up the difference and
+// still shows twice the scenes a default set has.
+constexpr f32 mixerH      = 186.f;
 constexpr f32 gutter      = 1.f;
 }
+
+// The return buses, as the UI says them. Letters for the strips and the send
+// knobs; the undo labels are spelled out because that is what the status bar
+// reads back after an undo.
+static const char* const kReturnLetter[kMaxReturns] = {"A", "B", "C", "D"};
+static const char* const kSendUndo[kMaxReturns] = {"send A", "send B", "send C", "send D"};
+static_assert(kMaxReturns == 4, "the return strips are lettered A-D by hand");
+// ReturnModel's default name. A bus still wearing it has not been named, and
+// the strip shows its letter instead; the project format leans on the same
+// value to decide a return is worth writing at all.
+static const char* const kReturnPlaceholder = "Return";
 
 // How much audio a single take can hold. Two minutes of interleaved stereo
 // floats is ~46 MB at 48 kHz: cheap enough to allocate up front, long enough
@@ -162,9 +179,28 @@ bool App::init(int argc, char** argv) {
             LOGW("LATTICE_DEBUG_ADDFX: no plugin matching \"%s\"", want);
         } else if (!ses_.tracks.empty()) {
             selTrack_ = 0;
-            addDeviceToTrack(0, *hit);
+            devOwner_ = 0;
+            addDevice(0, *hit);
             selDevice_ = (int)ses_.tracks[0].devices.size() - 1;
             detailTab_ = DetailTab::Devices;
+            showDetail_ = true;
+        }
+    }
+
+    // The same hook for the master chain -- a saturator or a bus compressor
+    // across the whole mix, which is what a master chain is for. It also parks
+    // the DEVICES tab on the master, so a screenshot shows the one part of the
+    // chain-owner selection nothing inside gamescope can click on.
+    if (const char* want = getenv("LATTICE_DEBUG_MASTERFX")) {
+        ensurePluginScan();
+        const PluginDesc* hit = nullptr;
+        for (const PluginDesc& d : registry_.plugins())
+            if (icontains(d.name, want)) { hit = &d; break; }
+        if (!hit) {
+            LOGW("LATTICE_DEBUG_MASTERFX: no plugin matching \"%s\"", want);
+        } else {
+            selectChainOwner(kOwnMaster);
+            addDevice(kOwnMaster, *hit);
             showDetail_ = true;
         }
     }
@@ -199,6 +235,8 @@ void App::shutdown() {
     // would deadlock or leak.
     if (audio_) { audio_->stop(); audio_.reset(); }
     for (const RtChain*& c : published_) { delete c; c = nullptr; }
+    for (const RtChain*& c : publishedReturn_) { delete c; c = nullptr; }
+    delete publishedMaster_; publishedMaster_ = nullptr;
     for (RetiredChain& rc : retiring_) delete rc.chain;
     retiring_.clear();          // frees the instances the chains had dropped
     for (auto& row : publishedNotes_)
@@ -319,6 +357,12 @@ void App::pushTrack(int t) {
     send(Cmd::TrackMute, t, tr.mute ? 1 : 0);
     send(Cmd::TrackSolo, t, tr.solo ? 1 : 0);
     send(Cmd::TrackArm,  t, tr.arm ? 1 : 0);
+    // Sends are part of a track's mixer state like volume and pan are, so they
+    // ride the same path: a load, an undo restore and a fresh set all arrive
+    // here and nowhere else. The model holds the linear level the engine wants
+    // (TrackModel::sends), so nothing is mapped on the way across.
+    for (int rn = 0; rn < kMaxReturns; ++rn)
+        send(Cmd::SendLevel, t, rn, tr.sends[rn]);
 }
 
 void App::pushAll() {
@@ -329,6 +373,10 @@ void App::pushAll() {
         pushTrack((int)t);
         for (int s = 0; s < (int)ses_.scenes.size(); ++s) pushClip((int)t, s);
     }
+    // Return levels. Their chains are published by materializeDevices (or by
+    // releaseAllChains, which empties them) -- this is the scalar half.
+    for (int i = 0; i < kMaxReturns; ++i)
+        send(Cmd::ReturnVol, i, 0, faderToGain(ses_.returns[i].fader));
     releaseStaleSlots();
 }
 
@@ -367,13 +415,20 @@ void App::pumpEngineEvents() {
             // The audio thread has swapped this chain out and will never look
             // at it again, so the struct and every instance it was the last
             // reference to can finally go.
+            //
+            // `e.a` says which owner it came off (a track, kMaxTracks+i for a
+            // return, -1 for the master) and is used for nothing but the
+            // message below: the pool is keyed on the POINTER, every chain is
+            // its own allocation, and no chain is ever published to two owners,
+            // so the address adds no information the lookup needs.
             const RtChain* old = (const RtChain*)e.p;
             if (!old) continue;
             auto it = retiring_.begin();
             for (; it != retiring_.end(); ++it) if (it->chain == old) break;
             if (it == retiring_.end()) {
-                LOGW("ChainRetired for an unknown chain %p - leaking it rather "
-                     "than freeing a pointer we do not own", (const void*)old);
+                LOGW("ChainRetired for an unknown chain %p (from %s) - leaking it "
+                     "rather than freeing a pointer we do not own",
+                     (const void*)old, ownerName(e.a).c_str());
                 continue;
             }
             delete it->chain;
@@ -430,17 +485,66 @@ void App::pumpEngineEvents() {
 // is the only path on which anything is freed while audio runs.
 // ---------------------------------------------------------------------------
 
-void App::publishChain(int track) {
-    if (track < 0 || track >= (int)ses_.tracks.size()) return;
-    TrackModel& t = ses_.tracks[track];
+// Where one owner's chain lives. The three cases differ in nothing else, which
+// is the whole point: past this function no code below knows what a return is.
+App::ChainOwner App::chainOwner(int owner) {
+    ChainOwner co;
+    if (owner == kOwnMaster) {
+        co.devices   = &ses_.masterDevices;
+        co.saved     = &ses_.masterSavedDevices;
+        co.published = &publishedMaster_;
+        co.cmd       = Cmd::SetMasterChain;
+        co.addr      = -1;                      // as the retirement event says it
+    } else if (ownIsReturn(owner)) {
+        ReturnModel& rm = ses_.returns[owner - kOwnReturn0];
+        co.devices   = &rm.devices;
+        co.saved     = &rm.savedDevices;
+        co.published = &publishedReturn_[owner - kOwnReturn0];
+        co.cmd       = Cmd::SetReturnChain;
+        co.addr      = owner - kOwnReturn0;
+    } else if (ownIsTrack(owner)) {
+        co.published = &published_[owner];
+        co.cmd       = Cmd::SetChain;
+        co.addr      = owner;
+        // A published slot outlives the track model: a set that shrank leaves
+        // the engine running a chain for an index the session no longer has.
+        if (owner < (int)ses_.tracks.size()) {
+            co.devices = &ses_.tracks[owner].devices;
+            co.saved   = &ses_.tracks[owner].savedDevices;
+        }
+    }
+    return co;
+}
+
+std::string App::ownerName(int owner) const {
+    if (owner == kOwnMaster) return "Master";
+    if (ownIsReturn(owner)) return std::string("Return ") + kReturnLetter[owner - kOwnReturn0];
+    if (owner >= 0 && owner < (int)ses_.tracks.size()) return ses_.tracks[owner].name;
+    char buf[32];
+    snprintf(buf, sizeof buf, "track %d", owner);
+    return buf;
+}
+
+std::vector<int> App::modelOwners() const {
+    std::vector<int> v;
+    v.reserve(ses_.tracks.size() + kMaxReturns + 1);
+    for (int t = 0; t < (int)ses_.tracks.size(); ++t) v.push_back(t);
+    for (int i = 0; i < kMaxReturns; ++i) v.push_back(ownReturn(i));
+    v.push_back(kOwnMaster);
+    return v;
+}
+
+void App::publishChain(int owner) {
+    ChainOwner co = chainOwner(owner);
+    if (!co.valid() || !co.devices) return;
 
     RtChain* chain = new RtChain();
     int n = 0;
-    for (const DeviceModel& d : t.devices) {
+    for (const DeviceModel& d : *co.devices) {
         if (!d.inst) continue;
         if (n >= kMaxChainFx) {
-            LOGW("track %d has more than %d devices - the extras will not sound",
-                 track, kMaxChainFx);
+            LOGW("%s has more than %d devices - the extras will not sound",
+                 ownerName(owner).c_str(), kMaxChainFx);
             break;
         }
         // Bypassed devices stay in the chain: the instance itself short-circuits
@@ -450,26 +554,27 @@ void App::publishChain(int track) {
     chain->count = n;
 
     Command c;
-    c.type = Cmd::SetChain;
-    c.a = track;
+    c.type = co.cmd;
+    c.a = co.addr;
     c.p = chain;
     if (!engine_.pushCommand(c)) {
         // The ring is full, so the engine never saw this chain. It is still
         // solely ours, and the previously published one is still live: drop the
         // new one and leave every piece of state exactly as it was.
-        LOGW("command ring full - chain for track %d not published", track);
+        LOGW("command ring full - chain for %s not published", ownerName(owner).c_str());
         delete chain;
         return;
     }
 
-    if (published_[track]) retiring_.push_back(RetiredChain{published_[track], {}});
-    published_[track] = chain;
+    if (*co.published) retiring_.push_back(RetiredChain{*co.published, {}});
+    *co.published = chain;
 }
 
-void App::addDeviceToTrack(int track, const PluginDesc& d) {
-    if (track < 0 || track >= (int)ses_.tracks.size()) return;
-    TrackModel& t = ses_.tracks[track];
-    if ((int)t.devices.size() >= kMaxChainFx) {
+void App::addDevice(int owner, const PluginDesc& d) {
+    ChainOwner co = chainOwner(owner);
+    if (!co.valid() || !co.devices) return;
+    std::vector<DeviceModel>& devices = *co.devices;
+    if ((int)devices.size() >= kMaxChainFx) {
         status_ = "Chain is full";
         return;
     }
@@ -487,40 +592,41 @@ void App::addDeviceToTrack(int track, const PluginDesc& d) {
     dm.uid = ses_.newUid();
     dm.desc = d;
     dm.inst = std::move(inst);
-    t.devices.push_back(std::move(dm));
+    devices.push_back(std::move(dm));
 
-    const RtChain* before = published_[track];
-    publishChain(track);
-    if (published_[track] == before) {
+    const RtChain* before = *co.published;
+    publishChain(owner);
+    if (*co.published == before) {
         // Publish failed. The engine never referenced this instance, so it is
         // safe to destroy right here and leave the model matching the engine.
-        t.devices.pop_back();
+        devices.pop_back();
         status_ = "Engine busy - device not added";
         return;
     }
-    selDevice_ = (int)t.devices.size() - 1;
+    selDevice_ = (int)devices.size() - 1;
     paramScroll_ = 0.f;
     status_ = "Added " + d.name;
 }
 
-void App::removeDevice(int track, int idx) {
-    if (track < 0 || track >= (int)ses_.tracks.size()) return;
-    TrackModel& t = ses_.tracks[track];
-    if (idx < 0 || idx >= (int)t.devices.size()) return;
+void App::removeDevice(int owner, int idx) {
+    ChainOwner co = chainOwner(owner);
+    if (!co.valid() || !co.devices) return;
+    std::vector<DeviceModel>& devices = *co.devices;
+    if (idx < 0 || idx >= (int)devices.size()) return;
 
     // Move the instance out of the model rather than letting erase() destroy
     // it: the audio thread is still running the *outgoing* chain, which points
     // straight at it. It may only die once that chain comes back to us.
-    DeviceModel dead = std::move(t.devices[idx]);
-    t.devices.erase(t.devices.begin() + idx);
+    DeviceModel dead = std::move(devices[idx]);
+    devices.erase(devices.begin() + idx);
 
-    const RtChain* outgoing = published_[track];
-    publishChain(track);
+    const RtChain* outgoing = *co.published;
+    publishChain(owner);
 
-    if (published_[track] == outgoing) {
+    if (*co.published == outgoing) {
         // Publish failed; the engine still runs the old chain, so the device
         // has to go back where it was or the model would lie about what sounds.
-        t.devices.insert(t.devices.begin() + idx, std::move(dead));
+        devices.insert(devices.begin() + idx, std::move(dead));
         status_ = "Engine busy - device not removed";
         return;
     }
@@ -532,8 +638,8 @@ void App::removeDevice(int track, int idx) {
     // Otherwise nothing was ever published, so nothing borrowed the instance
     // and it is freed as `dead` goes out of scope.
 
-    if (t.devices.empty())                selDevice_ = -1;
-    else if (selDevice_ >= (int)t.devices.size()) selDevice_ = (int)t.devices.size() - 1;
+    if (devices.empty())                        selDevice_ = -1;
+    else if (selDevice_ >= (int)devices.size()) selDevice_ = (int)devices.size() - 1;
     paramScroll_ = 0.f;
     status_ = "Removed " + dead.desc.name;
 }
@@ -563,11 +669,19 @@ void App::ensurePluginScan() {
 void App::assignUids() {
     u64 seen = 0;
     auto note = [&](u64 id) { if (id > seen) seen = id; };
+    // Devices are looked at through the owner list, so a return's chain and the
+    // master's are stamped by the same pass a track's is.
+    const std::vector<int> owners = modelOwners();
     for (const TrackModel& t : ses_.tracks) {
         note(t.uid);
         for (int s = 0; s < kMaxScenes; ++s) note(t.slots[s].uid);
-        for (const DeviceModel& d : t.devices)   note(d.uid);
-        for (const SavedDevice& d : t.savedDevices) note(d.uid);
+    }
+    for (const ReturnModel& r : ses_.returns) note(r.uid);
+    for (int o : owners) {
+        ChainOwner co = chainOwner(o);
+        if (!co.devices) continue;
+        for (const DeviceModel& d : *co.devices) note(d.uid);
+        for (const SavedDevice& d : *co.saved)   note(d.uid);
     }
     for (const SceneModel& s : ses_.scenes) note(s.uid);
     if (ses_.nextUid <= seen) ses_.nextUid = seen + 1;
@@ -580,8 +694,13 @@ void App::assignUids() {
             // whose audio went missing but whose reference survived, gets one.
             if (!c.uid && (c.valid() || !c.path.empty())) c.uid = ses_.newUid();
         }
-        for (DeviceModel& d : t.devices)        if (!d.uid) d.uid = ses_.newUid();
-        for (SavedDevice& d : t.savedDevices)   if (!d.uid) d.uid = ses_.newUid();
+    }
+    for (ReturnModel& r : ses_.returns) if (!r.uid) r.uid = ses_.newUid();
+    for (int o : owners) {
+        ChainOwner co = chainOwner(o);
+        if (!co.devices) continue;
+        for (DeviceModel& d : *co.devices)      if (!d.uid) d.uid = ses_.newUid();
+        for (SavedDevice& d : *co.saved)        if (!d.uid) d.uid = ses_.newUid();
     }
     for (SceneModel& s : ses_.scenes) if (!s.uid) s.uid = ses_.newUid();
 }
@@ -589,10 +708,13 @@ void App::assignUids() {
 // devices -> savedDevices. The project layer only ever sees the passive form,
 // so this is the one place that reads a live instance for persistence.
 void App::serializeDevices() {
-    for (TrackModel& t : ses_.tracks) {
-        t.savedDevices.clear();
-        t.savedDevices.reserve(t.devices.size());
-        for (DeviceModel& d : t.devices) {
+    for (int o : modelOwners()) {
+        ChainOwner co = chainOwner(o);
+        if (!co.devices) continue;
+        std::vector<SavedDevice>& out = *co.saved;
+        out.clear();
+        out.reserve(co.devices->size());
+        for (DeviceModel& d : *co.devices) {
             if (!d.uid) d.uid = ses_.newUid();
             SavedDevice sd;
             sd.uid = d.uid;
@@ -611,7 +733,7 @@ void App::serializeDevices() {
                 // the plugin and works again on one that does.
                 sd.params = d.lostParams;
             }
-            t.savedDevices.push_back(std::move(sd));
+            out.push_back(std::move(sd));
         }
     }
 }
@@ -627,8 +749,12 @@ void App::serializeDevices() {
 // the set. Instantiation stays the fallback, for a device the pool has no
 // match for -- one that was removed and is coming back, or a set being loaded.
 void App::materializeDevices(std::vector<LiveDevice>* reuse) {
+    const std::vector<int> owners = modelOwners();
     bool any = false;
-    for (const TrackModel& t : ses_.tracks) if (!t.savedDevices.empty()) { any = true; break; }
+    for (int o : owners) {
+        ChainOwner co = chainOwner(o);
+        if (co.saved && !co.saved->empty()) { any = true; break; }
+    }
     if (!any) return;
     // The scan is chatty about its progress in the status bar; a load that goes
     // through cleanly should still read as a load when it is done. It is also
@@ -639,11 +765,11 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
     const std::string prevStatus = status_;
 
     int missing = 0;
-    for (size_t ti = 0; ti < ses_.tracks.size(); ++ti) {
-        TrackModel& t = ses_.tracks[ti];
-        if (t.savedDevices.empty()) continue;
+    for (int owner : owners) {
+        ChainOwner co = chainOwner(owner);
+        if (!co.saved || co.saved->empty()) continue;
 
-        for (SavedDevice& sd : t.savedDevices) {
+        for (SavedDevice& sd : *co.saved) {
             DeviceModel dm;
             dm.uid = sd.uid;
             dm.bypass = sd.bypass;
@@ -678,7 +804,7 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
                     dm.desc.name = sd.name;
                 }
                 dm.lostParams = sd.params;
-                t.devices.push_back(std::move(dm));
+                co.devices->push_back(std::move(dm));
                 continue;
             }
 
@@ -700,13 +826,13 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
 
             if (!rebound) dm.desc = *found;
             dm.inst = std::move(inst);
-            t.devices.push_back(std::move(dm));
+            co.devices->push_back(std::move(dm));
         }
 
         // The live models are now the truth; the passive copies are rebuilt
         // from them at the next save, missing plugins included.
-        t.savedDevices.clear();
-        publishChain((int)ti);
+        co.saved->clear();
+        publishChain(owner);
     }
 
     if (missing > 0) {
@@ -724,29 +850,35 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
 // destroyed, and destroying a PluginInstance the audio thread is still running
 // is the one thing the chain protocol exists to prevent.
 void App::releaseAllChains() {
-    for (int t = 0; t < kMaxTracks; ++t) {
-        const bool hasDevices = t < (int)ses_.tracks.size() && !ses_.tracks[t].devices.empty();
-        if (!published_[t] && !hasDevices) continue;
+    // Every published slot, not only the ones the session still has a model
+    // for: a set that shrank leaves the engine running a chain for a track
+    // index that no longer exists, and that chain has to be let go of too.
+    auto release = [&](int owner) {
+        ChainOwner co = chainOwner(owner);
+        if (!co.valid()) return;
+        const bool hasDevices = co.devices && !co.devices->empty();
+        if (!*co.published && !hasDevices) return;
 
         RtChain* empty = new RtChain();
         Command c;
-        c.type = Cmd::SetChain;
-        c.a = t;
+        c.type = co.cmd;
+        c.a = co.addr;
         c.p = empty;
         const bool sent = engine_.pushCommand(c);
         if (!sent) {
-            LOGW("command ring full - track %d keeps running its old chain", t);
+            LOGW("command ring full - %s keeps running its old chain",
+                 ownerName(owner).c_str());
             delete empty;
         }
 
         RetiredChain rc;
         if (hasDevices)
-            for (DeviceModel& d : ses_.tracks[t].devices)
+            for (DeviceModel& d : *co.devices)
                 if (d.inst) rc.dying.push_back(std::move(d.inst));
 
         if (sent) {
-            rc.chain = published_[t];       // may be null: nothing was published
-            published_[t] = empty;
+            rc.chain = *co.published;       // may be null: nothing was published
+            *co.published = empty;
         }
         // rc.chain stays null when nothing was ever published, or when the send
         // failed and the engine is therefore still following the old chain.
@@ -754,7 +886,11 @@ void App::releaseAllChains() {
         // in retiring_ until shutdown() - which is after the audio thread is
         // joined, and the only moment freeing it unilaterally is safe.
         if (rc.chain || !rc.dying.empty()) retiring_.push_back(std::move(rc));
-    }
+    };
+
+    for (int t = 0; t < kMaxTracks; ++t) release(t);
+    for (int i = 0; i < kMaxReturns; ++i) release(ownReturn(i));
+    release(kOwnMaster);
 }
 
 // The whole session is being replaced -- by a file, or by an undo snapshot.
@@ -771,16 +907,24 @@ void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
     //    what should happen to a device the snapshot does not have.
     std::vector<LiveDevice> reuse;
     if (restoring) {
-        for (TrackModel& t : ses_.tracks) {
-            for (DeviceModel& d : t.devices) {
+        // "Does the incoming set still name this device?", asked of every chain
+        // it has -- tracks, the four returns, the master.
+        auto wantedBy = [&next](u64 uid, const std::string& uri) {
+            auto hit = [&](const std::vector<SavedDevice>& v) {
+                for (const SavedDevice& sd : v)
+                    if (sd.uid == uid && sd.uri == uri) return true;
+                return false;
+            };
+            for (const TrackModel& nt : next.tracks) if (hit(nt.savedDevices)) return true;
+            for (const ReturnModel& nr : next.returns) if (hit(nr.savedDevices)) return true;
+            return hit(next.masterSavedDevices);
+        };
+        for (int o : modelOwners()) {
+            ChainOwner co = chainOwner(o);
+            if (!co.devices) continue;
+            for (DeviceModel& d : *co.devices) {
                 if (!d.inst) continue;
-                bool wanted = false;
-                for (const TrackModel& nt : next.tracks) {
-                    for (const SavedDevice& sd : nt.savedDevices)
-                        if (sd.uid == d.uid && sd.uri == d.desc.uri) { wanted = true; break; }
-                    if (wanted) break;
-                }
-                if (!wanted) continue;
+                if (!wantedBy(d.uid, d.desc.uri)) continue;
                 LiveDevice ld;
                 ld.uid = d.uid;
                 ld.uri = d.desc.uri;
@@ -844,6 +988,10 @@ void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
     selTrack_ = clampv(selTrack_, 0, (int)ses_.tracks.size() - 1);
     selSlot_  = clampv(selSlot_,  0, (int)ses_.scenes.size() - 1);
     selDevice_ = -1;
+    // A return or the master is still there whatever the incoming set looks
+    // like; a track index may not be, and the device view must not be left
+    // pointing past the end of the new track list.
+    if (ownIsTrack(devOwner_)) devOwner_ = selTrack_;
     // The tracks this index referred to are gone; the arms in the incoming set
     // are its own, not ours to take back.
     autoArmed_ = -1;
@@ -1124,13 +1272,16 @@ void App::debugUndoSelfTest() {
     };
 
     int fails = 0, ran = 0;
+    // Returns false when the edit left the serialized set identical -- the
+    // format cannot express it yet, so there was nothing to undo. The caller
+    // may then have to put the set back itself; everything else is untouched.
     auto step = [&](const char* name, auto&& edit) {
         const std::string before = text();
         edit();
         const std::string after = text();
         if (after == before) {
             LOGW("undo self-test: %s changed nothing - not exercised", name);
-            return;
+            return false;
         }
         ++ran;
         undo();
@@ -1139,6 +1290,7 @@ void App::debugUndoSelfTest() {
         if (text() != after)  { LOGE("undo self-test: %s did not redo", name); ++fails; }
         undo();                        // leave the set as this step found it
         if (text() != before) { LOGE("undo self-test: %s did not undo twice", name); ++fails; }
+        return true;
     };
 
     step("tempo", [&] { undoPoint("tempo"); setTempo(ses_.tempo + 7.0); });
@@ -1155,6 +1307,20 @@ void App::debugUndoSelfTest() {
         send(Cmd::TrackSolo, 0, ses_.tracks[0].solo ? 1 : 0);
     });
     step("add track", [&] { undoPoint("add track"); addTrack(); });
+    // A send is a per-track array the mixer writes straight into, so it goes
+    // through the same before-value path a fader does.
+    step("send level", [&] {
+        const f32 was = ses_.tracks[0].sends[0];
+        ses_.tracks[0].sends[0] = was > 0.5f ? 0.f : 0.7f;
+        undoPointWith(kSendUndo[0], ses_.tracks[0].sends[0], was);
+        send(Cmd::SendLevel, 0, 0, ses_.tracks[0].sends[0]);
+    });
+    step("return volume", [&] {
+        const f32 was = ses_.returns[0].fader;
+        ses_.returns[0].fader = was > 0.5f ? 0.4f : 0.9f;
+        undoPointWith("return volume", ses_.returns[0].fader, was);
+        send(Cmd::ReturnVol, 0, 0, faderToGain(ses_.returns[0].fader));
+    });
 
     // Notes, through the same before-value path the roll uses.
     int mt = -1, msl = -1;
@@ -1188,6 +1354,28 @@ void App::debugUndoSelfTest() {
             undoPoint("param");
             in->setParam(0, v == pi.max ? pi.min : pi.max);
         });
+        // The master chain, which reaches materializeDevices and the retirement
+        // flow through the owner id rather than a track index. The plugin is
+        // one the set already has loaded, so this costs no extra scan and works
+        // on any machine the set itself works on.
+        // The two chains that are not a track's, which reach materializeDevices
+        // and the retirement flow through an owner id rather than a track
+        // index. The plugin is one the set already has loaded, so this costs no
+        // extra scan and works wherever the set itself does.
+        const PluginDesc mdesc = ses_.tracks[dt].devices[0].desc;
+        const int busOwners[2] = {kOwnMaster, ownReturn(0)};
+        const char* busNames[2] = {"master device", "return device"};
+        for (int k = 0; k < 2; ++k) {
+            const int own = busOwners[k];
+            if (step(busNames[k], [&] { undoPoint("add device"); addDevice(own, mdesc); })) continue;
+            // The set text could not express this chain, so the undo had
+            // nothing to take back and the device is still there. Put the set
+            // back by hand: a self-test must not leave the session it borrowed
+            // in a state the user did not ask for.
+            ChainOwner co = chainOwner(own);
+            if (co.devices && !co.devices->empty())
+                removeDevice(own, (int)co.devices->size() - 1);
+        }
         step("remove device", [&] { undoPoint("remove device"); removeDevice(dt, 0); });
     } else {
         LOGW("undo self-test: no device with parameters - devices not exercised");
@@ -1324,12 +1512,36 @@ void App::createMidiClip(int track, int slot) {
     status_ = "New " + m.name;
 }
 
+// Points the DEVICES tab somewhere. Not an edit and not undoable -- it is the
+// same kind of move as selecting a track, which is explicitly outside the
+// history (see app.h).
+void App::selectChainOwner(int owner) {
+    if (!chainOwner(owner).valid()) return;
+    if (devOwner_ != owner) {
+        selDevice_ = -1;
+        stripScroll_ = 0.f;
+        paramScroll_ = 0.f;
+    }
+    devOwner_ = owner;
+    // A bus has no clips, so the CLIP tab has nothing to show for it and the
+    // panel would sit there looking at the last track's clip instead. Only the
+    // tab is switched: a hidden panel stays hidden.
+    if (!ownIsTrack(owner) && detailTab_ != DetailTab::Devices) {
+        detailTab_ = DetailTab::Devices;
+        ensurePluginScan();
+    }
+}
+
 // Live's exclusive record-arm, which is what makes the computer keyboard and a
 // controller play the track you just clicked on without a second gesture. The
 // arm this hands out is ours to take back; one the user set by hand is not.
 void App::selectTrack(int track) {
     if (track < 0 || track >= (int)ses_.tracks.size()) return;
     selTrack_ = track;
+    // The device view follows the selection back off a bus. Guarded so that
+    // clicking around the grid on the track already selected does not reset the
+    // chain the user is editing every frame.
+    if (devOwner_ != track) selectChainOwner(track);
     if (autoArmed_ == track) return;
 
     if (autoArmed_ >= 0 && autoArmed_ < (int)ses_.tracks.size()) {
@@ -2278,11 +2490,16 @@ void App::drawSessionView(const Rect& r) {
     Input& in = win_.input();
     rend_.rect(r, pal::appBg);
 
+    // Right-hand furniture, in Live's order: the scene launchers stay against
+    // the clip grid (their rows line up with it), then the return buses, then
+    // the master. Everything the mix ends up in reads left to right.
     const f32 masterW = lay::masterW * s;
     const f32 sceneW  = lay::sceneColW * s;
+    const f32 retW    = lay::returnW * s * kMaxReturns;
     Rect masterCol{r.right() - masterW, r.y, masterW, r.h};
-    Rect sceneCol{masterCol.x - sceneW, r.y, sceneW, r.h};
-    Rect tracksCol{r.x, r.y, sceneCol.x - r.x, r.h};
+    Rect retCol{masterCol.x - retW, r.y, retW, r.h};
+    Rect sceneCol{retCol.x - sceneW, r.y, sceneW, r.h};
+    Rect tracksCol{r.x, r.y, std::max(0.f, sceneCol.x - r.x), r.h};
 
     // Horizontal scroll over the track area.
     f32 totalW = 0.f;
@@ -2299,6 +2516,7 @@ void App::drawSessionView(const Rect& r) {
     rend_.popClip();
 
     drawSceneColumn(sceneCol);
+    drawReturnStrips(retCol);
     drawMasterStrip(masterCol);
 }
 
@@ -2632,6 +2850,29 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
         rend_.circle(ar.cx(), ar.cy(), 3.5f * s, t.arm ? pal::textOnClip : pal::armRed);
         y += 20 * s;
 
+        // Sends A-D, above the pan knob as a 2x2 grid. A strip is 94px wide, so
+        // four knobs in a row would be 12px across and unusable; two rows of two
+        // leave room for a 15px knob with its letter beside it, which is the
+        // smallest thing here that still reads as a send and not as a dot.
+        // Anything the user has dialled in also shows as an arc, so a track with
+        // send on it is visible without hovering.
+        {
+            const f32 cellW = (col.w - 12 * s) * 0.5f;
+            const f32 rowH  = 18 * s;
+            for (int rn = 0; rn < kMaxReturns; ++rn) {
+                Rect cell{col.x + 6 * s + (rn % 2) * cellW, y + (rn / 2) * rowH, cellW, rowH};
+                rend_.textIn(fSmall_, {cell.x, cell.y, 9 * s, cell.h}, kReturnLetter[rn],
+                             pal::textFaint, Align::Left, 0);
+                Rect kr{cell.x + 10 * s, cell.y + 1 * s, 15 * s, 15 * s};
+                const f32 wasSend = t.sends[rn];
+                if (ui_.knob(uiId(6, (int)ti, 10 + rn), kr, &t.sends[rn], 0.f, 1.f, 0.f)) {
+                    undoPointWith(kSendUndo[rn], t.sends[rn], wasSend);
+                    send(Cmd::SendLevel, (int)ti, rn, t.sends[rn]);
+                }
+            }
+            y += 2 * rowH + 3 * s;
+        }
+
         // Pan
         Rect pan{col.cx() - 11 * s, y, 22 * s, 22 * s};
         if (ui_.knob(uiId(6, (int)ti, 3), pan, &t.pan, -1.f, 1.f, 0.f)) {
@@ -2656,18 +2897,142 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
     rend_.popClip();
 }
 
+// The A-D buses. No clips, no M/S/arm, no pan: a return is a name, a chain and
+// a level, so the strip is a header, the chain's device names where a track has
+// its grid, and a fader with its meter. Clicking anywhere that is not a control
+// points the DEVICES tab at the bus, which is the only way to edit its chain.
+void App::drawReturnStrips(const Rect& r) {
+    const f32 s = win_.dpiScale();
+    Input& in = win_.input();
+    if (r.w <= 0.f) return;
+    rend_.rect(r, pal::panel);
+    rend_.rect({r.x, r.y, 1 * s, r.h}, pal::divider);
+
+    const f32 colW = r.w / (f32)kMaxReturns;
+    const f32 top  = r.bottom() - lay::mixerH * s;
+
+    for (int i = 0; i < kMaxReturns; ++i) {
+        ReturnModel& rt = ses_.returns[i];
+        const int owner = ownReturn(i);
+        const bool sel  = devOwner_ == owner;
+        Rect col{r.x + i * colW, r.y, colW - lay::gutter * s, r.h};
+
+        // Claimed first so the fader and the name field can take hot back --
+        // the same last-setHot-wins trick the device boxes use.
+        const u64 id = uiId(13, i, 0);
+        const bool hot = ui_.setHot(id, col) && ui_.isHot(id);
+        rend_.rect(col, sel ? pal::panelAlt : pal::panel);
+
+        Rect head{col.x, col.y, col.w, lay::trackHeadH * s};
+        rend_.rect(head, sel ? pal::gridBg : pal::panelAlt);
+        rend_.rect({head.x, head.y, head.w, 2 * s}, pal::soloBlue);
+        rend_.textIn(fBold_, {head.x + 3 * s, head.y, 10 * s, head.h}, kReturnLetter[i],
+                     sel ? pal::text : pal::textDim, Align::Left, 0);
+        // The model's placeholder name is "Return" for all four buses, which
+        // says nothing in a strip this narrow and would be clipped to "Retu"
+        // anyway -- so the letter carries the identity and the field stays
+        // blank until the bus is named. A DISPLAY choice, deliberately: writing
+        // a letter into the model would make every set on disk carry four
+        // return blocks it has no reason to (see project.cpp's `interesting`).
+        const u64 nameId = uiId(13, i, 1);
+        std::string shown = (rt.name == kReturnPlaceholder) ? std::string() : rt.name;
+        if (ui_.textField(nameId, {head.x + 13 * s, head.y, head.w - 15 * s, head.h},
+                          &shown, Col(0, 0, 0, 0), sel ? pal::text : pal::textDim, Align::Left)) {
+            const std::string was = rt.name;
+            rt.name = shown.empty() ? std::string(kReturnPlaceholder) : shown;
+            undoPointWith("rename return", rt.name, was);
+        }
+
+        // What the bus is made of, in the space a track spends on clips. A
+        // return with an empty chain is inert, and saying so beats an empty
+        // column the user has no reason to click on.
+        Rect body{col.x, head.bottom(), col.w, top - head.bottom()};
+        rend_.pushClip(body);
+        if (rt.devices.empty()) {
+            rend_.textIn(fSmall_, {body.x, body.y + 6 * s, body.w, 12 * s}, "no fx",
+                         pal::textFaint, Align::Center, 0);
+        } else {
+            f32 dy = body.y + 4 * s;
+            for (const DeviceModel& d : rt.devices) {
+                if (dy + 12 * s > body.bottom()) break;
+                Rect row{body.x + 3 * s, dy, body.w - 6 * s, 12 * s};
+                rend_.roundRect(row, 2 * s, pal::panelAlt);
+                rend_.pushClip(row);
+                rend_.textIn(fSmall_, row, d.desc.name.c_str(),
+                             d.inst ? pal::textDim : pal::armRed, Align::Left, 3 * s);
+                rend_.popClip();
+                dy += 14 * s;
+            }
+        }
+        rend_.popClip();
+
+        Rect mix{col.x, top, col.w, r.bottom() - top};
+        rend_.rect({mix.x, mix.y, mix.w, 1 * s}, pal::divider);
+        // The same top inset the master strip uses, so the buses and the mix
+        // they land in read as one row of faders rather than a staircase.
+        f32 y = mix.y + 26 * s;
+        const f32 fh = mix.bottom() - y - 6 * s;
+        Rect fader{mix.x + 10 * s, y, 15 * s, fh};
+        Rect meter{fader.right() + 5 * s, y, 9 * s, fh};
+
+        const f32 wasFader = rt.fader;
+        if (ui_.vFader(uiId(13, i, 2), fader, &rt.fader)) {
+            undoPointWith("return volume", rt.fader, wasFader);
+            send(Cmd::ReturnVol, i, 0, faderToGain(rt.fader));
+        }
+        const f32 lvl = std::max(engine_.returnMeterL[i].load(), engine_.returnMeterR[i].load());
+        peakHoldR_[i] = std::max(lvl, peakHoldR_[i] * 0.985f);
+        ui_.meterV(meter, lvl, peakHoldR_[i]);
+
+        if (sel) rend_.roundRectOutline(col, 2 * s, 1 * s, pal::accent);
+        if (hot) {
+            ui_.cursor = Cursor::Hand;
+            if (in.pressed[0]) selectChainOwner(owner);
+        }
+    }
+}
+
 void App::drawMasterStrip(const Rect& r) {
     const f32 s = win_.dpiScale();
+    Input& in = win_.input();
+    const bool sel = devOwner_ == kOwnMaster;
     rend_.rect(r, pal::panelAlt);
     rend_.rect({r.x, r.y, 1 * s, r.h}, pal::divider);
 
+    // Same deal as a return: the strip is the handle for the master chain, so
+    // the whole column is a click target that the controls in it take back.
+    const u64 id = uiId(7, 10);
+    const bool hot = ui_.setHot(id, r) && ui_.isHot(id);
+
     Rect head{r.x, r.y, r.w, lay::trackHeadH * s};
-    rend_.rect(head, pal::panel);
+    rend_.rect(head, sel ? pal::gridBg : pal::panel);
     rend_.textIn(fBold_, head, "MASTER", pal::text, Align::Center);
 
     const f32 top = r.bottom() - lay::mixerH * s;
     Rect mix{r.x, top, r.w, lay::mixerH * s};
     rend_.rect({mix.x, mix.y, mix.w, 1 * s}, pal::divider);
+
+    // The master chain, where a return lists its own: this is where a bus
+    // compressor or a saturator across the whole mix lives.
+    {
+        Rect body{r.x, head.bottom(), r.w, top - head.bottom()};
+        rend_.pushClip(body);
+        f32 dy = body.y + 4 * s;
+        for (const DeviceModel& d : ses_.masterDevices) {
+            if (dy + 12 * s > body.bottom()) break;
+            Rect row{body.x + 4 * s, dy, body.w - 8 * s, 12 * s};
+            rend_.roundRect(row, 2 * s, pal::panel);
+            rend_.pushClip(row);
+            rend_.textIn(fSmall_, row, d.desc.name.c_str(),
+                         d.inst ? pal::textDim : pal::armRed, Align::Left, 3 * s);
+            rend_.popClip();
+            dy += 14 * s;
+        }
+        if (ses_.masterDevices.empty())
+            rend_.textIn(fSmall_, {body.x, body.y + 6 * s, body.w, 12 * s}, "no fx",
+                         pal::textFaint, Align::Center, 0);
+        rend_.popClip();
+    }
 
     static f32 masterFader = 0.85f;
     f32 y = mix.y + 26 * s;
@@ -2684,6 +3049,12 @@ void App::drawMasterStrip(const Rect& r) {
     peakHoldM_[1] = std::max(rr, peakHoldM_[1] * 0.985f);
     ui_.meterV(meterL, l, peakHoldM_[0]);
     ui_.meterV(meterR, rr, peakHoldM_[1]);
+
+    if (sel) rend_.roundRectOutline(r, 2 * s, 1 * s, pal::accent);
+    if (hot) {
+        ui_.cursor = Cursor::Hand;
+        if (in.pressed[0]) selectChainOwner(kOwnMaster);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,9 +3108,10 @@ void App::drawDetailPanel(const Rect& r) {
             snprintf(buf, sizeof buf, "%s  -  scene %d", m.valid() ? m.name.c_str() : "no clip",
                      selSlot_ + 1);
         } else {
-            snprintf(buf, sizeof buf, "%s  -  %zu device%s", ses_.tracks[selTrack_].name.c_str(),
-                     ses_.tracks[selTrack_].devices.size(),
-                     ses_.tracks[selTrack_].devices.size() == 1 ? "" : "s");
+            ChainOwner co = chainOwner(devOwner_);
+            const size_t n = co.devices ? co.devices->size() : 0;
+            snprintf(buf, sizeof buf, "%s  -  %zu device%s", ownerName(devOwner_).c_str(),
+                     n, n == 1 ? "" : "s");
         }
         rend_.textIn(fSmall_, head, buf, pal::textFaint, Align::Right, 8 * s);
     }
@@ -3044,12 +3416,12 @@ void App::drawPluginBrowser(const Rect& r) {
 
         if (hot && in.pressed[0]) pluginSel_ = pi;
         // Double-click loads, matching how the file browser drops a sample.
-        // The entry is taken here rather than inside addDeviceToTrack, which
+        // The entry is taken here rather than inside addDevice, which
         // init() also calls through the LATTICE_DEBUG_ADDFX hook: nothing that
         // happens while the app is starting up belongs in the history.
         if (hot && in.dblClick) {
             undoPoint("add device");
-            addDeviceToTrack(selTrack_, d);
+            addDevice(devOwner_, d);
         }
     }
     rend_.popClip();
@@ -3060,40 +3432,52 @@ void App::drawDeviceStrip(const Rect& r) {
     Input& in = win_.input();
     rend_.rect(r, pal::panel);
 
-    TrackModel& t = ses_.tracks[selTrack_];
-    const Col tc = pal::clipColors[t.colorIdx % pal::clipColorCount];
+    // The chain being edited belongs to a track, a return or the master; past
+    // this point the only difference is the colour of the identity chip.
+    ChainOwner co = chainOwner(devOwner_);
+    if (!co.devices) {                       // the target went away under us
+        devOwner_ = selTrack_;
+        co = chainOwner(devOwner_);
+        if (!co.devices) return;             // nothing is clipped yet
+    }
+    std::vector<DeviceModel>& devices = *co.devices;
+    const Col tc = ownIsTrack(devOwner_)
+                 ? pal::clipColors[ses_.tracks[devOwner_].colorIdx % pal::clipColorCount]
+                 : (ownIsReturn(devOwner_) ? pal::soloBlue : pal::accent);
 
     Rect head{r.x, r.y, r.w, 16 * s};
     rend_.rect(head, pal::panelAlt);
-    rend_.rect({head.x, head.y, 4 * s, head.h}, tc);       // track identity chip
-    rend_.textIn(fBold_, {head.x + 10 * s, head.y, 220 * s, head.h}, t.name.c_str(),
-                 pal::text, Align::Left, 0);
-    rend_.textIn(fSmall_, head, "double-click a plugin to add it to this track",
+    rend_.rect({head.x, head.y, 4 * s, head.h}, tc);       // owner identity chip
+    rend_.textIn(fBold_, {head.x + 10 * s, head.y, 220 * s, head.h},
+                 ownerName(devOwner_).c_str(), pal::text, Align::Left, 0);
+    rend_.textIn(fSmall_, head, "double-click a plugin to add it to this chain",
                  pal::textFaint, Align::Right, 8 * s);
 
     Rect area{r.x, head.bottom(), r.w, r.bottom() - head.bottom()};
     rend_.pushClip(area);
 
-    // Keep the selection honest: tracks can be switched under it, and a device
-    // can have been removed since the last frame.
-    if (t.devices.empty()) selDevice_ = -1;
-    else selDevice_ = clampv(selDevice_ < 0 ? 0 : selDevice_, 0, (int)t.devices.size() - 1);
+    // Keep the selection honest: the target can be switched under it, and a
+    // device can have been removed since the last frame.
+    if (devices.empty()) selDevice_ = -1;
+    else selDevice_ = clampv(selDevice_ < 0 ? 0 : selDevice_, 0, (int)devices.size() - 1);
 
-    if (t.devices.empty()) {
-        rend_.textIn(fBody_, area, "No devices on this track", pal::textFaint, Align::Center);
+    if (devices.empty()) {
+        char msg[80];
+        snprintf(msg, sizeof msg, "No devices on %s", ownerName(devOwner_).c_str());
+        rend_.textIn(fBody_, area, msg, pal::textFaint, Align::Center);
         rend_.popClip();
         return;
     }
 
     const f32 boxW = 150 * s, gap = 5 * s;
-    const f32 total = t.devices.size() * (boxW + gap) + 6 * s;
+    const f32 total = devices.size() * (boxW + gap) + 6 * s;
     const f32 maxScroll = std::max(0.f, total - area.w);
     stripScroll_ = clampv(stripScroll_, 0.f, maxScroll);
     bool wheelUsed = false;
 
     f32 x = area.x + 6 * s - stripScroll_;
-    for (size_t i = 0; i < t.devices.size(); ++i) {
-        DeviceModel& d = t.devices[i];
+    for (size_t i = 0; i < devices.size(); ++i) {
+        DeviceModel& d = devices[i];
         Rect box{x, area.y + 4 * s, boxW, area.h - 9 * s};
         x += boxW + gap;
         if (box.right() < area.x || box.x > area.right()) continue;
@@ -3143,9 +3527,9 @@ void App::drawDeviceStrip(const Rect& r) {
             // parameters does not survive, which is the same trade a saved set
             // makes and is documented as such in app.h.
             undoPoint("remove device");
-            removeDevice(selTrack_, (int)i);
+            removeDevice(devOwner_, (int)i);
             rend_.popClip();
-            return;                       // t.devices changed under us
+            return;                       // the device list changed under us
         }
         if (hotBox && in.pressed[0]) { selDevice_ = (int)i; paramScroll_ = 0.f; }
 
@@ -3295,12 +3679,20 @@ void App::drawStatusBar(const Rect& r) {
     char midiTag[32] = "";
     if (midi_.running()) snprintf(midiTag, sizeof midiTag, " · MIDI %d:0", midi_.clientId());
 
-    char buf[192];
-    snprintf(buf, sizeof buf, "%s · %s %.0f Hz / %d fr%s · %.0f fps · %d draws",
+    // Delay compensation, when the engine is applying any. It is latency the
+    // user did not ask for and cannot see anywhere else, and it moves when a
+    // plugin is added to a chain, so it belongs beside the buffer size.
+    char pdcTag[24] = "";
+    const int pdc = engine_.latencyFrames.load();
+    if (pdc > 0) snprintf(pdcTag, sizeof pdcTag, " · PDC %d", pdc);
+
+    char buf[224];
+    snprintf(buf, sizeof buf, "%s · %s %.0f Hz / %d fr%s%s · %.0f fps · %d draws",
              win_.backendName(),
              audio_ ? audio_->name() : "silent",
              audio_ ? audio_->sampleRate() : 0.0,
              audio_ ? audio_->bufferSize() : 0,
+             pdcTag,
              midiTag,
              fps_, rend_.drawCalls());
     rend_.textIn(fSmall_, r, buf, pal::textFaint, Align::Right, 8 * s);

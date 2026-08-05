@@ -381,6 +381,7 @@ private:
     void drawClipGrid(const Rect& r, f32 scrollX);
     void drawSceneColumn(const Rect& r);
     void drawMixer(const Rect& r, f32 scrollX);
+    void drawReturnStrips(const Rect& r);         // the A-D buses, beside MASTER
     void drawMasterStrip(const Rect& r);
     void drawDetailPanel(const Rect& r);          // tab header + active tab
     void drawClipDetail(const Rect& r);
@@ -415,6 +416,11 @@ private:
     // Every path that moves the selection goes through here: selecting a track
     // also arms it (see autoArmed_).
     void  selectTrack(int track);
+    // Points the DEVICES tab at a chain owner (see the addressing below).
+    // Selecting a track goes through selectTrack, which calls this; a return or
+    // the master has no clips, so clicking one also swings the detail panel to
+    // DEVICES -- the CLIP tab has nothing to say about a bus.
+    void  selectChainOwner(int owner);
 
     // --- recording ---
     void  startRecording(int track, int slot);   // allocate + arm a take
@@ -531,10 +537,56 @@ private:
     };
     std::vector<RetiredChain> retiring_;
     const RtChain* published_[kMaxTracks] = {};
-    void publishChain(int track);
+    const RtChain* publishedReturn_[kMaxReturns] = {};
+    const RtChain* publishedMaster_ = nullptr;
+    // One retirement pool for all three kinds of owner, and deliberately so: an
+    // entry is matched on the chain POINTER, every published RtChain is its own
+    // allocation, and no chain is ever published to two owners -- so the pointer
+    // alone says which entry an Ev::ChainRetired means, whatever its `a` is.
+    // Per-owner pools would only add a way for the two to disagree.
+
+    // --- chain owners ------------------------------------------------------
+    // A chain hangs off one of three things: a track, a return bus, or the
+    // master. They differ only in *where* the device list, the saved list and
+    // the published pointer live and in which command carries the chain across,
+    // so everything that builds, publishes, saves, restores or draws a chain
+    // takes an owner id and goes through ChainOwner rather than existing three
+    // times. The id is the engine's own Ev::ChainRetired addressing (engine.h):
+    //   0 .. kMaxTracks-1            a track
+    //   kMaxTracks + i               return i
+    //   -1                           the master
+    static constexpr int kOwnMaster  = -1;
+    static constexpr int kOwnReturn0 = kMaxTracks;
+    static constexpr int ownReturn(int i)   { return kOwnReturn0 + i; }
+    static constexpr bool ownIsTrack(int o) { return o >= 0 && o < kMaxTracks; }
+    static constexpr bool ownIsReturn(int o) {
+        return o >= kOwnReturn0 && o < kOwnReturn0 + kMaxReturns;
+    }
+    struct ChainOwner {
+        // Null for a published slot the session has no model behind any more --
+        // a track index past the end after the set shrank. The engine may still
+        // be running its chain, so the slot outlives the model.
+        std::vector<DeviceModel>* devices = nullptr;
+        std::vector<SavedDevice>* saved   = nullptr;
+        const RtChain** published = nullptr;      // null only for a bad id
+        Cmd cmd  = Cmd::SetChain;
+        i32 addr = 0;                             // Command::a, and the event's
+        bool valid() const { return published != nullptr; }
+    };
+    ChainOwner chainOwner(int owner);
+    std::string ownerName(int owner) const;       // for headers and messages
+    // Every owner the current session has a model for, tracks first. The order
+    // everything that walks all the chains at once uses.
+    std::vector<int> modelOwners() const;
+
+    void publishChain(int owner);
+    // Named siblings, purely so call sites read as what they do; both are
+    // publishChain with the owner id spelled out.
+    void publishReturnChain(int idx) { publishChain(ownReturn(idx)); }
+    void publishMasterChain()        { publishChain(kOwnMaster); }
     void ensurePluginScan();                      // lazy, first time DEVICES opens
-    void addDeviceToTrack(int track, const PluginDesc& d);
-    void removeDevice(int track, int idx);
+    void addDevice(int owner, const PluginDesc& d);
+    void removeDevice(int owner, int idx);
 
     Session  ses_;
     MainView view_ = MainView::Session;
@@ -562,7 +614,11 @@ private:
     std::string pluginFilter_;
     f32  pluginScroll_ = 0.f;
     int  pluginSel_ = -1;
-    int  selDevice_ = -1;              // index into the selected track's devices
+    // What the DEVICES tab edits, in the owner addressing above. Tracks the
+    // selection while it is a track; a click on a return or on MASTER parks it
+    // there until the next track selection.
+    int  devOwner_ = 0;
+    int  selDevice_ = -1;              // index into the target chain's devices
     f32  stripScroll_ = 0.f;           // horizontal, device boxes
     f32  paramScroll_ = 0.f;           // vertical, inside the selected device
 
@@ -725,6 +781,7 @@ private:
     // per-frame UI feedback
     std::string status_;
     f32  peakHoldT_[kMaxTracks]{};
+    f32  peakHoldR_[kMaxReturns]{};
     f32  peakHoldM_[2]{};
     f64  lastFrameTime_ = 0.0;
     f32  fps_ = 0.f;
