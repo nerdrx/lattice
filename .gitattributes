@@ -1,0 +1,14 @@
+# Normalize line endings; the Windows port must not turn diffs into noise.
+* text=auto
+*.cpp text
+*.h text
+*.md text
+*.sh text eol=lf
+Makefile* text eol=lf
+
+# Binary media
+*.wav binary
+*.flac binary
+*.ogg binary
+*.png binary
+*.ttf binary

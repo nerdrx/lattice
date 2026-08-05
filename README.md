@@ -126,5 +126,6 @@ directly, so the prototypes are declared and that is that.
 
 ## Licence
 
-Not yet chosen. Note that adding VST3 would pull in Steinberg's SDK, which is
-GPLv3-or-commercial and would constrain this decision.
+GPL-3.0-or-later — see [LICENSE](LICENSE). This also keeps the VST3 door open:
+Steinberg's SDK is dual GPLv3/commercial, so a GPL host can vendor it without a
+signed agreement. The vendored CLAP headers are MIT and compatible.
