@@ -7,6 +7,14 @@
 #include <cmath>
 
 namespace lat {
+
+// Text that sits ON a colored fill: dark ink on bright fills (the pastel clip
+// colors), light ink on dark fills (the purple accent). Rec.601 luma.
+static Col inkOn(const Col& fill) {
+    const f32 luma = 0.299f * fill.r + 0.587f * fill.g + 0.114f * fill.b;
+    return luma > 0.45f ? pal::textOnClip : Col(0.94f, 0.92f, 1.f, 1.f);
+}
+
 namespace {
 
 constexpr f32 kPi = 3.14159265358979323846f;
@@ -130,7 +138,7 @@ bool Ui::button(u64 id, const Rect& b, const char* label, bool on, Col onCol, f3
     Col fg = pal::text;
     if (on) {
         fill = held ? onCol.scale(0.85f) : onCol;
-        fg = pal::textOnClip;
+        fg = inkOn(fill);
     } else if (held) {
         fill = pal::panelAlt.scale(0.7f);
     } else if (hotNow) {
@@ -166,7 +174,7 @@ bool Ui::squareToggle(u64 id, const Rect& b, const char* label, bool* value, Col
     Col fg = pal::textDim;
     if (*value) {
         fill = held ? onCol.scale(0.85f) : onCol;
-        fg = pal::textOnClip;
+        fg = inkOn(fill);
     } else if (held) {
         fill = pal::panelAlt.scale(0.7f);
     } else if (hotNow) {

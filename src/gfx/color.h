@@ -44,8 +44,12 @@ constexpr Col textDim      = rgb(0x8A8A8A);
 constexpr Col textFaint    = rgb(0x5E5E5E);
 constexpr Col textOnClip   = rgb(0x1A1A1A);
 
-// Accents
-constexpr Col accent       = rgb(0xFF764D);   // selection / focus
+// Accents. The brand accent is the user's chosen electric purple. It is a
+// dark hue, so two rules keep it readable: as small TEXT on dark surfaces use
+// accentHi (a lifted tint), and anything drawn ON an accent fill uses light
+// text — widgets.cpp picks per-luminance.
+constexpr Col accent       = rgb(0x7700FF);   // selection / focus / brand
+constexpr Col accentHi     = rgb(0xA875FF);   // accent as text on dark
 constexpr Col playGreen    = rgb(0x59D64B);
 constexpr Col recRed       = rgb(0xFF3B30);
 constexpr Col armRed       = rgb(0xC8462F);
