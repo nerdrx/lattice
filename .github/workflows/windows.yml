@@ -78,8 +78,24 @@ jobs:
           set -euxo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends mingw-w64
-          sudo apt-get install -y --no-install-recommends wine64 \
+          # The `wine` meta first: on noble, `wine64` alone installs only
+          # /usr/bin/wine64 and no `wine` entry point (found the hard way —
+          # the job died at `wine --version`).
+          sudo apt-get install -y --no-install-recommends wine wine64 \
+            || sudo apt-get install -y --no-install-recommends wine64 \
             || sudo apt-get install -y --no-install-recommends wine
+
+      # Whatever the packages actually installed, resolve the entry points once
+      # and thread them through GITHUB_ENV; every later step uses $WINE rather
+      # than assuming a spelling.
+      - name: Resolve wine entry points
+        run: |
+          set -euo pipefail
+          WINE=$(command -v wine || command -v wine64)
+          [ -n "$WINE" ] || { echo "::error::no wine binary found after install"; exit 1; }
+          echo "WINE=$WINE" >> "$GITHUB_ENV"
+          echo "WINESERVER_BIN=$(command -v wineserver || true)" >> "$GITHUB_ENV"
+          echo "resolved: WINE=$WINE wineserver=$(command -v wineserver || echo none)"
 
       # Debian/Ubuntu ship two mingw toolchains that differ in thread model.
       # The win32 one had no std::thread before GCC 13, and src/audio/
@@ -114,7 +130,7 @@ jobs:
           x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a || true
           echo "::endgroup::"
           echo "::group::wine"
-          wine --version
+          "$WINE" --version
           echo "WINEARCH=$WINEARCH  WINEPREFIX=$WINEPREFIX"
           echo "::endgroup::"
           # Informational only, never fatal. libsndfile/libsamplerate for
@@ -189,8 +205,10 @@ jobs:
       - name: Initialise the wine prefix
         run: |
           set -euo pipefail
-          wineboot --init
-          wineserver -w
+          # `wineboot` may not exist as a standalone script with wine64-only
+          # installs; running it as a wine builtin works either way.
+          "$WINE" wineboot --init
+          if [ -n "${WINESERVER_BIN:-}" ]; then "$WINESERVER_BIN" -w; else sleep 3; fi
           echo "prefix ready: $WINEPREFIX"
 
       # The point of the whole job. Same binary, same assertions as the Linux
@@ -203,7 +221,7 @@ jobs:
       - name: Run the engine suite under wine
         run: |
           set -euo pipefail
-          wine ./build-mingw/engine_test.exe 2>wine-stderr.txt | tee engine_test-wine.txt
+          "$WINE" ./build-mingw/engine_test.exe 2>wine-stderr.txt | tee engine_test-wine.txt
           echo "::group::wine stderr"
           cat wine-stderr.txt
           echo "::endgroup::"
@@ -221,7 +239,7 @@ jobs:
           {
             echo "### Engine suite under Wine"
             echo ""
-            echo "\`$(wine --version)\` ran \`engine_test.exe\`: **${passed} checks passed, 0 failed**"
+            echo "\`$("$WINE" --version)\` ran \`engine_test.exe\`: **${passed} checks passed, 0 failed**"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # always(), because a .exe that failed under wine is the one you most want
