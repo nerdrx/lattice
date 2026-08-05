@@ -13,15 +13,20 @@ namespace {
 // scene and clip, the clip's generative fields (prob / follow / followbeats),
 // and `device` blocks inside a track.
 //
-// There is deliberately ONE parser for both versions rather than a v1 and a v2
-// reader. The additions are all new keys with defaults, so a v1 file simply
-// never mentions them and comes out with the defaults; the version number gates
-// nothing on the read side beyond the upper bound. The alternative -- rejecting
-// v2 keys inside a file that calls itself v1 -- would only punish someone who
-// hand-edited the header, and buys no safety: an old Lattice already refuses
-// every one of those keys, so no half-understood file can be read either way.
-// Saving always writes the current version.
-constexpr int kFormatVersion = 2;
+// Version 3 adds MIDI clips: a `kind midi` line and zero or more `note` lines
+// inside a clip block. An audio clip writes neither, so every set that has no
+// MIDI in it saves exactly the bytes version 2 saved -- only the header line
+// moves.
+//
+// There is deliberately ONE parser for all versions rather than a reader per
+// version. The additions are all new keys with defaults, so an older file
+// simply never mentions them and comes out with the defaults; the version
+// number gates nothing on the read side beyond the upper bound. The
+// alternative -- rejecting v3 keys inside a file that calls itself v1 -- would
+// only punish someone who hand-edited the header, and buys no safety: an old
+// Lattice already refuses every one of those keys, so no half-understood file
+// can be read either way. Saving always writes the current version.
+constexpr int kFormatVersion = 3;
 constexpr int kMinFormatVersion = 1;
 
 // ---------------------------------------------------------------------------
@@ -123,12 +128,36 @@ f64 clFollowBeats(f64 v){ return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
 // and anything below it are nonsense.
 u64 clNextUid(u64 v)    { return v < 1 ? 1 : v; }
 
-// A slot counts as occupied if it holds audio, remembers a source file, or was
-// given a name. There is no explicit "used" flag in ClipModel; the path is what
-// keeps a clip whose media went offline alive across a save/load cycle, and the
-// name covers clips that never had a file at all.
+// Notes. The same reasoning as above applies: these are applied on save and on
+// load, so a value the model holds out of range is written once, read back
+// unchanged, and written again identically.
+//
+// A zero-length note is not a note -- it would sound for no frames and could
+// never be grabbed again in the piano roll -- so the length has a floor rather
+// than being clamped to 0. A 32nd is the smallest grid the editor offers.
+constexpr f64 kMinNoteLen = 1.0 / 32.0;
+f64 clNoteBeat(f64 v) { return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
+f64 clNoteLen(f64 v)  { return std::isfinite(v) ? clampv(v, kMinNoteLen, 1e7) : 0.25; }
+// Both are u8 in the model, so only the top of the range can be violated in
+// memory; the parameter is widened to i64 so a negative number in a file is
+// caught here instead of wrapping. Velocity 0 is a note-off in MIDI, never a
+// note, hence the floor of 1.
+u8 clPitch(i64 v)     { return (u8)clampv(v, (i64)0, (i64)127); }
+u8 clVel(i64 v)       { return (u8)clampv(v, (i64)1, (i64)127); }
+
+// A slot counts as occupied if it holds audio, remembers a source file, was
+// given a name, or is a MIDI clip. There is no explicit "used" flag in
+// ClipModel; the path is what keeps a clip whose media went offline alive
+// across a save/load cycle, and the name covers clips that never had a file at
+// all. A MIDI clip occupies its slot unconditionally: an empty, unnamed
+// pattern is still launchable (it plays silence for its length), so it is a
+// clip the user made and not a ghost -- which is also why ClipModel::valid()
+// is true for it. Every derivation of "is this slot used" in this file goes
+// through here: what gets written, which rows the scene list has to cover
+// (sceneRowCount), and whether a just-parsed clip is kept.
 bool clipOccupied(const ClipModel& c) {
-    return c.sample != nullptr || !c.path.empty() || !c.name.empty();
+    return c.sample != nullptr || !c.path.empty() || !c.name.empty() ||
+           c.kind == ClipKind::Midi;
 }
 
 // Number of scene rows the file must describe: the model's own scene list,
@@ -189,24 +218,61 @@ void writeDevice(std::string& o, const SavedDevice& d) {
     o += "  enddevice\n";
 }
 
+// The field set is per kind. A MIDI clip emits, in this order:
+//
+//     uid, kind, name, color, gain, loop, beats, quantum,
+//     [prob] [follow] [followbeats], note*
+//
+// and an audio clip emits what it always did (uid, file, name, color, gain,
+// warp, loop, bpm, beats, range, quantum, then the sparse generative fields).
+// So `kind`, and `note`, are the only two lines version 2 never saw, and only a
+// MIDI clip has them.
+//
+// The four audio-only lines are dropped from a MIDI clip because they describe
+// a sample being played back, and there is no sample: `file` names one, `bpm`
+// and `warp` say how to stretch it to the transport, and `range` is a pair of
+// frame offsets into it. `beats` is NOT in that group -- it is the clip's
+// length in musical time, which is exactly what the piano roll edits, so MIDI
+// clips keep it. Ditto `loop`, `quantum` and the generative fields, none of
+// which care what is inside the clip.
+//
+// Dropping a field whose in-memory value is not the default is safe here in a
+// way it would not be for the sparse fields above, because the suppression is
+// unconditional: the writer never emits it, so the reader never sets it, so
+// the second save suppresses exactly what the first one did. The one visible
+// consequence is that a MIDI clip which somehow carries, say, a clipBpm of 150
+// comes back from a load with the default 120 -- the field is not part of what
+// a MIDI clip means, and nothing reads it for one.
 void writeClip(std::string& o, const ClipModel& c, int idx) {
+    const bool midi = (c.kind == ClipKind::Midi);
     o += "  clip " + std::to_string(idx) + "\n";
     writeUid(o, "    ", c.uid);
+    // Immediately after the uid, i.e. in front of everything that could depend
+    // on it. The reader does not actually need it early (the kind-sensitive
+    // checks happen at `endclip`, so a hand-shuffled file still parses), but a
+    // human scanning a diff should not have to read to the end of the block to
+    // find out what kind of clip it is.
+    if (midi) kv(o, "    ", "kind", "midi");
     // ClipModel::path is the authority: unlike the sample's own path it outlives
     // a file that failed to load, so an offline set keeps its references instead
     // of quietly dropping the `file` line on the next save. The sample is only
     // consulted for in-memory clips built before `path` was populated.
-    if (!c.path.empty())                          kv(o, "    ", "file", c.path);
-    else if (c.sample && !c.sample->path.empty()) kv(o, "    ", "file", c.sample->path);
+    if (!midi) {
+        if (!c.path.empty())                          kv(o, "    ", "file", c.path);
+        else if (c.sample && !c.sample->path.empty()) kv(o, "    ", "file", c.sample->path);
+    }
     kv(o, "    ", "name", c.name);
     kn(o, "    ", "color",  std::to_string(clColor(c.colorIdx)));
     kn(o, "    ", "gain",   fmtF32(clGain(c.gain)));
-    kn(o, "    ", "warp",   std::to_string(clWarp((int)c.warp)));
+    if (!midi)
+        kn(o, "    ", "warp", std::to_string(clWarp((int)c.warp)));
     kn(o, "    ", "loop",   c.loop ? "1" : "0");
-    kn(o, "    ", "bpm",    fmtF64(clBpm(c.clipBpm)));
+    if (!midi)
+        kn(o, "    ", "bpm", fmtF64(clBpm(c.clipBpm)));
     kn(o, "    ", "beats",  fmtF64(clBeats(c.lengthBeats)));
-    kn(o, "    ", "range",  std::to_string(clFrame(c.loopStart)) + " " +
-                            std::to_string(clFrame(c.loopEnd)));
+    if (!midi)
+        kn(o, "    ", "range", std::to_string(clFrame(c.loopStart)) + " " +
+                               std::to_string(clFrame(c.loopEnd)));
     kn(o, "    ", "quantum", std::to_string(clClipQuantum(c.quantumIdx)));
     // Sparse: the generative fields are off on almost every clip, and a set of
     // 300 clips should not carry 900 lines saying so. Emitting only non-default
@@ -218,6 +284,28 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
     if (prob != 1.0)              kn(o, "    ", "prob", fmtF64(prob));
     if (fol != (int)Follow::None) kn(o, "    ", "follow", std::to_string(fol));
     if (fb != 0.0)                kn(o, "    ", "followbeats", fmtF64(fb));
+    // Notes last, after every scalar, so the block reads header-then-content
+    // and a clip with 400 notes still shows its settings at the top.
+    //
+    // Written in vector order, not sorted here. ClipModel::notes is kept sorted
+    // by beat by the editor, and that is where the ordering contract lives: the
+    // writer emits the order it is given and the reader preserves the order it
+    // finds. Neither end reorders, so a file whose notes were shuffled by hand
+    // still round-trips byte-identically -- it just loads as a session whose
+    // note vector is not sorted, which is the writer's problem, not the
+    // format's. (The App does not sort on load either. If that ever becomes a
+    // requirement it belongs in the App, next to the editing code that upholds
+    // the invariant, and not here.)
+    //
+    // Gated on the kind rather than just on the vector being non-empty: the
+    // reader refuses `note` inside an audio clip, so an audio ClipModel that
+    // somehow carries leftover notes must not be written into a file that
+    // cannot be read back.
+    if (midi) for (const auto& n : c.notes)
+        kn(o, "    ", "note", fmtF64(clNoteBeat(n.beat)) + " " +
+                              fmtF64(clNoteLen(n.len)) + " " +
+                              std::to_string((int)clPitch(n.pitch)) + " " +
+                              std::to_string((int)clVel(n.vel)));
     o += "  endclip\n";
 }
 
@@ -417,6 +505,9 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         }
         if (!clipOccupied(c)) {
             // Nothing identifies this slot; drop it rather than leave a ghost.
+            // A MIDI clip never lands here, however empty and unnamed it is:
+            // the block in the file is itself the statement that the slot is
+            // taken, and clipOccupied agrees.
             c = ClipModel{};
         }
     };
@@ -573,6 +664,29 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             if (key == "uid") {
                 u64 v; if (!sc.uid(v)) return fail("clip uid: expected an integer");
                 c.uid = v;
+            } else if (key == "kind") {
+                // Only the two kinds that exist. `kind audio` is accepted even
+                // though the writer never emits it -- it names the default, and
+                // refusing a redundant statement of the truth would be perverse
+                // -- but it is dropped on the next save, like any other line
+                // whose value a clip of that kind does not carry.
+                if (rest == "midi")       c.kind = ClipKind::Midi;
+                else if (rest == "audio") c.kind = ClipKind::Audio;
+                else return fail("clip kind: expected 'audio' or 'midi'");
+            } else if (key == "note") {
+                // Structure is rejected, values are clamped -- the same split as
+                // `param` and every scalar above. A note missing a field is a
+                // broken line and there is no sane guess for what it meant; a
+                // note at pitch 300 is a line that says something, just not
+                // something MIDI can express, so it is pulled into range.
+                f64 beat = 0.0, len = 0.0;
+                i64 pitch = 0, vel = 0;
+                if (!sc.num(beat) || !sc.num(len) || !sc.integer(pitch) || !sc.integer(vel))
+                    return fail("note: expected beat, length, pitch and velocity");
+                // Appended, never sorted: see writeClip. File order is the
+                // order the session gets.
+                c.notes.push_back(NoteModel{clNoteBeat(beat), clNoteLen(len),
+                                            clPitch(pitch), clVel(vel)});
             } else if (key == "file") {
                 clipFile = unesc(rest);
             } else if (key == "name") {
@@ -613,6 +727,27 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 f64 v; if (!sc.num(v)) return fail("clip followbeats: expected a number");
                 c.followBeats = clFollowBeats(v);
             } else if (key == "endclip") {
+                // Checked here rather than at the offending line so the block
+                // may be written in any order: `note` before `kind midi` is
+                // still a MIDI clip, and the reader has to have seen the whole
+                // block before it can say otherwise.
+                //
+                // These two are rejections, not silent repairs, because both
+                // combinations describe content that this format cannot carry
+                // and the next save would therefore throw away: a MIDI clip has
+                // nowhere to keep a sample path, and an audio clip has nowhere
+                // to keep notes. Guessing (promoting the clip to MIDI and
+                // dropping its file, or the reverse) would destroy one half of
+                // what the file says. Failing loudly leaves the session
+                // untouched and the file on disk intact for the user to fix.
+                // Inapplicable *scalars* are the tolerated case, not this one:
+                // a `bpm` or `range` line inside a MIDI clip parses and is then
+                // simply not re-emitted, since nothing is lost that the clip
+                // was actually using.
+                if (c.kind == ClipKind::Midi && !clipFile.empty())
+                    return fail("a midi clip cannot have a 'file' line");
+                if (c.kind != ClipKind::Midi && !c.notes.empty())
+                    return fail("'note' is only valid inside a midi clip");
                 finishClip();
                 ci = -1;
                 st = St::Track;

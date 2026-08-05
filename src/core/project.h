@@ -7,10 +7,21 @@
 //
 // Version 2 of the format adds stable identifiers (`nextuid` plus a `uid` on
 // every track, scene and clip), the clip's generative fields, and a track's
-// device chain. Saving always writes version 2; version 1 files load unchanged,
-// with every addition taking its default. A device is read and written only as
-// the passive SavedDevice form, so nothing here knows how to instantiate a
-// plugin.
+// device chain. A device is read and written only as the passive SavedDevice
+// form, so nothing here knows how to instantiate a plugin.
+//
+// Version 3 adds MIDI clips. A clip block gains a `kind midi` line and, after
+// its scalars, one `note <beat> <length> <pitch> <velocity>` line per note.
+// Audio clips write neither line, so a set without MIDI in it produces the same
+// bytes version 2 produced apart from the header. A MIDI clip in turn omits the
+// four fields that only describe sample playback (`file`, `warp`, `bpm`,
+// `range`) and keeps everything musical, `beats` -- the clip length the piano
+// roll edits -- included. Notes are written and read in vector order; keeping
+// them sorted by beat is the editor's job, not the format's.
+//
+// Saving always writes the current version; versions 1 through 3 all load,
+// through one parser, with every field a file does not mention taking its
+// default.
 #pragma once
 #include "common.h"
 #include <string>
