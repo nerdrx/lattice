@@ -186,10 +186,19 @@ build/engine_test: tests/engine_test.cpp src/audio/engine.cpp src/core/common.cp
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS)
 
+# src/ipc is header-only and depends on libc alone, so this one deliberately
+# does not use TOOL_CF/TOOL_LIBS: no sndfile, no lilv, and warnings left on.
+# -lrt is only needed for shm_open on glibc < 2.34; harmless after.
+IPC_CF := -std=c++20 -O2 $(WARN)
+build/ipc_test: tests/ipc_test.cpp src/ipc/shm.h
+	@mkdir -p build
+	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
+
 # Full headless check: engine unit tests, then a real render that must not be
 # silent, then a plugin scan.
-test: build/engine_test build/render build/gen_demo build/plugin_scan
+test: build/engine_test build/ipc_test build/render build/gen_demo build/plugin_scan
 	./build/engine_test
+	./build/ipc_test
 	./build/gen_demo /tmp/lattice-selftest >/dev/null
 	./build/render /tmp/lattice-selftest/demo.lattice /tmp/lattice-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3
