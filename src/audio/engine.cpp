@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "../plugin/host.h"
 #include <chrono>
 #include <cstring>
 
@@ -152,6 +153,19 @@ void Engine::drainCommands() {
             if (c.a >= 0 && c.a < kMaxTracks && c.b >= 0 && c.b < kMaxScenes)
                 clips_[c.a][c.b] = c.clip;
             break;
+        // A pointer swap and nothing else. The audio thread must never free a
+        // chain or a PluginInstance, so the displaced chain rides an event back
+        // to the GUI, which owns the memory and is the only side allowed to
+        // release it — and only once this event proves we are no longer in it.
+        case Cmd::SetChain: {
+            if (c.a < 0 || c.a >= kMaxTracks) break;
+            Track& t = tracks_[c.a];
+            const RtChain* old = t.chain;
+            t.chain = (const RtChain*)c.p;
+            if (old) evts_.push({Ev::ChainRetired, c.a, 0, 0.0, (void*)old});
+            break;
+        }
+
         case Cmd::ClearClip:
             if (c.a >= 0 && c.a < kMaxTracks && c.b >= 0 && c.b < kMaxScenes) {
                 Track& t = tracks_[c.a];
@@ -209,27 +223,26 @@ void Engine::fireDue(f64 atBeat) {
     }
 }
 
+// Renders voices into each track's pre-fader scratch for the sub-range
+// [from, to). Only clip gain and the declick envelope are applied here: volume,
+// pan and mute/solo sit *after* the device chain, and the chain runs once over
+// the whole block, so those stages cannot live in this per-sub-block path.
+// The metronome is the one thing that goes straight to the master, since it is
+// not on any track and must not be coloured by a track's plugins.
 void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
     if (to <= from) return;
     const f64 bps = tempo_ / 60.0 / sr_;
-
-    bool anySolo = false;
-    for (const auto& t : tracks_) if (t.solo) { anySolo = true; break; }
 
     // Ramp lengths for click-free starts and stops.
     const f32 attack  = 1.f / (f32)std::max(1.0, 0.003 * sr_);
     const f32 release = 1.f / (f32)std::max(1.0, 0.006 * sr_);
 
-    // Renders one voice into the mix. Called for the live voice and, during a
-    // clip switch, for the outgoing one that is still fading out.
+    // Renders one voice into the track scratch. Called for the live voice and,
+    // during a clip switch, for the outgoing one that is still fading out.
     auto renderVoice = [&](Track& t, Voice& v, int ti, bool primary) {
         if (!v.active || !v.clip) return;
 
         const RtClip& c = *v.clip;
-        const bool audible = !t.mute && (!anySolo || t.solo);
-        const f32 pgL = t.pan <= 0.f ? 1.f : 1.f - t.pan;
-        const f32 pgR = t.pan >= 0.f ? 1.f : 1.f + t.pan;
-        const f32 base = c.gain * t.vol * (audible ? 1.f : 0.f);
 
         // Fitting material recorded at clipBpm onto a grid running at tempo_
         // means consuming source frames at tempo_/clipBpm: a 120 BPM loop in a
@@ -238,7 +251,6 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
         const bool granular = (c.warp == (int)Warp::Beats) && std::fabs(rate - 1.0) > 1e-4;
         const f64 loopLen = (f64)(c.loopEnd - c.loopStart);
 
-        f32 pkL = 0.f, pkR = 0.f;
         for (int i = from; i < to; ++i) {
             f32 l, r;
             if (granular) {
@@ -273,18 +285,12 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
             if (v.releasing) { v.env -= release; if (v.env <= 0.f) { v.env = 0.f; } }
             else if (v.env < 1.f) { v.env += attack; if (v.env > 1.f) v.env = 1.f; }
 
-            const f32 g = base * v.env;
-            const f32 sl = l * g * pgL;
-            const f32 sr = r * g * pgR;
-            outL[i] += sl;
-            outR[i] += sr;
-            const f32 al = std::fabs(sl), ar = std::fabs(sr);
-            if (al > pkL) pkL = al;
-            if (ar > pkR) pkR = ar;
+            // Pre-fader: clip gain and declick only. Both voices of a track sum
+            // into the same scratch, which is what makes the crossfade work.
+            const f32 g = c.gain * v.env;
+            t.fxL[i] += l * g;
+            t.fxR[i] += r * g;
         }
-
-        if (pkL > t.mL) t.mL = pkL;
-        if (pkR > t.mR) t.mR = pkR;
 
         if (v.releasing && v.env <= 0.f) {
             v.active = false;
@@ -324,12 +330,34 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
     }
 }
 
-void Engine::process(f32* outL, f32* outR, int n) {
+void Engine::process(f32* outL, f32* outR, int nframes) {
     const auto t0 = std::chrono::steady_clock::now();
 
     drainCommands();
-    std::memset(outL, 0, (size_t)n * sizeof(f32));
-    std::memset(outR, 0, (size_t)n * sizeof(f32));
+    std::memset(outL, 0, (size_t)nframes * sizeof(f32));
+    std::memset(outR, 0, (size_t)nframes * sizeof(f32));
+
+    // The per-track scratch is sized kMaxBlock. Growing it here would mean
+    // allocating on the audio thread, so an oversized block renders what fits
+    // and leaves the remainder silent rather than running off the end.
+    const int n = nframes < kMaxBlock ? nframes : kMaxBlock;
+    if (n <= 0) { publish(); return; }
+
+    // Decide up front which tracks take part in this block, and clear their
+    // scratch before any voice writes into it. A track is live if it has audio
+    // now, will have audio before the block ends (a launch is queued), or owns
+    // a chain — a chain has to keep running on silence so reverb tails and
+    // monitoring survive both the transport stopping and the clip ending.
+    bool live[kMaxTracks];
+    for (int ti = 0; ti < kMaxTracks; ++ti) {
+        Track& t = tracks_[ti];
+        live[ti] = t.voice.active || t.prev.active || t.queued != -2 ||
+                   (t.chain && t.chain->count > 0);
+        if (live[ti]) {
+            std::memset(t.fxL, 0, (size_t)n * sizeof(f32));
+            std::memset(t.fxR, 0, (size_t)n * sizeof(f32));
+        }
+    }
 
     if (playing_) {
         const f64 bps = tempo_ / 60.0 / sr_;
@@ -355,6 +383,48 @@ void Engine::process(f32* outL, f32* outR, int n) {
         bool anyTail = false;
         for (auto& t : tracks_) if (t.voice.active || t.prev.active) { anyTail = true; break; }
         if (anyTail) renderRange(outL, outR, 0, n);
+    }
+
+    // Per-track post stage. The launch-boundary loop above splits *voice*
+    // rendering only; everything from here runs exactly once over the whole
+    // block, because a plugin must see one contiguous run per callback and
+    // because a fader change mid-block would be a click either way.
+    bool anySolo = false;
+    for (const auto& t : tracks_) if (t.solo) { anySolo = true; break; }
+
+    for (int ti = 0; ti < kMaxTracks; ++ti) {
+        Track& t = tracks_[ti];
+        if (!live[ti]) continue;
+
+        if (t.chain && t.chain->count > 0) {
+            // In-place is part of the PluginInstance contract, so the whole
+            // chain runs through the one scratch pair with no copies.
+            f32* bufs[2] = {t.fxL, t.fxR};
+            const int cnt = t.chain->count < kMaxChainFx ? t.chain->count : kMaxChainFx;
+            for (int fi = 0; fi < cnt; ++fi)
+                if (PluginInstance* fx = t.chain->fx[fi])
+                    fx->process(bufs, bufs, 2, n);
+        }
+
+        const bool audible = !t.mute && (!anySolo || t.solo);
+        const f32 pgL = t.pan <= 0.f ? 1.f : 1.f - t.pan;
+        const f32 pgR = t.pan >= 0.f ? 1.f : 1.f + t.pan;
+        const f32 gL = audible ? t.vol * pgL : 0.f;
+        const f32 gR = audible ? t.vol * pgR : 0.f;
+
+        // Meters are post-fader: what the user sees is what the master gets.
+        f32 pkL = 0.f, pkR = 0.f;
+        for (int i = 0; i < n; ++i) {
+            const f32 l = t.fxL[i] * gL;
+            const f32 r = t.fxR[i] * gR;
+            outL[i] += l;
+            outR[i] += r;
+            const f32 al = std::fabs(l), ar = std::fabs(r);
+            if (al > pkL) pkL = al;
+            if (ar > pkR) pkR = ar;
+        }
+        if (pkL > t.mL) t.mL = pkL;
+        if (pkR > t.mR) t.mR = pkR;
     }
 
     // Master bus.

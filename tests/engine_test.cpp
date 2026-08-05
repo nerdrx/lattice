@@ -8,6 +8,7 @@
 //   g++ -std=c++20 -O2 tests/engine_test.cpp src/audio/engine.cpp
 //                       src/core/common.cpp -o engine_test
 #include "../src/audio/engine.h"
+#include "../src/plugin/host.h"
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -67,6 +68,12 @@ struct Host {
     }
     void setClip(int track, int slot, const RtClip& cl) {
         Command c; c.type = Cmd::SetClip; c.a = track; c.b = slot; c.clip = cl;
+        e.pushCommand(c);
+    }
+    // The engine only ever borrows the chain; the caller keeps it alive until
+    // Ev::ChainRetired comes back, exactly as the GUI has to.
+    void setChain(int track, const RtChain* ch) {
+        Command c; c.type = Cmd::SetChain; c.a = track; c.p = (void*)ch;
         e.pushCommand(c);
     }
     // Renders at least `frames` frames, block-aligned. Returns the frame index
@@ -466,6 +473,272 @@ static void testRingSaturation() {
 }
 
 // ---------------------------------------------------------------------------
+// 9. device chains
+// ---------------------------------------------------------------------------
+
+// A PluginInstance that does nothing but scale, so any level change in the
+// output is attributable to the chain and to nothing else. It also records how
+// it was called, which is how the "chains run while stopped" case is checked.
+class FakeFx : public PluginInstance {
+public:
+    explicit FakeFx(f32 gain) : gain_(gain) {}
+
+    int calls = 0;
+    int maxFrames = 0;
+    int maxChannels = 0;
+
+    bool prepare(f64, int) override { return true; }
+
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        ++calls;
+        if (nframes > maxFrames) maxFrames = nframes;
+        if (channels > maxChannels) maxChannels = channels;
+        if (bypassed_) return;                    // in aliases out, so a no-op
+        for (int c = 0; c < channels; ++c) {
+            if (!out[c] || !in[c]) continue;
+            for (int i = 0; i < nframes; ++i) out[c][i] = in[c][i] * gain_;
+        }
+    }
+
+    int              paramCount() const override     { return 0; }
+    const ParamInfo& paramInfo(int) const override   { static ParamInfo p; return p; }
+    f32              getParam(int) const override    { return 0.f; }
+    void             setParam(int, f32) override     {}
+    const PluginDesc& desc() const override          { static PluginDesc d; return d; }
+    void             setBypassed(bool b) override    { bypassed_ = b; }
+    bool             bypassed() const override       { return bypassed_; }
+
+private:
+    f32  gain_ = 1.f;
+    bool bypassed_ = false;
+};
+
+// Drains the event ring, counting ChainRetired and remembering which chain
+// pointers came back.
+struct RetiredEvents {
+    int count = 0;
+    std::vector<const void*> ptrs;
+    std::vector<int> tracks;
+    bool sawPtr(const void* p) const {
+        for (const void* q : ptrs) if (q == p) return true;
+        return false;
+    }
+};
+static RetiredEvents drainRetired(Engine& e) {
+    RetiredEvents r;
+    Event ev;
+    while (e.popEvent(ev)) {
+        if (ev.type != Ev::ChainRetired) continue;
+        ++r.count;
+        r.ptrs.push_back(ev.p);
+        r.tracks.push_back(ev.a);
+    }
+    return r;
+}
+
+// A track playing a +1.0 DC clip at clip gain 0.5, with the default unity
+// fader: the bare output level is 0.50 and anything else is the chain.
+static void armDcTrack(Host& h, const std::vector<f32>& buf) {
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setClip(0, 0, mkClip(buf, 1, 0.5f, Warp::Off, true, 120.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+}
+
+// One Host per function, never several per frame: Track carries two kMaxBlock
+// scratch buffers, so an Engine is ~2 MB by value and a handful of them in one
+// stack frame overflows under ASan.
+
+// a. one effect in the chain
+static void chainSingleEffect(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f);
+    RtChain chain; chain.fx[0] = &half; chain.count = 1;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chain);
+    h.run(8000);
+
+    CHECK(std::fabs(tailLevel(h.outL) - 0.25f) < 0.01f,
+          "0.5 clip through a 0.5x effect -> %.4f (expected 0.25)",
+          (double)tailLevel(h.outL));
+    CHECK(std::fabs(tailLevel(h.outR) - 0.25f) < 0.01f,
+          "right channel matches -> %.4f (expected 0.25)", (double)tailLevel(h.outR));
+    CHECK(half.calls > 0, "the effect actually ran (%d calls)", half.calls);
+    CHECK(half.maxFrames == h.block,
+          "the chain sees the full block, not a launch sub-range (%d, block %d)",
+          half.maxFrames, h.block);
+    CHECK(half.maxChannels == 2, "the chain is handed both channels (%d)", half.maxChannels);
+}
+
+// b. two effects in series
+static void chainTwoInSeries(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx a(0.5f), b(0.5f);
+    RtChain chain; chain.fx[0] = &a; chain.fx[1] = &b; chain.count = 2;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chain);
+    h.run(8000);
+
+    CHECK(std::fabs(tailLevel(h.outL) - 0.125f) < 0.005f,
+          "0.5 clip through two 0.5x effects -> %.4f (expected 0.125)",
+          (double)tailLevel(h.outL));
+    CHECK(a.calls == b.calls && a.calls > 0,
+          "both effects ran the same number of times (%d / %d)", a.calls, b.calls);
+}
+
+// c. swapping a chain hands the old one back exactly once
+static void chainSwapRetires(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx fa(0.5f), fb(0.25f);
+    RtChain chainA; chainA.fx[0] = &fa; chainA.count = 1;
+    RtChain chainB; chainB.fx[0] = &fb; chainB.count = 1;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chainA);
+    h.run(8000);
+    drainRetired(h.e);                       // also clears the launch events
+
+    CHECK(std::fabs(tailLevel(h.outL) - 0.25f) < 0.01f,
+          "chain A in place -> %.4f (expected 0.25)", (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.setChain(0, &chainB);
+    h.run(8000);
+    RetiredEvents r = drainRetired(h.e);
+    CHECK(r.count == 1, "swapping A->B retires exactly one chain (%d)", r.count);
+    CHECK(r.count == 1 && r.ptrs[0] == (const void*)&chainA,
+          "the retired pointer is chain A (%p, expected %p)",
+          r.count ? r.ptrs[0] : nullptr, (const void*)&chainA);
+    CHECK(r.count == 1 && r.tracks[0] == 0, "the event names track 0 (%d)",
+          r.count ? r.tracks[0] : -1);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.125f) < 0.005f,
+          "chain B is now in the path -> %.4f (expected 0.125)", (double)tailLevel(h.outL));
+
+    h.outL.clear(); h.outR.clear();
+    h.setChain(0, nullptr);                  // clearing the chain
+    h.run(8000);
+    RetiredEvents r2 = drainRetired(h.e);
+    CHECK(r2.count == 1 && r2.ptrs[0] == (const void*)&chainB,
+          "clearing the chain retires B (%d events, ptr %p, expected %p)",
+          r2.count, r2.count ? r2.ptrs[0] : nullptr, (const void*)&chainB);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.01f,
+          "with no chain the track is passthrough again -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+
+    h.setChain(0, nullptr);                  // null over null
+    h.runBlocks(2);
+    CHECK(drainRetired(h.e).count == 0,
+          "clearing an already-empty chain retires nothing");
+}
+
+// d. chains keep running with the transport stopped (reverb tails, monitoring)
+static void chainRunsWhileStopped(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx tail(0.5f);
+    RtChain chain; chain.fx[0] = &tail; chain.count = 1;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chain);
+    h.run(8000);
+
+    h.push(Cmd::SetPlaying, 0);              // stop
+    h.runBlocks(8);                          // well past the 6 ms release tail
+    const int afterStop = tail.calls;
+    tail.maxFrames = 0;
+    h.runBlocks(8);
+
+    CHECK(tail.calls > afterStop,
+          "the chain still runs with the transport stopped (%d -> %d calls)",
+          afterStop, tail.calls);
+    CHECK(tail.calls - afterStop == 8,
+          "exactly one run per block while stopped (%d over 8 blocks)",
+          tail.calls - afterStop);
+    CHECK(tail.maxFrames == h.block,
+          "stopped blocks are still full length (%d, block %d)", tail.maxFrames, h.block);
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-5f,
+          "a 0.5x effect on silence is still silent -> %.3g", (double)tailLevel(h.outL));
+}
+
+// e. holes in fx[] and a zero count
+static void chainNullSlots(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f);
+    // A hole at index 0 and a trailing hole: the GUI removing a device must
+    // never be able to make the audio thread dereference null.
+    RtChain chain;
+    chain.fx[0] = nullptr;
+    chain.fx[1] = &half;
+    chain.fx[2] = nullptr;
+    chain.count = 3;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chain);
+    h.run(8000);
+
+    CHECK(half.calls > 0, "the one real effect ran (%d calls)", half.calls);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.25f) < 0.01f,
+          "nulls are skipped, gain applied once -> %.4f (expected 0.25)",
+          (double)tailLevel(h.outL));
+
+    // count == 0 with a populated array must run nothing at all.
+    h.outL.clear(); h.outR.clear();
+    const int before = half.calls;
+    RtChain empty; empty.fx[0] = &half; empty.count = 0;
+    h.setChain(0, &empty);
+    h.run(8000);
+    CHECK(half.calls == before, "count == 0 runs nothing (%d -> %d)", before, half.calls);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.01f,
+          "an empty chain is passthrough -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// f. the chain sits before vol/pan/mute, and the meter after them
+static void chainSitsBeforeFader(const std::vector<f32>& buf) {
+    Host h; h.init();
+    FakeFx half(0.5f);
+    RtChain chain; chain.fx[0] = &half; chain.count = 1;
+
+    armDcTrack(h, buf);
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackMute, 0, 1);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+          "mute after the chain silences the track -> %.3g", (double)tailLevel(h.outL));
+    CHECK(half.calls > 0, "a muted track still runs its chain (%d calls)", half.calls);
+
+    h.outL.clear(); h.outR.clear();
+    h.push(Cmd::TrackMute, 0, 0);
+    h.push(Cmd::TrackPan, 0, 0, -1.0);       // hard left
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.25f) < 0.01f,
+          "pan is applied after the chain, left -> %.4f (expected 0.25)",
+          (double)tailLevel(h.outL));
+    CHECK(std::fabs(tailLevel(h.outR)) < 1e-4f,
+          "hard left mutes the right channel -> %.3g", (double)tailLevel(h.outR));
+    CHECK(std::fabs(h.e.meterL[0].load() - 0.25f) < 0.02f,
+          "the meter is post-chain and post-fader -> %.4f (expected 0.25)",
+          (double)h.e.meterL[0].load());
+}
+
+static void testDeviceChains() {
+    banner("9. device chains");
+    note("signal flow: voices (clip gain + declick) -> fx chain -> vol/pan/mute");
+    note("-> meters -> master. faderToGain(0.85) is unity, so a bare track is 0.50.");
+    const auto buf = dcBuf(300000, 1, 1.0f);
+
+    chainSingleEffect(buf);
+    chainTwoInSeries(buf);
+    chainSwapRetires(buf);
+    chainRunsWhileStopped(buf);
+    chainNullSlots(buf);
+    chainSitsBeforeFader(buf);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -478,6 +751,7 @@ int main() {
     testSceneLaunch();
     testFiniteOutput();
     testRingSaturation();
+    testDeviceChains();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);
