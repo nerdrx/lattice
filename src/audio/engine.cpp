@@ -17,6 +17,12 @@ static constexpr f64 kNoFollow = 1e300;
 // callback can be handed, and anything left over is simply one block late.
 static constexpr int kMidiPerBlock = 256;
 
+// Shortest loop a MIDI clip may claim. Anything under a 1/64 note is a bad edit
+// rather than music, and it is what would turn the lap loop in renderMidiVoice
+// into a spin and the overdub wrap below into a division by ~zero. Both paths
+// use this one constant so "plays" and "can be overdubbed into" never disagree.
+static constexpr f64 kMinLoopBeats = 1.0 / 64.0;
+
 // ---------------------------------------------------------------------------
 // generative scheduling: deterministic "randomness"
 //
@@ -155,6 +161,68 @@ static void reseekNotes(VoiceT& v, const RtClip& c) {
 // in the piano roll and impossible to grab.
 static constexpr f64 kMinNoteLen = 1.0 / 32.0;
 
+// ---------------------------------------------------------------------------
+// overdub: a MIDI take that laps over the clip already in the slot
+//
+// Whether a take is an overdub is *derived*, every time it is needed, from what
+// the target slot holds — there is no flag. engine.h is frozen and every Track
+// field is spoken for, so latching one at the toggle would have meant stealing
+// the sign bit of some unrelated member, and that would have been the worse
+// answer even with room to spare: overdub is a property of what is in the slot
+// *now*, and the GUI may clear, replace or repush that clip in the middle of a
+// take. A latched flag would go on wrapping notes into a clip that no longer
+// exists, or keep treating a slot as empty after one appeared; re-deriving
+// cannot. The cost is a handful of loads on a path that already walks every
+// track once per sub-block.
+// ---------------------------------------------------------------------------
+
+// The clip a take into `slot` would lap over, or null when this is an ordinary
+// take (audio take, empty slot, audio clip, unusable loop length).
+static const RtClip* overdubSlot(const RtClip* row, int slot, bool midi) {
+    if (!midi || slot < 0 || slot >= kMaxScenes) return nullptr;
+    const RtClip& c = row[slot];
+    if (!c.valid || !c.isMidi || c.lengthBeats <= kMinLoopBeats) return nullptr;
+    return &c;
+}
+
+// The same clip, but only once it is the voice actually running on the track:
+// the wrap origin is the *voice's* position in the loop, so with no voice on it
+// there is nothing to wrap against and the take falls back to take-relative
+// stamping. A voice marked `releasing` still counts — it dies in the next
+// renderRange, and until then its beatPos is the truthful clip position, which
+// is exactly what the transport-stop path needs to close its open notes with.
+template <class TrackT>
+static const RtClip* overdubVoice(const RtClip* row, const TrackT& t) {
+    const RtClip* c = overdubSlot(row, t.recSlot, t.recMidi);
+    if (!c || !t.voice.active || t.voice.clip != c) return nullptr;
+    return c;
+}
+
+// Reduces a beat position into [0, L). Used for the wrap origin and nothing
+// else, so the fp guard is worth its two branches: a position a hair under zero
+// would otherwise come back as L itself and put a note one lap out.
+static inline f64 wrapBeat(f64 b, f64 L) {
+    b -= std::floor(b / L) * L;
+    if (!(b >= 0.0)) return 0.0;               // also catches NaN
+    return b < L ? b : 0.0;
+}
+
+// How long a note captured in an overdub pass lasts, from two *in-loop*
+// positions. Both the wrap ("held past the loop point": off is numerically
+// before on) and the long hold ("held more than a lap": off comes round again
+// past where it started) end at the loop end rather than splitting the note in
+// two. Clamping is the choice that matches what the pattern can actually replay
+// — the clip is one lap long, so a note that outlives the lap has nowhere to be
+// except the lap's end — and it is also what the player hears: the next pass
+// re-triggers the note at its in-loop start, so a clamped tail joins seamlessly
+// onto the next lap's attack instead of stacking a second voice on top of it.
+static inline f64 overdubNoteLen(f64 from, f64 to, f64 L) {
+    const f64 cap = L - from;                  // clamp-to-loop-end
+    f64 len = to - from;
+    if (len <= 0.0 || len > cap) len = cap;
+    return len > kMinNoteLen ? len : kMinNoteLen;
+}
+
 // Appends to the take buffer keeping it sorted by start beat. Notes close in
 // note-off order, which for anything a human plays is almost start order, so
 // the backwards scan below normally stops on its first compare. Sorting as we
@@ -195,8 +263,13 @@ static void cancelRec(TrackT& t) {
 // the boundary fell on; a MIDI take closes whatever is still held there, which
 // is what stops a key that was down when you hit stop from becoming a note of
 // zero length or, worse, of no length at all.
+//
+// `loopLen` > 0 marks an overdub pass: `endBeat` is then the boundary's
+// position *inside the clip's loop*, not a take-relative beat, and the notes
+// still held close against it the same way they would have closed against a
+// note-off — wrap and over-long hold clamped to the loop end.
 template <class TrackT, class EvRing>
-static void finishRec(int ti, TrackT& t, EvRing& evts, f64 endBeat) {
+static void finishRec(int ti, TrackT& t, EvRing& evts, f64 endBeat, f64 loopLen = 0.0) {
     if (t.recMidi) {
         // recBuf is the f32* the Cmd contract gives us; a MIDI take stores
         // RtNote through it and recCap/recLen count notes. See the note on
@@ -206,7 +279,9 @@ static void finishRec(int ti, TrackT& t, EvRing& evts, f64 endBeat) {
             if (!o.used) continue;
             RtNote n;
             n.beat  = o.beat;
-            n.len   = (endBeat - o.beat) > kMinNoteLen ? (endBeat - o.beat) : kMinNoteLen;
+            n.len   = loopLen > 0.0
+                          ? overdubNoteLen(o.beat, endBeat, loopLen)
+                          : ((endBeat - o.beat) > kMinNoteLen ? (endBeat - o.beat) : kMinNoteLen);
             n.pitch = o.pitch;
             n.vel   = o.vel;
             insertNote(notes, t.recLen, t.recCap, n);
@@ -367,9 +442,16 @@ void Engine::drainCommands() {
                     // captured; a short take beats a lost one.
                     t.pendBuf = nullptr; t.pendCap = 0;
                     t.pendSlot = -1; t.pendMidi = false;
-                    if (t.recPhase == 2 || t.recPhase == 3)
-                        finishRec(ti, t, evts_, stopBeat - t.recStartBeat);
-                    else if (t.recPhase == 1) cancelRec(t);
+                    if (t.recPhase == 2 || t.recPhase == 3) {
+                        // An overdub pass closes its held notes against where
+                        // the clip *was*, not against the take's own elapsed
+                        // beats: drainCommands runs at the top of the block, so
+                        // the voice's beatPos is still the position the stop
+                        // lands on.
+                        const RtClip* oc = overdubVoice(clips_[ti], t);
+                        if (oc) finishRec(ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
+                        else    finishRec(ti, t, evts_, stopBeat - t.recStartBeat);
+                    } else if (t.recPhase == 1) cancelRec(t);
                 }
                 evts_.push({Ev::TransportStopped, 0, 0, 0.0});
             } else if (!playing_) {
@@ -560,6 +642,40 @@ void Engine::drainCommands() {
 }
 
 void Engine::fireDue(f64 atBeat) {
+    // A take whose target slot already holds a playable MIDI clip is a looper
+    // pass, and a pass needs something to lap over: the record boundary is
+    // therefore also that clip's launch boundary. It goes through startVoice()
+    // rather than poking the voice directly so every downstream detail stays
+    // uniform with an ordinary launch — the outgoing clip's note-offs, the
+    // beatPos reset, clipPhase, Ev::ClipStarted, the follow timer. That is what
+    // keeps this three lines instead of thirty, and it is why the GUI needs no
+    // special case for a clip that started because you hit record.
+    //
+    // A clip that is *already* the voice on this track is left strictly alone.
+    // Restarting it would be the wrong musical answer: hitting record on a loop
+    // you are listening to should drop you into the lap that is running, at the
+    // position you are hearing it, the way a hardware looper does — the take
+    // joins in progress. (It is also precisely why the wrap origin cannot be
+    // the take's start beat: a pass joined mid-loop is offset from it, and after
+    // the first wrap the two are a whole lap apart.)
+    auto armOverdub = [&](int ti, Track& t, int slot, bool midi, f64 sched) {
+        const RtClip* c = overdubSlot(clips_[ti], slot, midi);
+        if (!c) return;
+        if (t.voice.active && t.voice.clip == c) return;   // joins in progress
+        // The user's own launch of this same clip is already due on this same
+        // grid line (record and launch pressed together, say). Step 3 below
+        // will fire it in this very pass; doing it here as well would start the
+        // voice twice and report two ClipStarted for one launch.
+        if (t.queued == slot && t.fireBeat <= atBeat + kEps) return;
+        startVoice(t, *c);
+        t.playing = slot;
+        // fireBeat is the queued action's beat for as long as something is
+        // queued (see the note above prepare()); only claim it for the follow
+        // timer when nothing is, or this launch would eat that queued action.
+        if (t.queued == -2) t.fireBeat = followDueBeat(*c, sched);
+        evts_.push({Ev::ClipStarted, ti, slot, atBeat});
+    };
+
     // 1. Recording boundaries. Independent of clip scheduling, but on the same
     //    grid, so they are resolved in the same sub-block pass.
     for (int ti = 0; ti < kMaxTracks; ++ti) {
@@ -572,13 +688,22 @@ void Engine::fireDue(f64 atBeat) {
             t.recLen = 0;
             // The *scheduled* beat, not the sub-block one: they differ by a
             // fraction of a frame and the GUI wants the grid line. A MIDI take
-            // stamps its notes against it, so it is also the take's beat zero.
+            // stamps its notes against it, so it is also the take's beat zero —
+            // for an overdub pass the clip's own loop takes that job instead,
+            // but the event still reports the grid line either way.
             t.recStartBeat = t.recFireBeat;
             for (auto& o : t.recOpen) o.used = false;
             evts_.push({Ev::RecordStarted, ti, t.recSlot, t.recFireBeat});
+            armOverdub(ti, t, t.recSlot, t.recMidi, t.recFireBeat);
         } else {
             const f64 boundary = t.recFireBeat;
-            finishRec(ti, t, evts_, boundary - t.recStartBeat);
+            // fireDue runs at the head of a sub-block, before renderRange has
+            // moved anything, so the voice's beatPos is exactly the boundary's
+            // position inside the loop — what an overdub's held notes close
+            // against. The clip keeps playing; only the take ends here.
+            const RtClip* oc = overdubVoice(clips_[ti], t);
+            if (oc) finishRec(ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
+            else    finishRec(ti, t, evts_, boundary - t.recStartBeat);
             // A take displaced by a Record*Slot into another slot hands over
             // here, on the very same grid line it stopped on.
             if (t.pendBuf) {
@@ -589,6 +714,7 @@ void Engine::fireDue(f64 atBeat) {
                 t.pendBuf = nullptr; t.pendCap = 0;
                 t.pendSlot = -1; t.pendMidi = false;
                 evts_.push({Ev::RecordStarted, ti, t.recSlot, boundary});
+                armOverdub(ti, t, t.recSlot, t.recMidi, boundary);
             }
         }
     }
@@ -693,7 +819,7 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
         const RtClip& c = *v.clip;
         // A clip shorter than a 1/64 note is not music, it is a bad edit; it is
         // also what would turn the lap loop below into a spin, so it ends here.
-        const f64 L = c.lengthBeats > (1.0 / 64.0) ? c.lengthBeats : 0.0;
+        const f64 L = c.lengthBeats > kMinLoopBeats ? c.lengthBeats : 0.0;
 
         // Stop, switch, transport stop: deliver what is owed and die on the
         // spot rather than after a ramp that would carry no sound anyway.
@@ -943,8 +1069,19 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     bool live[kMaxTracks];
     for (int ti = 0; ti < kMaxTracks; ++ti) {
         Track& t = tracks_[ti];
+        // A queued MIDI take into a slot that holds a MIDI clip launches that
+        // clip on its own boundary, which can fall part-way through this very
+        // block — the same trap as the follow case above, and just as silent:
+        // the track would be skipped for the block its clip started in, so the
+        // instrument would never see that block and the notes handed to it
+        // would be rendered a block late. Phase 3 counts too, because a
+        // hand-over starts its successor on the same grid line it stops on.
+        const bool recWillLaunch =
+            (t.recPhase == 1 && overdubSlot(clips_[ti], t.recSlot, t.recMidi)) ||
+            (t.recPhase == 3 && t.pendBuf &&
+             overdubSlot(clips_[ti], t.pendSlot, t.pendMidi));
         live[ti] = t.voice.active || t.prev.active || t.queued != -2 || t.arm ||
-                   (t.playing >= 0 && t.fireBeat < kNoFollow) ||
+                   (t.playing >= 0 && t.fireBeat < kNoFollow) || recWillLaunch ||
                    (t.chain && t.chain->count > 0);
         if (live[ti]) {
             std::memset(t.fxL, 0, (size_t)n * sizeof(f32));
@@ -995,14 +1132,38 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             if (!t.arm) continue;
             RtNote* notes = (RtNote*)t.recBuf;   // aliased per Cmd::RecordMidiSlot
 
+            // The wrap origin of an overdub pass.
+            //
+            // What a note has to land on is its position in the *clip's* loop,
+            // and the only thing that knows that is the voice. recStartBeat is
+            // where the take began, which for a pass joined mid-loop is not
+            // where the lap began, and after the first wrap the two are a whole
+            // lap apart — stamping against it would smear every pass by its own
+            // start offset. So the origin is beatPos, read fresh per event.
+            //
+            // renderRange has already walked the voice across [from, to) by the
+            // time we get here (it runs first in the sub-block loop, so an
+            // instrument sees a note before the audio it is meant to make), so
+            // beatPos is the position at frame `to` and the position at frame
+            // `fr` is that walked back the frames it ran ahead. Exact across
+            // wraps: beatPos comes back already reduced into the loop and the
+            // walk-back is reduced again below.
+            const RtClip* oc = overdubVoice(clips_[ti], t);
+            const f64 loopLen = oc ? oc->lengthBeats : 0.0;
+
             for (int mi = 0; mi < midiCount; ++mi) {
                 const MidiMsg& m = midi[mi];
                 const int fr = clampv((int)m.frame, 0, n - 1);
                 if (fr < from || fr >= to) continue;
                 const u8 hi = (u8)(m.status & 0xF0);
                 if (hi != 0x90 && hi != 0x80) continue;
-                f64 at = beat_ + (f64)fr * bpf - t.recStartBeat;
-                if (at < 0.0) at = 0.0;
+                f64 at;
+                if (oc) {
+                    at = wrapBeat(t.voice.beatPos - (f64)(to - fr) * bpf, loopLen);
+                } else {
+                    at = beat_ + (f64)fr * bpf - t.recStartBeat;
+                    if (at < 0.0) at = 0.0;
+                }
                 const u8 pitch = (u8)(m.d1 & 0x7F);
 
                 // Note-on with velocity 0 is a note-off; every source that
@@ -1015,7 +1176,10 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                         if (o.used && o.pitch == pitch) {
                             RtNote nn;
                             nn.beat  = o.beat;
-                            nn.len   = (at - o.beat) > kMinNoteLen ? (at - o.beat) : kMinNoteLen;
+                            nn.len   = loopLen > 0.0
+                                           ? overdubNoteLen(o.beat, at, loopLen)
+                                           : ((at - o.beat) > kMinNoteLen ? (at - o.beat)
+                                                                          : kMinNoteLen);
                             nn.pitch = o.pitch;
                             nn.vel   = o.vel;
                             o.used = false;
@@ -1036,7 +1200,10 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                         if (!o.used || o.pitch != pitch) continue;
                         RtNote nn;
                         nn.beat  = o.beat;
-                        nn.len   = (at - o.beat) > kMinNoteLen ? (at - o.beat) : kMinNoteLen;
+                        nn.len   = loopLen > 0.0
+                                       ? overdubNoteLen(o.beat, at, loopLen)
+                                       : ((at - o.beat) > kMinNoteLen ? (at - o.beat)
+                                                                      : kMinNoteLen);
                         nn.pitch = o.pitch;
                         nn.vel   = o.vel;
                         o.used = false;
@@ -1046,8 +1213,10 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                 }
 
                 // Same rule as audio: the engine cannot grow a GUI-owned buffer
-                // and must not write past it, so a full one ends the take.
-                if (t.recLen >= t.recCap) { finishRec(ti, t, evts_, at); break; }
+                // and must not write past it, so a full one ends the take. The
+                // notes still held close against this event's position, which
+                // for an overdub is already the in-loop one.
+                if (t.recLen >= t.recCap) { finishRec(ti, t, evts_, at, loopLen); break; }
             }
         }
     };

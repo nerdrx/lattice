@@ -2091,6 +2091,501 @@ static void testNoteRetirement() {
 }
 
 // ---------------------------------------------------------------------------
+// 16. MIDI overdub
+// ---------------------------------------------------------------------------
+
+// The clip every case below overdubs into: one beat long, one note on the
+// downbeat. Pitch 60 is the *clip's* material, so anything that pitch turning up
+// in a take buffer would be the engine handing the GUI back what it already has.
+static std::vector<RtNote> hostClip() {
+    std::vector<RtNote> n(1);
+    n[0].beat = 0.0; n[0].len = 0.25; n[0].pitch = 60; n[0].vel = 100;
+    return n;
+}
+
+// Where an absolute frame falls inside a 1-beat loop that began at frame 0.
+// Computed from the grid, not from the engine, so it is an independent answer.
+static f64 inLoop(i64 absFrame) {
+    const f64 b = (f64)absFrame / (f64)kBeat120;
+    return b - std::floor(b);
+}
+static i64 lapOf(i64 absFrame) { return absFrame / kBeat120; }
+
+// Absolute frames of every note-on of one pitch, in arrival order.
+static std::vector<i64> onsOf(const NoteSink& s, u8 pitch) {
+    std::vector<i64> v;
+    for (const NoteSink::Msg& m : s.evs)
+        if (isOn(m) && m.pitch == pitch) v.push_back(m.frame);
+    return v;
+}
+
+// The take buffer entry for a pitch, or null.
+static const RtNote* takeNote(const std::vector<RtNote>& take, int count, u8 pitch) {
+    for (int i = 0; i < count; ++i) if (take[(size_t)i].pitch == pitch) return &take[(size_t)i];
+    return nullptr;
+}
+
+static constexpr f64 kBeatTol = 1e-4;            // ~2.4 frames at 120 BPM
+
+// a. three passes over a playing 1-beat clip: every pass lands where it sounds
+static void overdubThreePasses() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto host = hostClip();
+    std::vector<RtNote> take(64);
+    for (RtNote& n : take) { n.beat = -1.0; n.len = -1.0; n.pitch = 0; n.vel = 0; }
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                  // None: boundaries land at once
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.setClip(0, 0, mkMidiClip(host, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(1);                              // lap 0 began at frame 0
+    drainEvents(h.e);
+
+    // The take begins *mid-lap*, which is the whole point: a pass joined half a
+    // beat in must still put its notes where they sound. Stamping against the
+    // take's own start would drag every one of them half a beat early.
+    h.run(kBeat120 / 2);
+    const i64 takeStart = (i64)h.outL.size();
+    h.pushRecMidi(0, 0, take.data(), 64);
+    h.runBlocks(1);
+    CHECK(inLoop(takeStart) > 0.2 && inLoop(takeStart) < 0.8,
+          "the take joins the loop mid-lap, at in-loop beat %.4f", inLoop(takeStart));
+    CHECK(h.e.recState[0].load() == 2 && h.e.activeSlot[0].load() == 0,
+          "it is recording (%d) into the slot that is playing (%d)",
+          h.e.recState[0].load(), h.e.activeSlot[0].load());
+
+    // One note per pass, each in a different lap and at a different place in
+    // the loop, all short enough to close inside their own lap.
+    const u8 pitches[3] = {72, 74, 76};
+    const i64 gap[3]    = {kBeat120 / 8, kBeat120 / 2, kBeat120};
+    const i64 hold[3]   = {kBeat120 / 8, kBeat120 / 8, kBeat120 / 16};
+    i64 onAt[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) {
+        h.run(gap[k]);
+        onAt[k] = (i64)h.outL.size();
+        h.pushMidi(0x90, pitches[k], (u8)(100 - k));
+        h.run(hold[k]);
+        h.pushMidi(0x80, pitches[k], 0);
+        h.runBlocks(1);
+    }
+    CHECK(lapOf(onAt[0]) == 0 && lapOf(onAt[1]) == 1 && lapOf(onAt[2]) == 2,
+          "the three notes were played in three consecutive laps (%lld %lld %lld)",
+          (long long)lapOf(onAt[0]), (long long)lapOf(onAt[1]), (long long)lapOf(onAt[2]));
+
+    h.pushRecMidi(0, 0, take.data(), 64);        // toggle: stop
+    h.runBlocks(4);
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    CHECK(fin != nullptr, "an overdub pass finishes with Ev::MidiRecordFinished");
+    CHECK(fin && fin->p == (void*)take.data() && fin->a == 0 && fin->b == 0,
+          "handing back the GUI's own buffer for track 0 slot 0 (%p, %d/%d)",
+          fin ? fin->p : nullptr, fin ? fin->a : -1, fin ? fin->b : -1);
+    const int got = fin ? (int)fin->x : 0;
+    CHECK(got == 3, "three passes into one buffer accumulate: %d notes (expected 3)", got);
+
+    // Every note wrapped into the clip's own loop, at the position it sounded.
+    bool inRange = got == 3, placed = got == 3;
+    f64 worst = 0.0;
+    for (int k = 0; k < 3 && got == 3; ++k) {
+        const RtNote* n = takeNote(take, got, pitches[k]);
+        if (!n) { placed = false; break; }
+        if (!(n->beat >= 0.0 && n->beat < 1.0)) inRange = false;
+        const f64 d = std::fabs(n->beat - inLoop(onAt[k]));
+        if (d > worst) worst = d;
+        if (d > kBeatTol) placed = false;
+    }
+    CHECK(inRange, "all three land inside [0, 1), the clip's own loop");
+    CHECK(placed, "each at the in-loop position it was played at (worst error %.6f beats, "
+                  "%.1f frames)", worst, worst * (f64)kBeat120);
+    CHECK(got == 3 && take[0].beat <= take[1].beat && take[1].beat <= take[2].beat,
+          "and the buffer comes back sorted by in-loop beat (%.4f %.4f %.4f)",
+          take[0].beat, take[1].beat, take[2].beat);
+    CHECK(got == 3 && take[0].vel && take[1].vel && take[2].vel &&
+          takeNote(take, got, 72) && takeNote(take, got, 72)->vel == 100,
+          "velocities survive the wrap (%d %d %d)", take[0].vel, take[1].vel, take[2].vel);
+
+    // Only the NEW notes: the clip's own material is the GUI's to merge, and
+    // handing it back here would double every note on every pass.
+    CHECK(takeNote(take, got, 60) == nullptr,
+          "the clip's own note is not in the take buffer");
+    CHECK(take[3].pitch == 0 && take[3].beat < 0.0,
+          "and nothing was written past the third note (%d)", take[3].pitch);
+    CHECK(host.size() == 1 && host[0].pitch == 60 && host[0].beat == 0.0,
+          "the clip's note array is untouched — merging is the GUI's job");
+
+    // The clip never stopped playing: its downbeat kept arriving throughout,
+    // once per lap, and the slot is still the active one afterwards.
+    const std::vector<i64> downbeats = onsOf(sink, 60);
+    int lapsDuringTake = 0;
+    bool onGrid = true;
+    for (i64 f : downbeats) {
+        if (std::llabs((long long)(f % kBeat120)) > 1) onGrid = false;
+        if (f > takeStart) ++lapsDuringTake;
+    }
+    CHECK(onGrid && lapsDuringTake >= 2,
+          "the clip played its downbeat on every lap of the overdub (%d in total, %d of "
+          "them after the take began, all on the grid)",
+          (int)downbeats.size(), lapsDuringTake);
+    CHECK(h.e.activeSlot[0].load() == 0 &&
+          h.e.slotState[0].load() == (int)SlotState::Playing,
+          "and keeps playing once the take ends (slot %d, state %d)",
+          h.e.activeSlot[0].load(), h.e.slotState[0].load());
+    CHECK(h.e.recState[0].load() == 0, "while the track is idle again (%d)",
+          h.e.recState[0].load());
+
+    h.push(Cmd::StopTrack, 0);
+    h.runBlocks(2);
+    CHECK(notesBalanced(sink.evs), "nothing was left hanging (%d messages)",
+          (int)sink.evs.size());
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// b. overdubbing a stopped clip launches it on the record boundary
+static void overdubLaunchesStoppedClip() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto host = hostClip();
+    std::vector<RtNote> take(16);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.setClip(0, 0, mkMidiClip(host, 1.0, true));
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120 * 2);                         // mid-bar, nothing playing
+    CHECK(h.e.activeSlot[0].load() == -1 && sink.evs.empty(),
+          "the target clip starts out stopped and silent (slot %d, %d messages)",
+          h.e.activeSlot[0].load(), (int)sink.evs.size());
+    drainEvents(h.e);
+
+    h.pushRecMidi(0, 0, take.data(), 16);
+    h.run(kBar120);                              // across the bar line and on
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* started = findEvent(evs, Ev::RecordStarted);
+    const Event* launch  = findEvent(evs, Ev::ClipStarted);
+    CHECK(started && std::fabs(started->x - 4.0) < 1e-6,
+          "the take is still quantized to the bar line, beat %.4f (expected 4.0)",
+          started ? started->x : -1.0);
+    CHECK(countEvents(evs, Ev::ClipStarted) == 1,
+          "and the clip launches there, exactly once (%d ClipStarted)",
+          countEvents(evs, Ev::ClipStarted));
+    CHECK(launch && launch->a == 0 && launch->b == 0,
+          "the event names the overdubbed slot (%d/%d)",
+          launch ? launch->a : -1, launch ? launch->b : -1);
+    CHECK(h.e.activeSlot[0].load() == 0 &&
+          h.e.slotState[0].load() == (int)SlotState::Playing,
+          "the UI sees an ordinary playing clip (slot %d, state %d)",
+          h.e.activeSlot[0].load(), h.e.slotState[0].load());
+    CHECK(h.e.recState[0].load() == 2, "with the take running over it (%d)",
+          h.e.recState[0].load());
+
+    // It is really playing, not merely marked as playing: one downbeat per lap
+    // from the bar line on, and the first of them on the bar line itself.
+    const std::vector<i64> downbeats = onsOf(sink, 60);
+    CHECK(downbeats.size() >= 3,
+          "the clip sounds while the take runs: %d downbeats", (int)downbeats.size());
+    CHECK(!downbeats.empty() && std::llabs((long long)(downbeats[0] - kBar120)) <= 1,
+          "the first is on the record boundary, frame %lld (expected %lld)",
+          downbeats.empty() ? -1 : (long long)downbeats[0], (long long)kBar120);
+    bool spaced = downbeats.size() >= 3;
+    for (size_t i = 1; i < downbeats.size(); ++i)
+        if (std::llabs((long long)(downbeats[i] - downbeats[i - 1] - kBeat120)) > 1) spaced = false;
+    CHECK(spaced, "and they are one beat apart, lap after lap");
+    const f64 ph = h.e.clipPhase[0].load();
+    CHECK(ph >= 0.0 && ph < 1.0, "clipPhase runs like any other clip's (%.4f)", ph);
+
+    h.push(Cmd::StopTrack, 0);
+    h.run(kBar120);
+    CHECK(notesBalanced(sink.evs), "and nothing hangs when it finally stops");
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// c. a take that joins a clip already playing does not retrigger it
+static void overdubJoinsWithoutRetrigger() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto host = hostClip();
+    std::vector<RtNote> take(16);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                  // None: the take starts mid-lap
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.setClip(0, 0, mkMidiClip(host, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 + kBeat120 / 2);              // a lap and a half in
+    drainEvents(h.e);
+    const f64 phaseBefore = h.e.clipPhase[0].load();
+
+    const i64 recAt = (i64)h.outL.size();
+    h.pushRecMidi(0, 0, take.data(), 16);
+    h.run(kBeat120 * 2);
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    CHECK(countEvents(evs, Ev::ClipStarted) == 0,
+          "recording into the clip you are listening to does not relaunch it "
+          "(%d ClipStarted)", countEvents(evs, Ev::ClipStarted));
+    CHECK(countEvents(evs, Ev::RecordStarted) == 1,
+          "the take itself still starts, once (%d)",
+          countEvents(evs, Ev::RecordStarted));
+    CHECK(inLoop(recAt) > 0.25 && inLoop(recAt) < 0.75 && phaseBefore > 0.25,
+          "the take joined at in-loop beat %.4f, mid-lap (phase was %.4f)",
+          inLoop(recAt), phaseBefore);
+
+    // A retrigger would have put a downbeat note-on at the record boundary
+    // instead of on the grid, and reset clipPhase with it.
+    const std::vector<i64> downbeats = onsOf(sink, 60);
+    bool onGrid = downbeats.size() >= 3;
+    i64 offGridAt = -1;
+    for (i64 f : downbeats)
+        if (std::llabs((long long)(f % kBeat120)) > 1) { onGrid = false; offGridAt = f; }
+    CHECK(onGrid, "every downbeat stayed on the lap grid: the lap in progress ran on "
+                  "(%d notes, first stray at frame %lld)",
+          (int)downbeats.size(), (long long)offGridAt);
+
+    h.push(Cmd::StopTrack, 0);
+    h.runBlocks(2);
+    CHECK(notesBalanced(sink.evs), "and the join left nothing sounding");
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// d. notes that outlive their lap clamp to the loop end; the stop boundary
+//    closes what is still held at *its* in-loop position
+static void overdubHeldNotes() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto host = hostClip();
+    std::vector<RtNote> take(16);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.setClip(0, 0, mkMidiClip(host, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(1);
+    h.pushRecMidi(0, 0, take.data(), 16);
+    h.runBlocks(1);
+
+    // Pressed at in-loop 0.8, released a third of the way into the *next* lap:
+    // the note-off arrives at a smaller in-loop position than the note-on.
+    h.run(kBeat120 * 4 / 5 - 2 * (i64)h.block);
+    const i64 onA = (i64)h.outL.size();
+    h.pushMidi(0x90, 72, 100);
+    h.run(kBeat120 / 2);
+    h.pushMidi(0x80, 72, 0);
+    h.runBlocks(1);
+
+    // A second note, pressed late in a later lap and never released: the stop
+    // boundary has to close it, and at the boundary's own in-loop position.
+    h.run(kBeat120 + kBeat120 / 4);
+    const i64 onB = (i64)h.outL.size();
+    h.pushMidi(0x90, 74, 90);
+    h.run(kBeat120 / 8);
+    const i64 stopAt = (i64)h.outL.size();
+    h.pushRecMidi(0, 0, take.data(), 16);        // toggle: stops on this frame
+    h.runBlocks(4);
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    const int got = fin ? (int)fin->x : 0;
+    CHECK(got == 2, "both notes came back (%d)", got);
+    CHECK(lapOf(onA) != lapOf(onA + kBeat120 / 2),
+          "the first was held across the loop point (lap %lld -> %lld)",
+          (long long)lapOf(onA), (long long)lapOf(onA + kBeat120 / 2));
+
+    const RtNote* a = got == 2 ? takeNote(take, got, 72) : nullptr;
+    CHECK(a && std::fabs(a->beat - inLoop(onA)) < kBeatTol,
+          "it starts where it was played, in-loop beat %.4f (expected %.4f)",
+          a ? a->beat : -1.0, inLoop(onA));
+    CHECK(a && std::fabs(a->beat + a->len - 1.0) < kBeatTol,
+          "and is clamped to the loop end rather than split: ends at %.4f (expected 1.0)",
+          a ? a->beat + a->len : -1.0);
+
+    const RtNote* b = got == 2 ? takeNote(take, got, 74) : nullptr;
+    CHECK(b && std::fabs(b->beat - inLoop(onB)) < kBeatTol,
+          "the unreleased note starts at in-loop beat %.4f (expected %.4f)",
+          b ? b->beat : -1.0, inLoop(onB));
+    CHECK(b && std::fabs(b->beat + b->len - inLoop(stopAt)) < kBeatTol,
+          "and is closed at the stop boundary's in-loop position: ends at %.4f "
+          "(expected %.4f)", b ? b->beat + b->len : -1.0, inLoop(stopAt));
+    CHECK(b && b->beat + b->len <= 1.0 + kBeatTol && a && a->beat + a->len <= 1.0 + kBeatTol,
+          "neither runs past the end of the loop it belongs to");
+
+    CHECK(h.e.activeSlot[0].load() == 0,
+          "the clip is still playing after the take (%d)", h.e.activeSlot[0].load());
+    // The key was still down when the take stopped. Closing it in the *buffer*
+    // is the take's business; the wire is a pass-through, so the player's own
+    // note-off is what releases the instrument — and it arrives too late to be
+    // recorded, which is exactly what the buffer check above already proved.
+    h.pushMidi(0x80, 74, 0);
+    h.runBlocks(1);
+    h.push(Cmd::StopTrack, 0);
+    h.runBlocks(2);
+    CHECK(notesBalanced(sink.evs), "and the live notes were all released");
+    CHECK(fin && (int)fin->x == 2, "with nothing captured after the boundary (%d notes)",
+          fin ? (int)fin->x : -1);
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+}
+
+// e. a take into a slot that is empty, or holds audio, is untouched by any of
+//    this: same take-relative stamping, no launch
+static void overdubLeavesPlainTakesAlone() {
+    {
+        Host h; h.init();
+        NoteSink sink(h.block);
+        RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+        std::vector<RtNote> take(16);
+
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setChain(0, &chain);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.pushRecMidi(0, 0, take.data(), 16);    // slot 0 is empty
+        h.runBlocks(1);
+        const i64 start = (i64)h.outL.size() - h.block;
+        h.run(kBeat120 * 2 + kBeat120 / 2);      // well past a 1-beat lap
+        const i64 on = (i64)h.outL.size();
+        h.pushMidi(0x90, 67, 100);
+        h.run(kBeat120 / 4);
+        h.pushMidi(0x80, 67, 0);
+        h.runBlocks(1);
+        h.pushRecMidi(0, 0, take.data(), 16);
+        h.runBlocks(2);
+
+        const std::vector<Event> evs = drainEvents(h.e);
+        const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+        CHECK(countEvents(evs, Ev::ClipStarted) == 0,
+              "a take into an empty slot launches nothing (%d ClipStarted)",
+              countEvents(evs, Ev::ClipStarted));
+        CHECK(fin && (int)fin->x == 1 && take[0].pitch == 67,
+              "and captures its note (%d notes, pitch %d)",
+              fin ? (int)fin->x : -1, take[0].pitch);
+        CHECK(std::fabs(take[0].beat - relBeat(on, start)) < kBeatTol,
+              "stamped take-relative, past beat 1 and not wrapped: %.4f (expected %.4f)",
+              take[0].beat, relBeat(on, start));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+    {
+        // The same, with an *audio* clip in the target slot: isMidi is what
+        // makes a slot overdubbable, not merely being occupied.
+        Host h; h.init();
+        std::vector<f32> buf = dcBuf(kBeat120 * 2, 1, 0.5f);
+        std::vector<RtNote> take(16);
+
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.setClip(0, 0, mkClip(buf, 1, 1.f, Warp::Beats, true, 120.0));
+        h.pushRecMidi(0, 0, take.data(), 16);
+        h.runBlocks(1);
+        const i64 start = (i64)h.outL.size() - h.block;
+        h.run(kBeat120 * 2);
+        const i64 on = (i64)h.outL.size();
+        h.pushMidi(0x90, 67, 100);
+        h.run(kBeat120 / 4);
+        h.pushMidi(0x80, 67, 0);
+        h.runBlocks(1);
+        h.pushRecMidi(0, 0, take.data(), 16);
+        h.runBlocks(2);
+
+        const std::vector<Event> evs = drainEvents(h.e);
+        const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+        CHECK(countEvents(evs, Ev::ClipStarted) == 0,
+              "an audio clip in the slot is not overdub material: nothing launched (%d)",
+              countEvents(evs, Ev::ClipStarted));
+        CHECK(h.e.activeSlot[0].load() == -1, "the track stayed stopped (%d)",
+              h.e.activeSlot[0].load());
+        CHECK(fin && (int)fin->x == 1 &&
+              std::fabs(take[0].beat - relBeat(on, start)) < kBeatTol,
+              "and the take is stamped take-relative as before: %.4f (expected %.4f)",
+              take[0].beat, relBeat(on, start));
+    }
+}
+
+// f. the wrap origin is buffer-size independent
+//
+// It is derived by walking the voice's position back to the frame each message
+// arrived on, and the voice advances per *sub-block* — so a different block
+// size means different sub-block splits and a different arithmetic path to the
+// same answer. That answer has to be the same one, for the same reason a launch
+// grid and a probability roll do not depend on the buffer size: a set that
+// records differently on a 64-frame host than on a 1024-frame one is broken.
+static void overdubBlockSizes() {
+    for (int blk : {64, 1024}) {
+        Host h; h.init(kSR, blk);
+        auto host = hostClip();
+        std::vector<RtNote> take(16);
+
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.setClip(0, 0, mkMidiClip(host, 1.0, true));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.runBlocks(1);
+        h.run(kBeat120 / 2);                     // join mid-lap
+        h.pushRecMidi(0, 0, take.data(), 16);
+        h.runBlocks(1);
+
+        i64 onAt[3] = {0, 0, 0};
+        for (int k = 0; k < 3; ++k) {
+            h.run(k == 0 ? kBeat120 / 8 : kBeat120);
+            onAt[k] = (i64)h.outL.size();
+            h.pushMidi(0x90, (u8)(72 + 2 * k), 100);
+            h.run(kBeat120 / 8);
+            h.pushMidi(0x80, (u8)(72 + 2 * k), 0);
+            h.runBlocks(1);
+        }
+        h.pushRecMidi(0, 0, take.data(), 16);
+        h.runBlocks(2);
+
+        const std::vector<Event> evs = drainEvents(h.e);
+        const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+        const int got = fin ? (int)fin->x : 0;
+        CHECK(got == 3, "three passes at a %d-frame block size capture three notes (%d)",
+              blk, got);
+        f64 worst = 0.0;
+        for (int k = 0; k < 3 && got == 3; ++k) {
+            const RtNote* n = takeNote(take, got, (u8)(72 + 2 * k));
+            const f64 d = n ? std::fabs(n->beat - inLoop(onAt[k])) : 1.0;
+            if (d > worst) worst = d;
+        }
+        CHECK(got == 3 && worst < kBeatTol,
+              "and place them by the clip's loop, not by the block grid "
+              "(worst error %.6f beats, %.2f frames)", worst, worst * (f64)kBeat120);
+    }
+}
+
+static void testOverdub() {
+    banner("16. MIDI overdub");
+    note("recording into a slot that already holds a MIDI clip is a looper pass:");
+    note("the clip (re)launches on the record boundary and keeps playing, and the");
+    note("notes wrap into ITS loop — the wrap origin is the voice's position, not");
+    note("the take's start, so a pass joined mid-lap still lands where it sounds.");
+    overdubThreePasses();
+    overdubLaunchesStoppedClip();
+    overdubJoinsWithoutRetrigger();
+    overdubHeldNotes();
+    overdubLeavesPlainTakesAlone();
+    overdubBlockSizes();
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -2110,6 +2605,7 @@ int main() {
     testMidiClips();
     testMidiRecording();
     testNoteRetirement();
+    testOverdub();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);
