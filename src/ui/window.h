@@ -31,6 +31,15 @@ struct Input {
     u32  mods = 0;
     bool keyDown[KeyCount]{};
     bool keyPressed[KeyCount]{};     // includes auto-repeat
+    // Physical key state, indexed by Linux evdev scancode (KEY_Z = 44, ...).
+    // Layout-independent: on QWERTZ or AZERTY the bottom row is still the
+    // bottom row. This is what the computer-MIDI piano maps — a piano layout
+    // follows key POSITIONS, not the letters a locale prints on them.
+    // Shortcuts keep using keyDown[] (Ctrl+S should follow the layout).
+    // Win32 note: Set-1 make codes match evdev for the whole main block
+    // (Q=0x10, Z=0x2C, ...), so the WM_KEYDOWN lParam scancode fills this
+    // directly. Cleared alongside keyDown on focus loss.
+    bool scanDown[256]{};
     std::string textInput;           // UTF-8 typed this frame
 
     bool ctrl()  const { return mods & ModCtrl; }

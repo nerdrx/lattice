@@ -257,6 +257,9 @@ bool X11Backend::pump() {
             KeySym ks = 0;
             const int n = XLookupString(&ev.xkey, buf, sizeof buf - 1, &ks, nullptr);
             const int k = mapKey(ks);
+            // X keycodes are evdev scancode + 8 under evdev/libinput servers.
+            const unsigned sc = ev.xkey.keycode - 8;
+            if (sc < 256) in_->scanDown[sc] = true;
             if (k > 0 && k < KeyCount) { in_->keyDown[k] = true; in_->keyPressed[k] = true; }
             if (n > 0 && (u8)buf[0] >= 32 && (u8)buf[0] != 127) in_->textInput.append(buf, (size_t)n);
             break;
@@ -264,12 +267,15 @@ bool X11Backend::pump() {
         case KeyRelease: {
             KeySym ks = XLookupKeysym(&ev.xkey, 0);
             const int k = mapKey(ks);
+            const unsigned sc = ev.xkey.keycode - 8;
+            if (sc < 256) in_->scanDown[sc] = false;
             if (k > 0 && k < KeyCount) in_->keyDown[k] = false;
             break;
         }
         case LeaveNotify: haveLast_ = false; break;
         case FocusOut:
             std::memset(in_->keyDown, 0, sizeof in_->keyDown);
+            std::memset(in_->scanDown, 0, sizeof in_->scanDown);
             std::memset(in_->down, 0, sizeof in_->down);
             in_->mods = 0;
             break;

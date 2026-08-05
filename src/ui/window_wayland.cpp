@@ -400,12 +400,16 @@ void WaylandBackend::kbKeymap(void* d, wl_keyboard*, u32 fmt, i32 fd, u32 size) 
 void WaylandBackend::kbLeave(void* d, wl_keyboard*, u32, wl_surface*) {
     auto* self = (WaylandBackend*)d;
     std::memset(self->in_->keyDown, 0, sizeof self->in_->keyDown);
+    std::memset(self->in_->scanDown, 0, sizeof self->in_->scanDown);
     self->in_->mods = 0;
     self->repeating_ = false;
 }
 
 void WaylandBackend::handleKey(u32 key, bool down, bool isRepeat) {
     if (!xkbState_) return;
+    // `key` IS the evdev scancode — Wayland delivers it raw, before any
+    // layout applies. That is exactly what Input::scanDown wants.
+    if (key < 256 && !isRepeat) in_->scanDown[key] = down;
     const xkb_keycode_t kc = key + 8;
     const xkb_keysym_t sym = xkb_state_key_get_one_sym(xkbState_, kc);
     const int k = mapSym(sym);
