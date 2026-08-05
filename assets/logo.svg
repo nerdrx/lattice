@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Lattice">
+  <title>Lattice</title>
+  <!--
+    The mark is a Session View: nine clip slots, two of them lit.
+    Every colour is a literal from src/gfx/color.h —
+      unlit  #333333  pal::gridBg
+      purple #7700FF  pal::accent
+      green  #59D64B  pal::playGreen
+    This is the dark-background variant; logo-light.svg is the light one.
+  -->
+  <g fill="#333333">
+    <rect x="64"  y="64"  width="112" height="112" rx="26"/>
+    <rect x="336" y="64"  width="112" height="112" rx="26"/>
+    <rect x="64"  y="200" width="112" height="112" rx="26"/>
+    <rect x="200" y="200" width="112" height="112" rx="26"/>
+    <rect x="336" y="200" width="112" height="112" rx="26"/>
+    <rect x="200" y="336" width="112" height="112" rx="26"/>
+    <rect x="336" y="336" width="112" height="112" rx="26"/>
+  </g>
+  <rect x="200" y="64"  width="112" height="112" rx="26" fill="#7700FF"/>
+  <rect x="64"  y="336" width="112" height="112" rx="26" fill="#59D64B"/>
+</svg>

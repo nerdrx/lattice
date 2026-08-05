@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-6 -6 602 162" width="602" height="162" role="img" aria-label="NxTakt">
+  <title>NxTakt</title>
+  <!-- Light-background variant of assets/wordmark.svg. Ink colour only. -->
+  <g fill="none" stroke="#1D1D1D" stroke-width="12" stroke-linecap="butt" stroke-linejoin="miter">
+    <path d="M 6 6 L 6 150"/>
+    <path d="M 6 6 L 98 150"/>
+    <path d="M 98 6 L 98 150"/>
+    <path d="M 126 50 L 212 150"/>
+    <path d="M 212 50 L 126 150"/>
+    <path d="M 194 12 L 312 12"/>
+    <path d="M 264 12 L 264 150"/>
+    <circle cx="384" cy="100" r="50"/>
+    <path d="M 434 50 L 434 150"/>
+    <path d="M 462 6 L 462 150"/>
+    <path d="M 514 50 L 462 108"/>
+    <path d="M 464 108 L 514 150"/>
+    <path d="M 566 24 L 566 150"/>
+    <path d="M 542 50 L 590 50"/>
+  </g>
+</svg>

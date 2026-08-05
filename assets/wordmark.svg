@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-6 -6 602 162" width="602" height="162" role="img" aria-label="NxTakt">
+  <title>NxTakt</title>
+  <!--
+    Drawn, not typeset. A monoline geometric alphabet: one stroke weight (12),
+    one x-height (100), one cap height (144), bowls that are true circles of
+    r=50. Nothing depends on a font being installed, which is what an SVG
+    embedded through GitHub's <img> requires.
+
+    The xT is the joint the whole word turns on: the pair is kerned to 4 units
+    and the T's crossbar reaches 22 units back over the x, so the two letters
+    lock instead of merely touching.
+
+    Dark-background variant; wordmark-light.svg is the light one.
+  -->
+  <g fill="none" stroke="#E8E8E8" stroke-width="12" stroke-linecap="butt" stroke-linejoin="miter">
+    <path d="M 6 6 L 6 150"/>          <!-- N -->
+    <path d="M 6 6 L 98 150"/>
+    <path d="M 98 6 L 98 150"/>
+    <path d="M 126 50 L 212 150"/>     <!-- x -->
+    <path d="M 212 50 L 126 150"/>
+    <path d="M 194 12 L 312 12"/>      <!-- T, crossbar overhanging the x -->
+    <path d="M 264 12 L 264 150"/>
+    <circle cx="384" cy="100" r="50"/> <!-- a -->
+    <path d="M 434 50 L 434 150"/>
+    <path d="M 462 6 L 462 150"/>      <!-- k -->
+    <path d="M 514 50 L 462 108"/>
+    <path d="M 464 108 L 514 150"/>
+    <path d="M 566 24 L 566 150"/>     <!-- t -->
+    <path d="M 542 50 L 590 50"/>
+  </g>
+</svg>
