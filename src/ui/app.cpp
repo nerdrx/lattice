@@ -908,14 +908,31 @@ void App::frame() {
 
 void App::handleShortcuts() {
     Input& in = win_.input();
+
+    // Ahead of the edit guard on purpose: when a text field takes focus while a
+    // piano key is still held, this call is what releases the note.
+    updateKbdPiano();
+
     if (ui_.editId) return;                      // typing takes precedence
+
+    // Live's Computer MIDI Keyboard toggle. Edge-detected on keyDown[] rather
+    // than keyPressed[], which repeats.
+    const bool tgl = in.keyDown['k'] && in.ctrl() && in.shift();
+    if (tgl && !kbdTogglePrev_) toggleKbdMidi();
+    kbdTogglePrev_ = tgl;
+
+    // An unmodified key that the piano owns is a note, not a shortcut. Ctrl-
+    // and Alt-modified chords are unaffected: notes only fire unmodified.
+    const auto plain = [&](int k) {
+        return in.keyPressed[k] && !in.ctrl() && !(kbdMidi_ && KbdPiano::consumes(k));
+    };
 
     if (in.keyPressed[' ']) togglePlay();
     if (in.keyPressed[KeyTab])
         view_ = (view_ == MainView::Session) ? MainView::Arrangement : MainView::Session;
     if (in.keyPressed['b'] && in.ctrl()) showBrowser_ = !showBrowser_;
     if (in.keyPressed['d'] && in.ctrl()) showDetail_ = !showDetail_;
-    if (in.keyPressed['m'] && !in.ctrl()) {
+    if (plain('m')) {
         ses_.metronome = !ses_.metronome;
         send(Cmd::SetMetronome, ses_.metronome ? 1 : 0);
     }
@@ -939,6 +956,44 @@ void App::handleShortcuts() {
     if (in.keyPressed['s'] && in.ctrl()) {
         const std::string p = ses_.path.empty() ? (homeDir() + "/" + ses_.name + ".lattice") : ses_.path;
         saveProjectTo(p);
+    }
+}
+
+// The QWERTY piano, run once per frame. Everything hard about it lives in
+// KbdPiano; this only decides whether the gate is open and where the notes go.
+void App::updateKbdPiano() {
+    Input& in = win_.input();
+    // A focused text field must type, and a modified chord must stay a command
+    // (Ctrl+S saves; it does not play a G). Closing the gate mid-hold releases
+    // whatever is sounding, and reopening it never retriggers a still-held key.
+    const bool live = kbdMidi_ && !ui_.editId &&
+                      !in.ctrl() && !in.alt() && !(in.mods & ModSuper);
+
+    const KbdPiano::Result res = kbd_.update(in.keyDown, live,
+        [this](const MidiMsg& m) { engine_.pushMidi(m); });
+
+    if (res.baseChanged || res.velChanged) {
+        char buf[96];
+        snprintf(buf, sizeof buf, "Keyboard octave C%d · velocity %d", kbd_.octave(), kbd_.velocity());
+        status_ = buf;
+    }
+}
+
+void App::toggleKbdMidi() {
+    kbdMidi_ = !kbdMidi_;
+    if (kbdMidi_) {
+        char buf[192];
+        snprintf(buf, sizeof buf,
+                 "Computer MIDI Keyboard on — ASDFGHJKL white / WETYUOP black, "
+                 "Z X octave (C%d), C V velocity (%d), Ctrl+Shift+K off",
+                 kbd_.octave(), kbd_.velocity());
+        status_ = buf;
+    } else {
+        // Anything still held has to be let go here: the key release that would
+        // normally end the note is about to be ignored, and a hung note would
+        // sit in the instrument with nothing left to stop it.
+        kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidi(m); });
+        status_ = "Computer MIDI Keyboard off";
     }
 }
 
@@ -1062,6 +1117,24 @@ void App::drawControlBar(const Rect& r) {
         Rect br{rx - 60 * s, cy, 60 * s, h};
         rend_.textIn(fSmall_, br, audio_ ? audio_->name() : "no audio",
                      audio_ ? pal::textFaint : pal::recRed, Align::Right, 0);
+        rx = br.x - 8 * s;
+    }
+    // Computer MIDI keyboard. It belongs with the audio/MIDI readouts because
+    // it is an input status: while it is lit the letter keys are notes and not
+    // shortcuts, and that must be visible without opening anything. The label
+    // carries the octave so Z / X have somewhere to show their work.
+    {
+        char buf[24];
+        snprintf(buf, sizeof buf, "KBD C%d", kbd_.octave());
+        Rect kr{rx - 58 * s, cy, 58 * s, h};
+        const u64 id = uiId(1, 9);
+        const bool hot = ui_.setHot(id, kr) && ui_.isHot(id);
+        if (hot) ui_.cursor = Cursor::Hand;
+        rend_.roundRect(kr, 2 * s, kbdMidi_ ? pal::accent.alpha(0.18f)
+                                            : (hot ? pal::slotHover : pal::appBg));
+        rend_.textIn(fSmall_, kr, buf, kbdMidi_ ? pal::accent : pal::textFaint, Align::Center);
+        if (hot && win_.input().pressed[0]) toggleKbdMidi();
+        rx = kr.x - 8 * s;
     }
 }
 

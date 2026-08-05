@@ -126,6 +126,124 @@ struct DragState {
     bool armed = false;                // past the movement threshold
 };
 
+// Live's "Computer MIDI Keyboard": the QWERTY rows become a piano feeding the
+// same MIDI ring a hardware controller uses.
+//
+// Deliberately knows nothing about App, the window or the engine: update() is
+// handed a raw keyDown[] snapshot and emits through a callback. That keeps the
+// part with the actual subtlety in it — edge detection and note ownership —
+// testable without a GUI, an audio device or a keyboard to press.
+//
+// The subtlety: Input::keyPressed[] includes auto-repeat, so a held key would
+// machine-gun note-ons. Notes therefore come from *edges* of keyDown[] (held
+// state), and each key remembers the note it started so a note-off is always
+// the note that sounded, even if the octave moved while the key was down.
+struct KbdPiano {
+    static constexpr int kHighestSemi = 15;    // 'p', the top of the mapped range
+    static constexpr int kDefaultBase = 48;    // C3
+    static constexpr int kDefaultVel  = 100;
+    static constexpr int kVelStep     = 20;
+    static constexpr int kOctave      = 12;
+
+    struct Result { bool baseChanged = false, velChanged = false; };
+
+    KbdPiano() { for (int i = 0; i < KeyCount; ++i) active_[i] = -1; }
+
+    // Semitones above the base note for a playing key, -1 if the key is not one.
+    // Live's layout: the home row is the white keys, the row above it the black
+    // ones, so the two rows sit like the two halves of a real keyboard.
+    static int semiFor(int key) {
+        switch (key) {
+        case 'a': return 0;   case 'w': return 1;   case 's': return 2;   case 'e': return 3;
+        case 'd': return 4;   case 'f': return 5;   case 't': return 6;   case 'g': return 7;
+        case 'y': return 8;   case 'h': return 9;   case 'u': return 10;  case 'j': return 11;
+        case 'k': return 12;  case 'o': return 13;  case 'l': return 14;  case 'p': return 15;
+        default:  return -1;
+        }
+    }
+
+    // Keys the piano owns while it is on. Their older unmodified shortcut
+    // meanings must not fire underneath a note; unowned keys still pass through.
+    static bool consumes(int key) {
+        return semiFor(key) >= 0 || key == 'z' || key == 'x' || key == 'c' || key == 'v';
+    }
+
+    // `enabled` is the whole gate: feature on, no text field focused, no
+    // command modifier down. When it is false the piano still runs, because
+    // that is what releases notes held across losing the gate, and because it
+    // has to re-adopt the physical key state: a key already down when the gate
+    // returns (the 'k' of Ctrl+Shift+K, a letter typed into a field) must not
+    // read as a fresh press.
+    template <class Emit>
+    Result update(const bool* keyDown, bool enabled, const Emit& emit) {
+        Result res;
+        if (!enabled) {
+            allNotesOff(emit);
+            for (int k = 0; k < KeyCount; ++k) prev_[k] = keyDown[k];
+            return res;
+        }
+        for (int k = 0; k < KeyCount; ++k) {
+            const bool now = keyDown[k], was = prev_[k];
+            prev_[k] = now;
+            if (now == was) continue;              // held: no event, no repeat
+            if (!now) {                            // up edge -> the note this key started
+                if (active_[k] >= 0) {
+                    emit(MidiMsg{0x80, (u8)active_[k], 0, 0, 0});
+                    active_[k] = -1;
+                }
+                continue;
+            }
+            // Down edge. Octave and velocity move once per physical press.
+            if (k == 'z' || k == 'x') { res.baseChanged = shiftOctave(k == 'x' ? kOctave : -kOctave); continue; }
+            if (k == 'c' || k == 'v') { res.velChanged  = shiftVel(k == 'v' ? kVelStep : -kVelStep);  continue; }
+            const int semi = semiFor(k);
+            if (semi < 0) continue;
+            const int note = base_ + semi;         // shiftOctave keeps this in 0..127
+            active_[k] = (i8)note;
+            emit(MidiMsg{0x90, (u8)note, (u8)vel_, 0, 0});
+        }
+        return res;
+    }
+
+    // Ends every sounding note. Called when the piano is switched off, and from
+    // update() whenever the gate closes: a hung note outlives the UI state that
+    // started it, and nothing downstream will clean it up.
+    template <class Emit>
+    void allNotesOff(const Emit& emit) {
+        for (int k = 0; k < KeyCount; ++k) {
+            if (active_[k] < 0) continue;
+            emit(MidiMsg{0x80, (u8)active_[k], 0, 0, 0});
+            active_[k] = -1;
+        }
+    }
+
+    int base() const { return base_; }
+    int velocity() const { return vel_; }
+    // The base is always a C (it only ever moves by whole octaves from C3).
+    int octave() const { return base_ / kOctave - 1; }
+
+private:
+    // Clamped so the whole mapped span stays inside 0..127: the lowest key must
+    // not go under 0 and 'p', fifteen semitones up, must not go over 127.
+    bool shiftOctave(int by) {
+        const int b = base_ + by;
+        if (b < 0 || b + kHighestSemi > 127) return false;
+        base_ = b;
+        return true;
+    }
+    bool shiftVel(int by) {
+        const int v = clampv(vel_ + by, 1, 127);
+        if (v == vel_) return false;
+        vel_ = v;
+        return true;
+    }
+
+    int  base_ = kDefaultBase;
+    int  vel_  = kDefaultVel;
+    bool prev_[KeyCount]{};        // keyDown[] as of last update, for edges
+    i8   active_[KeyCount];        // note each key started, -1 = silent
+};
+
 class App {
 public:
     bool init(int argc, char** argv);
@@ -136,6 +254,8 @@ private:
     // --- frame ---
     void frame();
     void handleShortcuts();
+    void updateKbdPiano();                        // QWERTY piano -> engine MIDI
+    void toggleKbdMidi();
     void pumpEngineEvents();
 
     // --- views ---
@@ -270,6 +390,15 @@ private:
     int  selDevice_ = -1;              // index into the selected track's devices
     f32  stripScroll_ = 0.f;           // horizontal, device boxes
     f32  paramScroll_ = 0.f;           // vertical, inside the selected device
+
+    // --- computer MIDI keyboard -------------------------------------------
+    // Off by default: while it is on the letter keys are notes, so this is a
+    // mode the user has to ask for (Ctrl+Shift+K, as in Live) and see.
+    bool      kbdMidi_ = false;
+    KbdPiano  kbd_;
+    // The toggle chord's own down edge. keyPressed[] auto-repeats, and a held
+    // Ctrl+Shift+K would otherwise flap the mode on and off.
+    bool      kbdTogglePrev_ = false;
 
     // per-frame UI feedback
     std::string status_;

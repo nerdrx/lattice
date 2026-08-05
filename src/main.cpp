@@ -27,7 +27,10 @@ static void usage() {
         "  Arrows         move selection         Del      clear selected clip\n"
         "  M              metronome              Ctrl+S   save\n"
         "  Ctrl+B         browser                Ctrl+D   clip detail\n"
-        "  Ctrl+T         add track              Ctrl+Enter add scene\n");
+        "  Ctrl+T         add track              Ctrl+Enter add scene\n"
+        "  Ctrl+Shift+K   computer MIDI keyboard (QWERTY plays the armed track)\n"
+        "                 A S D F G H J K L = white keys, W E T Y U O P = black,\n"
+        "                 Z / X octave, C / V velocity\n");
 }
 
 int main(int argc, char** argv) {
