@@ -32,6 +32,12 @@ constexpr f32 gutter      = 1.f;
 // capacity it was given, so overrunning truncates rather than corrupts.
 constexpr f64 kRecordSeconds = 120.0;
 
+// The undo gesture the auto-repeating arrow keys hold while a note is being
+// nudged. Widget gestures are identified by the widget's own id, so this only
+// has to avoid colliding with one: every uiId `kind` in use is listed at its
+// call site, and 15 is not one of them.
+static const u64 kArrowGesture = uiId(15, 0);
+
 // How many notes a single MIDI take can hold. Four thousand is more than an
 // hour of dense playing, and the array is 24 bytes a note, so the whole buffer
 // is under 100 kB — cheap enough not to bother sizing it to the material.
@@ -163,6 +169,11 @@ bool App::init(int argc, char** argv) {
         }
     }
 
+    // The other headless hook: undo cannot be clicked inside gamescope, so
+    // LATTICE_DEBUG_UNDO drives the restore path here instead. See
+    // debugUndoSelfTest, and note that it puts the set back as it found it.
+    if (getenv("LATTICE_DEBUG_UNDO")) debugUndoSelfTest();
+
     LOGI("backend: %s   audio: %s", win_.backendName(), audio_ ? audio_->name() : "none");
     return true;
 }
@@ -261,6 +272,7 @@ void App::pushClip(int track, int slot) {
         }
         // A cleared MIDI slot retires its notes exactly like a replaced one.
         publishNotes(track, slot, nullptr);
+        clipLive_[track][slot] = false;
         return;
     }
 
@@ -297,6 +309,7 @@ void App::pushClip(int track, int slot) {
     // Unconditional, not only for MIDI clips: a slot that just turned into an
     // audio clip still has an old note array to hand back.
     publishNotes(track, slot, fresh);
+    clipLive_[track][slot] = true;
 }
 
 void App::pushTrack(int t) {
@@ -315,6 +328,35 @@ void App::pushAll() {
     for (size_t t = 0; t < ses_.tracks.size(); ++t) {
         pushTrack((int)t);
         for (int s = 0; s < (int)ses_.scenes.size(); ++s) pushClip((int)t, s);
+    }
+    releaseStaleSlots();
+}
+
+// The loop above only reaches slots the current session has a track and a
+// scene for. A load or an undo can make the set *smaller*, and a slot that
+// falls outside the new one keeps whatever was last pushed into it: an RtClip
+// whose sample data belongs to a session we have just stopped owning, and a
+// note array nothing will ever retire. Neither is reachable from the grid, but
+// Cmd::StopAll and scene launches walk the engine's own tables, so "unreachable
+// from the UI" is not the same as "cannot sound".
+void App::releaseStaleSlots() {
+    const int nt = (int)ses_.tracks.size(), ns = (int)ses_.scenes.size();
+    for (int t = 0; t < kMaxTracks; ++t) {
+        for (int s = 0; s < kMaxScenes; ++s) {
+            if (t < nt && s < ns) continue;
+            if (!clipLive_[t][s] && !publishedNotes_[t][s]) continue;
+            Command c;
+            c.type = Cmd::ClearClip;
+            c.a = t; c.b = s;
+            if (!engine_.pushCommand(c)) {
+                // The engine still holds it, so the flags stay set and the next
+                // push (or the next restore) tries again.
+                LOGW("command ring full - stale slot %d/%d not cleared", t, s);
+                continue;
+            }
+            clipLive_[t][s] = false;
+            publishNotes(t, s, nullptr);
+        }
     }
 }
 
@@ -577,14 +619,24 @@ void App::serializeDevices() {
 // savedDevices -> devices. Every entry keeps its slot in the chain even if the
 // plugin is gone, so the order a set was saved with is the order it comes back
 // with once the missing plugin is installed.
-void App::materializeDevices() {
+//
+// `reuse` (see the declaration) turns this into a *rebind* for everything an
+// undo restore already has running. That is not an optimisation for its own
+// sake: a plugin reload loses everything the plugin holds that its parameters
+// do not describe, so undoing a note edit would silently reset every synth in
+// the set. Instantiation stays the fallback, for a device the pool has no
+// match for -- one that was removed and is coming back, or a set being loaded.
+void App::materializeDevices(std::vector<LiveDevice>* reuse) {
     bool any = false;
     for (const TrackModel& t : ses_.tracks) if (!t.savedDevices.empty()) { any = true; break; }
     if (!any) return;
     // The scan is chatty about its progress in the status bar; a load that goes
-    // through cleanly should still read as a load when it is done.
+    // through cleanly should still read as a load when it is done. It is also
+    // deferred to the first device that actually needs the registry: a restore
+    // that rebinds the whole chain touches no plugin, and making the first undo
+    // of a session pay for a full LV2 + CLAP scan would be a bizarre place to
+    // spend the better part of a second.
     const std::string prevStatus = status_;
-    ensurePluginScan();
 
     int missing = 0;
     for (size_t ti = 0; ti < ses_.tracks.size(); ++ti) {
@@ -596,9 +648,26 @@ void App::materializeDevices() {
             dm.uid = sd.uid;
             dm.bypass = sd.bypass;
 
-            const PluginDesc* found = registry_.find(sd.uri);
+            // A live instance for this uid is this device, still running; the
+            // uri is checked too, because a uid only means "the same device"
+            // while the plugin behind it is the same plugin.
             std::unique_ptr<PluginInstance> inst;
-            if (found) inst = registry_.instantiate(*found, engine_.sampleRate(), kMaxBlock);
+            if (reuse) {
+                for (LiveDevice& ld : *reuse) {
+                    if (!ld.inst || ld.uid != sd.uid || ld.uri != sd.uri) continue;
+                    dm.desc = ld.desc;
+                    inst = std::move(ld.inst);
+                    break;
+                }
+            }
+            const bool rebound = inst != nullptr;
+
+            const PluginDesc* found = nullptr;
+            if (!rebound) {
+                ensurePluginScan();
+                found = registry_.find(sd.uri);
+                if (found) inst = registry_.instantiate(*found, engine_.sampleRate(), kMaxBlock);
+            }
 
             if (!inst) {
                 ++missing;
@@ -616,7 +685,9 @@ void App::materializeDevices() {
             // Parameters are matched on ParamInfo::id, not on index: a plugin
             // can gain or reorder controls between versions, and dropping the
             // ones we no longer recognise beats applying them to the wrong
-            // control.
+            // control. A rebound instance goes through exactly the same loop:
+            // its live values are whatever the user has since dragged them to,
+            // and the snapshot's are the ones being restored.
             const int n = inst->paramCount();
             for (const std::pair<u32, f32>& pv : sd.params) {
                 for (int i = 0; i < n; ++i) {
@@ -627,7 +698,7 @@ void App::materializeDevices() {
             }
             inst->setBypassed(sd.bypass);
 
-            dm.desc = *found;
+            if (!rebound) dm.desc = *found;
             dm.inst = std::move(inst);
             t.devices.push_back(std::move(dm));
         }
@@ -686,6 +757,128 @@ void App::releaseAllChains() {
     }
 }
 
+// The whole session is being replaced -- by a file, or by an undo snapshot.
+// The two differ only in where `next` came from and in what may be carried
+// across; everything about *how* a session is torn down and stood back up is
+// here, once, because the ownership rules it has to respect are the hardest
+// thing in this file.
+void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
+    const bool restoring = restore != nullptr;
+    // 1. Instances the incoming session names and this one is already running.
+    //    Harvested before releaseAllChains, which would otherwise hand every
+    //    instance to the retirement flow and destroy it. Anything NOT taken
+    //    here stays on its track and dies the ordinary way, which is exactly
+    //    what should happen to a device the snapshot does not have.
+    std::vector<LiveDevice> reuse;
+    if (restoring) {
+        for (TrackModel& t : ses_.tracks) {
+            for (DeviceModel& d : t.devices) {
+                if (!d.inst) continue;
+                bool wanted = false;
+                for (const TrackModel& nt : next.tracks) {
+                    for (const SavedDevice& sd : nt.savedDevices)
+                        if (sd.uid == d.uid && sd.uri == d.desc.uri) { wanted = true; break; }
+                    if (wanted) break;
+                }
+                if (!wanted) continue;
+                LiveDevice ld;
+                ld.uid = d.uid;
+                ld.uri = d.desc.uri;
+                ld.desc = d.desc;
+                ld.inst = std::move(d.inst);          // off the track, into the pool
+                reuse.push_back(std::move(ld));
+            }
+        }
+    }
+
+    // 2. Every published chain and every instance still on a track goes into
+    //    the retirement flow. This also publishes an empty chain per track,
+    //    which is what makes the audio thread let go of the *rebound*
+    //    instances as well before they turn up again in a new chain.
+    releaseAllChains();
+
+    // 3. Samples. Two separate jobs, both about pointers the engine holds.
+    //
+    //    Reuse: on a restore every clip takes back the SampleBuffer it was
+    //    playing when the snapshot was taken, matched on clip uid. loadProject
+    //    has unavoidably decoded the files again (it only knows how to read
+    //    from disk) and those copies are dropped here, so an undo does not
+    //    double every sample in the set. More importantly this is the only way
+    //    a clip with no file behind it -- a take that has been recorded and
+    //    not exported -- survives an undo at all: the text can name a file and
+    //    nothing else. See ClipSample.
+    //
+    //    Grace: whatever the outgoing session owned is held for one more
+    //    generation. The engine can still be running a clip that points into
+    //    one of those buffers for the few milliseconds it takes to drain the
+    //    Cmd::SetClip below, and there is no "the audio thread has let go of
+    //    this buffer" event the way there is for chains and note arrays. This
+    //    is not that handshake; it is a window measured in user actions rather
+    //    than in samples, which is the best this side of the boundary can do.
+    if (restoring) {
+        for (TrackModel& t : next.tracks)
+            for (ClipModel& c : t.slots) {
+                if (!c.uid) continue;
+                for (const ClipSample& cs : *restore)
+                    if (cs.uid == c.uid) { c.sample = cs.sample; break; }
+            }
+    }
+    sampleGrace_.clear();          // the previous generation, long since idle
+    for (const TrackModel& t : ses_.tracks)
+        for (const ClipModel& c : t.slots)
+            if (c.sample) sampleGrace_.push_back(c.sample);
+
+    const int wasTracks = (int)ses_.tracks.size();
+    ses_ = std::move(next);
+
+    // Identity. On a load, everything below hands out fresh UIDs and they must
+    // come from a counter already pulled past whatever the file used. On a
+    // restore there is nothing to fill in: the snapshot carries every uid and
+    // the counter itself, and handing out new ones would break the very
+    // identities (clip uid, device uid) the restore is matching on.
+    if (!restoring) assignUids();
+
+    // A set with nothing in it would leave the views indexing past the end.
+    if (ses_.tracks.empty()) addTrack();
+    if (ses_.scenes.empty()) addScene();
+    selTrack_ = clampv(selTrack_, 0, (int)ses_.tracks.size() - 1);
+    selSlot_  = clampv(selSlot_,  0, (int)ses_.scenes.size() - 1);
+    selDevice_ = -1;
+    // The tracks this index referred to are gone; the arms in the incoming set
+    // are its own, not ours to take back.
+    autoArmed_ = -1;
+
+    materializeDevices(restoring ? &reuse : nullptr);   // may set its own status
+
+    // A pool entry nothing adopted (two saved devices sharing a uid, a plugin
+    // swapped under one) is still an instance the outgoing chain borrowed, so
+    // it cannot simply be dropped here. It rides out with the newest chain that
+    // has a retirement coming; if there is none -- the send failed, or nothing
+    // was ever published -- it waits for shutdown, which is the same bargain
+    // releaseAllChains makes for the same reason.
+    RetiredChain* host = nullptr;
+    for (auto it = retiring_.rbegin(); it != retiring_.rend(); ++it)
+        if (it->chain) { host = &*it; break; }
+    for (LiveDevice& ld : reuse) {
+        if (!ld.inst) continue;
+        if (!host) { retiring_.push_back(RetiredChain{}); host = &retiring_.back(); }
+        host->dying.push_back(std::move(ld.inst));
+    }
+
+    pushAll();                     // also clears the slots outside the new set
+
+    // The mixer flags of tracks the new set does not have. Their clips are
+    // gone and their chains are empty, so volume and pan no longer describe
+    // anything -- but solo is global by nature, and one left standing on a
+    // track nobody can see any more would silence the whole set with no
+    // visible cause. Bounded by how far the set actually shrank.
+    for (int t = (int)ses_.tracks.size(); t < wasTracks; ++t) {
+        send(Cmd::TrackSolo, t, 0);
+        send(Cmd::TrackMute, t, 0);
+        send(Cmd::TrackArm,  t, 0);
+    }
+}
+
 bool App::openProject(const std::string& path) {
     // Load into a scratch session first. loadProject() leaves its target alone
     // on a parse error, but the session is only *ours* to throw away once we
@@ -698,26 +891,11 @@ bool App::openProject(const std::string& path) {
         return false;
     }
 
-    releaseAllChains();
-    ses_ = std::move(next);
-
-    // Identity first: everything below hands out fresh UIDs, and they must come
-    // from a counter that has already been pulled past whatever the file used.
-    assignUids();
-
-    // A set with nothing in it would leave the views indexing past the end.
-    if (ses_.tracks.empty()) addTrack();
-    if (ses_.scenes.empty()) addScene();
-    selTrack_ = clampv(selTrack_, 0, (int)ses_.tracks.size() - 1);
-    selSlot_  = clampv(selSlot_,  0, (int)ses_.scenes.size() - 1);
-    selDevice_ = -1;
-    // The tracks this index referred to are gone; the arms in the loaded set
-    // are the file's, not ours to take back.
-    autoArmed_ = -1;
-
     status_ = "Loaded " + path;
-    materializeDevices();          // may replace the status with its own warning
-    pushAll();
+    adoptSession(std::move(next), nullptr);   // may replace the status with a warning
+    // The history belonged to the set that was open a moment ago. Undoing into
+    // it would silently overwrite the one just loaded.
+    clearUndo();
     return true;
 }
 
@@ -725,6 +903,335 @@ void App::saveProjectTo(const std::string& path) {
     serializeDevices();
     std::string err;
     status_ = saveProject(ses_, path, &err) ? ("Saved " + path) : ("Save failed: " + err);
+}
+
+// ---------------------------------------------------------------------------
+// undo / redo
+//
+// See the block in app.h for what an entry is, how gestures coalesce into one,
+// and what is deliberately outside all of this. Everything here is GUI thread.
+// ---------------------------------------------------------------------------
+
+// Where a snapshot is staged on its way through the project serializer.
+// XDG_RUNTIME_DIR is a per-user tmpfs, which is the right home for a file that
+// exists for the length of one write and one read; /tmp is the fallback.
+static std::string stagingPath() {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    const std::string dir = (rt && *rt) ? rt : "/tmp";
+    char buf[64];
+    snprintf(buf, sizeof buf, "/lattice-undo-%d.lattice", (int)getpid());
+    return dir + buf;
+}
+
+static bool writeAll(const std::string& path, const std::string& text) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const size_t n = fwrite(text.data(), 1, text.size(), f);
+    const bool ok = (n == text.size()) && (fflush(f) == 0);
+    fclose(f);
+    if (!ok) remove(path.c_str());
+    return ok;
+}
+
+static bool readAll(const std::string& path, std::string& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[64 * 1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    const bool bad = ferror(f) != 0;
+    fclose(f);
+    return !bad;
+}
+
+// The session as a project document. There is exactly one serializer in this
+// program and it writes to a path -- there is no string form of saveProject,
+// and a second writer for undo is precisely how the two would drift apart
+// until an undo restored something a save could not express. So the snapshot
+// goes out to tmpfs and comes straight back in.
+bool App::snapshotSession(std::string& out, std::vector<ClipSample>& samples) {
+    if (undoTmp_.empty()) undoTmp_ = stagingPath();
+    // The audio first, because it is the half the text cannot carry.
+    samples.clear();
+    for (const TrackModel& t : ses_.tracks)
+        for (const ClipModel& c : t.slots)
+            if (c.sample && c.uid) samples.push_back(ClipSample{c.uid, c.sample});
+    serializeDevices();            // live instances -> the passive form the writer reads
+    // saveProject records where it wrote as the set's home. The staging file is
+    // not where this set lives.
+    const std::string home = ses_.path;
+    std::string err;
+    const bool ok = saveProject(ses_, undoTmp_, &err);
+    ses_.path = home;
+    if (!ok) {
+        LOGW("undo: could not stage a snapshot: %s", err.c_str());
+        return false;
+    }
+    out.clear();
+    const bool got = readAll(undoTmp_, out);
+    remove(undoTmp_.c_str());
+    if (!got || out.empty()) {
+        LOGW("undo: could not read the staged snapshot back");
+        return false;
+    }
+    return true;
+}
+
+bool App::undoCoalesce(u64 gesture) {
+    // A widget owns `active` for the whole of a drag, so the second and every
+    // later frame of one gesture lands here and is refused. A one-shot edit
+    // (a button, a key, a menu) has no active widget and always takes a point.
+    const u64 g = gesture ? gesture : ui_.active;
+    if (g && g == undoGesture_) return true;
+    undoGesture_ = g;
+    return false;
+}
+
+void App::pushUndoNow(const char* what) {
+    std::string text;
+    std::vector<ClipSample> samples;
+    if (!snapshotSession(text, samples)) return;
+    // An "edit" that changed nothing -- nudging a note already against the edge
+    // of its clip, retyping the same name -- would otherwise leave an entry
+    // that appears to do nothing when it comes back.
+    if (!undo_.empty() && undo_.back().text == text) {
+        redo_.clear();
+        return;
+    }
+    UndoEntry e;
+    e.text = std::move(text);
+    e.samples = std::move(samples);
+    e.what = what ? what : "edit";
+    e.path = ses_.path;
+    e.selTrack = selTrack_;
+    e.selSlot = selSlot_;
+    if ((int)undo_.size() >= kUndoDepth) undo_.erase(undo_.begin());
+    undo_.push_back(std::move(e));
+    redo_.clear();                 // the future this edit branched away from
+}
+
+void App::undoPoint(const char* what, u64 gesture) {
+    if (undoCoalesce(gesture)) return;
+    pushUndoNow(what);
+}
+
+void App::clearUndo() {
+    undo_.clear();
+    redo_.clear();
+    undoGesture_ = 0;
+}
+
+// A take in flight has no coherent place in a session about to be replaced:
+// the slot it is aimed at may not exist a moment from now, and half a
+// recording is not a state to restore to. The buffer is NOT freed here -- the
+// engine may still be appending to it -- so the stop goes out and the finish
+// handler drops the material when it comes back.
+void App::cancelTakes(const char* why) {
+    bool any = false;
+    for (PendingRec& p : pendingRecs_) {
+        if (p.cancelled) continue;
+        p.cancelled = true;
+        stopRecording(p.track);
+        any = true;
+    }
+    if (any && why) status_ = why;
+}
+
+// openProject's body, minus the disk. The snapshot is written back out to the
+// staging file only because loadProject, like saveProject, speaks paths.
+bool App::restoreEntry(const UndoEntry& e) {
+    cancelTakes("Recording cancelled by undo");
+
+    if (undoTmp_.empty()) undoTmp_ = stagingPath();
+    if (!writeAll(undoTmp_, e.text)) {
+        status_ = "Undo failed: cannot stage the snapshot";
+        return false;
+    }
+    Session next;
+    std::string err;
+    const bool ok = loadProject(next, undoTmp_, engine_.sampleRate(), &err);
+    remove(undoTmp_.c_str());
+    if (!ok) {
+        // Our own text failed to parse: a bug, not a user error. The session is
+        // untouched (loadProject leaves its target alone on failure) and this
+        // entry is not usable, so say so rather than pretending.
+        LOGW("undo: snapshot did not parse: %s", err.c_str());
+        status_ = "Undo failed: " + err;
+        return false;
+    }
+    next.path = e.path;            // the staging file is not the set's home
+
+    adoptSession(std::move(next), &e.samples);
+
+    // Cursor, after adoptSession's own clamping: the point of carrying it is
+    // that an undo lands where the edit happened.
+    selTrack_ = clampv(e.selTrack, 0, (int)ses_.tracks.size() - 1);
+    selSlot_  = clampv(e.selSlot,  0, (int)ses_.scenes.size() - 1);
+    // The roll's selection is an index into a note vector that has just been
+    // replaced wholesale, and a sounding preview belongs to the clip that was
+    // on screen before the restore.
+    if (roll_) roll_->clearSelection();
+    stopPreviews();
+    // A drag in flight names a source track and slot that the restored set may
+    // not have. Nothing about a mouse gesture survives the model it was
+    // dragging, and drawDragGhost would index straight past the end.
+    drag_ = DragState{};
+    return true;
+}
+
+void App::undo() {
+    if (undo_.empty()) { status_ = "Nothing to undo"; return; }
+
+    UndoEntry e = std::move(undo_.back());
+    undo_.pop_back();
+
+    // What is being left behind becomes the redo entry, under the same label:
+    // it is the same edit, seen from the other side.
+    UndoEntry back;
+    const bool haveBack = snapshotSession(back.text, back.samples);
+    if (haveBack) {
+        back.what = e.what;
+        back.path = ses_.path;
+        back.selTrack = selTrack_;
+        back.selSlot = selSlot_;
+    }
+
+    if (!restoreEntry(e)) {
+        undo_.push_back(std::move(e));           // still the state to go back to
+        return;
+    }
+    if (haveBack) {
+        if ((int)redo_.size() >= kUndoDepth) redo_.erase(redo_.begin());
+        redo_.push_back(std::move(back));
+    }
+    undoGesture_ = 0;
+    status_ = "Undo: " + e.what;
+}
+
+// Drives one edit of each shape that reaches a different corner of the restore
+// path -- a session scalar, a track flag, notes, the track list, a plugin
+// parameter, a device removed and brought back -- and checks that undo and redo
+// land on exactly the state they claim to. The serialized session is the
+// comparison because it is the same thing an entry is made of: if a rebound
+// plugin came back with the wrong parameter, or a clip lost its audio, the text
+// says so.
+void App::debugUndoSelfTest() {
+    auto text = [this]() {
+        std::string t;
+        std::vector<ClipSample> s;
+        snapshotSession(t, s);
+        return t;
+    };
+
+    int fails = 0, ran = 0;
+    auto step = [&](const char* name, auto&& edit) {
+        const std::string before = text();
+        edit();
+        const std::string after = text();
+        if (after == before) {
+            LOGW("undo self-test: %s changed nothing - not exercised", name);
+            return;
+        }
+        ++ran;
+        undo();
+        if (text() != before) { LOGE("undo self-test: %s did not undo", name); ++fails; }
+        redo();
+        if (text() != after)  { LOGE("undo self-test: %s did not redo", name); ++fails; }
+        undo();                        // leave the set as this step found it
+        if (text() != before) { LOGE("undo self-test: %s did not undo twice", name); ++fails; }
+    };
+
+    step("tempo", [&] { undoPoint("tempo"); setTempo(ses_.tempo + 7.0); });
+    step("rename track", [&] {
+        std::string was = ses_.tracks[0].name;
+        std::string now = was + " (edited)";
+        std::swap(ses_.tracks[0].name, now);
+        undoPointWith("rename track", ses_.tracks[0].name, was);
+    });
+    step("solo", [&] {
+        const bool was = ses_.tracks[0].solo;
+        ses_.tracks[0].solo = !was;
+        undoPointWith("solo", ses_.tracks[0].solo, was);
+        send(Cmd::TrackSolo, 0, ses_.tracks[0].solo ? 1 : 0);
+    });
+    step("add track", [&] { undoPoint("add track"); addTrack(); });
+
+    // Notes, through the same before-value path the roll uses.
+    int mt = -1, msl = -1;
+    for (int t = 0; t < (int)ses_.tracks.size() && mt < 0; ++t)
+        for (int s = 0; s < (int)ses_.scenes.size(); ++s)
+            if (ses_.tracks[t].slots[s].kind == ClipKind::Midi &&
+                ses_.tracks[t].slots[s].valid()) { mt = t; msl = s; break; }
+    if (mt >= 0) {
+        step("note edit", [&] {
+            ClipModel& m = ses_.tracks[mt].slots[msl];
+            const ClipModel was = m;
+            m.notes.push_back(NoteModel{0.0, 0.25, 61, 99});
+            undoPointWith("note edit", m, was);
+            pushClip(mt, msl);
+        });
+    } else {
+        LOGW("undo self-test: no MIDI clip in this set - notes not exercised");
+    }
+
+    // Devices: a parameter (rebound instance, value re-applied) and a removal
+    // (instance retired, then instantiated again from the registry).
+    int dt = -1;
+    for (int t = 0; t < (int)ses_.tracks.size() && dt < 0; ++t)
+        for (const DeviceModel& d : ses_.tracks[t].devices)
+            if (d.inst && d.inst->paramCount() > 0) { dt = t; break; }
+    if (dt >= 0) {
+        step("device param", [&] {
+            PluginInstance* in = ses_.tracks[dt].devices[0].inst.get();
+            const ParamInfo& pi = in->paramInfo(0);
+            const f32 v = in->getParam(0);
+            undoPoint("param");
+            in->setParam(0, v == pi.max ? pi.min : pi.max);
+        });
+        step("remove device", [&] { undoPoint("remove device"); removeDevice(dt, 0); });
+    } else {
+        LOGW("undo self-test: no device with parameters - devices not exercised");
+    }
+
+    step("clear clip", [&] {
+        undoPoint("clear clip");
+        clearClip(selTrack_, selSlot_);
+    });
+
+    // The history, and the status line, are the self-test's and not the user's.
+    clearUndo();
+    status_ = "Ready";
+    if (fails) LOGE("undo self-test: %d FAILURE(S) across %d edits", fails, ran);
+    else       LOGI("undo self-test: %d edits undone and redone cleanly", ran);
+}
+
+void App::redo() {
+    if (redo_.empty()) { status_ = "Nothing to redo"; return; }
+
+    UndoEntry e = std::move(redo_.back());
+    redo_.pop_back();
+
+    UndoEntry back;
+    const bool haveBack = snapshotSession(back.text, back.samples);
+    if (haveBack) {
+        back.what = e.what;
+        back.path = ses_.path;
+        back.selTrack = selTrack_;
+        back.selSlot = selSlot_;
+    }
+
+    if (!restoreEntry(e)) {
+        redo_.push_back(std::move(e));
+        return;
+    }
+    // Straight onto the undo stack, and without clearing the redo stack: this
+    // is a walk back along the same history, not a new edit.
+    if (haveBack) {
+        if ((int)undo_.size() >= kUndoDepth) undo_.erase(undo_.begin());
+        undo_.push_back(std::move(back));
+    }
+    undoGesture_ = 0;
+    status_ = "Redo: " + e.what;
 }
 
 void App::setTempo(f64 bpm) {
@@ -743,6 +1250,9 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
     if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
     SampleRef sb = loadSample(path, engine_.sampleRate());
     if (!sb) { status_ = "Could not load " + path; return; }
+    // After the decode, so a file that could not be read leaves no history
+    // behind, and before the slot is touched.
+    undoPoint("load clip");
 
     ClipModel& m = ses_.tracks[track].slots[slot];
     // A slot that already held a clip keeps its identity: the material behind
@@ -793,6 +1303,10 @@ bool App::trackHasNoteDevice(int track) const {
 void App::createMidiClip(int track, int slot) {
     if (track < 0 || track >= (int)ses_.tracks.size()) return;
     if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
+
+    // Here rather than at the (single) call site: this is the whole edit, and
+    // the slot is untouched until the next line.
+    undoPoint("new clip");
 
     ClipModel& m = ses_.tracks[track].slots[slot];
     m = ClipModel{};
@@ -948,6 +1462,15 @@ void App::finishRecording(const Event& e) {
              "freeing a pointer we do not own", (const void*)buf);
         return;
     }
+    if (it->cancelled) {
+        // An undo replaced the session this take was aimed at (see
+        // cancelTakes). The buffer coming home is the only thing that still had
+        // to happen; the material is dropped rather than written into a
+        // session that never asked for it.
+        delete[] buf;
+        pendingRecs_.erase(it);
+        return;
+    }
 
     const int track = e.a, slot = e.b;
     const i64 frames = (i64)e.x;
@@ -959,6 +1482,10 @@ void App::finishRecording(const Event& e) {
         snprintf(name, sizeof name, "Rec %d", recTakeNo_++);
         SampleRef sb = sampleFromRecording(buf, frames, engine_.sampleRate(), ses_.tempo, name);
         if (sb) {
+            // pushUndoNow rather than undoPoint: this runs while engine events
+            // are drained, so a widget the user happens to be dragging still
+            // owns ui_.active and would coalesce a take away.
+            pushUndoNow("record");
             ClipModel& m = ses_.tracks[track].slots[slot];
             m = ClipModel{};
             m.uid = ses_.newUid();
@@ -1003,11 +1530,62 @@ void App::finishMidiRecording(const Event& e) {
              "than freeing a pointer we do not own", (const void*)buf);
         return;
     }
+    if (it->cancelled) {          // see finishRecording
+        delete[] buf;
+        pendingRecs_.erase(it);
+        return;
+    }
 
     const int track = e.a, slot = e.b;
     const int count = clampv((int)e.x, 0, (int)it->cap);
     const bool inRange = track >= 0 && track < (int)ses_.tracks.size() &&
                          slot  >= 0 && slot  < (int)ses_.scenes.size();
+
+    // One note of the take, in the model's form. Both paths below want exactly
+    // this, and the clamps are the ones the format applies anyway.
+    const auto asNote = [](const RtNote& r) {
+        NoteModel n;
+        n.beat  = std::max(0.0, r.beat);
+        n.len   = std::max(1.0 / 64.0, r.len);
+        n.pitch = (u8)clampv((int)r.pitch, 0, 127);
+        n.vel   = (u8)clampv((int)r.vel, 1, 127);
+        return n;
+    };
+    // Everything downstream -- the roll, the RtNote array, the engine's own
+    // scheduler -- wants notes by beat. The engine pairs ons with offs as they
+    // arrive, so a short note inside a long one comes back out of order, and an
+    // overdub arrives after everything already in the clip regardless.
+    const auto sortByBeat = [](std::vector<NoteModel>& v) {
+        std::stable_sort(v.begin(), v.end(),
+                         [](const NoteModel& a, const NoteModel& b) { return a.beat < b.beat; });
+    };
+
+    // Overdub. The slot already held a pattern, so this take was a looper pass
+    // over it: the engine kept the clip playing, wrapped each captured note's
+    // beat into the clip's loop, and returned only the NEW notes (see the
+    // Cmd::RecordMidiSlot contract in engine.h). Merging is therefore the whole
+    // job -- the length stays the clip's, and nothing already in it is touched.
+    if (count > 0 && inRange &&
+        ses_.tracks[track].slots[slot].valid() &&
+        ses_.tracks[track].slots[slot].kind == ClipKind::Midi) {
+        pushUndoNow("overdub");             // not undoPoint: see finishRecording
+        ClipModel& m = ses_.tracks[track].slots[slot];
+        m.notes.reserve(m.notes.size() + (size_t)count);
+        for (int i = 0; i < count; ++i) m.notes.push_back(asNote(buf[i]));
+        sortByBeat(m.notes);
+
+        pushClip(track, slot);
+        selectTrack(track); selSlot_ = slot;
+        detailTab_ = DetailTab::Clip;
+        char st[80];
+        snprintf(st, sizeof st, "Overdubbed %d note%s  -  %s now has %zu",
+                 count, count == 1 ? "" : "s", m.name.c_str(), m.notes.size());
+        status_ = st;
+
+        delete[] buf;
+        pendingRecs_.erase(it);
+        return;
+    }
 
     if (count > 0 && inRange) {
         // Length. The engine hands back notes and a count, not a duration, so
@@ -1028,6 +1606,7 @@ void App::finishMidiRecording(const Event& e) {
         char name[32];
         snprintf(name, sizeof name, "Rec %d", recTakeNo_++);
 
+        pushUndoNow("record");              // not undoPoint: see finishRecording
         ClipModel& m = ses_.tracks[track].slots[slot];
         m = ClipModel{};
         m.uid = ses_.newUid();
@@ -1039,19 +1618,8 @@ void App::finishMidiRecording(const Event& e) {
         m.gain = 1.f;
         m.loop = true;
         m.notes.reserve((size_t)count);
-        for (int i = 0; i < count; ++i) {
-            NoteModel n;
-            n.beat  = std::max(0.0, buf[i].beat);
-            n.len   = std::max(1.0 / 64.0, buf[i].len);
-            n.pitch = (u8)clampv((int)buf[i].pitch, 0, 127);
-            n.vel   = (u8)clampv((int)buf[i].vel, 1, 127);
-            m.notes.push_back(n);
-        }
-        // The engine pairs ons with offs as they arrive, so a short note inside
-        // a long one comes back out of order. Everything downstream — the roll,
-        // the RtNote array, the engine's own scheduler — wants them by beat.
-        std::stable_sort(m.notes.begin(), m.notes.end(),
-                         [](const NoteModel& a, const NoteModel& b) { return a.beat < b.beat; });
+        for (int i = 0; i < count; ++i) m.notes.push_back(asNote(buf[i]));
+        sortByBeat(m.notes);
 
         pushClip(track, slot);
         selectTrack(track); selSlot_ = slot;
@@ -1129,6 +1697,18 @@ void App::frame() {
     glClear(GL_COLOR_BUFFER_BIT);
 
     ui_.beginFrame();
+
+    // A gesture ends when what was driving it lets go, and the next one has to
+    // take an entry of its own even when it is the same fader being dragged a
+    // second time. Ui::endFrame() drops `active` on mouse-up, so by now it is
+    // already gone; the arrows are the one gesture not held by a widget.
+    {
+        const Input& k = win_.input();
+        const bool arrows = k.keyDown[KeyLeft] || k.keyDown[KeyRight] ||
+                            k.keyDown[KeyUp]   || k.keyDown[KeyDown];
+        if (!ui_.active && !(arrows && undoGesture_ == kArrowGesture)) undoGesture_ = 0;
+    }
+
     handleShortcuts();
 
     Rect full{0, 0, W, H};
@@ -1179,6 +1759,17 @@ void App::handleShortcuts() {
     if (tgl && !kbdTogglePrev_) toggleKbdMidi();
     kbdTogglePrev_ = tgl;
 
+    // Undo / redo, edge-detected for the same reason: a held Ctrl+Z would run
+    // a full session restore every frame. Ctrl+Shift+Z and Ctrl+Y both redo,
+    // which is the split the rest of the world never settled.
+    const bool undoChord = in.keyDown['z'] && in.ctrl() && !in.shift();
+    const bool redoChord = (in.keyDown['z'] && in.ctrl() && in.shift()) ||
+                           (in.keyDown['y'] && in.ctrl());
+    if (undoChord && !undoKeyPrev_) undo();
+    if (redoChord && !redoKeyPrev_) redo();
+    undoKeyPrev_ = undoChord;
+    redoKeyPrev_ = redoChord;
+
     // While the piano is on it owns the printable keys, so an unmodified letter
     // is a note and not a shortcut — see KbdPiano::consumes for why this is now
     // the whole block rather than the mapped keys: the piano reads positions
@@ -1194,11 +1785,12 @@ void App::handleShortcuts() {
     if (in.keyPressed['b'] && in.ctrl()) showBrowser_ = !showBrowser_;
     if (in.keyPressed['d'] && in.ctrl()) showDetail_ = !showDetail_;
     if (plain('m')) {
+        undoPoint("metronome");
         ses_.metronome = !ses_.metronome;
         send(Cmd::SetMetronome, ses_.metronome ? 1 : 0);
     }
-    if (in.keyPressed['t'] && in.ctrl()) addTrack();
-    if (in.keyPressed[KeyEnter] && in.ctrl()) addScene();
+    if (in.keyPressed['t'] && in.ctrl()) { undoPoint("add track"); addTrack(); }
+    if (in.keyPressed[KeyEnter] && in.ctrl()) { undoPoint("add scene"); addScene(); }
 
     // --- keys the piano roll can claim --------------------------------------
     // The roll only claims a key while it is on screen for the selected clip,
@@ -1224,15 +1816,26 @@ void App::handleShortcuts() {
     // spectacular way to lose work.
     if (in.keyPressed[KeyDelete] || (in.keyPressed[KeyBackspace] && !in.ctrl())) {
         if (noteSel) {
-            if (roll->deleteSelected(*selClip)) pushClip(selTrack_, selSlot_);
+            // The roll edits the clip in place, so the entry has to be taken
+            // with the clip as it was -- and only if the edit happened at all,
+            // which is not knowable until the call returns. Copying a clip is
+            // a note vector and two strings; see undoPointWith.
+            const ClipModel before = *selClip;
+            if (roll->deleteSelected(*selClip)) {
+                undoPointWith("delete note", *selClip, before);
+                pushClip(selTrack_, selSlot_);
+            }
         } else {
+            undoPoint("clear clip");
             clearClip(selTrack_, selSlot_);
         }
     }
     // Live's duplicate-loop (Cmd+D there; Ctrl+D is already the detail panel
     // here, so Ctrl+U). Clip-scoped, not note-scoped: no selection needed.
     if (in.keyPressed['u'] && in.ctrl() && roll) {
+        const ClipModel before = *selClip;
         if (roll->duplicateLoop(*selClip)) {
+            undoPointWith("duplicate loop", *selClip, before);
             pushClip(selTrack_, selSlot_);
             char buf[64];
             snprintf(buf, sizeof buf, "Loop duplicated — %.0f beats", selClip->lengthBeats);
@@ -1251,8 +1854,16 @@ void App::handleShortcuts() {
         const int step = in.shift() ? 12 : 1;      // Shift = octave, as everywhere
         if (in.keyPressed[KeyUp])    semis += step;
         if (in.keyPressed[KeyDown])  semis -= step;
-        if ((steps || semis) && roll->nudgeSelected(*selClip, steps, semis))
-            pushClip(selTrack_, selSlot_);
+        if (steps || semis) {
+            const ClipModel before = *selClip;
+            if (roll->nudgeSelected(*selClip, steps, semis)) {
+                // The arrows auto-repeat, so sliding a note across two beats is
+                // one gesture and not thirty entries. It ends when the key
+                // comes up (see frame()).
+                undoPointWith("nudge note", *selClip, before, kArrowGesture);
+                pushClip(selTrack_, selSlot_);
+            }
+        }
     } else {
         // Through selectTrack so arrowing across the grid arms what it lands
         // on, exactly as clicking does.
@@ -1417,14 +2028,23 @@ void App::drawControlBar(const Rect& r) {
     if (ui_.button(uiId(1, 0), tapR, "TAP")) {
         static f64 lastTap = 0.0;
         const f64 now = nowSeconds();
-        if (now - lastTap < 3.0) setTempo(clampv(60.0 / (now - lastTap), 20.0, 999.0));
+        if (now - lastTap < 3.0) {
+            undoPoint("tempo");
+            setTempo(clampv(60.0 / (now - lastTap), 20.0, 999.0));
+        }
         lastTap = now;
     }
     x += tapR.w + 4 * s;
 
     Rect tempoR{x, cy, 62 * s, h};
     f64 bpm = ses_.tempo;
-    if (ui_.dragNumber(uiId(1, 1), tempoR, &bpm, 20.0, 999.0, 0.15, "%.2f")) setTempo(bpm);
+    // The number is edited through a copy, so the session still holds the old
+    // tempo here and a plain undoPoint is enough; the drag coalesces on the
+    // widget's id.
+    if (ui_.dragNumber(uiId(1, 1), tempoR, &bpm, 20.0, 999.0, 0.15, "%.2f")) {
+        undoPoint("tempo");
+        setTempo(bpm);
+    }
     x += tempoR.w + 6 * s;
 
     Rect sigR{x, cy, 44 * s, h};
@@ -1438,6 +2058,7 @@ void App::drawControlBar(const Rect& r) {
 
     Rect metR{x, cy, 36 * s, h};
     if (ui_.button(uiId(1, 2), metR, "MET", ses_.metronome, pal::accent)) {
+        undoPoint("metronome");
         ses_.metronome = !ses_.metronome;
         send(Cmd::SetMetronome, ses_.metronome ? 1 : 0);
     }
@@ -1446,8 +2067,13 @@ void App::drawControlBar(const Rect& r) {
     // --- global launch quantum ---
     rend_.textIn(fSmall_, {x, cy, 26 * s, h}, "Q", pal::textFaint, Align::Left, 0);
     Rect quantR{x + 16 * s, cy, 62 * s, h};
-    if (ui_.selector(uiId(1, 3), quantR, &ses_.quantumIdx, kQuantumNames, kQuantumCount))
+    // The selector writes into the session and only then reports the change,
+    // so the entry needs the index handed back to it.
+    const int wasQuantum = ses_.quantumIdx;
+    if (ui_.selector(uiId(1, 3), quantR, &ses_.quantumIdx, kQuantumNames, kQuantumCount)) {
+        undoPointWith("launch quantum", ses_.quantumIdx, wasQuantum);
         send(Cmd::SetQuantum, ses_.quantumIdx);
+    }
     x = quantR.right() + 16 * s;
 
     // --- transport ---
@@ -1696,15 +2322,22 @@ void App::drawTrackHeaders(const Rect& r, f32 scrollX) {
         // Colour chip so the track's identity reads at a glance, as in Live.
         rend_.rect({cell.x, cell.y, cell.w, 2 * s}, pal::clipColors[t.colorIdx % pal::clipColorCount]);
 
-        if (ui_.textField(uiId(3, 1000 + (int)i), cell, &t.name,
-                          Col(0, 0, 0, 0), sel ? pal::text : pal::textDim, Align::Left)) {}
+        // textField writes the new name and only then says it committed, and it
+        // can only commit on a frame where it already owns the caret -- so the
+        // old name is captured then, and only then.
+        const u64 nameId = uiId(3, 1000 + (int)i);
+        std::string wasName;
+        if (ui_.editId == nameId) wasName = t.name;
+        if (ui_.textField(nameId, cell, &t.name,
+                          Col(0, 0, 0, 0), sel ? pal::text : pal::textDim, Align::Left))
+            undoPointWith("rename track", t.name, wasName);
         if (hot && in.pressed[0]) selectTrack((int)i);
     }
 
     // "+" to append a track.
     Rect add{x, r.y, 22 * s, h};
     if (add.x < r.right()) {
-        if (ui_.button(uiId(3, 900), add, "+")) addTrack();
+        if (ui_.button(uiId(3, 900), add, "+")) { undoPoint("add track"); addTrack(); }
     }
 }
 
@@ -1823,13 +2456,27 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     if (playing) ui_.playTriangle(btn.insetXY(4.5f * s, 4.5f * s), pal::playGreen.scale(0.85f));
     else         ui_.playTriangle(btn.insetXY(4.5f * s, 4.5f * s), pal::textOnClip.alpha(0.55f));
 
+    // Recording into a slot that already holds a clip is an overdub, so the
+    // slot keeps its playing look and gains the record dot rather than turning
+    // solid red the way a slot being captured into from empty does: what is on
+    // screen is still the clip, and it is still playing.
+    f32 nameW = cell.w - btnW - 2 * s;
+    f32 markRight = cell.right();
+    if (recHere) {
+        // Pulsing while the take waits for its quantum, solid once it is
+        // capturing - the same two states the empty-slot look has, said quietly.
+        const f32 a = recPhase >= 2 ? 1.f : (f32)(0.45 + 0.45 * std::sin(nowSeconds() * 8.0));
+        rend_.circle(markRight - 7 * s, cell.cy(), 3.5f * s, pal::recRed.alpha(a));
+        markRight -= 13 * s;
+        nameW -= 13 * s;
+    }
+
     // A MIDI clip gets a three-dot mark on the right: at 21px of row height a
     // real piano glyph is a smudge, and the dots read as "notes, not audio"
     // without competing with the name.
-    f32 nameW = cell.w - btnW - 2 * s;
     if (m.kind == ClipKind::Midi) {
         const f32 d = 1.6f * s;
-        const f32 dx0 = cell.right() - 12 * s;
+        const f32 dx0 = markRight - 12 * s;
         for (int i = 0; i < 3; ++i)
             rend_.rect({dx0 + i * 3.5f * s, cell.cy() - d * 0.5f - (i == 1 ? 2 * s : 0.f), d, d},
                        pal::textOnClip.alpha(0.6f));
@@ -1850,19 +2497,37 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
         ui_.cursor = Cursor::Hand;
         if (in.pressed[0]) {
             selectTrack(ti); selSlot_ = si;
-            send(Cmd::LaunchClip, ti, si);
+            // With the record button lit, a MIDI clip on an armed track is an
+            // overdub target and not just something to launch: the engine
+            // relaunches it at the record boundary and captures another pass
+            // into it (see the Cmd::RecordMidiSlot contract). A second click
+            // stops the take, exactly as on an empty slot. Audio clips are
+            // untouched by this - there is no overdub for a sample.
+            const bool overdub = recIntent_ && ses_.tracks[ti].arm &&
+                                 m.kind == ClipKind::Midi && trackHasNoteDevice(ti);
+            if (recHere)       stopRecording(ti);
+            else if (overdub)  startRecording(ti, si);
+            else               send(Cmd::LaunchClip, ti, si);
             drag_.kind = DragState::Kind::Clip;
             drag_.srcTrack = ti; drag_.srcSlot = si;
             drag_.startX = in.mx; drag_.startY = in.my;
             drag_.armed = false;
         }
-        if (in.pressed[2]) { selectTrack(ti); selSlot_ = si; clearClip(ti, si); }
+        if (in.pressed[2]) {
+            selectTrack(ti); selSlot_ = si;
+            undoPoint("clear clip");
+            clearClip(ti, si);
+        }
     }
 
     // Drop target for a drag in flight.
     if (drag_.kind != DragState::Kind::None && drag_.armed && hot && in.released[0]) {
-        if (drag_.kind == DragState::Kind::BrowserFile) loadClipInto(ti, si, drag_.path);
-        else if (drag_.srcTrack != ti || drag_.srcSlot != si) {
+        if (drag_.kind == DragState::Kind::BrowserFile) {
+            loadClipInto(ti, si, drag_.path);   // takes its own entry, after the decode
+        } else if (drag_.srcTrack != ti || drag_.srcSlot != si) {
+            // One entry for the whole move: the destination write and the
+            // source clear are halves of the same edit.
+            undoPoint(in.ctrl() ? "copy clip" : "move clip");
             ses_.tracks[ti].slots[si] = ses_.tracks[drag_.srcTrack].slots[drag_.srcSlot];
             if (!in.ctrl()) clearClip(drag_.srcTrack, drag_.srcSlot);
             pushClip(ti, si);
@@ -1895,8 +2560,12 @@ void App::drawSceneColumn(const Rect& r) {
 
         Rect btn{cell.x, cell.y, 14 * s, cell.h};
         ui_.playTriangle(btn.insetXY(4.5f * s, 4.5f * s), pal::textDim);
-        ui_.textField(uiId(5, 1000 + si), {cell.x + 14 * s, cell.y, cell.w - 16 * s, cell.h},
-                      &ses_.scenes[si].name, Col(0, 0, 0, 0), pal::text, Align::Left);
+        const u64 nameId = uiId(5, 1000 + si);
+        std::string wasName;                     // see drawTrackHeaders
+        if (ui_.editId == nameId) wasName = ses_.scenes[si].name;
+        if (ui_.textField(nameId, {cell.x + 14 * s, cell.y, cell.w - 16 * s, cell.h},
+                          &ses_.scenes[si].name, Col(0, 0, 0, 0), pal::text, Align::Left))
+            undoPointWith("rename scene", ses_.scenes[si].name, wasName);
 
         if (hot) ui_.cursor = Cursor::Hand;
         if (hot && in.pressed[0]) { selSlot_ = si; send(Cmd::LaunchScene, si); }
@@ -1909,7 +2578,7 @@ void App::drawSceneColumn(const Rect& r) {
 
     Rect add{r.x + 2 * s, stopAll.bottom() + 4 * s, r.w - 4 * s, 18 * s};
     if (add.bottom() <= r.bottom() - lay::mixerH * s) {
-        if (ui_.button(uiId(5, 901), add, "+ Scene")) addScene();
+        if (ui_.button(uiId(5, 901), add, "+ Scene")) { undoPoint("add scene"); addScene(); }
     }
 }
 
@@ -1937,13 +2606,24 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
         Rect mr{col.x + 6 * s, y, bw - 2 * s, 15 * s};
         Rect sr{mr.right() + 2 * s, y, bw - 2 * s, 15 * s};
         Rect ar{sr.right() + 2 * s, y, bw - 2 * s, 15 * s};
-        if (ui_.squareToggle(uiId(6, (int)ti, 0), mr, "M", &t.mute, pal::meterAmber))
+        // Every control in this strip is bound straight to the model and writes
+        // before it reports, so each hands its previous value to the entry.
+        const bool wasMute = t.mute, wasSolo = t.solo, wasArm = t.arm;
+        const f32  wasPan = t.pan, wasFader = t.fader;
+        if (ui_.squareToggle(uiId(6, (int)ti, 0), mr, "M", &t.mute, pal::meterAmber)) {
+            undoPointWith("mute", t.mute, wasMute);
             send(Cmd::TrackMute, (int)ti, t.mute ? 1 : 0);
-        if (ui_.squareToggle(uiId(6, (int)ti, 1), sr, "S", &t.solo, pal::soloBlue))
+        }
+        if (ui_.squareToggle(uiId(6, (int)ti, 1), sr, "S", &t.solo, pal::soloBlue)) {
+            undoPointWith("solo", t.solo, wasSolo);
             send(Cmd::TrackSolo, (int)ti, t.solo ? 1 : 0);
+        }
         // Record-arm is a filled dot in Live, and the glyph atlas is ASCII-only,
         // so draw the dot rather than trying to letter it.
         if (ui_.squareToggle(uiId(6, (int)ti, 2), ar, "", &t.arm, pal::armRed)) {
+            // Arming by hand is an edit; the auto-arm that follows the
+            // selection is not, and takes no entry of its own.
+            undoPointWith("arm", t.arm, wasArm);
             send(Cmd::TrackArm, (int)ti, t.arm ? 1 : 0);
             // Touched by hand: this arm is the user's now, so selecting another
             // track must not take it away again.
@@ -1954,16 +2634,20 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
 
         // Pan
         Rect pan{col.cx() - 11 * s, y, 22 * s, 22 * s};
-        if (ui_.knob(uiId(6, (int)ti, 3), pan, &t.pan, -1.f, 1.f, 0.f))
+        if (ui_.knob(uiId(6, (int)ti, 3), pan, &t.pan, -1.f, 1.f, 0.f)) {
+            undoPointWith("pan", t.pan, wasPan);
             send(Cmd::TrackPan, (int)ti, 0, t.pan);
+        }
         y += 26 * s;
 
         // Fader + meter
         const f32 fh = col.bottom() - y - 6 * s;
         Rect fader{col.x + 10 * s, y, 16 * s, fh};
         Rect meter{fader.right() + 5 * s, y, 9 * s, fh};
-        if (ui_.vFader(uiId(6, (int)ti, 4), fader, &t.fader))
+        if (ui_.vFader(uiId(6, (int)ti, 4), fader, &t.fader)) {
+            undoPointWith("volume", t.fader, wasFader);
             send(Cmd::TrackVol, (int)ti, 0, faderToGain(t.fader));
+        }
 
         const f32 lvl = std::max(engine_.meterL[ti].load(), engine_.meterR[ti].load());
         peakHoldT_[ti] = std::max(lvl, peakHoldT_[ti] * 0.985f);
@@ -2103,6 +2787,7 @@ void App::drawClipDetail(const Rect& r) {
             int wi = (int)m.warp;
             Rect sel{row.x + lblW, row.y, 84 * s, row.h};
             if (ui_.selector(uiId(8, 0), sel, &wi, warpNames, 3)) {
+                undoPoint("warp mode");
                 m.warp = (Warp)wi;
                 send(Cmd::ClipWarp, selTrack_, selSlot_, (f64)wi);
             }
@@ -2111,6 +2796,7 @@ void App::drawClipDetail(const Rect& r) {
             label("PLAY", row);
         }
         if (ui_.button(uiId(8, 1), lp, "LOOP", m.loop, pal::accent)) {
+            undoPoint("clip loop");
             m.loop = !m.loop;
             send(Cmd::ClipLoop, selTrack_, selSlot_, m.loop ? 1.0 : 0.0);
         }
@@ -2122,14 +2808,23 @@ void App::drawClipDetail(const Rect& r) {
         f64 bpm = m.clipBpm;
         Rect dn{row.x + lblW, row.y, 70 * s, row.h};
         if (ui_.dragNumber(uiId(8, 2), dn, &bpm, 20.0, 400.0, 0.1, "%.2f")) {
+            undoPoint("clip tempo");
             m.clipBpm = bpm;
             pushClip(selTrack_, selSlot_);
         }
         // Halve / double, exactly like Live's :2 and *2 buttons.
         Rect h2{dn.right() + 6 * s, row.y, 26 * s, row.h};
         Rect d2{h2.right() + 3 * s, row.y, 26 * s, row.h};
-        if (ui_.button(uiId(8, 3), h2, ":2")) { m.clipBpm *= 0.5; pushClip(selTrack_, selSlot_); }
-        if (ui_.button(uiId(8, 4), d2, "*2")) { m.clipBpm *= 2.0; pushClip(selTrack_, selSlot_); }
+        if (ui_.button(uiId(8, 3), h2, ":2")) {
+            undoPoint("clip tempo");
+            m.clipBpm *= 0.5;
+            pushClip(selTrack_, selSlot_);
+        }
+        if (ui_.button(uiId(8, 4), d2, "*2")) {
+            undoPoint("clip tempo");
+            m.clipBpm *= 2.0;
+            pushClip(selTrack_, selSlot_);
+        }
         y += rowH + 4 * s;
     }
     {   // Gain
@@ -2138,6 +2833,7 @@ void App::drawClipDetail(const Rect& r) {
         f64 db = gainToDb(m.gain);
         Rect dn{row.x + lblW, row.y, 70 * s, row.h};
         if (ui_.dragNumber(uiId(8, 5), dn, &db, -70.0, 12.0, 0.1, "%.1f dB")) {
+            undoPoint("clip gain");
             m.gain = dbToGain((f32)db);
             send(Cmd::ClipGain, selTrack_, selSlot_, m.gain);
         }
@@ -2152,6 +2848,7 @@ void App::drawClipDetail(const Rect& r) {
         int qi = m.quantumIdx + 1;
         Rect sel{row.x + lblW, row.y, 84 * s, row.h};
         if (ui_.selector(uiId(8, 6), sel, &qi, qn, kQuantumCount + 1)) {
+            undoPoint("clip quantum");
             m.quantumIdx = qi - 1;
             pushClip(selTrack_, selSlot_);
         }
@@ -2167,6 +2864,7 @@ void App::drawClipDetail(const Rect& r) {
         f64 pct = m.prob * 100.0;
         Rect pr{row.x + lblW, row.y, 48 * s, row.h};
         if (ui_.dragNumber(uiId(13, 0), pr, &pct, 0.0, 100.0, 0.4, "%.0f%%")) {
+            undoPoint("launch probability");
             m.prob = clampv(pct * 0.01, 0.0, 1.0);
             pushClip(selTrack_, selSlot_);
         }
@@ -2174,6 +2872,7 @@ void App::drawClipDetail(const Rect& r) {
         int fa = (int)m.followAction;
         Rect fr{pr.right() + 6 * s, row.y, 58 * s, row.h};
         if (ui_.selector(uiId(13, 1), fr, &fa, kFollowNames, kFollowCount)) {
+            undoPoint("follow action");
             m.followAction = (Follow)clampv(fa, 0, kFollowCount - 1);
             pushClip(selTrack_, selSlot_);
         }
@@ -2185,6 +2884,7 @@ void App::drawClipDetail(const Rect& r) {
         Rect br{fr.right() + 6 * s, row.y, 52 * s, row.h};
         if (ui_.dragNumber(uiId(13, 2), br, &fb, 0.0, 128.0, 0.06, "%.0f bt",
                            Align::Center, "Auto", 1.0)) {
+            undoPoint("follow length");
             m.followBeats = fb;
             pushClip(selTrack_, selSlot_);
         }
@@ -2218,8 +2918,20 @@ void App::drawClipDetail(const Rect& r) {
         // The roll edits m.notes (and its length) in place and says whether it
         // touched anything; republishing is ours, and pushClip is what retires
         // the array the engine is still reading from.
-        if (roll_->draw(ui_, wave, m, active ? phase * m.lengthBeats : 0.0, active))
+        //
+        // The undo entry therefore needs the clip as it was *before* the call,
+        // which is why the copy is taken unconditionally: whether an edit
+        // happens is not knowable until draw() returns, and by then m already
+        // has it. A clip is a note vector, two strings and a shared pointer --
+        // cheap enough to copy once a frame, and it buys the one thing that
+        // matters here, which is that a click that adds a note can be undone.
+        // The roll owns ui_.active for the length of a drag, so a note dragged
+        // across the grid leaves one entry and not one per frame.
+        const ClipModel before = m;
+        if (roll_->draw(ui_, wave, m, active ? phase * m.lengthBeats : 0.0, active)) {
+            undoPointWith("note edit", m, before);
             pushClip(selTrack_, selSlot_);
+        }
         // Auditioning is the caller's job: the roll only names the pitches that
         // want to be heard (from this draw, and from any keyboard edit earlier
         // in the frame — handleShortcuts runs first). See previews_ for why
@@ -2332,7 +3044,13 @@ void App::drawPluginBrowser(const Rect& r) {
 
         if (hot && in.pressed[0]) pluginSel_ = pi;
         // Double-click loads, matching how the file browser drops a sample.
-        if (hot && in.dblClick) addDeviceToTrack(selTrack_, d);
+        // The entry is taken here rather than inside addDeviceToTrack, which
+        // init() also calls through the LATTICE_DEBUG_ADDFX hook: nothing that
+        // happens while the app is starting up belongs in the history.
+        if (hot && in.dblClick) {
+            undoPoint("add device");
+            addDeviceToTrack(selTrack_, d);
+        }
     }
     rend_.popClip();
 }
@@ -2404,8 +3122,11 @@ void App::drawDeviceStrip(const Rect& r) {
 
         // Bypass lives on the instance, so the chain does not have to be
         // republished; setBypassed() is GUI-safe per the host contract.
-        if (ui_.squareToggle(uiId(11, (int)i, 0), br, "", &d.bypass, pal::meterAmber))
+        const bool wasBypass = d.bypass;
+        if (ui_.squareToggle(uiId(11, (int)i, 0), br, "", &d.bypass, pal::meterAmber)) {
+            undoPointWith("bypass", d.bypass, wasBypass);
             if (d.inst) d.inst->setBypassed(d.bypass);
+        }
         rend_.circle(br.cx(), br.cy(), 3.5f * s,
                      d.bypass ? pal::textOnClip : pal::playGreen);   // lit = active
         const bool xHot = ui_.button(uiId(11, (int)i, 1), xr, "");
@@ -2416,6 +3137,12 @@ void App::drawDeviceStrip(const Rect& r) {
             rend_.line(xr.cx() - k, xr.cy() + k, xr.cx() + k, xr.cy() - k, 1.2f * s, xc);
         }
         if (xHot) {
+            // The instance is retired with the outgoing chain, so undoing this
+            // loads the plugin again and applies the parameters the snapshot
+            // carries - see materializeDevices. What a plugin holds beyond its
+            // parameters does not survive, which is the same trade a saved set
+            // makes and is documented as such in app.h.
+            undoPoint("remove device");
             removeDevice(selTrack_, (int)i);
             rend_.popClip();
             return;                       // t.devices changed under us
@@ -2475,17 +3202,25 @@ void App::drawDeviceStrip(const Rect& r) {
             const ParamInfo& info = d.inst->paramInfo(p);
             Rect lbl{cell.x, cell.bottom() - 11 * s, cell.w, 10 * s};
 
+            // Both controls edit a copy and hand the result to the instance, so
+            // the value the snapshot reads (serializeDevices asks the instance)
+            // is still the old one when the entry is taken. A knob drag
+            // coalesces on the widget's id, as everywhere else.
             if (info.isBool) {
                 Rect tg{cell.cx() - 11 * s, cell.y + 8 * s, 22 * s, 14 * s};
                 bool on = d.inst->getParam(p) > 0.5f;
-                if (ui_.squareToggle(uiId(12, (int)i * 256 + p, 0), tg, "", &on, pal::accent))
+                if (ui_.squareToggle(uiId(12, (int)i * 256 + p, 0), tg, "", &on, pal::accent)) {
+                    undoPoint(info.name.c_str());
                     d.inst->setParam(p, on ? info.max : info.min);
+                }
             } else {
                 Rect kr{cell.cx() - 16 * s, cell.y + 2 * s, 32 * s, 32 * s};
                 f32 v = d.inst->getParam(p);
                 if (ui_.knob(uiId(12, (int)i * 256 + p, 0), kr, &v, info.min, info.max,
-                             info.def, info.isInt ? "%.0f" : "%.2f"))
+                             info.def, info.isInt ? "%.0f" : "%.2f")) {
+                    undoPoint(info.name.c_str());
                     d.inst->setParam(p, v);
+                }
             }
 
             rend_.pushClip(lbl);

@@ -86,6 +86,31 @@ struct SavedDevice {
     std::vector<std::pair<u32, f32>> params;   // (ParamInfo::id, value)
 };
 
+// A live plugin instance lifted out of a session that is about to be replaced,
+// so an undo can rebind it instead of loading the plugin again. Identity is the
+// uid; the uri is carried too because a uid only means "the same device" if the
+// plugin behind it is still the same one. See App::adoptSession.
+struct LiveDevice {
+    u64 uid = 0;
+    std::string uri;
+    PluginDesc desc;
+    std::unique_ptr<PluginInstance> inst;
+};
+
+// One clip's audio at the moment an undo snapshot was taken, keyed by clip uid.
+//
+// Keyed by uid and not by source path because the path is not always the
+// truth: a take that has been recorded but not exported has no file behind it
+// at all, and a project document can only name files. Restoring such a set
+// from its text alone would quietly turn a recording into an empty clip, so an
+// undo entry carries the audio itself -- a shared_ptr each, so the cost is a
+// pointer per clip and the history pins the buffers it may still have to give
+// back. See App::UndoEntry.
+struct ClipSample {
+    u64 uid = 0;
+    SampleRef sample;
+};
+
 struct TrackModel {
     u64 uid = 0;
     std::string name = "Track";
@@ -388,8 +413,24 @@ private:
     void  saveProjectTo(const std::string& path);
     void  assignUids();                          // fill in any uid still 0
     void  serializeDevices();                    // devices -> savedDevices
-    void  materializeDevices();                  // savedDevices -> devices
+    // savedDevices -> devices. `reuse`, when given, is a pool of instances
+    // lifted out of the session being replaced (undo only): a saved device
+    // whose uid *and* uri are in the pool adopts that instance and has the
+    // snapshot's parameter values applied to it, instead of loading the plugin
+    // again. Everything with no match is instantiated exactly as before.
+    void  materializeDevices(std::vector<LiveDevice>* reuse = nullptr);
     void  releaseAllChains();                    // hand every instance to retiring_
+    // The shared tail of "the whole session is being replaced", used by both a
+    // project load and an undo restore -- they differ only in where the Session
+    // came from and in what may be carried across it. `restore` is what says
+    // this is state the app already had: it carries the clips' audio (see
+    // ClipSample), and its presence is also what turns on the plugin rebind
+    // and turns off assignUids, because those are the same question.
+    void  adoptSession(Session&& next, const std::vector<ClipSample>* restore);
+    // Clears whatever the engine still holds for slots the new session has no
+    // track or scene for. Called from pushAll, which is the only place that
+    // knows the engine's slot table has just been rewritten.
+    void  releaseStaleSlots();
 
     // --- transport helpers ---
     void  send(Cmd t, i32 a = 0, i32 b = 0, f64 x = 0.0);
@@ -426,6 +467,12 @@ private:
         i64  cap = 0;                 // frames for audio, notes for MIDI
         int  track = -1, slot = -1;
         bool midi = false;
+        // Set when an undo tore the session out from under a take in flight.
+        // The buffer is NOT freed here -- the engine may still be appending to
+        // it -- so the entry stays, the stop is sent, and the finish handler
+        // throws the material away instead of building a clip in a session
+        // that no longer expects one.
+        bool cancelled = false;
         const void* payload() const {
             return midi ? (const void*)notes : (const void*)buf;
         }
@@ -448,6 +495,12 @@ private:
     // thread runs — a clip's notes can be edited while that clip is playing.
     const RtNote* publishedNotes_[kMaxTracks][kMaxScenes] = {};
     std::vector<const RtNote*> retiringNotes_;
+    // "The engine currently holds a clip for this slot." Only pushClip writes
+    // it, and only from a command the ring accepted. A load or an undo can
+    // shrink the set, and the slots that fall outside the new one would
+    // otherwise keep an RtClip pointing into a SampleBuffer this session has
+    // stopped owning -- see releaseStaleSlots.
+    bool clipLive_[kMaxTracks][kMaxScenes] = {};
 
     // --- plugin hosting -------------------------------------------------
     // Chain lifecycle: publishChain(t) heap-allocates an RtChain from
@@ -548,6 +601,112 @@ private:
     static constexpr int kPreviewVel   = 100;
     std::vector<Preview> previews_;
     u64  previewClip_ = 0;            // ClipModel::uid the sounding previews belong to
+
+    // --- undo / redo --------------------------------------------------------
+    // An undo entry is the whole session, serialized with the project writer.
+    // That sounds extravagant and is the cheapest correct thing available: the
+    // text format is complete (it is what a saved set is made of) and
+    // byte-stable (save -> load -> save is identity, see project.cpp), so "the
+    // state before this edit" needs no per-command inverse, no diff machinery,
+    // and cannot drift out of sync with what the app can actually represent.
+    // A restore is therefore a sibling of a project load and shares its body,
+    // adoptSession(), retirement protocol included.
+    //
+    // The one thing the format does not carry is where the set lives on disk
+    // (Session::path is bookkeeping about the last save, not content), and
+    // undoing should not move the cursor to the other end of the grid, so the
+    // path and the selection ride along beside the text.
+    //
+    // WHAT IS NOT UNDOABLE, and deliberately so:
+    //   * transport -- playing, the playhead, which clips are launched or
+    //     queued. Undo is an edit operation; a set that stopped playing because
+    //     a note moved would be unusable on stage.
+    //   * the record-intent button and per-track arm as such. Arm is session
+    //     state and does come back with a restore, but clicking around the grid
+    //     (which auto-arms, see selectTrack) never takes an undo point of its
+    //     own -- selection is not an edit.
+    //   * a take in flight. There is no coherent "half a recording" to restore
+    //     to, so an undo during recording cancels the take first: the engine is
+    //     told to stop, and the buffer it hands back is thrown away rather than
+    //     turned into a clip (PendingRec::cancelled). The buffer itself is
+    //     still freed only on the RecordFinished handshake.
+    //   * plugin state beyond the parameters a plugin exposes. What is captured
+    //     is exactly what a saved set captures -- id/value pairs -- so a
+    //     plugin's internal editor state, its samples, its preset name are not
+    //     restored. A rebound instance additionally keeps whatever it holds
+    //     internally, which is the same trade a saved set makes.
+    //   * view state: which panel is open, scroll positions, zoom, the browser,
+    //     the plugin filter.
+    struct UndoEntry {
+        std::string text;             // a complete .lattice document
+        std::string what;             // the edit this entry is the state before
+        std::string path;             // Session::path, which the format omits
+        int selTrack = 0, selSlot = 0;
+        // The audio the set was playing, by clip uid. The text names files;
+        // this is what makes an undo able to give back a take that has never
+        // been one -- and, incidentally, what stops a restore from re-decoding
+        // every sample in the set. See ClipSample.
+        std::vector<ClipSample> samples;
+    };
+    // Deep enough to cover a working session, shallow enough that a big set
+    // (a few hundred kB of text at the top end) cannot quietly eat a gigabyte.
+    static constexpr int kUndoDepth = 128;
+    std::vector<UndoEntry> undo_, redo_;
+    // The widget id an entry was taken for, so one continuous gesture -- a
+    // fader drag, a note dragged across the roll -- produces one entry and not
+    // one per frame. 0 means "no gesture in progress"; a one-shot edit (a
+    // button, a key) always takes an entry.
+    u64  undoGesture_ = 0;
+    // Snapshots go through the project writer, which only writes to a path, so
+    // they land in a runtime-tmpfs file that is written, read back and removed
+    // immediately. Not elegant; correct, and it keeps the *one* serializer.
+    std::string undoTmp_;
+    // Samples the outgoing session owned and the incoming one does not. The
+    // engine may still be running a clip that points into one of them for the
+    // few milliseconds it takes to drain our Cmd::SetClip, and there is no
+    // event for "the audio thread has let go of this buffer" the way there is
+    // for chains and note arrays. One generation of grace -- freed at the next
+    // session swap, which is a user action away -- is not a handshake, but it
+    // covers the window by many orders of magnitude. See adoptSession.
+    std::vector<SampleRef> sampleGrace_;
+    // Edge latches for the undo/redo chords: keyPressed[] auto-repeats, and a
+    // held Ctrl+Z would run the whole restore path once a frame.
+    bool undoKeyPrev_ = false, redoKeyPrev_ = false;
+
+    // Takes an undo entry for the edit that is about to happen. Call it at the
+    // START of a gesture and before the model changes. `gesture` names the
+    // gesture explicitly for edits that are not driven by a widget (a held,
+    // auto-repeating key); the default reads it from whichever widget owns the
+    // mouse, which is what a drag is.
+    void undoPoint(const char* what, u64 gesture = 0);
+    // Same, for the widgets that write into the model and only then report the
+    // change (squareToggle, textField, knob/vFader/selector bound straight to a
+    // member) and for the piano roll, which edits the clip in place. An entry
+    // that already contains the edit undoes nothing, so the caller hands the
+    // pre-edit value back for the length of the snapshot.
+    template <class T>
+    void undoPointWith(const char* what, T& slot, const T& before, u64 gesture = 0) {
+        if (undoCoalesce(gesture)) return;
+        T now = std::move(slot);
+        slot = before;
+        pushUndoNow(what);
+        slot = std::move(now);
+    }
+    // True when this frame continues a gesture that already has an entry.
+    bool undoCoalesce(u64 gesture);
+    void pushUndoNow(const char* what);          // serialize + push, no coalescing
+    // The session as project text, plus the audio the text can only name.
+    bool snapshotSession(std::string& out, std::vector<ClipSample>& samples);
+    void undo();
+    void redo();
+    bool restoreEntry(const UndoEntry& e);
+    void clearUndo();                            // a fresh set has no history
+    void cancelTakes(const char* why);           // stop + discard every take in flight
+    // Headless verification hook (LATTICE_DEBUG_UNDO). Nothing can click a
+    // fader inside gamescope, and the restore path is the part of this feature
+    // a screenshot cannot check -- so it is driven from here instead, against
+    // whatever set was loaded, with a live engine and real plugins.
+    void debugUndoSelfTest();
 
     // per-frame UI feedback
     std::string status_;
