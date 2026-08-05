@@ -9,7 +9,20 @@
 namespace lat {
 namespace {
 
-constexpr int kFormatVersion = 1;
+// Version 2 adds: `nextuid` at the top level, a `uid` line on every track,
+// scene and clip, the clip's generative fields (prob / follow / followbeats),
+// and `device` blocks inside a track.
+//
+// There is deliberately ONE parser for both versions rather than a v1 and a v2
+// reader. The additions are all new keys with defaults, so a v1 file simply
+// never mentions them and comes out with the defaults; the version number gates
+// nothing on the read side beyond the upper bound. The alternative -- rejecting
+// v2 keys inside a file that calls itself v1 -- would only punish someone who
+// hand-edited the header, and buys no safety: an old Lattice already refuses
+// every one of those keys, so no half-understood file can be read either way.
+// Saving always writes the current version.
+constexpr int kFormatVersion = 2;
+constexpr int kMinFormatVersion = 1;
 
 // ---------------------------------------------------------------------------
 // number formatting
@@ -98,6 +111,17 @@ f32 clGain(f32 v)       { return std::isfinite(v) ? clampv(v, 0.f, 8.f) : 1.f; }
 f32 clWidth(f32 v)      { return std::isfinite(v) ? clampv(v, 24.f, 1024.f) : 94.f; }
 int clWarp(int v)       { return clampv(v, (int)Warp::Off, (int)Warp::Beats); }
 i64 clFrame(i64 v)      { return v < 0 ? 0 : v; }
+f32 clParam(f32 v)      { return std::isfinite(v) ? v : 0.f; }
+int clFollow(int v)     { return clampv(v, (int)Follow::None, (int)Follow::Random); }
+// The non-finite arms matter for more than tidiness: the sparse fields below
+// are written only when they differ from their default, and the value tested
+// has to be the value printed. Folding NaN to the default here is what stops a
+// NaN probability from emitting "prob 1" -- a line the next save would omit.
+f64 clProb(f64 v)       { return std::isfinite(v) ? clampv(v, 0.0, 1.0) : 1.0; }
+f64 clFollowBeats(f64 v){ return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
+// The counter only ever hands out identifiers, so 0 (the "unassigned" marker)
+// and anything below it are nonsense.
+u64 clNextUid(u64 v)    { return v < 1 ? 1 : v; }
 
 // A slot counts as occupied if it holds audio, remembers a source file, or was
 // given a name. There is no explicit "used" flag in ClipModel; the path is what
@@ -143,8 +167,31 @@ void kn(std::string& o, const char* indent, const char* key, const std::string& 
     o += indent; o += key; o += ' '; o += num; o += '\n';
 }
 
+// A uid of 0 means "not assigned yet"; the App sweeps after load and fills the
+// gaps. Writing "uid 0" would be noise, so the line is omitted and its absence
+// reads back as 0 -- which keeps a file written by version 1 (no uids at all)
+// and one written today identical wherever nothing has an identity yet.
+void writeUid(std::string& o, const char* indent, u64 uid) {
+    if (uid) kn(o, indent, "uid", std::to_string(uid));
+}
+
+// Serialized from TrackModel::savedDevices, never from the live DeviceModel:
+// core has no business knowing that a plugin can be instantiated. Blocks are
+// positional, so no index is written -- load order is chain order.
+void writeDevice(std::string& o, const SavedDevice& d) {
+    o += "  device\n";
+    writeUid(o, "    ", d.uid);
+    kv(o, "    ", "plugin", d.uri);
+    kv(o, "    ", "name",   d.name);
+    kn(o, "    ", "bypass", d.bypass ? "1" : "0");
+    for (const auto& p : d.params)
+        kn(o, "    ", "param", std::to_string(p.first) + " " + fmtF32(clParam(p.second)));
+    o += "  enddevice\n";
+}
+
 void writeClip(std::string& o, const ClipModel& c, int idx) {
     o += "  clip " + std::to_string(idx) + "\n";
+    writeUid(o, "    ", c.uid);
     // ClipModel::path is the authority: unlike the sample's own path it outlives
     // a file that failed to load, so an offline set keeps its references instead
     // of quietly dropping the `file` line on the next save. The sample is only
@@ -161,11 +208,22 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
     kn(o, "    ", "range",  std::to_string(clFrame(c.loopStart)) + " " +
                             std::to_string(clFrame(c.loopEnd)));
     kn(o, "    ", "quantum", std::to_string(clClipQuantum(c.quantumIdx)));
+    // Sparse: the generative fields are off on almost every clip, and a set of
+    // 300 clips should not carry 900 lines saying so. Emitting only non-default
+    // values stays round-trip stable because the value a missing line loads as
+    // is exactly the value that suppresses the line.
+    const f64 prob = clProb(c.prob);
+    const int fol  = clFollow((int)c.followAction);
+    const f64 fb   = clFollowBeats(c.followBeats);
+    if (prob != 1.0)              kn(o, "    ", "prob", fmtF64(prob));
+    if (fol != (int)Follow::None) kn(o, "    ", "follow", std::to_string(fol));
+    if (fb != 0.0)                kn(o, "    ", "followbeats", fmtF64(fb));
     o += "  endclip\n";
 }
 
 void writeTrack(std::string& o, const TrackModel& t, int idx) {
     o += "track " + std::to_string(idx) + "\n";
+    writeUid(o, "  ", t.uid);
     kv(o, "  ", "name", t.name);
     kn(o, "  ", "color", std::to_string(clColor(t.colorIdx)));
     kn(o, "  ", "fader", fmtF32(clFader(t.fader)));
@@ -173,11 +231,8 @@ void writeTrack(std::string& o, const TrackModel& t, int idx) {
     kn(o, "  ", "flags", std::string(t.mute ? "1" : "0") + " " +
                          (t.solo ? "1" : "0") + " " + (t.arm ? "1" : "0"));
     kn(o, "  ", "width", fmtF32(clWidth(t.width)));
-    // WAVE 2: the device chain goes here, between the track scalars and the
-    // clips -- one "device <idx>" / "enddevice" block per entry of t.devices,
-    // holding the plugin URI, bypass flag and its saved state. Deliberately not
-    // serialized yet: a `device` key inside a track is still a parse error, so
-    // no half-written chain can be read back by this version.
+    // The chain sits between the track scalars and the clips.
+    for (const auto& d : t.savedDevices) writeDevice(o, d);
     for (int i = 0; i < kMaxScenes; ++i)
         if (clipOccupied(t.slots[i])) writeClip(o, t.slots[i], i);
     o += "endtrack\n";
@@ -211,9 +266,24 @@ struct Scan {
         return true;
     }
     bool integer(int& out) { i64 v; if (!integer(v)) return false; out = (int)clampv(v, (i64)INT32_MIN, (i64)INT32_MAX); return true; }
+    // Identifiers use the full u64 range, which strtoll would saturate. strtoull
+    // is the right width but silently wraps a leading '-', so a negative uid is
+    // caught here and read as "unassigned" instead of as a huge one.
+    bool uid(u64& out) {
+        const char* q = p;
+        while (*q == ' ' || *q == '\t') ++q;
+        const bool neg = (*q == '-');
+        char* e = nullptr;
+        errno = 0;
+        const unsigned long long v = std::strtoull(p, &e, 10);
+        if (e == p) return false;
+        p = e;
+        out = neg ? 0 : (u64)v;
+        return true;
+    }
 };
 
-enum class St { Top, Track, Clip, Scene };
+enum class St { Top, Track, Device, Clip, Scene };
 
 bool readWholeFile(const std::string& path, std::string& out, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -246,6 +316,10 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     kn(o, "", "sig",       std::to_string(clSig(s.sigNum)) + " " + std::to_string(clSig(s.sigDen)));
     kn(o, "", "quantum",   std::to_string(clQuantum(s.quantumIdx)));
     kn(o, "", "metronome", s.metronome ? "1" : "0");
+    // Always written, unlike the per-entity uids: the counter is what keeps
+    // identifiers unique across a save, so "no line" would mean handing out
+    // numbers that are already in use.
+    kn(o, "", "nextuid",   std::to_string(clNextUid(s.nextUid)));
     kv(o, "", "name", s.name);
 
     const size_t nTracks = std::min(s.tracks.size(), (size_t)kMaxTracks);
@@ -256,6 +330,7 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     for (size_t i = 0; i < nScenes; ++i) {
         const SceneModel& sc = (i < s.scenes.size()) ? s.scenes[i] : deflt;
         o += "scene " + std::to_string(i) + "\n";
+        writeUid(o, "  ", sc.uid);
         kv(o, "  ", "name", sc.name);
         kn(o, "  ", "tempo", fmtF64(clSceneTempo(sc.tempo)));
         o += "endscene\n";
@@ -372,7 +447,8 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             if (key != "lattice") return fail("not a lattice project (expected 'lattice <version>')");
             int v = 0;
             if (!sc.integer(v)) return fail("missing format version");
-            if (v != kFormatVersion) return fail("unsupported format version " + std::to_string(v));
+            if (v < kMinFormatVersion || v > kFormatVersion)
+                return fail("unsupported format version " + std::to_string(v));
             sawHeader = true;
             continue;
         }
@@ -393,6 +469,9 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             } else if (key == "metronome") {
                 int v; if (!sc.integer(v)) return fail("metronome: expected 0 or 1");
                 out.metronome = v != 0;
+            } else if (key == "nextuid") {
+                u64 v; if (!sc.uid(v)) return fail("nextuid: expected an integer");
+                out.nextUid = clNextUid(v);
             } else if (key == "name") {
                 out.name = unesc(rest);
             } else if (key == "track") {
@@ -417,7 +496,10 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         // ---------------------------------------------------------------
         case St::Track: {
             TrackModel& t = out.tracks[(size_t)ti];
-            if (key == "name") {
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("track uid: expected an integer");
+                t.uid = v;
+            } else if (key == "name") {
                 t.name = unesc(rest);
             } else if (key == "color") {
                 int v; if (!sc.integer(v)) return fail("color: expected an integer");
@@ -436,6 +518,13 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             } else if (key == "width") {
                 f64 v; if (!sc.num(v)) return fail("width: expected a number");
                 t.width = clWidth((f32)v);
+            } else if (key == "device") {
+                // Positional: the chain is rebuilt in file order. No cap is
+                // imposed here -- the App decides how many of these it can
+                // actually instantiate; silently dropping the tail of a user's
+                // chain at load time would be the worse failure.
+                t.savedDevices.emplace_back();
+                st = St::Device;
             } else if (key == "clip") {
                 int v; if (!sc.integer(v)) return fail("clip: expected an index");
                 if (v < 0 || v >= kMaxScenes)
@@ -454,9 +543,37 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             break;
         }
         // ---------------------------------------------------------------
+        case St::Device: {
+            SavedDevice& d = out.tracks[(size_t)ti].savedDevices.back();
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("device uid: expected an integer");
+                d.uid = v;
+            } else if (key == "plugin") {
+                d.uri = unesc(rest);
+            } else if (key == "name") {
+                d.name = unesc(rest);
+            } else if (key == "bypass") {
+                int v; if (!sc.integer(v)) return fail("device bypass: expected 0 or 1");
+                d.bypass = v != 0;
+            } else if (key == "param") {
+                i64 id = 0; f64 v = 0.0;
+                if (!sc.integer(id) || !sc.num(v))
+                    return fail("param: expected an id and a value");
+                d.params.emplace_back((u32)clampv(id, (i64)0, (i64)UINT32_MAX), clParam((f32)v));
+            } else if (key == "enddevice") {
+                st = St::Track;
+            } else {
+                return fail("unexpected '" + key + "' inside device");
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
         case St::Clip: {
             ClipModel& c = out.tracks[(size_t)ti].slots[ci];
-            if (key == "file") {
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("clip uid: expected an integer");
+                c.uid = v;
+            } else if (key == "file") {
                 clipFile = unesc(rest);
             } else if (key == "name") {
                 c.name = unesc(rest); clipSawName = true;
@@ -486,6 +603,15 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             } else if (key == "quantum") {
                 int v; if (!sc.integer(v)) return fail("clip quantum: expected an integer");
                 c.quantumIdx = clClipQuantum(v);
+            } else if (key == "prob") {
+                f64 v; if (!sc.num(v)) return fail("clip prob: expected a number");
+                c.prob = clProb(v);
+            } else if (key == "follow") {
+                int v; if (!sc.integer(v)) return fail("clip follow: expected an integer");
+                c.followAction = (Follow)clFollow(v);
+            } else if (key == "followbeats") {
+                f64 v; if (!sc.num(v)) return fail("clip followbeats: expected a number");
+                c.followBeats = clFollowBeats(v);
             } else if (key == "endclip") {
                 finishClip();
                 ci = -1;
@@ -498,7 +624,10 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         // ---------------------------------------------------------------
         case St::Scene: {
             SceneModel& scn = out.scenes[(size_t)sci];
-            if (key == "name") {
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("scene uid: expected an integer");
+                scn.uid = v;
+            } else if (key == "name") {
                 scn.name = unesc(rest);
             } else if (key == "tempo") {
                 f64 v; if (!sc.num(v)) return fail("scene tempo: expected a number");
@@ -516,7 +645,9 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
 
     if (!sawHeader) return fail("empty or truncated project file");
     if (st != St::Top) {
-        const char* what = (st == St::Clip) ? "endclip" : (st == St::Track) ? "endtrack" : "endscene";
+        const char* what = (st == St::Clip)   ? "endclip"
+                         : (st == St::Device) ? "enddevice"
+                         : (st == St::Track)  ? "endtrack" : "endscene";
         return fail(std::string("unexpected end of file, missing '") + what + "'");
     }
 
