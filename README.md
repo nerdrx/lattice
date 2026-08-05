@@ -70,6 +70,7 @@ the audio.
 | **Plugins** | Per-track device chains in the signal path — **LV2** via lilv and **CLAP**, both with working note input — plus a filterable browser, bypass and parameter knobs. 410 usable on a stock Arch box. |
 | **Stock devices** | `Saturator` (compensated tanh shaper) and `Pulse` (8-voice PolyBLEP morph synth), riding the same machinery as every third-party plugin. |
 | **Buses** | Post-fader sends into four return chains and a master chain, with plugin delay compensation aligning every parallel path into the master sum. |
+| **Automation** | Clip envelopes on any track parameter or device knob, drawn in the piano roll on the notes' own time axis. Record a knob move while armed; the engine ramps within the block and never overwrites the value you set. |
 | **Generative clips** | Launch probability and follow actions (Stop / Again / Next / Prev / First / Random), scheduled through the same quantised path and deterministic under offline render. |
 | **Undo** | Snapshot history over the project serializer — including the audio of unsaved takes. Gestures coalesce into one entry per drag. |
 | **Engine daemon** | `nxtaktd` hosts the transport and the sample pool in its own process, over shared-memory SPSC rings with crash-orphan reaping. |
@@ -122,7 +123,7 @@ Audio comes up on JACK if it is running — playback *and* capture auto-connecte
 ## Not done yet
 
 - Arrangement View is a navigable placeholder — no recording, no timeline edits.
-- No automation, no time-signature changes.
+- No time-signature changes.
 - VST3 is not started (licensing).
 - The GUI still runs its own in-process engine; `nxtaktd` is not yet the
   shipping path.
