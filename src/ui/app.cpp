@@ -168,6 +168,12 @@ bool App::init(int argc, char** argv) {
 }
 
 void App::shutdown() {
+    // Anything the UI left sounding is ended while there is still an engine to
+    // hear it: previews and held keyboard notes both outlive the state that
+    // started them, and a plugin does not know the app is closing.
+    stopPreviews();
+    kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidi(m); });
+
     // Order matters. The MIDI reader goes first: it pushes into the engine's
     // ring from its own thread, so it has to be joined before anything else
     // starts tearing the engine down, or a push could land in a ring nobody
@@ -1110,6 +1116,10 @@ void App::frame() {
     fps_ = fps_ * 0.92f + (dt > 0.f ? 1.f / dt : 0.f) * 0.08f;
 
     pumpEngineEvents();
+    // Note previews are ended by the frame loop, not by a timer: whatever else
+    // this frame does, an audition started a moment ago has to be allowed to
+    // stop. Ahead of the UI so a preview retired here can be restarted below.
+    updatePreviews();
 
     const f32 s = win_.dpiScale();
     const f32 W = (f32)win_.width(), H = (f32)win_.height();
@@ -1169,8 +1179,11 @@ void App::handleShortcuts() {
     if (tgl && !kbdTogglePrev_) toggleKbdMidi();
     kbdTogglePrev_ = tgl;
 
-    // An unmodified key that the piano owns is a note, not a shortcut. Ctrl-
-    // and Alt-modified chords are unaffected: notes only fire unmodified.
+    // While the piano is on it owns the printable keys, so an unmodified letter
+    // is a note and not a shortcut — see KbdPiano::consumes for why this is now
+    // the whole block rather than the mapped keys: the piano reads positions
+    // and shortcuts read keysyms, and on a non-US layout the two disagree.
+    // Ctrl- and Alt-modified chords are unaffected: notes only fire unmodified.
     const auto plain = [&](int k) {
         return in.keyPressed[k] && !in.ctrl() && !(kbdMidi_ && KbdPiano::consumes(k));
     };
@@ -1187,17 +1200,67 @@ void App::handleShortcuts() {
     if (in.keyPressed['t'] && in.ctrl()) addTrack();
     if (in.keyPressed[KeyEnter] && in.ctrl()) addScene();
 
-    if (in.keyPressed[KeyEscape]) send(Cmd::StopAll);
-    if (in.keyPressed[KeyDelete] || (in.keyPressed[KeyBackspace] && !in.ctrl()))
-        clearClip(selTrack_, selSlot_);
+    // --- keys the piano roll can claim --------------------------------------
+    // The roll only claims a key while it is on screen for the selected clip,
+    // and the note-scoped keys only while a note is selected in it. Everything
+    // else keeps its session-wide meaning, so the editor never steals a key it
+    // has no use for. The selection is read once, before anything below can
+    // change it, and the clip is only reached through the roll — visibleRoll()
+    // has already bounds-checked the indices it would be read with.
+    PianoRoll* const roll = visibleRoll();
+    ClipModel* const selClip = roll ? &ses_.tracks[selTrack_].slots[selSlot_] : nullptr;
+    const bool noteSel = roll && roll->hasSelection(*selClip);
+
+    // Escape is layered rather than overridden: with a note selected it drops
+    // that selection (the editor's own scope) and nothing else; pressing it
+    // again — or with nothing selected — reaches the global stop, which is
+    // what it has always done and what a panicking user expects of it.
+    if (in.keyPressed[KeyEscape]) {
+        if (noteSel) roll->clearSelection();
+        else         send(Cmd::StopAll);
+    }
+    // Delete with a note selected removes the note, not the clip that contains
+    // it. Clearing the whole pattern from under an active note edit would be a
+    // spectacular way to lose work.
+    if (in.keyPressed[KeyDelete] || (in.keyPressed[KeyBackspace] && !in.ctrl())) {
+        if (noteSel) {
+            if (roll->deleteSelected(*selClip)) pushClip(selTrack_, selSlot_);
+        } else {
+            clearClip(selTrack_, selSlot_);
+        }
+    }
+    // Live's duplicate-loop (Cmd+D there; Ctrl+D is already the detail panel
+    // here, so Ctrl+U). Clip-scoped, not note-scoped: no selection needed.
+    if (in.keyPressed['u'] && in.ctrl() && roll) {
+        if (roll->duplicateLoop(*selClip)) {
+            pushClip(selTrack_, selSlot_);
+            char buf[64];
+            snprintf(buf, sizeof buf, "Loop duplicated — %.0f beats", selClip->lengthBeats);
+            status_ = buf;
+        }
+    }
 
     const int nt = (int)ses_.tracks.size(), ns = (int)ses_.scenes.size();
-    // Through selectTrack so arrowing across the grid arms what it lands on,
-    // exactly as clicking does.
-    if (in.keyPressed[KeyLeft])  selectTrack(clampv(selTrack_ - 1, 0, nt - 1));
-    if (in.keyPressed[KeyRight]) selectTrack(clampv(selTrack_ + 1, 0, nt - 1));
-    if (in.keyPressed[KeyUp])    selSlot_  = clampv(selSlot_ - 1, 0, ns - 1);
-    if (in.keyPressed[KeyDown])  selSlot_  = clampv(selSlot_ + 1, 0, ns - 1);
+    if (noteSel) {
+        // Arrows nudge the note and do NOT move the clip selection: with an
+        // editor open on a note, "left" means that note, and having the panel
+        // switch to another clip mid-edit is the trap this avoids.
+        int steps = 0, semis = 0;
+        if (in.keyPressed[KeyLeft])  --steps;
+        if (in.keyPressed[KeyRight]) ++steps;
+        const int step = in.shift() ? 12 : 1;      // Shift = octave, as everywhere
+        if (in.keyPressed[KeyUp])    semis += step;
+        if (in.keyPressed[KeyDown])  semis -= step;
+        if ((steps || semis) && roll->nudgeSelected(*selClip, steps, semis))
+            pushClip(selTrack_, selSlot_);
+    } else {
+        // Through selectTrack so arrowing across the grid arms what it lands
+        // on, exactly as clicking does.
+        if (in.keyPressed[KeyLeft])  selectTrack(clampv(selTrack_ - 1, 0, nt - 1));
+        if (in.keyPressed[KeyRight]) selectTrack(clampv(selTrack_ + 1, 0, nt - 1));
+        if (in.keyPressed[KeyUp])    selSlot_  = clampv(selSlot_ - 1, 0, ns - 1);
+        if (in.keyPressed[KeyDown])  selSlot_  = clampv(selSlot_ + 1, 0, ns - 1);
+    }
     if (in.keyPressed[KeyEnter] && !in.ctrl()) {
         if (ses_.tracks[selTrack_].slots[selSlot_].valid())
             send(Cmd::LaunchClip, selTrack_, selSlot_);
@@ -1219,7 +1282,12 @@ void App::updateKbdPiano() {
     const bool live = kbdMidi_ && !ui_.editId &&
                       !in.ctrl() && !in.alt() && !(in.mods & ModSuper);
 
-    const KbdPiano::Result res = kbd_.update(in.keyDown, live,
+    // scanDown[] rather than keyDown[]: the piano is a set of key *positions*
+    // (KbdPiano::semiFor), so it plays the same on QWERTZ and AZERTY as on
+    // QWERTY. The octave keys are passed separately because they are labelled
+    // keys and follow the layout like any other named shortcut.
+    const KbdPiano::Result res = kbd_.update(in.scanDown, in.keyDown[KeyPageUp],
+        in.keyDown[KeyPageDown], live,
         [this](const MidiMsg& m) { engine_.pushMidi(m); });
 
     if (res.baseChanged) {
@@ -1256,6 +1324,79 @@ void App::toggleKbdMidi() {
         kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidi(m); });
         status_ = "Computer MIDI Keyboard off";
     }
+}
+
+// ---------------------------------------------------------------------------
+// piano roll: key routing and note preview
+// ---------------------------------------------------------------------------
+
+// On screen and showing the selected clip's notes — the only state in which the
+// roll may claim a key or hold a meaningful selection. Note that it also
+// answers "was the roll ever drawn", since roll_ is created by drawClipDetail.
+PianoRoll* App::visibleRoll() {
+    if (!roll_ || view_ != MainView::Session || !showDetail_ || detailTab_ != DetailTab::Clip)
+        return nullptr;
+    if (selTrack_ < 0 || selTrack_ >= (int)ses_.tracks.size()) return nullptr;
+    if (selSlot_ < 0 || selSlot_ >= kMaxScenes) return nullptr;
+    const ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
+    return m.kind == ClipKind::Midi ? roll_.get() : nullptr;
+}
+
+void App::startPreview(int pitch, u64 clipUid) {
+    if (pitch < 0 || pitch > 127) return;
+    // Previews belong to one clip at a time: the moment the panel shows a
+    // different one, the old clip's notes are stopped rather than left ringing
+    // under the new one (updatePreviews does the checking).
+    if (clipUid != previewClip_) {
+        stopPreviews();
+        previewClip_ = clipUid;
+    }
+    const f64 off = nowSeconds() + kPreviewSecs;
+    // Same pitch again: retrigger rather than stack, so a repeated nudge is
+    // audible as repeated notes and never leaves two offs chasing one on.
+    for (Preview& p : previews_) {
+        if (p.pitch != (u8)pitch) continue;
+        engine_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
+        engine_.pushMidi(MidiMsg{0x90, p.pitch, (u8)kPreviewVel, 0, 0});
+        p.offAt = off;
+        return;
+    }
+    // Full: the oldest audition gives way. A dropped preview would be a note
+    // that never sounds; a hung one would be a note that never stops.
+    if ((int)previews_.size() >= kMaxPreviews) {
+        engine_.pushMidi(MidiMsg{0x80, previews_.front().pitch, 0, 0, 0});
+        previews_.erase(previews_.begin());
+    }
+    engine_.pushMidi(MidiMsg{0x90, (u8)pitch, (u8)kPreviewVel, 0, 0});
+    previews_.push_back(Preview{(u8)pitch, off});
+}
+
+void App::updatePreviews() {
+    if (previews_.empty()) return;
+    // Context check first. A preview outlives whatever started it, and both the
+    // clip and the panel can vanish between frames (another slot selected,
+    // Ctrl+D, the DEVICES tab, Arrangement). Nothing downstream will ever end
+    // these notes if this does not.
+    const PianoRoll* live = visibleRoll();
+    if (!live || ses_.tracks[selTrack_].slots[selSlot_].uid != previewClip_) {
+        stopPreviews();
+        return;
+    }
+    const f64 now = nowSeconds();
+    for (size_t i = 0; i < previews_.size();) {
+        if (previews_[i].offAt <= now) {
+            engine_.pushMidi(MidiMsg{0x80, previews_[i].pitch, 0, 0, 0});
+            previews_.erase(previews_.begin() + (long)i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+void App::stopPreviews() {
+    for (const Preview& p : previews_) engine_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
+    previews_.clear();
+    previewClip_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,6 +2220,13 @@ void App::drawClipDetail(const Rect& r) {
         // the array the engine is still reading from.
         if (roll_->draw(ui_, wave, m, active ? phase * m.lengthBeats : 0.0, active))
             pushClip(selTrack_, selSlot_);
+        // Auditioning is the caller's job: the roll only names the pitches that
+        // want to be heard (from this draw, and from any keyboard edit earlier
+        // in the frame — handleShortcuts runs first). See previews_ for why
+        // these reach the right instrument.
+        u8 pv[PianoRoll::kPreviewMax];
+        const int np = roll_->drainPreview(pv, PianoRoll::kPreviewMax);
+        for (int i = 0; i < np; ++i) startPreview((int)pv[i], m.uid);
         return;
     }
 

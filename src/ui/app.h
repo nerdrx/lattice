@@ -141,64 +141,75 @@ struct DragState {
     bool armed = false;                // past the movement threshold
 };
 
-// Live's "Computer MIDI Keyboard": the QWERTY rows become a piano feeding the
+// Live's "Computer MIDI Keyboard": the letter rows become a piano feeding the
 // same MIDI ring a hardware controller uses.
 //
 // Deliberately knows nothing about App, the window or the engine: update() is
-// handed a raw keyDown[] snapshot and emits through a callback. That keeps the
-// part with the actual subtlety in it — edge detection and note ownership —
+// handed a raw physical-key snapshot and emits through a callback. That keeps
+// the part with the actual subtlety in it — edge detection and note ownership —
 // testable without a GUI, an audio device or a keyboard to press.
 //
-// The subtlety: Input::keyPressed[] includes auto-repeat, so a held key would
-// machine-gun note-ons. Notes therefore come from *edges* of keyDown[] (held
-// state), and each key remembers the note it started so a note-off is always
-// the note that sounded, even if the octave moved while the key was down.
+// The subtlety, part one: Input::keyPressed[] includes auto-repeat, so a held
+// key would machine-gun note-ons. Notes therefore come from *edges* of held
+// state, and each key remembers the note it started so a note-off is always the
+// note that sounded, even if the octave moved while the key was down.
+//
+// Part two, and the reason this maps Input::scanDown[] rather than keyDown[]:
+// a piano layout is POSITIONAL. The keys under the fingers form two and a bit
+// octaves whatever the locale prints on them; on the reporter's German QWERTZ
+// board the keysym map put the bottom row's C on 'y' and its A on 'z', which
+// is not a keyboard anyone can play. Scancodes are evdev's (KEY_Z = 44), so
+// the bottom row is the bottom row everywhere. Shortcuts keep using keysyms —
+// Ctrl+S should be the key labelled S — which is why the two are now
+// unrelated, and why consumes() had to change with them.
 struct KbdPiano {
-    static constexpr int kHighestSemi = 28;    // 'p', the top of the mapped range
+    static constexpr int kScanCount   = 256;   // Input::scanDown[]
+    static constexpr int kHighestSemi = 28;    // top row's last key, the top of the range
     static constexpr int kDefaultBase = 48;    // C3
     static constexpr int kDefaultVel  = 100;
     static constexpr int kOctave      = 12;
 
     struct Result { bool baseChanged = false; };
 
-    KbdPiano() { for (int i = 0; i < KeyCount; ++i) active_[i] = -1; }
+    KbdPiano() { for (int i = 0; i < kScanCount; ++i) active_[i] = -1; }
 
-    // Semitones above the base note for a playing key, -1 if the key is not one.
+    // Semitones above the base note for a physical key, -1 if it is not one.
     // FL Studio's layout, which lays two and a bit octaves across the board
-    // instead of Live's one: ZXCVBNM is the lower octave's white keys with
-    // SDGHJ as its blacks, QWERTYU the octave above with 23567, and IOP + 90
-    // carry the run on into a third octave.
-    static int semiFor(int key) {
-        switch (key) {
-        // lower octave — white
-        case 'z': return 0;   case 'x': return 2;   case 'c': return 4;
-        case 'v': return 5;   case 'b': return 7;   case 'n': return 9;
-        case 'm': return 11;
-        // lower octave — black
-        case 's': return 1;   case 'd': return 3;   case 'g': return 6;
-        case 'h': return 8;   case 'j': return 10;
-        // upper octave — white
-        case 'q': return 12;  case 'w': return 14;  case 'e': return 16;
-        case 'r': return 17;  case 't': return 19;  case 'y': return 21;
-        case 'u': return 23;
-        // upper octave — black
-        case '2': return 13;  case '3': return 15;  case '5': return 18;
-        case '6': return 20;  case '7': return 22;
-        // and on into the third
-        case 'i': return 24;  case 'o': return 26;  case 'p': return 28;
-        case '9': return 25;  case '0': return 27;
-        default:  return -1;
+    // instead of Live's one. Positions are named by their US-QWERTY legends
+    // purely because that is how the layout is documented everywhere; the codes
+    // are what matters, and they are evdev's (linux/input-event-codes.h).
+    static int semiFor(int scan) {
+        switch (scan) {
+        // lower octave — white (Z X C V B N M row, KEY_Z = 44)
+        case 44: return 0;    case 45: return 2;    case 46: return 4;
+        case 47: return 5;    case 48: return 7;    case 49: return 9;
+        case 50: return 11;
+        // lower octave — black (S D _ G H J on the home row, KEY_A = 30)
+        case 31: return 1;    case 32: return 3;    case 34: return 6;
+        case 35: return 8;    case 36: return 10;
+        // upper octave — white (Q W E R T Y U row, KEY_Q = 16)
+        case 16: return 12;   case 17: return 14;   case 18: return 16;
+        case 19: return 17;   case 20: return 19;   case 21: return 21;
+        case 22: return 23;
+        // upper octave — black (2 3 _ 5 6 7 on the digit row, KEY_1 = 2)
+        case 3:  return 13;   case 4:  return 15;   case 6:  return 18;
+        case 7:  return 20;   case 8:  return 22;
+        // and on into the third (I O P, with 9 0 as its blacks)
+        case 23: return 24;   case 24: return 26;   case 25: return 28;
+        case 10: return 25;   case 11: return 27;
+        default: return -1;
         }
     }
 
-    // Keys the piano owns while it is on. Their older unmodified shortcut
-    // meanings must not fire underneath a note; unowned keys still pass through.
-    // The octave keys moved to PageUp/PageDown because Z and X are notes now,
-    // and velocity lost its keys entirely (C and V are notes) — it lives on the
-    // control bar beside the KBD chip instead.
-    static bool consumes(int key) {
-        return semiFor(key) >= 0 || key == KeyPageUp || key == KeyPageDown;
-    }
+    // Shortcut gating, and no longer a per-key question. Shortcuts are keysym-
+    // based while the piano is scancode-based, so on a non-US layout there is
+    // no correspondence left to consult: the key that plays a C types 'y' on
+    // QWERTZ, 'w' on AZERTY. While the piano is live it therefore owns the
+    // whole printable block — every unmodified letter/digit shortcut is
+    // suppressed, which is also what Live does. Modified chords are unaffected
+    // (notes only fire unmodified, so Ctrl+S still saves), and space is left
+    // out on purpose: transport works while playing, on every DAW there is.
+    static bool consumes(int key) { return key > 32 && key <= 126; }
 
     // `enabled` is the whole gate: feature on, no text field focused, no
     // command modifier down. When it is false the piano still runs, because
@@ -206,16 +217,31 @@ struct KbdPiano {
     // has to re-adopt the physical key state: a key already down when the gate
     // returns (the 'k' of Ctrl+Shift+K, a letter typed into a field) must not
     // read as a fresh press.
+    //
+    // The octave keys come in as their own flags rather than through the
+    // scancode array: PageUp/PageDown are *labelled* keys, not positions on a
+    // keyboard-shaped instrument, so they follow the layout like every other
+    // named shortcut. They moved off Z and X when those became notes; velocity
+    // lost its keys entirely (C and V are notes) and lives on the control bar.
     template <class Emit>
-    Result update(const bool* keyDown, bool enabled, const Emit& emit) {
+    Result update(const bool* scanDown, bool octaveUp, bool octaveDown, bool enabled,
+                  const Emit& emit) {
         Result res;
         if (!enabled) {
             allNotesOff(emit);
-            for (int k = 0; k < KeyCount; ++k) prev_[k] = keyDown[k];
+            for (int k = 0; k < kScanCount; ++k) prev_[k] = scanDown[k];
+            prevOctUp_ = octaveUp;
+            prevOctDown_ = octaveDown;
             return res;
         }
-        for (int k = 0; k < KeyCount; ++k) {
-            const bool now = keyDown[k], was = prev_[k];
+        // Down edges only: the octave moves once per physical press.
+        if (octaveUp   && !prevOctUp_)   res.baseChanged |= shiftOctave(kOctave);
+        if (octaveDown && !prevOctDown_) res.baseChanged |= shiftOctave(-kOctave);
+        prevOctUp_ = octaveUp;
+        prevOctDown_ = octaveDown;
+
+        for (int k = 0; k < kScanCount; ++k) {
+            const bool now = scanDown[k], was = prev_[k];
             prev_[k] = now;
             if (now == was) continue;              // held: no event, no repeat
             if (!now) {                            // up edge -> the note this key started
@@ -223,11 +249,6 @@ struct KbdPiano {
                     emit(MidiMsg{0x80, (u8)active_[k], 0, 0, 0});
                     active_[k] = -1;
                 }
-                continue;
-            }
-            // Down edge. The octave moves once per physical press.
-            if (k == KeyPageUp || k == KeyPageDown) {
-                res.baseChanged = shiftOctave(k == KeyPageUp ? kOctave : -kOctave);
                 continue;
             }
             const int semi = semiFor(k);
@@ -244,7 +265,7 @@ struct KbdPiano {
     // started it, and nothing downstream will clean it up.
     template <class Emit>
     void allNotesOff(const Emit& emit) {
-        for (int k = 0; k < KeyCount; ++k) {
+        for (int k = 0; k < kScanCount; ++k) {
             if (active_[k] < 0) continue;
             emit(MidiMsg{0x80, (u8)active_[k], 0, 0, 0});
             active_[k] = -1;
@@ -272,8 +293,9 @@ private:
 
     int  base_ = kDefaultBase;
     int  vel_  = kDefaultVel;
-    bool prev_[KeyCount]{};        // keyDown[] as of last update, for edges
-    i8   active_[KeyCount];        // note each key started, -1 = silent
+    bool prev_[kScanCount]{};      // scanDown[] as of last update, for edges
+    i8   active_[kScanCount];      // note each key started, -1 = silent
+    bool prevOctUp_ = false, prevOctDown_ = false;
 };
 
 // The MIDI note editor. Declared rather than included: pianoroll.h includes
@@ -297,9 +319,20 @@ private:
     // --- frame ---
     void frame();
     void handleShortcuts();
-    void updateKbdPiano();                        // QWERTY piano -> engine MIDI
+    void updateKbdPiano();                        // computer piano -> engine MIDI
     void toggleKbdMidi();
     void pumpEngineEvents();
+
+    // --- piano roll routing + note preview ---
+    // The roll, but only while it is actually on screen for the selected clip.
+    // That is the whole condition for it to own a key: arrows, Delete, Escape
+    // and Ctrl+U keep their session-wide meaning everywhere else.
+    PianoRoll* visibleRoll();
+    // Audition one pitch for the clip identified by `clipUid`: note-on now, the
+    // matching off scheduled kPreviewSecs out. See the note on previews_.
+    void startPreview(int pitch, u64 clipUid);
+    void updatePreviews();                        // send the offs that came due
+    void stopPreviews();                          // every off, now
 
     // --- views ---
     void drawControlBar(const Rect& r);
@@ -488,6 +521,33 @@ private:
     // The piano roll, shown in the CLIP tab for MIDI clips. Created on first
     // use; see the forward declaration above for why it is not a plain member.
     std::unique_ptr<PianoRoll> roll_;
+
+    // --- piano roll note preview -------------------------------------------
+    // Editing a note you cannot hear is guesswork, so the roll asks for pitches
+    // to audition (PianoRoll::drainPreview) and this turns each into a short
+    // note. There is no per-note timer anywhere in the app and no need for one:
+    // a preview is a note-on now plus a deadline, and the frame loop — which
+    // runs regardless — sends the off once the deadline passes.
+    //
+    // Where they go: engine_.pushMidi, the same ring the computer keyboard and
+    // a hardware controller feed, which the engine forwards to note-capable
+    // devices on *armed* tracks. That lines up with "the clip on screen" only
+    // because selectTrack() auto-arms the selected track (Live's exclusive
+    // arm), and every path that changes the selection goes through it. If that
+    // ever stops being true, previews start sounding on the wrong instrument.
+    //
+    // A sounding preview outlives the thing that started it, so the offs are
+    // unconditional: they are sent when the deadline passes, when the clip or
+    // the panel goes away (updatePreviews checks), and at shutdown.
+    struct Preview {
+        u8  pitch = 0;
+        f64 offAt = 0.0;              // nowSeconds() deadline for the note-off
+    };
+    static constexpr int kMaxPreviews  = 8;      // a chord's worth; oldest gives way
+    static constexpr f64 kPreviewSecs  = 0.12;   // long enough to hear, short enough to edit over
+    static constexpr int kPreviewVel   = 100;
+    std::vector<Preview> previews_;
+    u64  previewClip_ = 0;            // ClipModel::uid the sounding previews belong to
 
     // per-frame UI feedback
     std::string status_;

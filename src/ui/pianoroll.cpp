@@ -28,9 +28,19 @@ constexpr f32 kKeyW       = 46.f;
 constexpr f32 kRulerH     = 16.f;
 constexpr f32 kLaneH      = 54.f;
 constexpr f32 kRowH       = 12.f;
+// Fit-to-width, the zoom a clip is first shown at, is kept inside a sane band:
+// a two-beat sketch must not draw beats a hand-span apart, and a 64-bar clip
+// must not open at one pixel per bar.
 constexpr f32 kPxPerBeatMin = 44.f;
 constexpr f32 kPxPerBeatMax = 128.f;
+// Ctrl+wheel reaches much further in both directions than the fit ever does:
+// far enough out to see a long pattern whole, far enough in to place a note
+// against the grid line rather than near it.
+constexpr f32 kZoomMin      = 8.f;
+constexpr f32 kZoomMax      = 512.f;
+constexpr f32 kZoomPerNotch = 0.25f;  // octaves of zoom per wheel notch
 constexpr int kCentrePitch  = 60;   // C4, the middle of the default C3..C5 view
+constexpr f64 kMaxLoopBeats = 64.0; // ceiling for Ctrl+U, 16 bars in 4/4
 
 // ---------------------------------------------------------------------------
 // axes
@@ -43,6 +53,17 @@ struct TimeAxis {
 };
 inline f32 beatToX(const TimeAxis& a, f64 b) { return a.x0 - a.view + (f32)(b * (f64)a.pxPerBeat); }
 inline f64 xToBeat(const TimeAxis& a, f32 x) { return (f64)(x - a.x0 + a.view) / (f64)a.pxPerBeat; }
+
+// Scroll offset for a zoom that must leave the beat under `anchorX` still under
+// `anchorX` — the only zoom that feels like the content is being magnified
+// rather than shuffled. Clamped like every other scroll, so within a view of
+// either end the anchor gives way to the content edge (there is no scroll that
+// satisfies both, and showing empty space past the loop is the worse answer).
+inline f32 zoomView(const TimeAxis& a, f32 newPxPerBeat, f32 anchorX, f64 lenBeats, f32 viewW) {
+    const f64 b = xToBeat(a, anchorX);
+    const f32 view = a.x0 + (f32)(b * (f64)newPxPerBeat) - anchorX;
+    return clampv(view, 0.f, std::max(0.f, (f32)(lenBeats * (f64)newPxPerBeat) - viewW));
+}
 
 struct PitchAxis {
     f32 y0 = 0, rowH = 12.f, view = 0;
@@ -144,6 +165,78 @@ int sortTracking(std::vector<NoteModel>& v, const NoteModel& key) {
     return -1;
 }
 
+// Keyboard nudge: `steps` grid steps along time, `semis` semitones of pitch.
+// Both clamped — into the clip at both ends, into 0..127 — and the time nudge
+// goes through the same snap as a mouse move, so nudging an off-grid note (one
+// that arrived by MIDI recording) pulls it onto the grid rather than carrying
+// the offset along forever.
+//
+// `index` comes back as the note's index *after* the re-sort, or -1 when the
+// nudge changed nothing at all (a note already against a clamp).
+struct NudgeResult {
+    int  index = -1;
+    bool pitchChanged = false;
+};
+NudgeResult nudgeNote(std::vector<NoteModel>& notes, int idx, int steps, int semis,
+                      f64 lengthBeats) {
+    NudgeResult res;
+    if (idx < 0 || idx >= (int)notes.size()) return res;
+    NoteModel nt = notes[(size_t)idx];
+    const NoteModel was = nt;
+    if (steps != 0) nt.beat = clampBeat(nt.beat + (f64)steps * kGridStep, nt.len, lengthBeats);
+    if (semis != 0) nt.pitch = (u8)clampv((int)nt.pitch + semis, 0, 127);
+    if (sameNote(nt, was)) return res;
+    notes[(size_t)idx] = nt;
+    res.index = sortTracking(notes, nt);
+    res.pitchChanged = nt.pitch != was.pitch;
+    return res;
+}
+
+// Live's duplicate-loop: the loop doubles and everything in it is copied one
+// old-length later, so a bar of material becomes two bars of it. `selected`
+// (an index, or -1) follows into the *copy*, which is the note the user is
+// about to edit; the returned index is where that copy landed.
+//
+// The cap is a length, not a factor: doubling a 40-beat loop gives 64 and the
+// copies that would start past the new end are simply not made (a note that
+// straddles the end is trimmed). Nothing happens at all once the loop is
+// already at the cap — a no-op that reports false, so the caller does not
+// re-push an unchanged clip.
+struct DupResult {
+    bool changed = false;
+    int  index = -1;
+};
+DupResult duplicateLoopNotes(std::vector<NoteModel>& notes, f64& lengthBeats, int selected) {
+    DupResult res;
+    const f64 oldLen = std::max(kGridStep, lengthBeats);
+    if (oldLen >= kMaxLoopBeats) return res;
+    const f64 newLen = std::min(kMaxLoopBeats, oldLen * 2.0);
+
+    // The note the selection should end on: the copy of the selected note, or
+    // the selected note itself when the cap left no room for its copy. Either
+    // way it is tracked through the sort, because a bare sort would leave the
+    // caller holding an index into the old order.
+    const size_t n = notes.size();
+    NoteModel key{};
+    bool haveKey = selected >= 0 && selected < (int)n;
+    if (haveKey) key = notes[(size_t)selected];
+    for (size_t i = 0; i < n; ++i) {
+        NoteModel c = notes[i];
+        c.beat += oldLen;
+        if (c.beat >= newLen - 1e-9) continue;
+        c.len = std::min(c.len, newLen - c.beat);
+        if ((int)i == selected) { key = c; haveKey = true; }
+        notes.push_back(c);
+    }
+    lengthBeats = newLen;
+    res.changed = true;
+    // The vector is two sorted runs (originals, then copies, each in order and
+    // the second entirely later), which sortTracking restores in one pass.
+    if (haveKey) res.index = sortTracking(notes, key);
+    else         std::sort(notes.begin(), notes.end(), noteLess);
+    return res;
+}
+
 // Topmost note under a point, or -1. Later notes win so the hit order matches
 // the draw order.
 int noteAt(const std::vector<NoteModel>& notes, const RowMap& rows,
@@ -201,8 +294,25 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     const Rect laneKey{r.x, lane.y, keyW, laneH};
     if (grid.w < 24.f * s || grid.h < rowH) return false;
 
-    // The caller can swap the clip under us between frames, and nothing here
-    // identifies a clip, so stale indices are always a possibility.
+    // The caller swaps the clip under us between frames (selecting another
+    // slot), and everything the roll remembers — a selection index, where the
+    // view sits, how far it is zoomed in — is about one particular clip. So the
+    // whole lot resets when the identity changes, and the new clip is shown the
+    // way a clip is first shown: fit to the width, nothing selected.
+    if (clip.uid != clipUid_) {
+        clipUid_ = clip.uid;
+        selected_ = -1;
+        dragNote_ = -1;
+        drag_ = Drag::None;
+        scrollX_ = scrollY_ = 0.f;
+        zoom_ = 0.f;                 // -> fit to width below
+        addedLastPress_ = false;
+        followSel_ = false;
+        preview_.clear();            // an audition for a clip nobody is looking at
+    }
+
+    // A note count can still change under a live selection (undo, a MIDI take
+    // finishing), so indices are re-checked on every frame regardless.
     const int noteCount = (int)clip.notes.size();
     if (selected_ >= noteCount) selected_ = -1;
     if (dragNote_ >= noteCount) { dragNote_ = -1; drag_ = Drag::None; }
@@ -212,22 +322,44 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     const RowMap rows = buildRows(clip.notes, fold_, keepPitch);
 
     const f64 lenBeats = std::max(1.0, clip.lengthBeats);
-    // Fixed zoom, except that a short clip is allowed to fill the width rather
-    // than sit in a sea of empty grid. Ctrl+wheel zoom will replace this.
-    const f32 pxPerBeat = clampv((f32)(grid.w / lenBeats), kPxPerBeatMin * s, kPxPerBeatMax * s);
-    const f32 contentW = (f32)(lenBeats * (f64)pxPerBeat);
-    const f32 contentH = (f32)rows.count * rowH;
+    // First sight of a clip: fit the loop to the width, so a pattern opens as
+    // itself rather than as a window onto part of itself. From the first
+    // Ctrl+wheel on, the zoom is the user's and nothing takes it back — not
+    // even dragging the loop longer, which would otherwise re-fit under the
+    // hand that was editing.
+    if (zoom_ <= 0.f)
+        zoom_ = clampv((f32)(grid.w / lenBeats) / s, kPxPerBeatMin, kPxPerBeatMax);
+    f32 pxPerBeat = zoom_ * s;
 
     const u64 gridId = uiId(20, 0), laneId = uiId(20, 1);
     const bool overBody = (grid.contains(in.mx, in.my) || lane.contains(in.mx, in.my) ||
                            keys.contains(in.mx, in.my)) &&
                           rr.currentClip().contains(in.mx, in.my);
-    // Ctrl+wheel is reserved for zoom: swallow it rather than scroll, so the
-    // gesture does not do the wrong thing until zoom lands.
-    if (overBody && in.wheel != 0.f && !in.ctrl()) {
-        if (in.shift()) scrollX_ -= in.wheel * pxPerBeat * 0.5f;
-        else            scrollY_ -= in.wheel * rowH * 3.f;
+    if (overBody && in.wheel != 0.f) {
+        if (in.ctrl()) {
+            // Zoom about the cursor. Exponential in the wheel so a notch is the
+            // same *proportion* everywhere, which is the only way one gesture
+            // covers 8..512 px/beat without feeling geared wrong at one end.
+            const f32 nz = clampv(zoom_ * std::pow(2.f, in.wheel * kZoomPerNotch),
+                                  kZoomMin, kZoomMax);
+            if (nz != zoom_) {
+                const TimeAxis prev{grid.x, pxPerBeat, scrollX_};
+                zoom_ = nz;
+                pxPerBeat = zoom_ * s;
+                // Off in the keyboard column there is no beat under the cursor,
+                // so the left edge of the grid anchors instead.
+                scrollX_ = zoomView(prev, pxPerBeat, clampv(in.mx, grid.x, grid.right()),
+                                    lenBeats, grid.w);
+            }
+        } else if (in.shift()) {
+            scrollX_ -= in.wheel * pxPerBeat * 0.5f;
+        } else {
+            scrollY_ -= in.wheel * rowH * 3.f;
+        }
     }
+
+    const f32 contentW = (f32)(lenBeats * (f64)pxPerBeat);
+    const f32 contentH = (f32)rows.count * rowH;
 
     scrollX_ = clampv(scrollX_, 0.f, std::max(0.f, contentW - grid.w));
     // scrollY_ is an offset from the *default* view rather than from the top of
@@ -236,7 +368,31 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     // written back so scrolling never has a dead zone at either end.
     const int centreRow = fold_ ? rows.count / 2 : rows.rowOf(kCentrePitch);
     const f32 anchorY = (f32)std::max(0, centreRow) * rowH + rowH * 0.5f - grid.h * 0.5f;
-    const f32 viewY = clampv(anchorY + scrollY_, 0.f, std::max(0.f, contentH - grid.h));
+    f32 viewY = clampv(anchorY + scrollY_, 0.f, std::max(0.f, contentH - grid.h));
+
+    // A keyboard edit can push the selected note out of the view — an octave
+    // nudge usually does — and a note the user cannot see is a note they have
+    // lost. The view follows it, by the smallest move that puts it back on
+    // screen (clamping to a window it is already inside is a no-op).
+    if (followSel_) {
+        followSel_ = false;
+        if (selected_ >= 0 && selected_ < noteCount) {
+            const NoteModel& sel = clip.notes[(size_t)selected_];
+            const int row = rows.rowOf(sel.pitch);
+            if (row >= 0) {
+                const f32 top = (f32)row * rowH;
+                viewY = clampv(viewY, top + rowH - grid.h, top);
+                viewY = clampv(viewY, 0.f, std::max(0.f, contentH - grid.h));
+            }
+            const f32 nx0 = (f32)(sel.beat * (f64)pxPerBeat);
+            const f32 nx1 = (f32)((sel.beat + sel.len) * (f64)pxPerBeat);
+            // For a note wider than the view the two bounds cross; either way
+            // out of clampv lands on part of the note, which is all that is
+            // promised here.
+            scrollX_ = clampv(scrollX_, nx1 - grid.w, nx0);
+            scrollX_ = clampv(scrollX_, 0.f, std::max(0.f, contentW - grid.w));
+        }
+    }
     scrollY_ = viewY - anchorY;
 
     const TimeAxis ta{grid.x, pxPerBeat, scrollX_};
@@ -284,6 +440,10 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
                 if (p >= 0) np = p;
             }
             if (nb != nt.beat || np != (int)nt.pitch) {
+                // Dragging across rows plays what is under the note, the way a
+                // note dragged in Live does: the pitch is the thing being
+                // chosen, and choosing it by eye alone is guesswork.
+                if (np != (int)nt.pitch) preview_.push(np);
                 nt.beat = nb;
                 nt.pitch = (u8)np;
                 const NoteModel key = nt;           // nt dangles once we sort
@@ -303,13 +463,10 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
         }
     } else if (hotGrid && (in.pressed[0] || in.pressed[2])) {
         const int hit = noteAt(clip.notes, rows, ta, pa, in.mx, in.my, minNoteW);
-        // dragX_ carries "the previous press created a note" between gestures:
-        // clicking empty space adds, so without this the second click of a
+        // Clicking empty space adds, so without this the second click of a
         // double-click on empty space would delete what the first click made.
-        // (The frozen header has no spare member and dragX_ is otherwise
-        // unused — the beat grab offset in dragBeat_ covers the x axis.)
-        const bool prevAdded = (dragX_ != 0.f);
-        dragX_ = 0.f;
+        const bool prevAdded = addedLastPress_;
+        addedLastPress_ = false;
 
         if (in.pressed[2]) {
             if (hit >= 0) eraseNote(hit);                 // right-click deletes
@@ -319,6 +476,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             selected_ = hit;
             ui.active = gridId;
             const NoteModel& nt = clip.notes[(size_t)hit];
+            preview_.push((int)nt.pitch);          // clicking a note plays it
             const f32 x0 = beatToX(ta, nt.beat);
             const f32 x1 = std::max(beatToX(ta, nt.beat + nt.len), x0 + minNoteW);
             const f32 edge = std::min(4.f * s, (x1 - x0) * 0.35f);
@@ -346,7 +504,8 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
                 dragBeat_ = xToBeat(ta, in.mx) - nn.beat;
                 dragY_ = in.my;
                 dragPitch_ = pitch;
-                dragX_ = 1.f;
+                addedLastPress_ = true;
+                preview_.push(pitch);            // hear what was just written
                 ui.active = gridId;
                 changed = true;
             }
@@ -364,7 +523,10 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             selected_ = best;
             dragNote_ = best;
             drag_ = Drag::Velocity;
-            dragX_ = 0.f;
+            // The lane deliberately does not audition: a velocity drag would
+            // retrigger the note on every pixel, and the value being edited is
+            // not the pitch anyway.
+            addedLastPress_ = false;
             ui.active = laneId;
             const u8 nv = velAt(in.my);
             if (nv != clip.notes[(size_t)best].vel) {
@@ -522,6 +684,56 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
         }
     }
     return changed;
+}
+
+// ---------------------------------------------------------------------------
+// keyboard API
+//
+// These run from App::handleShortcuts, i.e. *before* this frame's draw(), and
+// they act on the state the last draw left behind. Hence the identity check on
+// every one of them: the clip in front of the roll can have been swapped since,
+// and an index into the wrong clip's notes is an edit to the wrong note.
+// ---------------------------------------------------------------------------
+
+bool PianoRoll::hasSelection(const ClipModel& clip) const {
+    return owns(clip) && selected_ >= 0 && selected_ < (int)clip.notes.size();
+}
+
+bool PianoRoll::clearSelection() {
+    if (selected_ < 0) return false;
+    selected_ = -1;
+    return true;
+}
+
+bool PianoRoll::nudgeSelected(ClipModel& clip, int gridSteps, int semitones) {
+    if (!hasSelection(clip)) return false;
+    const NudgeResult res = nudgeNote(clip.notes, selected_, gridSteps, semitones,
+                                      clip.lengthBeats);
+    if (res.index < 0) return false;               // already against a clamp
+    selected_ = res.index;
+    followSel_ = true;
+    if (res.pitchChanged) preview_.push((int)clip.notes[(size_t)res.index].pitch);
+    return true;
+}
+
+bool PianoRoll::deleteSelected(ClipModel& clip) {
+    if (!hasSelection(clip)) return false;
+    clip.notes.erase(clip.notes.begin() + selected_);
+    selected_ = -1;
+    // A drag cannot be in flight (this arrives from the keyboard), but the
+    // index would be stale if one ever were.
+    dragNote_ = -1;
+    drag_ = Drag::None;
+    return true;
+}
+
+bool PianoRoll::duplicateLoop(ClipModel& clip) {
+    if (!owns(clip)) return false;
+    const DupResult res = duplicateLoopNotes(clip.notes, clip.lengthBeats, selected_);
+    if (!res.changed) return false;                // already at the cap
+    selected_ = res.index;
+    followSel_ = true;
+    return true;
 }
 
 } // namespace lat

@@ -28,12 +28,23 @@ static void usage() {
         "  M              metronome              Ctrl+S   save\n"
         "  Ctrl+B         browser                Ctrl+D   clip detail\n"
         "  Ctrl+T         add track              Ctrl+Enter add scene\n"
-        "  Ctrl+Shift+K   computer MIDI keyboard (QWERTY plays the armed track)\n"
-        "                 FL layout: Z X C V B N M = lower octave white keys,\n"
+        "  Ctrl+Shift+K   computer MIDI keyboard (plays the armed track)\n"
+        "                 FL layout, by key position (any keyboard layout):\n"
+        "                            Z X C V B N M = lower octave white keys,\n"
         "                            S D   G H J   = its black keys,\n"
         "                 Q W E R T Y U + I O P    = the two octaves above,\n"
         "                 2 3   5 6 7   9 0        = their black keys,\n"
-        "                 PgUp / PgDn octave, velocity next to the KBD chip\n");
+        "                 PgUp / PgDn octave, velocity next to the KBD chip\n"
+        "\n"
+        "Piano roll (CLIP tab, MIDI clips):\n"
+        "  Click          add / select note      Double-click  add / delete\n"
+        "  Drag           move, right edge sizes Right-click   delete note\n"
+        "  Wheel          scroll                 Shift+wheel   scroll time\n"
+        "  Ctrl+wheel     zoom time about the cursor\n"
+        "  Arrows         nudge the selected note (grid step / semitone)\n"
+        "  Shift+Up/Down  nudge by an octave      Del      delete the note\n"
+        "  Esc            deselect the note (again: stop all clips)\n"
+        "  Ctrl+U         double the loop and duplicate its notes\n");
 }
 
 int main(int argc, char** argv) {
