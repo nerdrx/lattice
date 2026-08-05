@@ -208,7 +208,16 @@ public:
 
     // Creator. `payloadBytes` is what you need past the header; the region is
     // rounded up to a page. Fails if a live process already owns the name.
-    bool create(const char* name, size_t payloadBytes, u32 layoutHash, u32 version = kShmVersion) {
+    //
+    // `seal` asks the kernel to make the object un-shrinkable before the fd is
+    // dropped (§3.5: a peer that ftruncates a mapped region smaller hands the
+    // audio thread a SIGBUS on its next read). It is best-effort by design —
+    // see trySeal() — and sealed() reports what actually happened, because a
+    // pool that could not be sealed is still a usable pool, just one whose
+    // shrink-safety rests on nobody having a writable fd rather than on the
+    // kernel.
+    bool create(const char* name, size_t payloadBytes, u32 layoutHash,
+                u32 version = kShmVersion, bool seal = false) {
         close();
         if (!setName(name)) return false;
 
@@ -232,6 +241,7 @@ public:
             ::close(fd); ::shm_unlink(name_); name_[0] = '\0';
             return false;
         }
+        sealed_ = seal && trySeal(fd);
         void* p = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         ::close(fd);                     // the mapping keeps the object alive
         if (p == MAP_FAILED) {
@@ -240,9 +250,10 @@ public:
             return false;
         }
 
-        base_   = p;
-        bytes_  = total;
-        unlink_ = true;                  // creator owns the name
+        base_     = p;
+        bytes_    = total;
+        unlink_   = true;                // creator owns the name
+        readOnly_ = false;
 
         // The kernel zero-fills a fresh shm object, so the payload needs no
         // clearing here — which matters once the payload is a multi-megabyte
@@ -270,18 +281,28 @@ public:
     // timeoutMs (0 = single attempt). A region that exists and is ready but
     // disagrees about magic/version/layout/size fails immediately — retrying a
     // mismatch would just spin until the timeout and report the wrong reason.
-    bool attach(const char* name, u32 layoutHash, u32 version = kShmVersion, int timeoutMs = 0) {
+    //
+    // `readOnly` maps PROT_READ and opens O_RDONLY. It exists for the sample
+    // pool (§3.5): the GUI owns the allocator and the engine only ever reads
+    // block extents, so mapping it read-only in the daemon turns "the engine
+    // must not write the pool" from a comment into a page permission. It also
+    // means the attach counter cannot be bumped — the counter is informational
+    // and a write, and a write is exactly what we just gave up.
+    bool attach(const char* name, u32 layoutHash, u32 version = kShmVersion, int timeoutMs = 0,
+                bool readOnly = false) {
         close();
         if (!setName(name)) return false;
 
         const u64 deadline = monotonicNs() + (u64)(timeoutMs > 0 ? timeoutMs : 0) * 1000000ull;
         for (;;) {
-            int fd = ::shm_open(name_, O_RDWR, 0);
+            int fd = ::shm_open(name_, readOnly ? O_RDONLY : O_RDWR, 0);
             if (fd >= 0) {
                 struct stat st{};
                 if (::fstat(fd, &st) == 0 && (size_t)st.st_size >= kPayloadOffset) {
                     const size_t total = (size_t)st.st_size;
-                    void* p = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    void* p = ::mmap(nullptr, total,
+                                     readOnly ? PROT_READ : (PROT_READ | PROT_WRITE),
+                                     MAP_SHARED, fd, 0);
                     ::close(fd);
                     if (p == MAP_FAILED) {
                         setErr("mmap(%s, %zu): %s", name_, total, std::strerror(errno));
@@ -296,10 +317,11 @@ public:
                             // is not ours and must not be unlinked.
                             return false;
                         }
-                        base_   = p;
-                        bytes_  = total;
-                        unlink_ = false;                 // attachers never unlink
-                        h->attached.fetch_add(1, std::memory_order_relaxed);
+                        base_     = p;
+                        bytes_    = total;
+                        unlink_   = false;               // attachers never unlink
+                        readOnly_ = readOnly;
+                        if (!readOnly) h->attached.fetch_add(1, std::memory_order_relaxed);
                         err_[0] = '\0';
                         return true;
                     }
@@ -322,9 +344,36 @@ public:
     void close() {
         if (base_) { ::munmap(base_, bytes_); base_ = nullptr; }
         if (unlink_ && name_[0]) ::shm_unlink(name_);
-        unlink_  = false;
-        bytes_   = 0;
-        name_[0] = '\0';
+        unlink_   = false;
+        readOnly_ = false;
+        sealed_   = false;
+        bytes_    = 0;
+        name_[0]  = '\0';
+    }
+
+    // Detach without unlinking, whatever this handle's role is. The one place
+    // a creator wants this is a hand-off: the session region must outlive the
+    // process that made it (§4.3), so "I am going away but the region is not"
+    // has to be expressible. Ordinary shutdown still goes through close().
+    void release() {
+        unlink_ = false;
+        close();
+    }
+
+    // Best-effort shrink protection. Sealing is a memfd feature: a plain
+    // shm_open() object lives on tmpfs but its inode is not created sealable,
+    // so F_ADD_SEALS answers EINVAL and there is nothing to be done about it
+    // short of the memfd + SCM_RIGHTS path §3.2 needs a socket for. We ask
+    // anyway, because the answer is free and it becomes yes the moment the fd
+    // arrives from memfd_create() instead — and because a silent "we meant to
+    // seal this" is how the SIGBUS in §5 gets shipped.
+    static bool trySeal(int fd) {
+#if defined(F_ADD_SEALS) && defined(F_SEAL_SHRINK)
+        return ::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) == 0;
+#else
+        (void)fd;
+        return false;
+#endif
     }
 
     // Stale-region cleanup hook. Returns true if `name` named an orphan and it
@@ -368,6 +417,8 @@ public:
     const char* name() const   { return name_; }
     const char* error() const  { return err_; }
     bool        isCreator() const { return unlink_; }
+    bool        isReadOnly() const { return readOnly_; }
+    bool        sealed() const    { return sealed_; }
     size_t      totalBytes() const { return bytes_; }
     size_t      payloadBytes() const { return bytes_ ? bytes_ - kPayloadOffset : 0; }
 
@@ -391,9 +442,11 @@ private:
 
     void moveFrom(ShmRegion& o) {
         base_ = o.base_; bytes_ = o.bytes_; unlink_ = o.unlink_;
+        readOnly_ = o.readOnly_; sealed_ = o.sealed_;
         std::memcpy(name_, o.name_, sizeof name_);
         std::memcpy(err_,  o.err_,  sizeof err_);
-        o.base_ = nullptr; o.bytes_ = 0; o.unlink_ = false; o.name_[0] = '\0';
+        o.base_ = nullptr; o.bytes_ = 0; o.unlink_ = false;
+        o.readOnly_ = false; o.sealed_ = false; o.name_[0] = '\0';
     }
 
     // POSIX requires a leading slash and no others; accept both spellings from
@@ -447,9 +500,11 @@ private:
         va_end(ap);
     }
 
-    void*  base_   = nullptr;
-    size_t bytes_  = 0;
-    bool   unlink_ = false;
+    void*  base_     = nullptr;
+    size_t bytes_    = 0;
+    bool   unlink_   = false;
+    bool   readOnly_ = false;
+    bool   sealed_   = false;
     char   name_[kNameMax] = {};
     char   err_[192]       = {};
 };

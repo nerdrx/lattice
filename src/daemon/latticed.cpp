@@ -2,12 +2,26 @@
 //
 // Phase 1 of the process split (docs/PROCESS-SPLIT.md §6, brought forward from
 // phase 4): a headless process that owns an Engine and an audio backend and
-// exposes them through one shared-memory control region. Nothing in src/ui
-// talks to it yet — the GUI adopts EngineClient in phase 2 — so this binary is
-// currently exercised by tests/daemon_test.cpp and by hand.
+// exposes them through one shared-memory control region. Phase 2 added the
+// sample pool, so it can now actually play clips. Nothing in src/ui talks to it
+// yet, so this binary is currently exercised by tests/daemon_test.cpp and by
+// hand.
 //
 //   latticed [--session NAME] [--driver null|auto|jack|alsa]
 //            [--rate HZ] [--block FRAMES] [--verbose]
+//
+// THE ONE PLACE A NUMBER BECOMES A POINTER
+// ----------------------------------------
+// The daemon's phase-2 job is small and sharp: a clip arrives as a WireClip in
+// the control region whose sample data is a `u64` byte offset into the pool the
+// GUI created, and the daemon turns that offset into `const f32*` for
+// Engine::pushCommand. Engine never learns anything changed — no header in
+// src/audio moved, no field means something new — which is exactly what makes
+// the translation reviewable: there is one function (translateClip) with one
+// job, and everything that could go wrong with an untrusted offset has to go
+// wrong there. Bounds, alignment, block magic, block kind, block state and
+// declared size are all checked before the addition happens, and a failure is a
+// refusal with a reason, never a clamped pointer.
 //
 // Three threads:
 //
@@ -35,6 +49,7 @@
 #include "../audio/engine.h"
 #include "../core/common.h"
 #include "../ipc/control.h"
+#include "../ipc/pool.h"
 
 #include <atomic>
 #include <cmath>
@@ -275,6 +290,28 @@ public:
     }
 
 private:
+    // A translated command plus what the boundary has to remember about it
+    // until the engine has actually taken it. Declared up here because member
+    // function *signatures* below need the type complete.
+    struct Staged {
+        Command       cmd{};
+        ipc::WireClip cell{};
+        bool          pooled  = false;
+        bool          isClear = false;
+    };
+
+    // A pool block that no clip cell references any more, waiting for the
+    // proof that the audio thread has drained past the command that displaced
+    // it. See "the free-after-confirm rule, daemon side" below.
+    struct Retire {
+        u64  ref       = 0;
+        u32  kind      = 0;
+        i32  track     = 0, slot = 0;
+        u64  dueNs     = 0;
+        u64  dueBlocks = 0;
+        bool confirmed = false;   // the engine proved it (Ev::NotesRetired)
+    };
+
     // -- startup ------------------------------------------------------------
 
     bool startDriver() {
@@ -315,13 +352,73 @@ private:
 
     void pumpLoop() {
         while (!gQuit) {
+            pumpPool();
             pumpCommands();
             pumpMidi();
             pumpEvents();
+            pumpRetirements();
             map_.hdr->heartbeat.fetch_add(1, std::memory_order_relaxed);
             timespec ts{0, 1000000};        // 1 ms
             ::nanosleep(&ts, nullptr);
         }
+    }
+
+    // -- the sample pool ----------------------------------------------------
+    //
+    // The GUI creates the pool and announces it here (ControlHeader::poolEpoch,
+    // §3.5). Attaching is an mmap, so it happens on this thread and never on
+    // the audio thread — the doc's rule about growth applies just as much to
+    // the first mapping as to a later one.
+    //
+    // A pool is mapped ONCE per daemon lifetime. That is a real restriction and
+    // it is deliberate: every RtClip the engine holds is a raw pointer into
+    // this mapping, so unmapping it to attach a different one would turn every
+    // live clip into a dangling read on the audio thread — and there is no
+    // handshake in phase 2 that could prove the engine has dropped them all
+    // first. A GUI that genuinely needs a different pool restarts the engine,
+    // which costs a respawn and is honest. Re-announcing the *same* epoch is a
+    // no-op, which is what makes publishPool() idempotent for the client.
+    void pumpPool() {
+        const u64 epoch = map_.hdr->poolEpoch.load(std::memory_order_acquire);
+        if (epoch == 0 || epoch == poolEpoch_) return;
+        if (pool_.valid()) {
+            if (!poolRebindLogged_) {
+                poolRebindLogged_ = true;
+                LOGW("ignoring pool epoch %llu: '%s' is already mapped and live clips "
+                     "point into it (restart the engine to change pools)",
+                     (unsigned long long)epoch, pool_.name());
+            }
+            map_.hdr->poolAttachFailures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (ipc::monotonicNs() < poolRetryNs_) return;
+
+        // Snapshot the name: it is the peer's memory and the peer may rewrite
+        // it. Sized to hold ControlHeader::poolName in full, because a name
+        // truncated here would open a *different* region, not fail.
+        char nm[sizeof map_.hdr->poolName + 1];
+        std::snprintf(nm, sizeof nm, "%s", map_.hdr->poolName);
+        if (!pool_.attach(nm)) {
+            // Back off rather than hammering shm_open every millisecond: the
+            // usual cause is that the GUI has not called publishReady() yet.
+            poolRetryNs_ = ipc::monotonicNs() + 100ull * 1000000ull;
+            map_.hdr->poolAttachFailures.fetch_add(1, std::memory_order_relaxed);
+            if (!poolFailLogged_) {
+                poolFailLogged_ = true;
+                LOGW("cannot attach the sample pool: %s [further attempts silent]",
+                     pool_.error());
+            }
+            return;
+        }
+        poolEpoch_ = epoch;
+        map_.hdr->poolAttachedEpoch.store(epoch, std::memory_order_release);
+        LOGI("sample pool '%s' mapped read-only: %zu B, epoch %llu",
+             pool_.name(), pool_.bytes(), (unsigned long long)epoch);
+        ipc::WireEvent e{};
+        e.type = ipc::EvPoolAttached;
+        e.ref  = epoch;
+        e.x    = (f64)pool_.bytes();
+        map_.evts->push(e);
     }
 
     // Translates and validates each wire command, then hands it to the engine.
@@ -333,38 +430,76 @@ private:
     // phase 1 owes.
     void pumpCommands() {
         if (havePending_) {
-            if (!engine_->pushCommand(pending_)) return;
+            if (!engine_->pushCommand(pending_.cmd)) return;
+            commit(pending_);
             havePending_ = false;
-            map_.hdr->commandsApplied.fetch_add(1, std::memory_order_relaxed);
         }
         ipc::WireCommand w;
         while (map_.cmds->pop(w)) {
-            Command c{};
+            Staged st{};
             u32 reason = ipc::RejectNone;
-            if (!translate(w, c, reason)) {
+            if (!translate(w, st, reason)) {
                 reject(w, reason);
+                if (ipc::commandIsPooled(w.type)) ackClip(w, reason);
                 continue;
             }
-            if (!engine_->pushCommand(c)) {
-                pending_     = c;
+            if (!engine_->pushCommand(st.cmd)) {
+                pending_     = st;
                 havePending_ = true;
                 map_.hdr->commandsDeferred.fetch_add(1, std::memory_order_relaxed);
                 return;                      // resume from here next tick
             }
-            map_.hdr->commandsApplied.fetch_add(1, std::memory_order_relaxed);
+            commit(st);
         }
     }
 
-    // PHASE 1 SCOPE: scalars only. Everything that carries a pointer is
-    // refused here, at the boundary, with a reason — see the table in
-    // src/ipc/control.h. Half-translating one (a SetClip with a null `data`)
-    // would produce a clip that plays silence, which is a bug you find on
-    // stage rather than in CI.
-    static bool translate(const ipc::WireCommand& w, Command& out, u32& reason) {
+    // Everything that happens once a command is definitely in the engine's
+    // ring. Split out of pumpCommands because a deferred command reaches this
+    // point a tick later and must have exactly the same effects — the clip
+    // shadow and the retirement clock in particular, which key off "the engine
+    // has it", not "the client sent it".
+    void commit(const Staged& st) {
+        map_.hdr->commandsApplied.fetch_add(1, std::memory_order_relaxed);
+        if (!st.pooled) return;
+        installClip(st.cmd.a, st.cmd.b, st.cell);
+        map_.hdr->clipsApplied.fetch_add(1, std::memory_order_relaxed);
+        ipc::WireEvent e{};
+        e.type  = ipc::EvClipAck;
+        e.a     = st.cmd.a;
+        e.b     = st.cmd.b;
+        e.ref   = st.cell.generation;
+        e.flags = st.isClear ? ipc::ClipAckWasClear : 0u;
+        map_.evts->push(e);
+    }
+
+    // The acknowledgement a *refused* clip command still owes its sender. One
+    // of these answers every SetClip/ClearClip, whatever happened to it,
+    // because the client blocks further writes to a cell until it hears back
+    // (src/ipc/control.h, WireClip::generation) and a silent refusal would wedge
+    // that cell for the rest of the session.
+    void ackClip(const ipc::WireCommand& w, u32 reason) {
+        ipc::WireEvent e{};
+        e.type  = ipc::EvClipAck;
+        e.a     = w.a;
+        e.b     = w.b;
+        e.ref   = w.ref;                  // the generation the client sent
+        e.flags = ipc::ClipAckRefused | ((Cmd)w.type == Cmd::ClearClip ? ipc::ClipAckWasClear : 0u);
+        e.x     = (f64)reason;
+        map_.evts->push(e);
+    }
+
+    // Scalars pass straight through; SetClip/ClearClip go via the clip table
+    // and the pool; SetChain and the two Record commands still carry GUI-heap
+    // pointers and are still refused at the boundary rather than
+    // half-translated, because a SetChain whose `p` was silently zeroed is a
+    // track that loses its plugins, and you find that on stage.
+    bool translate(const ipc::WireCommand& w, Staged& out, u32& reason) {
         if (!ipc::commandIsKnown(w.type)) { reason = ipc::RejectUnknownCommand; return false; }
+        if (ipc::commandIsPooled(w.type)) return translateClip(w, out, reason);
         if (!ipc::commandIsScalar(w.type)) { reason = ipc::RejectPointerPayload; return false; }
         if (!std::isfinite(w.x)) { reason = ipc::RejectNotFinite; return false; }
 
+        Command& c  = out.cmd;
         const Cmd t = (Cmd)w.type;
         // Bounds-check indices at drain time (§5). The engine checks too, but a
         // peer's wild index should never get as far as the audio thread, and a
@@ -385,12 +520,155 @@ private:
             return false;
         }
 
-        out.type = t;
-        out.a    = w.a;
-        out.b    = w.b;
-        out.x    = w.x;
-        out.p    = nullptr;              // no pointer ever crosses in phase 1
+        c.type = t;
+        c.a    = w.a;
+        c.b    = w.b;
+        c.x    = w.x;
+        c.p    = nullptr;                // no raw pointer ever crosses the wire
         return true;
+    }
+
+    // -- clips --------------------------------------------------------------
+    //
+    // THE VALIDATION CONTRACT
+    //
+    // Everything below runs on a WireClip the peer wrote into shared memory. It
+    // is not input from a trusted library; it is whatever another process last
+    // stored at that address, which under a crashed or compromised GUI is any
+    // 120 bytes at all. The rule that follows from that is absolute and it is
+    // the reason this function is long:
+    //
+    //     no path through here may produce an RtClip whose `data` or `notes`
+    //     is anything other than a pointer into the mapped pool, backed by a
+    //     block that is allocated, of the right kind, and at least as large as
+    //     the clip says it will read.
+    //
+    // So the offsets go through poolValidate() (bounds, alignment, self-mixed
+    // block magic, block state and size — src/ipc/pool.h) and the *scalars* go
+    // through range checks here, because they are what the engine multiplies
+    // the pointer by. `frames * channels` is the read extent; a wild
+    // `loopEnd` walks `fetch()` off the end just as effectively as a wild
+    // offset would. Engine clamps some of these and the doc's §5 row says a bad
+    // offset "never reaches a voice" — this is where that is made true.
+    bool translateClip(const ipc::WireCommand& w, Staged& out, u32& reason) {
+        if (w.a < 0 || w.a >= kMaxTracks || w.b < 0 || w.b >= kMaxScenes) {
+            reason = ipc::RejectBadIndex;
+            return false;
+        }
+        const ipc::WireClip* cell = map_.clip(w.a, w.b);
+        if (!cell) { reason = ipc::RejectBadIndex; return false; }
+
+        out.pooled  = true;
+        out.cmd.a   = w.a;
+        out.cmd.b   = w.b;
+        out.cmd.p   = nullptr;
+
+        if ((Cmd)w.type == Cmd::ClearClip) {
+            // Nothing to validate: clearing names no memory. The cell is not
+            // even read — an empty shadow entry is what "cleared" means.
+            out.cmd.type = Cmd::ClearClip;
+            out.isClear  = true;
+            out.cell     = ipc::WireClip{};
+            out.cell.generation = (u32)w.ref;
+            return true;
+        }
+
+        // Snapshot first. The client may write the cell again the moment it
+        // sees the acknowledgement, so every check below and the RtClip that
+        // comes out of them must be reading one consistent copy, not the live
+        // shared memory.
+        const ipc::WireClip c = *cell;
+        out.cmd.type = Cmd::SetClip;
+        out.cell     = c;
+
+        const f64 scalars[] = {c.clipBpm, c.lengthBeats, c.prob, c.followBeats, (f64)c.gain};
+        for (f64 v : scalars) if (!std::isfinite(v)) { reason = ipc::RejectNotFinite; return false; }
+
+        if (c.channels < 1 || c.channels > 2)                    { reason = ipc::RejectBadClip; return false; }
+        if (c.frames < 0 || c.noteCount < 0)                     { reason = ipc::RejectBadClip; return false; }
+        if (c.warp < 0 || c.warp > (i32)Warp::Beats)             { reason = ipc::RejectBadClip; return false; }
+        if (c.followAction < 0 || c.followAction >= kFollowCount){ reason = ipc::RejectBadClip; return false; }
+        if (c.quantumIdx < -1 || c.quantumIdx >= kQuantumCount)  { reason = ipc::RejectBadClip; return false; }
+        if (c.clipBpm <= 0.0 || c.lengthBeats < 0.0)             { reason = ipc::RejectBadClip; return false; }
+        if (c.prob < 0.0 || c.prob > 1.0)                        { reason = ipc::RejectBadClip; return false; }
+        if (c.noteCount > (i64)INT32_MAX)                        { reason = ipc::RejectBadClip; return false; }
+
+        // An invalid cell is a legal thing to publish — it is how a GUI parks
+        // an empty slot — and it references nothing, so it skips the pool
+        // entirely. Anything that *does* reference the pool needs one mapped.
+        if ((c.sampleRef || c.notesRef) && !pool_.valid()) {
+            reason = ipc::RejectNoPool;
+            return false;
+        }
+
+        RtClip rc{};
+        if (c.valid) {
+            if (c.isMidi) {
+                if (!c.notesRef || c.noteCount <= 0) { reason = ipc::RejectBadClip; return false; }
+                if (c.lengthBeats <= 0.0)            { reason = ipc::RejectBadClip; return false; }
+            } else {
+                if (!c.sampleRef || c.frames <= 0)   { reason = ipc::RejectBadClip; return false; }
+                // The loop window is a read range, so it is bounded like one.
+                if (c.loopStart < 0 || c.loopEnd < c.loopStart || c.loopEnd > c.frames) {
+                    reason = ipc::RejectBadClip;
+                    return false;
+                }
+            }
+        }
+
+        if (c.sampleRef) {
+            const u64 need = (u64)c.frames * (u64)c.channels * sizeof(f32);
+            const char* why = "";
+            if (!pool_.validate(c.sampleRef, ipc::PoolKindSamples, need, &why)) {
+                logBadRef("sample", c.sampleRef, w.a, w.b, why);
+                reason = ipc::RejectBadPoolRef;
+                return false;
+            }
+            rc.data = (const f32*)pool_.at(c.sampleRef);
+        }
+        if (c.notesRef) {
+            const u64 need = (u64)c.noteCount * sizeof(ipc::WireNote);
+            const char* why = "";
+            if (!pool_.validate(c.notesRef, ipc::PoolKindNotes, need, &why)) {
+                logBadRef("notes", c.notesRef, w.a, w.b, why);
+                reason = ipc::RejectBadPoolRef;
+                return false;
+            }
+            // WireNote is asserted to mirror RtNote field for field (pool.h),
+            // so this is a reinterpretation and not a conversion — which is
+            // what keeps a 10 000-note clip free at the boundary.
+            rc.notes = (const RtNote*)pool_.at(c.notesRef);
+        }
+
+        rc.frames       = c.frames;
+        rc.channels     = (int)c.channels;
+        rc.loopStart    = c.loopStart;
+        rc.loopEnd      = c.loopEnd;
+        rc.clipBpm      = c.clipBpm;
+        rc.lengthBeats  = c.lengthBeats;
+        rc.gain         = c.gain;
+        rc.warp         = (int)c.warp;
+        rc.loop         = c.loop != 0;
+        rc.quantumIdx   = (int)c.quantumIdx;
+        rc.prob         = c.prob;
+        rc.followAction = (int)c.followAction;
+        rc.followBeats  = c.followBeats;
+        rc.noteCount    = (int)c.noteCount;
+        rc.isMidi       = c.isMidi != 0;
+        rc.valid        = c.valid != 0;
+        out.cmd.clip    = rc;
+        return true;
+    }
+
+    // Rate-limited like reject(): a GUI with a stale project can produce one of
+    // these per clip, and a log line per clip would bury everything else.
+    void logBadRef(const char* what, u64 ref, i32 t, i32 s, const char* why) {
+        if (opt_.verbose || badRefLogged_ < kRejectLogLimit) {
+            ++badRefLogged_;
+            LOGW("clip [%d][%d]: %s offset %llu rejected: %s%s", (int)t, (int)s, what,
+                 (unsigned long long)ref, why,
+                 (!opt_.verbose && badRefLogged_ == kRejectLogLimit) ? " [further bad offsets silent]" : "");
+        }
     }
 
     void reject(const ipc::WireCommand& w, u32 reason) {
@@ -423,13 +701,153 @@ private:
         }
     }
 
-    // Engine events out. The four pointer-carrying events cannot cross and are
-    // dropped with a counter; in phase 1 they are also unreachable, because the
-    // commands that would allocate their payloads are refused above. If the
+    // -- retirement ---------------------------------------------------------
+    //
+    // THE FREE-AFTER-CONFIRM RULE, DAEMON SIDE
+    //
+    // The client may return a pool block to its free list only after this
+    // daemon has echoed the block's offset back in an EvBlockRetired event
+    // (src/ipc/pool.h states the client's half). What the echo asserts is:
+    //
+    //   1. the command that displaced the block — a SetClip installing
+    //      something else in that cell, or a ClearClip — has been handed to
+    //      Engine::pushCommand. Not "sent by the client": handed over, which is
+    //      why the entry is queued from commit() and not from translate();
+    //   2. no other cell of the daemon's shadow clip table still names the
+    //      offset (a block may legitimately back several slots);
+    //   3. the audio thread has since run drainCommands() at least once.
+    //
+    // (3) is the interesting one, and it is what makes (1) sufficient. A Voice
+    // does not hold a copy of its RtClip; it holds `&clips_[t][s]`, and
+    // drainCommands() overwrites that cell in place. So the instant the engine
+    // drains the displacing command, every voice reading that slot is reading
+    // the *new* clip — there is no release tail over the old buffer to wait
+    // out, unlike the chain-retirement case this pattern comes from. One
+    // completed drain is the whole proof.
+    //
+    // How we know a drain happened, given that src/audio is frozen and cannot
+    // be asked:
+    //
+    //   * exactly, when the engine tells us. Replacing or clearing a MIDI clip
+    //     makes Engine push Ev::NotesRetired from inside drainCommands, so the
+    //     event's arrival *is* the drain. pumpEvents() below turns that
+    //     pointer back into an offset and releases the matching entry at once.
+    //   * conservatively otherwise, by deadline. There is no equivalent event
+    //     for sample data, so a sample block waits kRetireGraceNs — two orders
+    //     of magnitude longer than the block period, plus (under the null
+    //     driver, where we can count them) kRetireBlocks actual rendered
+    //     blocks.
+    //
+    // Both are documented rather than hidden because the deadline is the weak
+    // one: a wedged backend does not drain, and the deadline fires anyway. What
+    // bounds that is the pool's design, not the timer — the region stays mapped
+    // for the daemon's whole life and never shrinks, so the worst case is a
+    // voice reading bytes that have been reallocated to another clip. Audible,
+    // findable, and not a wild pointer. The exact version of this needs
+    // Engine to count its own drains, which is a two-line change in src/audio
+    // and the first thing phase 3 should take.
+    static constexpr u64 kRetireGraceNs = 100ull * 1000000ull;   // 100 ms
+    static constexpr u64 kRetireBlocks  = 4;
+
+    // Records what the engine now holds for a cell and queues whatever that
+    // displaced. Runs only from commit().
+    void installClip(int track, int slot, const ipc::WireClip& nc) {
+        ipc::WireClip& cur = shadow_[track][slot];
+        const u64 oldSample = cur.sampleRef;
+        const u64 oldNotes  = cur.notesRef;
+        cur = nc;
+        // A block can come back: clear a slot and re-publish the same sample
+        // into another one, and the retirement queued a moment ago is now
+        // wrong. Cancelling is not strictly required — the client ignores an
+        // echo for a block it has since marked live again — but an event that
+        // says "you may free this" about a block that is in use is the kind of
+        // thing that is true today and load-bearing tomorrow.
+        if (nc.sampleRef) cancelRetire(nc.sampleRef);
+        if (nc.notesRef)  cancelRetire(nc.notesRef);
+        if (oldSample) considerRetire(oldSample, ipc::PoolKindSamples, track, slot);
+        if (oldNotes)  considerRetire(oldNotes,  ipc::PoolKindNotes,   track, slot);
+    }
+
+    void cancelRetire(u64 ref) {
+        for (size_t i = 0; i < retiring_.size(); ++i)
+            if (retiring_[i].ref == ref) {
+                retiring_.erase(retiring_.begin() + (long)i);
+                return;
+            }
+    }
+
+    void considerRetire(u64 ref, u32 kind, int track, int slot) {
+        // Still backing another slot? Then it is not retiring, it is shared.
+        for (int t = 0; t < kMaxTracks; ++t)
+            for (int s = 0; s < kMaxScenes; ++s)
+                if (shadow_[t][s].sampleRef == ref || shadow_[t][s].notesRef == ref) return;
+        for (const Retire& r : retiring_) if (r.ref == ref) return;
+
+        Retire r{};
+        r.ref       = ref;
+        r.kind      = kind;
+        r.track     = track;
+        r.slot      = slot;
+        const u64 blockNs = (u64)((f64)block_ / sr_ * 1e9);
+        r.dueNs     = ipc::monotonicNs() +
+                      (kRetireGraceNs > 8 * blockNs ? kRetireGraceNs : 8 * blockNs);
+        r.dueBlocks = (nullDriver_ ? nullDriver_->blocks() : 0) + kRetireBlocks;
+        retiring_.push_back(r);
+    }
+
+    // An address the engine handed back names a block the client knows by
+    // offset. A pointer that is not inside the pool is not a block at all and
+    // must never be echoed as one — that is what offsetOf() returning 0 means.
+    void confirmRetire(const void* p) {
+        const u64 off = pool_.offsetOf(p);
+        if (!off) {
+            map_.hdr->eventsDropped.fetch_add(1, std::memory_order_relaxed);
+            LOGW("Ev::NotesRetired carried %p, which is not inside the sample pool", p);
+            return;
+        }
+        for (Retire& r : retiring_) if (r.ref == off) { r.confirmed = true; return; }
+    }
+
+    void pumpRetirements() {
+        if (retiring_.empty()) return;
+        const u64 now    = ipc::monotonicNs();
+        const u64 blocks = nullDriver_ ? nullDriver_->blocks() : 0;
+        size_t keep = 0;
+        for (size_t i = 0; i < retiring_.size(); ++i) {
+            const Retire& r = retiring_[i];
+            const bool due = r.confirmed ||
+                             (now >= r.dueNs && (!nullDriver_ || blocks >= r.dueBlocks));
+            if (due && publishRetired(r)) continue;          // done with it
+            retiring_[keep++] = r;                           // not yet, or ring full
+        }
+        retiring_.resize(keep);
+    }
+
+    bool publishRetired(const Retire& r) {
+        ipc::WireEvent e{};
+        e.type  = ipc::EvBlockRetired;
+        e.flags = r.kind;
+        e.a     = r.track;
+        e.b     = r.slot;
+        e.ref   = r.ref;
+        if (!map_.evts->push(e)) return false;               // client asleep; retry
+        map_.hdr->blocksRetired.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Engine events out. Ev::NotesRetired is translated rather than forwarded:
+    // its pointer is an address in *this* process, but it is an address inside
+    // the pool, so the daemon knows the offset the client calls it by. The
+    // other three pointer-carrying events remain unreachable, because the
+    // commands that would allocate their payloads are still refused. If their
     // counter ever moves, something reached the engine that should not have.
     void pumpEvents() {
         Event ev;
         while (engine_->popEvent(ev)) {
+            if (ev.type == Ev::NotesRetired) {
+                confirmRetire(ev.p);
+                continue;
+            }
             if (!ipc::eventIsScalar((u32)ev.type)) {
                 map_.hdr->eventsDropped.fetch_add(1, std::memory_order_relaxed);
                 LOGW("engine event %u carries a pointer and cannot cross (phase 2)",
@@ -524,6 +942,15 @@ private:
         if (backend_)    backend_->stop();
         if (nullDriver_) nullDriver_->stop();
 
+        // Rendering has stopped, so every outstanding retirement is trivially
+        // true: there is no audio thread left to be inside a clip. Publishing
+        // them now lets a client that is still attached free its pool cleanly
+        // instead of leaving blocks stuck in Retiring for the rest of its life
+        // — which matters because the pool outlives us and may well be handed
+        // to the next engine.
+        for (const Retire& r : retiring_) publishRetired(r);
+        retiring_.clear();
+
         // The shutdown flag is the last thing written and it is published with
         // release: an attacher's mapping survives shm_unlink, so this is how a
         // still-attached client learns the difference between "the engine went
@@ -549,6 +976,10 @@ private:
              (unsigned long long)map_.hdr->midiApplied.load(),
              (unsigned long long)map_.hdr->eventsForwarded.load(),
              (unsigned long long)map_.hdr->eventsDropped.load());
+        LOGI("clips: %llu applied, %llu pool blocks retired; pool %s",
+             (unsigned long long)map_.hdr->clipsApplied.load(),
+             (unsigned long long)map_.hdr->blocksRetired.load(),
+             pool_.valid() ? pool_.name() : "(none)");
     }
 
     static constexpr int kRejectLogLimit = 8;
@@ -559,14 +990,28 @@ private:
     std::unique_ptr<NullDriver>    nullDriver_;
     ipc::ShmRegion                 region_;
     ipc::ControlMap                map_;
+    ipc::PoolReader                pool_;       // read-only: the GUI owns it
     std::thread                    mirror_;
     std::atomic<bool>              mirrorRun_{false};
-    Command                        pending_{};
+    Staged                         pending_{};
     bool                           havePending_ = false;
     int                            rejectLogged_ = 0;
+    int                            badRefLogged_ = 0;
+    u64                            poolEpoch_    = 0;
+    u64                            poolRetryNs_  = 0;
+    bool                           poolFailLogged_   = false;
+    bool                           poolRebindLogged_ = false;
     f64                            sr_    = 48000.0;
     int                            block_ = 256;
     char                           driverName_[32] = "none";
+
+    // What the engine holds, as far as the boundary knows. It is a shadow and
+    // not a view of the shared table because the table is the *client's*
+    // memory: the client may rewrite a cell the moment it is acknowledged, and
+    // the diff that decides what got displaced has to be against what was
+    // actually forwarded.
+    ipc::WireClip                  shadow_[kMaxTracks][kMaxScenes]{};
+    std::vector<Retire>            retiring_;
 };
 
 } // namespace

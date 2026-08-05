@@ -1,10 +1,17 @@
 // Engine-daemon tests.
 //
 // Spawns a real ./build/latticed in --driver null mode, attaches to its control
-// region with ipc::EngineClient, and exercises the whole phase-1 boundary from
-// the outside: version handshake, scalar commands, the polled state block, the
+// region with ipc::EngineClient, and exercises the whole boundary from the
+// outside: version handshake, scalar commands, the polled state block, the
 // refusal of every pointer-carrying command, engine death by SIGKILL, and clean
 // shutdown by SIGTERM.
+//
+// Phase 2 added the sample pool, and with it the assertions that matter most
+// here: a clip synthesised in this process, written into shared memory,
+// published as an *offset*, launched by the engine in another process, and
+// heard coming back out through the published meters. Plus the ownership
+// inversion that makes the pool worth having — SIGKILL the engine and the
+// samples are still there, because the pool belongs to this process.
 //
 // Nothing here links the engine, the GUI or any audio library — the client side
 // of the protocol depends on libc alone and the test keeps it that way. The
@@ -18,6 +25,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <dirent.h>
@@ -67,6 +75,7 @@ static void note(const char* fmt, ...) {
 static const char* gDaemonPath = "./build/latticed";
 static char        gSession[64] = {};
 static char        gRegion[128] = {};
+static char        gPool[128]   = {};
 static pid_t       gDaemons[8]  = {};
 static int         gDaemonCount = 0;
 
@@ -83,6 +92,9 @@ static void cleanup() {
         gDaemons[i] = 0;
     }
     if (gRegion[0]) ipc::ShmRegion::forceUnlink(gRegion);
+    // The pool is GUI-owned, so a test that dies mid-run is exactly the "GUI
+    // crashed" case: nothing else will ever unlink it.
+    if (gPool[0]) ipc::ShmRegion::forceUnlink(gPool);
 }
 static void fatalSignal(int sig) {
     cleanup();
@@ -94,14 +106,29 @@ static void armCleanup() {
     for (int s : {SIGINT, SIGTERM, SIGSEGV, SIGABRT, SIGBUS, SIGPIPE}) ::signal(s, fatalSignal);
 }
 
-static int countLatticeShm() {
+// Lattice regions currently in /dev/shm, excluding `allow` (a leading '/' is
+// tolerated, since that is how region names are spelled everywhere else).
+// Anything counted is also printed: a leaked region is a bug report, not a
+// number.
+static int countLatticeShm(const char* allow = nullptr) {
+    const char* skip = (allow && *allow == '/') ? allow + 1 : allow;
     DIR* d = ::opendir("/dev/shm");
     if (!d) return -1;
     int n = 0;
-    while (dirent* e = ::readdir(d))
-        if (std::strstr(e->d_name, "lattice")) { ++n; note("leftover /dev/shm/%s", e->d_name); }
+    while (dirent* e = ::readdir(d)) {
+        if (!std::strstr(e->d_name, "lattice")) continue;
+        if (skip && !std::strcmp(e->d_name, skip)) continue;
+        ++n;
+        note("leftover /dev/shm/%s", e->d_name);
+    }
     ::closedir(d);
     return n;
+}
+
+static bool shmExists(const char* name) {
+    char path[256];
+    std::snprintf(path, sizeof path, "/dev/shm/%s", (*name == '/') ? name + 1 : name);
+    return ::access(path, F_OK) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +190,98 @@ static f32 peakMaster(ipc::EngineClient& c, int ms) {
         sleepMs(1);
     } while (ipc::monotonicNs() < deadline);
     return peak;
+}
+
+static f32 peakTrack(ipc::EngineClient& c, int track, int ms) {
+    f32 peak = 0.f;
+    const u64 deadline = ipc::monotonicNs() + (u64)ms * 1000000ull;
+    do {
+        const f32 l = c.state().meterL[track].load(std::memory_order_relaxed);
+        const f32 r = c.state().meterR[track].load(std::memory_order_relaxed);
+        peak = std::max(peak, std::max(l, r));
+        sleepMs(1);
+    } while (ipc::monotonicNs() < deadline);
+    return peak;
+}
+
+// ---------------------------------------------------------------------------
+// clip helpers
+// ---------------------------------------------------------------------------
+
+// The events the pool protocol answers with. Every clip publication gets
+// exactly one EvClipAck; a retirement gets one EvBlockRetired. Draining is not
+// optional in this test — EngineClient::popEvent() is where the client-side
+// bookkeeping happens (a cell unblocks, a block becomes freeable), so a section
+// that stopped draining would wedge itself.
+static bool waitClipIdle(ipc::EngineClient& c, int track, int slot, int timeoutMs = 2000) {
+    return waitUntil([&] { drainEvents(c); return !c.clipBusy(track, slot); }, timeoutMs);
+}
+
+static bool waitRetired(ipc::EngineClient& c, u64 ref, int timeoutMs = 3000) {
+    return waitUntil([&] {
+        drainEvents(c);
+        return c.pool().stateOf(ref) != ipc::BlockRetiring;
+    }, timeoutMs);
+}
+
+// A DC clip: every sample the same value. Deliberately the least musical
+// signal there is, because it makes the meter a *measurement* — a DC clip at
+// 0.5 through unity gain has to publish a peak of 0.5, so the assertion is an
+// equality with a tolerance rather than "something happened".
+static std::vector<f32> makeDc(i64 frames, int channels, f32 level) {
+    std::vector<f32> v((size_t)frames * (size_t)channels, level);
+    return v;
+}
+
+// An ascending run of notes. Built one at a time and pushed rather than sized
+// and indexed, because the latter lets gcc merge the two u8 stores into one
+// 16-bit store it then cannot prove is in bounds (-Wstringop-overflow); this
+// spelling is also the one a real note editor would use.
+static std::vector<ipc::WireNote> makeNotes(int count, int firstPitch, f64 step, f64 len) {
+    std::vector<ipc::WireNote> v;
+    v.reserve((size_t)count);
+    for (int i = 0; i < count; ++i) {
+        ipc::WireNote n{};
+        n.beat  = step * i;
+        n.len   = len;
+        n.pitch = (u8)(firstPitch + i);
+        n.vel   = 100;
+        v.push_back(n);
+    }
+    return v;
+}
+
+// Fills in the fields every clip in this file shares. Warp::Off on purpose:
+// the warp modes resample, and while DC survives resampling exactly, "the
+// meter reads the level" should not depend on that being true.
+static ipc::WireClip audioClip(u64 ref, i64 frames, int channels) {
+    ipc::WireClip c = ipc::defaultWireClip();
+    c.sampleRef   = ref;
+    c.frames      = frames;
+    c.channels    = channels;
+    c.loopStart   = 0;
+    c.loopEnd     = frames;
+    c.warp        = (i32)Warp::Off;
+    c.loop        = 1;
+    c.quantumIdx  = 0;            // launch now, do not wait for the bar line
+    c.lengthBeats = 4.0;
+    c.gain        = 1.0f;
+    c.valid       = 1;
+    return c;
+}
+
+// Puts track 0 back to unity and audible. Section 4 leaves a mute on track 0
+// and a solo on track 2, both of which would silence everything here — and a
+// meter test that silently measured a muted track would pass for the wrong
+// reason on the day the clip stopped playing.
+static void resetMixer(ipc::EngineClient& c) {
+    c.pushCommand(Cmd::TrackMute, 0, 0);
+    c.pushCommand(Cmd::TrackSolo, 2, 0);
+    c.pushCommand(Cmd::TrackArm,  3, 0);
+    c.pushCommand(Cmd::TrackVol,  0, 0, 1.0);
+    c.pushCommand(Cmd::TrackVol,  1, 0, 1.0);
+    c.pushCommand(Cmd::TrackPan,  1, 0, 0.0);
+    c.pushCommand(Cmd::MasterVol, 0, 0, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,9 +466,10 @@ static void testMetronomeAndMaster(ipc::EngineClient& c) {
 
 static void testCommandBoundary(ipc::EngineClient& c) {
     banner("4. scalar commands cross; pointer-carrying commands are refused");
-    note("phase 1 is scalar-only. SetClip/ClearClip/SetChain/RecordSlot/");
-    note("RecordMidiSlot carry GUI-heap pointers, so the daemon refuses them at");
-    note("the boundary with a reason rather than half-translating them.");
+    note("SetChain/RecordSlot/RecordMidiSlot still carry GUI-heap pointers, so");
+    note("the daemon refuses them at the boundary with a reason rather than");
+    note("half-translating them. SetClip and ClearClip left this list in phase 2");
+    note("and are exercised against a real pool in sections 6-10.");
 
     drainEvents(c);
     const ipc::ControlHeader& h = c.header();
@@ -379,30 +499,32 @@ static void testCommandBoundary(ipc::EngineClient& c) {
           (unsigned long long)(h.commandsApplied.load() - applied0));
     CHECK(h.commandsRejected.load() == rejected0, "and none of them was refused");
 
-    // -- the five that cannot cross -----------------------------------------
-    const Cmd pointerCmds[] = {Cmd::SetClip, Cmd::ClearClip, Cmd::SetChain,
-                               Cmd::RecordSlot, Cmd::RecordMidiSlot};
+    // -- the three that still cannot cross ----------------------------------
+    const Cmd pointerCmds[] = {Cmd::SetChain, Cmd::RecordSlot, Cmd::RecordMidiSlot};
+    const int kPointerCmds  = (int)(sizeof pointerCmds / sizeof pointerCmds[0]);
     const u64 applied1 = h.commandsApplied.load();
     for (Cmd t : pointerCmds) {
         ipc::WireCommand w{};
         w.type = (u32)t;
         w.a = 0; w.b = 0; w.x = 4.0;
-        w.ref = 0xdeadbeefull;                     // the future pool handle
+        w.ref = 0xdeadbeefull;
         CHECK(c.pushCommand(w), "push pointer-carrying command %u", (u32)t);
     }
     const bool allRejected = waitUntil([&] {
-        return h.commandsRejected.load() >= rejected0 + 5;
+        return h.commandsRejected.load() >= rejected0 + (u64)kPointerCmds;
     }, 1000);
-    CHECK(allRejected, "all five were refused (%llu rejected)",
+    CHECK(allRejected, "all three were refused (%llu rejected)",
           (unsigned long long)(h.commandsRejected.load() - rejected0));
     CHECK(h.commandsApplied.load() == applied1,
           "and not one of them reached the engine (%llu applied since)",
           (unsigned long long)(h.commandsApplied.load() - applied1));
 
     std::vector<ipc::WireEvent> evs;
-    waitUntil([&] { drainEvents(c, &evs); return countEvents(evs, ipc::EvCommandRejected) >= 5; },
-              1000);
-    CHECK(countEvents(evs, ipc::EvCommandRejected) == 5,
+    waitUntil([&] {
+        drainEvents(c, &evs);
+        return countEvents(evs, ipc::EvCommandRejected) >= kPointerCmds;
+    }, 1000);
+    CHECK(countEvents(evs, ipc::EvCommandRejected) == kPointerCmds,
           "one EvCommandRejected per refusal (%d)", countEvents(evs, ipc::EvCommandRejected));
     for (Cmd t : pointerCmds) {
         const ipc::WireEvent* e = findReject(evs, t);
@@ -410,6 +532,37 @@ static void testCommandBoundary(ipc::EngineClient& c) {
               "command %u refused with reason %u (%s)", (u32)t, e ? (u32)e->b : 0u,
               ipc::rejectReasonName(e ? (u32)e->b : 0u));
         CHECK(e && e->ref == 0xdeadbeefull, "the refusal echoes the caller's ref back");
+    }
+
+    // -- a clip with no pool behind it --------------------------------------
+    //
+    // SetClip is legal now, but only against a pool the daemon has mapped, and
+    // no pool exists yet. This is the first half of the "a bad offset never
+    // becomes a pointer" property: the offset here is plausible — aligned,
+    // small, positive — and it is still refused, because there is nothing to
+    // resolve it against.
+    evs.clear();
+    drainEvents(c);
+    {
+        ipc::WireClip wc = audioClip(/*ref*/64 * 1024, /*frames*/1024, /*channels*/2);
+        CHECK(c.setClip(0, 0, wc), "publish a clip cell that references a pool");
+        CHECK(c.clipBusy(0, 0), "the cell is blocked until the daemon answers");
+        const bool answered = waitUntil([&] {
+            drainEvents(c, &evs);
+            return countEvents(evs, ipc::EvClipAck) > 0;
+        }, 1000);
+        CHECK(answered, "an EvClipAck came back for it");
+        const ipc::WireEvent* ack = nullptr;
+        for (const ipc::WireEvent& e : evs) if (e.type == ipc::EvClipAck) ack = &e;
+        CHECK(ack && (ack->flags & ipc::ClipAckRefused),
+              "marked refused (flags 0x%x)", ack ? ack->flags : 0u);
+        CHECK(ack && (u32)ack->x == ipc::RejectNoPool,
+              "with reason %u (%s)", ack ? (u32)ack->x : 0u,
+              ipc::rejectReasonName(ack ? (u32)ack->x : 0u));
+        CHECK(!c.clipBusy(0, 0), "and the acknowledgement unblocks the cell for a retry");
+        CHECK(c.clipShadow(0, 0).sampleRef == 0,
+              "the client's shadow still says the slot is empty (%llu)",
+              (unsigned long long)c.clipShadow(0, 0).sampleRef);
     }
 
     // -- garbage is refused too, and refusing is not fatal -------------------
@@ -508,11 +661,443 @@ static void testBurst(ipc::EngineClient& c) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. engine crash: SIGKILL, detect, reap, respawn
+// 6. the sample pool: create, publish, attach
+// ---------------------------------------------------------------------------
+//
+// The pool is the one region the *client* owns. Everything downstream of here
+// depends on that inversion holding, so it is asserted directly rather than
+// inferred from clips working.
+
+static constexpr size_t kTestPoolBytes = 16u << 20;   // 16 MiB, sparse
+
+static void testPoolHandshake(ipc::EngineClient& c) {
+    banner("6. the sample pool: the client creates it, the daemon maps it read-only");
+
+    CHECK(c.createPool(gSession, kTestPoolBytes), "create %s: %s", gPool, c.error());
+    CHECK(c.pool().valid(), "the pool is mapped in this process");
+    CHECK(!std::strcmp(c.pool().name(), gPool), "under the session's name ('%s')",
+          c.pool().name());
+    CHECK(shmExists(gPool), "and it exists in /dev/shm");
+    CHECK(c.pool().bytes() >= kTestPoolBytes, "%zu B of payload (asked for %zu)",
+          c.pool().bytes(), kTestPoolBytes);
+    note("F_SEAL_SHRINK on a shm_open object: %s (memfd + SCM_RIGHTS is the "
+         "upgrade path, §3.2)", c.pool().sealed() ? "accepted" : "refused by the kernel");
+    note("bump %llu, largest free %llu B", (unsigned long long)c.pool().bump(),
+         (unsigned long long)c.pool().largestFree());
+
+    const bool mapped = waitUntil([&] { drainEvents(c); return c.poolReady(); }, 3000);
+    CHECK(mapped, "the daemon attached to it (epoch %llu, daemon says %llu)",
+          (unsigned long long)c.poolEpoch(),
+          (unsigned long long)c.header().poolAttachedEpoch.load());
+    CHECK(c.header().poolAttachFailures.load() == 0,
+          "with no failed attempts (%llu)",
+          (unsigned long long)c.header().poolAttachFailures.load());
+
+    // A second handle onto the same region: this is the §4.3 reattach path in
+    // miniature, and it is what proves the allocator's metadata really is in
+    // the region rather than in this object.
+    {
+        ipc::SamplePool second;
+        const bool ok = second.attach(gPool);
+        CHECK(ok, "a second handle attaches to the same pool%s%s", ok ? "" : ": ",
+              ok ? "" : second.error());
+        CHECK(ok && second.epoch() == c.poolEpoch(),
+              "and reads the same epoch (%llu)", (unsigned long long)second.epoch());
+        CHECK(ok && second.bump() == c.pool().bump(),
+              "and the same allocator state (bump %llu)",
+              (unsigned long long)second.bump());
+    }
+
+    // Layer 1 of the handshake applies to the pool exactly as it does to the
+    // control region: a build that disagrees about the layout must be refused
+    // rather than allowed to read blocks through the wrong offsets.
+    {
+        ipc::ShmRegion wrong;
+        const bool got = wrong.attach(gPool, ipc::pool::kHash ^ 1u, ipc::kShmVersion, 0);
+        CHECK(!got, "a mismatched layout hash is refused: %s", wrong.error());
+        ipc::ShmRegion oldVer;
+        const bool got2 = oldVer.attach(gPool, ipc::pool::kHash, ipc::kShmVersion + 1, 0);
+        CHECK(!got2, "so is a mismatched shm version: %s", oldVer.error());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. an audio clip, end to end
+// ---------------------------------------------------------------------------
+//
+// The headline of phase 2. A DC clip is synthesised here, memcpy'd into the
+// pool, published as an offset, launched by a command, and rendered by an
+// engine in another process — and because DC at 0.5 through unity gain is
+// exactly 0.5 at the meter, the check at the end is a measurement and not a
+// liveness test.
+
+static u64 gAudioRef = 0;
+
+static void testAudioClip(ipc::EngineClient& c) {
+    banner("7. upload a DC clip, SetClip, LaunchClip, and hear it in the meters");
+
+    resetMixer(c);
+
+    const i64 kFrames = 24000;              // half a second at 48 kHz
+    const f32 kLevel  = 0.5f;
+    const std::vector<f32> dc = makeDc(kFrames, 2, kLevel);
+
+    const u64 bump0 = c.pool().bump();
+    const u64 ref = c.poolWrite(dc.data(), kFrames, 2, 48000.0, /*key*/0xC0FFEEull);
+    gAudioRef = ref;
+    CHECK(ref != 0, "poolWrite %lld frames x 2ch -> offset %llu: %s",
+          (long long)kFrames, (unsigned long long)ref, ref ? "" : c.error());
+    if (!ref) return;
+    CHECK(ref % ipc::kPoolAlign == 0, "the offset is 64-byte aligned (%llu)",
+          (unsigned long long)ref);
+    CHECK(c.pool().stateOf(ref) == ipc::BlockQuiescent && c.pool().refsOf(ref) == 1,
+          "a fresh block is quiescent with one GUI reference (%s, refs %u)",
+          ipc::poolStateName(c.pool().stateOf(ref)), c.pool().refsOf(ref));
+    CHECK(c.pool().bump() > bump0, "the bump pointer moved (%llu -> %llu)",
+          (unsigned long long)bump0, (unsigned long long)c.pool().bump());
+    // The data really is in shared memory, not in the vector we built.
+    CHECK(c.pool().data<f32>(ref) && c.pool().data<f32>(ref)[0] == kLevel,
+          "and the samples are readable through the pool mapping");
+
+    ipc::WireClip wc = audioClip(ref, kFrames, 2);
+    CHECK(c.setClip(0, 0, wc), "publish it into clip cell [0][0]");
+    CHECK(waitClipIdle(c, 0, 0), "the daemon acknowledged the cell");
+    CHECK(c.clipShadow(0, 0).sampleRef == ref,
+          "the client's shadow holds the offset (%llu)",
+          (unsigned long long)c.clipShadow(0, 0).sampleRef);
+    CHECK(c.pool().stateOf(ref) == ipc::BlockLive && c.pool().liveOf(ref) == 1,
+          "and the block is live in one cell (%s, live %u)",
+          ipc::poolStateName(c.pool().stateOf(ref)), c.pool().liveOf(ref));
+    CHECK(c.header().clipsApplied.load() > 0, "the daemon counted a clip applied (%llu)",
+          (unsigned long long)c.header().clipsApplied.load());
+
+    // LaunchClip starts the transport itself, and the clip's quantum is None,
+    // so this fires on the next drained block rather than on a bar line.
+    CHECK(c.pushCommand(Cmd::LaunchClip, 0, 0), "push LaunchClip [0][0]");
+    const bool playing = waitUntil([&] {
+        drainEvents(c);
+        return c.state().slotState[0].load() == (int)SlotState::Playing &&
+               c.state().activeSlot[0].load() == 0;
+    }, 2000);
+    CHECK(playing, "slotState[0] is Playing on slot %d (state %d)",
+          c.state().activeSlot[0].load(), c.state().slotState[0].load());
+
+    const f64 phase0 = c.state().clipPhase[0].load();
+    const bool advanced = waitUntil([&] {
+        return c.state().clipPhase[0].load() != phase0;
+    }, 1000);
+    CHECK(advanced, "clipPhase advances (%.4f -> %.4f)", phase0,
+          c.state().clipPhase[0].load());
+
+    // The payoff: a number this process wrote into shared memory came back as
+    // audio rendered by another process.
+    const f32 peak = peakTrack(c, 0, 400);
+    CHECK(std::fabs(peak - kLevel) < 0.05f,
+          "the track meter reads the DC level: %.4f (expected %.2f)",
+          (double)peak, (double)kLevel);
+    const f32 master = peakMaster(c, 200);
+    CHECK(master > 0.4f, "and it reaches the master bus too (%.4f)", (double)master);
+
+    // A clip started event crossed as well; it is scalar, so it needed nothing
+    // from the pool.
+    std::vector<ipc::WireEvent> evs;
+    drainEvents(c, &evs);
+    note("%d events drained after the launch, %d of them ClipStarted",
+         (int)evs.size(), countEvents(evs, (u32)Ev::ClipStarted));
+}
+
+// ---------------------------------------------------------------------------
+// 8. ClearClip, the retirement echo, and reuse
+// ---------------------------------------------------------------------------
+//
+// The free-after-confirm rule, exercised in the order it is written down: the
+// block does not become freeable when the GUI stops wanting it, and it does not
+// become freeable when the GUI stops referencing it from a cell. It becomes
+// freeable when the daemon says the engine cannot reach it.
+
+static void testClearAndRetire(ipc::EngineClient& c) {
+    banner("8. ClearClip retires the block, and only then may the GUI free it");
+
+    const u64 ref = gAudioRef;
+    if (!ref) { CHECK(false, "section 7 left no block to retire"); return; }
+
+    const u64 bumpWithBlock = c.pool().bump();
+    const u64 blockBytes    = c.pool().blockAt(ref)->bytes;
+
+    // Freeing now must be refused: the block is Live.
+    CHECK(!c.pool().free(ref), "free() refuses a live block: %s", c.pool().error());
+    CHECK(c.pool().stateOf(ref) == ipc::BlockLive, "and it is still live");
+
+    CHECK(c.clearClip(0, 0), "push ClearClip [0][0]");
+    CHECK(waitClipIdle(c, 0, 0), "the daemon acknowledged the clear");
+    CHECK(c.clipShadow(0, 0).sampleRef == 0, "the shadow cell is empty");
+    // Displaced, but NOT freeable: this is the state the whole rule exists for.
+    CHECK(c.pool().stateOf(ref) == ipc::BlockRetiring ||
+          c.pool().stateOf(ref) == ipc::BlockQuiescent,
+          "the block left Live (%s)", ipc::poolStateName(c.pool().stateOf(ref)));
+
+    const u64 retired0 = c.header().blocksRetired.load();
+    std::vector<ipc::WireEvent> evs;
+    const bool echoed = waitUntil([&] {
+        drainEvents(c, &evs);
+        for (const ipc::WireEvent& e : evs)
+            if (e.type == ipc::EvBlockRetired && e.ref == ref) return true;
+        return false;
+    }, 3000);
+    CHECK(echoed, "an EvBlockRetired echoed offset %llu back (%llu retired in total)",
+          (unsigned long long)ref, (unsigned long long)c.header().blocksRetired.load());
+    for (const ipc::WireEvent& e : evs)
+        if (e.type == ipc::EvBlockRetired && e.ref == ref)
+            CHECK(e.flags == ipc::PoolKindSamples && e.a == 0 && e.b == 0,
+                  "naming the kind and the cell it left (kind %u, [%d][%d])",
+                  e.flags, e.a, e.b);
+    CHECK(c.header().blocksRetired.load() > retired0,
+          "the daemon counted the retirement (%llu -> %llu)",
+          (unsigned long long)retired0,
+          (unsigned long long)c.header().blocksRetired.load());
+    CHECK(c.pool().stateOf(ref) == ipc::BlockQuiescent,
+          "and the block is quiescent again (%s)", ipc::poolStateName(c.pool().stateOf(ref)));
+    CHECK(c.pool().refsOf(ref) == 1, "still holding the GUI's own reference");
+
+    // Now — and only now — dropping the last reference frees it.
+    CHECK(c.poolRelease(ref), "poolRelease() frees it");
+    CHECK(c.pool().stateOf(ref) == ipc::BlockFree, "the block is free (%s)",
+          ipc::poolStateName(c.pool().stateOf(ref)));
+    CHECK(c.pool().liveBlocks() == 0, "the pool holds no live blocks (%llu)",
+          (unsigned long long)c.pool().liveBlocks());
+
+    // Allocator behaviour, asserted rather than assumed: freeing the only block
+    // hands the arena's tail back to the bump pointer, so the next allocation
+    // of the same size lands on exactly the same offset. That is what keeps the
+    // edit-a-clip-and-repush loop from walking the pool.
+    CHECK(c.pool().bump() == bumpWithBlock - blockBytes - sizeof(ipc::PoolBlock),
+          "the bump pointer retracted over it (%llu, was %llu)",
+          (unsigned long long)c.pool().bump(), (unsigned long long)bumpWithBlock);
+    CHECK(c.pool().freeListLength() == 0,
+          "and nothing was left on the free list (%u entries)", c.pool().freeListLength());
+
+    const std::vector<f32> dc = makeDc(24000, 2, 0.25f);
+    const u64 again = c.poolWrite(dc.data(), 24000, 2, 48000.0, 0);
+    CHECK(again == ref, "reallocating the same size returns the same offset (%llu vs %llu)",
+          (unsigned long long)again, (unsigned long long)ref);
+    CHECK(c.poolRelease(again), "and it frees again immediately: it was never published");
+    gAudioRef = 0;
+
+    // Retirement is per *block*, not per cell. A block backing two slots must
+    // survive losing one of them — this is the case where a naive "the cell
+    // changed, so retire what it held" would hand the GUI permission to free
+    // memory the engine is still playing out of the other slot.
+    const std::vector<f32> mono = makeDc(2048, 1, 0.2f);
+    const u64 shared = c.poolWrite(mono.data(), 2048, 1, 48000.0, 0);
+    CHECK(shared != 0, "a block to share between two cells, at %llu",
+          (unsigned long long)shared);
+    if (!shared) return;
+    const ipc::WireClip sc = audioClip(shared, 2048, 1);
+    CHECK(c.setClip(3, 0, sc) && waitClipIdle(c, 3, 0), "publish it into [3][0]");
+    CHECK(c.setClip(3, 1, sc) && waitClipIdle(c, 3, 1), "and into [3][1] as well");
+    CHECK(c.pool().liveOf(shared) == 2, "the block is live in two cells (%u)",
+          c.pool().liveOf(shared));
+
+    CHECK(c.clearClip(3, 0) && waitClipIdle(c, 3, 0), "clear [3][0]");
+    sleepMs(300);                       // three times the retirement grace period
+    drainEvents(c);
+    CHECK(c.pool().stateOf(shared) == ipc::BlockLive,
+          "it stays live, because [3][1] still names it (%s)",
+          ipc::poolStateName(c.pool().stateOf(shared)));
+    CHECK(c.pool().liveOf(shared) == 1, "with one cell left (%u)", c.pool().liveOf(shared));
+    CHECK(!c.pool().free(shared), "and free() still refuses it");
+
+    CHECK(c.clearClip(3, 1) && waitClipIdle(c, 3, 1), "clear [3][1] too");
+    const bool sharedRetired = waitRetired(c, shared);
+    CHECK(sharedRetired, "now the last cell is gone, it retires");
+    CHECK(c.poolRelease(shared), "and the GUI may free it");
+    CHECK(c.pool().liveBlocks() == 0, "the pool is empty again (%llu live blocks)",
+          (unsigned long long)c.pool().liveBlocks());
+}
+
+// ---------------------------------------------------------------------------
+// 9. a MIDI clip through the notes pool
+// ---------------------------------------------------------------------------
+//
+// A MIDI clip carries no audio, so there is nothing to hear; what matters is
+// that the second kind of pool block survives the same round trip, that the
+// engine schedules from it, and that its retirement uses the *exact* path
+// rather than the deadline — replacing a notes array is the one displacement
+// the engine reports itself, through Ev::NotesRetired.
+
+static void testMidiClip(ipc::EngineClient& c) {
+    banner("9. a MIDI clip: notes cross as a pool offset too");
+
+    c.pushCommand(Cmd::StopAll);
+    c.pushCommand(Cmd::SetTempo, 0, 0, 120.0);
+
+    std::vector<ipc::WireNote> notes = makeNotes(8, 60, 0.5, 0.25);
+    const u64 nref = c.poolWriteNotes(notes.data(), (i64)notes.size(), 0);
+    CHECK(nref != 0, "poolWriteNotes 8 notes -> offset %llu", (unsigned long long)nref);
+    if (!nref) return;
+    CHECK(c.pool().blockAt(nref) && c.pool().blockAt(nref)->kind == ipc::PoolKindNotes,
+          "the block is tagged as notes, not samples");
+
+    ipc::WireClip wc = ipc::defaultWireClip();
+    wc.notesRef    = nref;
+    wc.noteCount   = (i64)notes.size();
+    wc.isMidi      = 1;
+    wc.lengthBeats = 4.0;
+    wc.loop        = 1;
+    wc.quantumIdx  = 0;
+    wc.valid       = 1;
+    CHECK(c.setClip(1, 0, wc), "publish it into clip cell [1][0]");
+    CHECK(waitClipIdle(c, 1, 0), "the daemon acknowledged the cell");
+    CHECK(c.pool().stateOf(nref) == ipc::BlockLive, "the notes block is live (%s)",
+          ipc::poolStateName(c.pool().stateOf(nref)));
+
+    CHECK(c.pushCommand(Cmd::LaunchClip, 1, 0), "push LaunchClip [1][0]");
+    const bool playing = waitUntil([&] {
+        drainEvents(c);
+        return c.state().slotState[1].load() == (int)SlotState::Playing;
+    }, 2000);
+    CHECK(playing, "slotState[1] is Playing (state %d)", c.state().slotState[1].load());
+
+    const f64 phase0 = c.state().clipPhase[1].load();
+    const bool advanced = waitUntil([&] {
+        return c.state().clipPhase[1].load() != phase0;
+    }, 1000);
+    CHECK(advanced, "clipPhase advances through the MIDI clip (%.4f -> %.4f)",
+          phase0, c.state().clipPhase[1].load());
+
+    // Replace the notes with a different array. Engine pushes Ev::NotesRetired
+    // for the old one from inside drainCommands, which the daemon turns back
+    // into an offset — so this retirement is proved rather than timed out.
+    const u64 dropped0 = c.header().eventsDropped.load();
+    std::vector<ipc::WireNote> more = makeNotes(16, 48, 0.25, 0.125);
+    const u64 nref2 = c.poolWriteNotes(more.data(), (i64)more.size(), 0);
+    CHECK(nref2 != 0 && nref2 != nref, "a second notes block at %llu",
+          (unsigned long long)nref2);
+
+    ipc::WireClip wc2 = wc;
+    wc2.notesRef  = nref2;
+    wc2.noteCount = (i64)more.size();
+    CHECK(c.setClip(1, 0, wc2), "repush the cell with the new notes");
+    CHECK(waitClipIdle(c, 1, 0), "acknowledged");
+    // The wait runs on its own line, never inside CHECK's condition: the order
+    // of a condition and the arguments that report it is unspecified, and the
+    // message would print the state from *before* the wait.
+    const bool oldRetired = waitRetired(c, nref);
+    CHECK(oldRetired, "the old notes block was retired");
+    CHECK(c.pool().stateOf(nref) == ipc::BlockQuiescent, "and is quiescent (%s)",
+          ipc::poolStateName(c.pool().stateOf(nref)));
+    CHECK(c.header().eventsDropped.load() == dropped0,
+          "Ev::NotesRetired was translated, not dropped (%llu dropped)",
+          (unsigned long long)(c.header().eventsDropped.load() - dropped0));
+    CHECK(c.poolRelease(nref), "so the GUI can free it");
+
+    // Leave the track quiet; the crash section wants a clean picture.
+    CHECK(c.clearClip(1, 0), "clear [1][0]");
+    CHECK(waitClipIdle(c, 1, 0), "acknowledged");
+    const bool secondRetired = waitRetired(c, nref2);
+    CHECK(secondRetired, "the second notes block retired too");
+    CHECK(c.poolRelease(nref2), "and freed");
+    c.pushCommand(Cmd::StopAll);
+}
+
+// ---------------------------------------------------------------------------
+// 10. bad offsets
+// ---------------------------------------------------------------------------
+//
+// Every one of these is a `u64` that must never become a pointer the engine
+// dereferences. The daemon has to refuse each of them and stay up: a boundary
+// that crashes on bad input has moved the failure, not prevented it.
+
+static void testBadOffsets(ipc::EngineClient& c) {
+    banner("10. a bad pool offset is refused, and the daemon survives every one");
+
+    const std::vector<f32> dc = makeDc(4096, 2, 0.3f);
+    const u64 good = c.poolWrite(dc.data(), 4096, 2, 48000.0, 0);
+    CHECK(good != 0, "a good block to compare against, at %llu", (unsigned long long)good);
+    if (!good) return;
+    const u64 blockBytes = c.pool().blockAt(good)->bytes;
+
+    struct BadCase { const char* what; u64 ref; i64 frames; i32 channels; };
+    const BadCase bad[] = {
+        {"a wild offset far past the arena",  1ull << 40,      4096, 2},
+        {"an offset inside the pool header",  1024,            4096, 2},
+        {"a misaligned offset",               good + 8,        4096, 2},
+        {"an offset one block past the good one", good + blockBytes + 64, 4096, 2},
+        {"the maximum u64",                   ~0ull,           4096, 2},
+        {"a valid block read past its end",   good,            1 << 20, 2},
+        {"a valid block with a wild channel count", good,      4096, 99},
+    };
+
+    const ipc::ControlHeader& h = c.header();
+    int refused = 0;
+    for (const BadCase& b : bad) {
+        drainEvents(c);
+        const u64 applied0 = h.clipsApplied.load();
+        ipc::WireClip wc = audioClip(b.ref, b.frames, b.channels);
+        wc.loopEnd = b.frames;
+        if (!c.setClip(2, 0, wc)) { CHECK(false, "could not push %s", b.what); continue; }
+
+        std::vector<ipc::WireEvent> evs;
+        const bool answered = waitUntil([&] {
+            drainEvents(c, &evs);
+            return !c.clipBusy(2, 0);
+        }, 2000);
+        const ipc::WireEvent* ack = nullptr;
+        for (const ipc::WireEvent& e : evs) if (e.type == ipc::EvClipAck) ack = &e;
+        const bool ok = answered && ack && (ack->flags & ipc::ClipAckRefused) &&
+                        h.clipsApplied.load() == applied0;
+        if (ok) ++refused;
+        CHECK(ok, "%s is refused (reason %s)", b.what,
+              ipc::rejectReasonName(ack ? (u32)ack->x : 0u));
+    }
+    CHECK(refused == (int)(sizeof bad / sizeof bad[0]),
+          "all %d bad offsets refused", (int)(sizeof bad / sizeof bad[0]));
+
+    // The point of refusing rather than crashing.
+    CHECK(c.alive(), "the daemon is still alive");
+    CHECK(c.state().slotState[2].load() == (int)SlotState::Empty ||
+          c.state().activeSlot[2].load() < 0,
+          "and track 2 never got a clip (activeSlot %d)", c.state().activeSlot[2].load());
+
+    // A good offset still works right afterwards, which is what proves the
+    // refusals did not leave the boundary in a bad state.
+    ipc::WireClip wc = audioClip(good, 4096, 2);
+    CHECK(c.setClip(2, 0, wc), "a valid clip after all of them");
+    CHECK(waitClipIdle(c, 2, 0), "is acknowledged");
+    CHECK(c.pool().stateOf(good) == ipc::BlockLive, "and installed (%s)",
+          ipc::poolStateName(c.pool().stateOf(good)));
+
+    CHECK(c.clearClip(2, 0), "clear it again");
+    CHECK(waitClipIdle(c, 2, 0), "acknowledged");
+    const bool goodRetired = waitRetired(c, good);
+    CHECK(goodRetired, "and retired");
+    CHECK(c.poolRelease(good), "and freed");
+}
+
+// ---------------------------------------------------------------------------
+// 11. engine crash: SIGKILL, detect, reap, respawn — with the pool attached
 // ---------------------------------------------------------------------------
 
 static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
-    banner("6. SIGKILL the daemon: alive() drops, the orphan is reaped, respawn works");
+    banner("11. SIGKILL the daemon: alive() drops, the orphan is reaped, respawn works");
+    note("and the pool survives, because the pool is ours and not the engine's.");
+
+    // Put a clip up first, so the kill happens with the pool mapped on both
+    // sides and a live block inside it. That is the case §4.4 cares about:
+    // samples survive an engine restart, so republish is not a reload.
+    resetMixer(c);
+    const i64 kFrames = 12000;
+    const std::vector<f32> dc = makeDc(kFrames, 2, 0.5f);
+    const u64 ref = c.poolWrite(dc.data(), kFrames, 2, 48000.0, /*key*/0xBEEFull);
+    CHECK(ref != 0, "a clip in the pool at offset %llu", (unsigned long long)ref);
+    ipc::WireClip wc = audioClip(ref, kFrames, 2);
+    CHECK(c.setClip(0, 0, wc) && waitClipIdle(c, 0, 0), "published into [0][0]");
+    c.pushCommand(Cmd::LaunchClip, 0, 0);
+    const bool wasPlaying = waitUntil([&] {
+        drainEvents(c);
+        return c.state().slotState[0].load() == (int)SlotState::Playing;
+    }, 2000);
+    CHECK(wasPlaying, "and playing before the kill");
 
     CHECK(c.alive(), "alive() before the kill");
     ::kill(daemon, SIGKILL);
@@ -536,6 +1121,19 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
     CHECK(wentStale, "the frozen heartbeat goes stale on its own terms too");
     CHECK(c.state().generation.load() > 0, "the mapping still reads (the region outlives its creator)");
 
+    // THE POINT: the control region died with its creator, but the pool did
+    // not, because we created it. The block, its contents and the client's
+    // allocator state are all exactly where they were.
+    CHECK(shmExists(gPool), "the pool is still in /dev/shm — the engine never owned it");
+    CHECK(c.pool().valid(), "and still mapped here");
+    CHECK(c.pool().stateOf(ref) == ipc::BlockLive,
+          "the block is still live (%s)", ipc::poolStateName(c.pool().stateOf(ref)));
+    CHECK(c.pool().data<f32>(ref) && c.pool().data<f32>(ref)[0] == 0.5f,
+          "and its samples are intact");
+    CHECK(c.pool().findByKey(0xBEEFull) == ref,
+          "the content key still finds it (§4.3 step 4): %llu",
+          (unsigned long long)c.pool().findByKey(0xBEEFull));
+
     // The corpse is still in /dev/shm — nobody unlinked it — so a fresh attach
     // must both refuse it and clear it out of the way.
     c.detach();
@@ -545,6 +1143,7 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
     CHECK(!attachedCorpse, "attaching to the orphan is refused: %s", corpse.error());
     CHECK(!ipc::ShmRegion::reapIfStale(gRegion),
           "and the orphan is already gone: the refused attach reaped it");
+    CHECK(shmExists(gPool), "reaping the engine's corpse left the pool alone");
 
     // Respawn on the same session, from scratch.
     daemon = spawnDaemon(gSession);
@@ -565,14 +1164,43 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
         return std::fabs(c.state().tempo.load() - 101.0) < 1e-9;
     }, 1000);
     CHECK(took, "which applies it (tempo %.3f)", c.state().tempo.load());
+
+    // §4.4 step 3: republish. attach() already re-announced the pool — the
+    // client does that for you precisely so a respawn cannot forget — and the
+    // clip table goes back as a memcpy plus one SetClip per occupied cell. No
+    // sample is decoded, no offset changes.
+    const bool poolBack = waitUntil([&] { drainEvents(c); return c.poolReady(); }, 3000);
+    CHECK(poolBack, "the new daemon mapped the *same* pool (epoch %llu)",
+          (unsigned long long)c.header().poolAttachedEpoch.load());
+    const int sent = c.republishClips();
+    CHECK(sent == 1, "republishClips() re-sent %d occupied cell(s)", sent);
+    const bool reapplied =
+        waitUntil([&] { drainEvents(c); return c.header().clipsApplied.load() > 0; }, 2000);
+    CHECK(reapplied, "which the new engine applied (%llu)",
+          (unsigned long long)c.header().clipsApplied.load());
+    CHECK(c.clipShadow(0, 0).sampleRef == ref,
+          "against the same offset as before the crash (%llu)",
+          (unsigned long long)c.clipShadow(0, 0).sampleRef);
+
+    resetMixer(c);
+    CHECK(c.pushCommand(Cmd::LaunchClip, 0, 0), "launch it on the new engine");
+    const bool playingAgain = waitUntil([&] {
+        drainEvents(c);
+        return c.state().slotState[0].load() == (int)SlotState::Playing;
+    }, 2000);
+    CHECK(playingAgain, "slotState[0] is Playing again (state %d)",
+          c.state().slotState[0].load());
+    const f32 peak = peakTrack(c, 0, 400);
+    CHECK(std::fabs(peak - 0.5f) < 0.05f,
+          "and the same samples are sounding: meter %.4f", (double)peak);
 }
 
 // ---------------------------------------------------------------------------
-// 7. clean shutdown
+// 12. clean shutdown, in two stages
 // ---------------------------------------------------------------------------
 
 static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
-    banner("7. SIGTERM: the daemon stops, publishes the flag and unlinks");
+    banner("12. SIGTERM: the daemon stops, publishes the flag and unlinks");
 
     drainEvents(c);
     ::kill(daemon, SIGTERM);
@@ -601,10 +1229,23 @@ static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
           "an EvEngineStopping event was published before the region went (%d)",
           countEvents(evs, ipc::EvEngineStopping));
 
+    // Stage one: the engine is gone and its region with it, but the *session*
+    // is not over until the client says so, and the pool is the session's. A
+    // shutdown that took the pool with it would make "attach a new engine to a
+    // running session" impossible, which is the feature §4.3 is built on.
+    CHECK(!shmExists(gRegion), "the control region is unlinked");
+    CHECK(shmExists(gPool), "and the pool is still there — it is the session's, not the engine's");
+    const int strays = countLatticeShm(gPool);
+    CHECK(strays == 0, "nothing else is left in /dev/shm (%d)", strays);
+
     c.detach();
 
     ipc::EngineClient after;
     CHECK(!after.attach(gSession, 200), "the session name no longer attaches: %s", after.error());
+
+    // Stage two: the client ends the session.
+    c.closePool();
+    CHECK(!shmExists(gPool), "closePool() unlinks the pool");
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +1257,12 @@ int main(int argc, char** argv) {
 
     std::snprintf(gSession, sizeof gSession, "dtest-%d", (int)::getpid());
     ipc::controlRegionName(gSession, gRegion, sizeof gRegion);
+    ipc::poolRegionName(gSession, gPool, sizeof gPool);
     armCleanup();
 
-    std::printf("lattice daemon tests  (shm v%u, protocol v%u, region %zu B)\n",
-                ipc::kShmVersion, ipc::kProtocolVersion, ipc::control::kBytes);
+    std::printf("lattice daemon tests  (shm v%u, protocol v%u, pool v%u, region %zu B)\n",
+                ipc::kShmVersion, ipc::kProtocolVersion, ipc::kPoolVersion,
+                ipc::control::kBytes);
     std::printf("daemon: %s   session: %s\n", gDaemonPath, gSession);
 
     if (::access(gDaemonPath, X_OK) != 0) {
@@ -635,11 +1278,16 @@ int main(int argc, char** argv) {
         testMetronomeAndMaster(client);
         testCommandBoundary(client);
         testBurst(client);
+        testPoolHandshake(client);
+        testAudioClip(client);
+        testClearAndRetire(client);
+        testMidiClip(client);
+        testBadOffsets(client);
         testCrashAndRespawn(client, daemon);
         testCleanShutdown(client, daemon);
     }
 
-    banner("8. /dev/shm is clean");
+    banner("13. /dev/shm is clean");
     cleanup();
     const int leftover = countLatticeShm();
     CHECK(leftover == 0, "no lattice region left in /dev/shm (found %d)", leftover);

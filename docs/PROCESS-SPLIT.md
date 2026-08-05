@@ -1,8 +1,11 @@
 # Splitting Lattice into an engine process and a GUI process
 
-Status: **phase 1 shipped — latticed daemon with a scalar control plane (§9).** Wave 1 landed the transport
-(`src/ipc/shm.h`, `tests/ipc_test.cpp`) and this document. Nothing in
-`src/audio` or `src/ui` has been touched yet.
+Status: **phase 2 shipped — `latticed` plays clips out of a shared sample pool (§10).**
+Wave 1 landed the transport (`src/ipc/shm.h`, `tests/ipc_test.cpp`) and this
+document; wave 2 landed the daemon and a scalar control plane (§9); wave 3
+landed the sample pool, the clip table and protocol v2 (§10). Nothing in
+`src/audio` or `src/ui` has been touched yet — the GUI still runs an in-process
+`Engine` and is still the shipping path.
 
 ## Contents
 
@@ -32,6 +35,8 @@ Status: **phase 1 shipped — latticed daemon with a scalar control plane (§9).
 6. [Phased migration](#6-phased-migration)
 7. [Open questions](#7-open-questions)
 8. [What wave 1 actually delivered](#8-what-wave-1-actually-delivered)
+9. [Phase 1 shipped](#9-phase-1-shipped)
+10. [Phase 2 shipped — the sample pool](#10-phase-2-shipped--the-sample-pool)
 
 ---
 
@@ -836,7 +841,9 @@ and still the shipping path.
    1 no clip can exist (its `SetClip` is refused), so it has nothing to clear,
    and clearing a clip with notes pushes `Ev::NotesRetired`, which hands a GUI
    pointer back across the boundary. It becomes legal in phase 2 with the clip
-   table.
+   table. **Superseded by §10:** `SetClip` and `ClearClip` are both accepted
+   now, and `Ev::NotesRetired` is translated into an offset rather than
+   dropped.
 5. **`WireCommand` is 32 B, not the 48 B sketched in §3.4** — same fields, real
    packing.
 6. **`SharedStateT` gained `recState[]`/`recSlotIdx[]`** so it mirrors Engine's
@@ -854,9 +861,12 @@ and still the shipping path.
 
 ### Explicitly deferred
 
+*(This list is phase 1's. §10 says which items it closed.)*
+
 - **The sample pool and the clip table** (§3.5, §3.4). `Cmd::SetClip` is
   refused at the boundary with `RejectPointerPayload`; no audio material can
   reach the daemon, so the only sound it can make is the metronome.
+  **— done in §10.**
 - **Chains, devices and the param table** (§3.6, §3.7). `Cmd::SetChain` is
   refused; `Ev::ChainRetired` is dropped and counted. The daemon hosts no
   plugins and runs no scan.
@@ -864,7 +874,8 @@ and still the shipping path.
   refused. `SharedState` already carries the record indicators, unused.
 - **The session region**, `ShmRegion::adopt(int fd)`, `adoptOwnership()`,
   `memfd` + `F_SEAL_SHRINK`, and GUI-crash reattach (§4.3). None of it is
-  reachable until there is a pool to put in it.
+  reachable until there is a pool to put in it. **— the session region is done
+  in §10; the `memfd`/fd-passing and reattach parts are not, and §10 says why.**
 - **`SharedState::xruns` and `blocksRendered` for device backends.** The null
   driver publishes its block count; a real backend's is not observable without
   editing `src/audio`.
@@ -876,6 +887,9 @@ and still the shipping path.
   has no callers outside the test.
 
 ### The exact next step for phase 2
+
+*(Written before phase 2 landed. Steps 2 and 3 shipped; step 1 did not, because
+it edits `src/audio`, and step 4 is now the next thing. §10 has the details.)*
 
 In order, each step leaving the tree green:
 
@@ -903,3 +917,311 @@ In order, each step leaving the tree green:
 
 Devices by id, the param table and the socket follow as the doc's phases 3–5,
 unchanged.
+
+---
+
+## 10. Phase 2 shipped — the sample pool
+
+`latticed` can play clips. A clip's audio is decoded (or, in the tests,
+synthesised) into a shared region the *client* owns, published as a `u64` byte
+offset, translated back into a `const f32*` by the daemon, and rendered by an
+`Engine` in another process. `src/audio` is still untouched, `src/ui` is still
+untouched, and no pointer crosses the boundary in either direction.
+
+Protocol version 2. `kShmVersion` stays at 2 — `ShmHeader`, `ShmSpscRing` and
+`SharedStateT` did not change — but the control region's layout hash did, so a
+phase-1 binary and a phase-2 binary refuse each other at `attach()` with a
+specific message rather than reading a clip table that is not there.
+
+### 10.1 What exists now
+
+- **`src/ipc/pool.h`** — header-only, the session region.
+  - `PoolHeader` + inline `PoolBlock` descriptors + a bump/free-list arena.
+  - `SamplePool`: the writer side. Create, attach, allocate, write samples or
+    notes, and the free-after-confirm state machine (§10.3).
+  - `PoolReader`: the reader side. Attaches **`PROT_READ`**, so "the engine only
+    reads the pool" is a page permission and not a comment. It can validate an
+    offset and turn it into a `const` pointer; it has no way to acquire
+    allocator state, because it has none.
+  - `poolValidate()` — the single place an untrusted `u64` becomes a pointer.
+  - `WireNote`, asserted to mirror `RtNote` field for field, so a notes block is
+    reinterpreted rather than converted and a 10 000-note clip costs nothing at
+    the boundary.
+- **`src/ipc/control.h`** — protocol v2.
+  - `WireClip` (120 B): every `RtClip` scalar, with `sampleRef`/`notesRef` where
+    `data`/`notes` used to be, plus a per-cell `generation`.
+  - A `WireClip[32][32]` **clip table** as a sixth region section — the
+    idempotent form §3.4 prefers — written by the client, read by the daemon.
+    `Cmd::SetClip{a=track, b=slot, ref=generation}` says which cell moved.
+  - The pool handshake in `ControlHeader` (`poolName`, `poolBytes`, `poolEpoch`
+    written by the *client*; `poolAttachedEpoch`, `poolAttachFailures` written
+    by the daemon), and the counters `clipsApplied` / `blocksRetired`.
+  - New events: `EvClipAck`, `EvBlockRetired`, `EvPoolAttached`. New reject
+    reasons: `RejectNoPool`, `RejectBadPoolRef`, `RejectBadClip`.
+  - The policy table grew a third class: `commandIsScalar` (17),
+    `commandIsPooled` (`SetClip`, `ClearClip`), `commandCarriesPointer`
+    (`SetChain`, `RecordSlot`, `RecordMidiSlot` — still refused, phase 3).
+- **`src/ipc/client.h`** — `EngineClient` gained `createPool`/`attachPool`/
+  `publishPool`/`closePool`/`abandonPool`, `poolWrite`/`poolWriteNotes`/
+  `poolRelease`, `setClip`/`clearClip`/`clipShadow`/`clipBusy`, and
+  `republishClips()`. `popEvent()` now runs `observe()` on every event so the
+  client-side bookkeeping cannot be forgotten.
+- **`src/ipc/shm.h`** — three additive changes, no layout change:
+  `attach(..., readOnly)`, `create(..., seal)` with `trySeal()`/`sealed()`, and
+  `release()` (detach without unlinking, for a hand-off).
+- **`src/daemon/latticed.cpp`** — `pumpPool()`, `translateClip()`, the clip
+  shadow table, and the retirement queue.
+- **`tests/daemon_test.cpp`** — 200 checks, thirteen sections.
+
+### 10.2 The pool region
+
+| | |
+|---|---|
+| name | `/lattice-pool-<session>` |
+| creator | the **client**, and the client unlinks it |
+| daemon | attaches `PROT_READ`, once per process lifetime |
+| size | fixed at create, default 256 MiB, sparse |
+| layout | `[PoolHeader][… 4 KiB …][PoolBlock][data][PoolBlock][data]…` |
+| handle | one `u64` byte offset of the *data*; `poolBase + ref` is the RT read path |
+
+**The ownership asymmetry is the feature.** The control region belongs to the
+engine and dies with it; the pool belongs to the session and outlives engine
+restarts, which is precisely what makes §4.4's "republish is not a reload" true.
+`daemon_test` asserts it directly: `SIGKILL` the daemon with a clip playing, and
+the pool is still in `/dev/shm`, still mapped, its block still `Live`, its
+samples still readable, and `findByKey()` still finds it. The replacement daemon
+attaches to the same region and `republishClips()` puts the session back with a
+`memcpy` plus one `SetClip` per occupied cell — no decode, no offset change.
+
+**Sizing, `ftruncate` and SIGBUS.** `/dev/shm` is tmpfs, so `ftruncate` to
+256 MiB creates a sparse file that costs one page until something writes to it.
+That gets §3.5's reservation trick for free and removes the growth handshake
+entirely: there is no `Cmd::PoolGrow`, no window where the engine holds an
+offset past the committed end, and no `mmap` on any thread but the client's.
+SIGBUS has two causes and both are the writer's: writing past the object (the
+allocator bounds every block, and the daemon re-checks) and writing a page tmpfs
+cannot back, which faults the *decoding* thread, never the audio thread —
+because a block is fully written before its offset is published, and publication
+is the release store on `PoolBlock::magic`.
+
+**Sealing.** `create(..., seal=true)` asks for `F_SEAL_SHRINK`. On a plain
+`shm_open` object Linux says no — sealing is a memfd property — and
+`sealed()` reports that rather than pretending. What remains is weaker and is
+documented as such: after create the client closes its fd and nobody re-opens
+the object `O_RDWR`, so nothing in the system can shrink it. The real fix is
+`memfd_create` + `SCM_RIGHTS`, which needs the socket (§3.2).
+
+**Allocator.** Bump pointer plus an address-ordered free list; first fit,
+split when the leftover can hold a header and a line, coalesce adjacent free
+blocks on every free, and **retract the bump pointer when the freed block ends
+at the high-water mark**. That last rule is why freeing the pool's only block
+and allocating the same size again returns the same offset — the
+edit-a-clip-and-repush loop reuses one block forever instead of walking the
+arena. `daemon_test` §8 asserts the offset equality, the retraction and the
+empty free list, because an allocator whose behaviour is only *probably* stable
+is one nobody can reason about.
+
+Blocks are 64-byte aligned, header included (`sizeof(PoolBlock) == 128`), so
+every `const f32*` the engine gets is cache-line and SIMD aligned and
+`ref % 64 == 0` is a free first check on an untrusted number.
+
+**Descriptors are inline, not a `BlockDesc[]` table** as §3.5 sketched. The
+reason is validation: the daemon can check an offset knowing nothing but the
+offset, because the header lives at `ref - 128` and its magic is
+`kPoolBlockMagic ^ ref`. A self-mixed magic means a plausible-but-wrong offset —
+off by one block, stale from a previous allocation, invented by a corrupted GUI
+— fails on its own terms instead of yielding a self-consistent header
+describing somebody else's samples. A side table would have to be indexed by a
+number that is exactly as untrusted. §4.3's reattach key lives in the same
+header, so `findByKey()` still works.
+
+### 10.3 The free-after-confirm rule, exactly as shipped
+
+> **A pool block may be returned to the free list only when both:**
+> **(a)** the GUI holds no references of its own (`PoolBlock::refs == 0`), and
+> **(b)** the block is `Quiescent` — either it was never published to a clip
+> cell, or the daemon has echoed its offset back in an `EvBlockRetired` event.
+
+Four states enforce it, and `SamplePool::free()` refuses outright on the two
+middle ones:
+
+```
+Free ──alloc──► Quiescent ──markLive (a cell now names it)──► Live
+                    ▲                                          │
+                    │                          markDisplaced (the cell changed)
+   confirmRetired (EvBlockRetired arrived)                      │
+                    └──────────────── Retiring ◄────────────────┘
+```
+
+Note what is *not* in that diagram: no edge from `Live` or `Retiring` to
+`Free`. A GUI that drops its last reference to a displaced block does not free
+it; the free happens later, when the echo arrives, inside `popEvent()`.
+
+**What the daemon asserts when it sends the echo.** `EvBlockRetired{ref}` means:
+
+1. the command that displaced the block — a `SetClip` installing something else
+   in that cell, or a `ClearClip` — has been handed to `Engine::pushCommand`.
+   Not "the client sent it": handed over, which is why the retirement is queued
+   from `commit()` and not from `translate()`;
+2. no other cell of the daemon's shadow clip table still names the offset. A
+   block may legitimately back several slots, and losing one of them is not a
+   retirement — `daemon_test` §8 covers exactly this;
+3. the audio thread has since run `drainCommands()` at least once.
+
+**(3) is the interesting one, and it is what makes (1) sufficient.** A `Voice`
+does not hold a copy of its `RtClip`; it holds `&clips_[t][s]`, and
+`drainCommands()` overwrites that cell in place. So the instant the engine
+drains the displacing command, every voice reading that slot is reading the
+*new* clip. Unlike the `ChainRetired` case this pattern comes from, there is no
+release tail over the old buffer to wait out — the 6 ms declick runs over the
+new cell contents. One completed drain is the whole proof.
+
+**How the daemon knows a drain happened**, given that `src/audio` is frozen and
+cannot be asked:
+
+- **Exactly, when the engine tells it.** Replacing or clearing a MIDI clip makes
+  `Engine` push `Ev::NotesRetired` from *inside* `drainCommands`, so the event's
+  arrival **is** the drain. The daemon turns that pointer back into an offset
+  (`PoolReader::offsetOf`, which answers 0 for anything outside the pool, so a
+  foreign pointer can never be echoed as a block) and releases the entry at
+  once. `Ev::NotesRetired` is therefore translated, not dropped — the one line
+  of §9's event policy that changed.
+- **Conservatively otherwise, by deadline.** There is no equivalent event for
+  sample data, so a sample block waits `max(100 ms, 8 block periods)` and,
+  under the null driver where they can be counted, four actually-rendered
+  blocks.
+
+The deadline is the weak half and is called out rather than buried: a wedged
+backend does not drain, and the deadline fires anyway. **What bounds that is the
+pool's design, not the timer.** The region stays mapped for the daemon's entire
+life and never shrinks, so a premature free cannot produce a wild pointer or a
+segfault — the worst case is a voice reading bytes that have been reallocated to
+another clip. Audible, findable, and not a crash, which is a strictly better
+failure than any of the ownership bugs this phase removed. The exact version
+needs `Engine` to publish a drain counter: two lines in `src/audio`, and the
+first thing phase 3 should take.
+
+At clean shutdown the daemon flushes every outstanding retirement after the
+driver has stopped, since with no audio thread left they are all trivially true.
+A client that is still attached can then free its pool cleanly instead of
+leaving blocks stuck in `Retiring` — which matters, because the pool outlives
+the daemon and may well be handed to the next one.
+
+### 10.4 The clip table and the generation handshake
+
+`SetClip`'s payload does not fit in a 32-byte message, so it travels in a table:
+`WireClip clips[32][32]` in the control region, written by the client, with
+`Cmd::SetClip{track, slot}` naming the cell. That is §3.4's preferred form, and
+it makes republish-after-restart a `memcpy`.
+
+A mutable table shared with a peer that reads it *later* has one hazard, and it
+is not the obvious one. If the client wrote a cell twice before the daemon
+popped the first command, the daemon would read the second value for both and
+never learn what the first one displaced — a block retired on the client's books
+and never retired on the daemon's, i.e. a permanent leak of a live-looking
+block. The fix is a per-cell `generation`:
+
+- the client bumps it on every write and refuses to overwrite a cell whose
+  previous write has not been acknowledged (`setClip()` returns false, the
+  caller retries next frame — the same "handle a refused push" discipline §5
+  already demands of every ring push);
+- the daemon answers **every** `SetClip`/`ClearClip` with exactly one
+  `EvClipAck{track, slot, ref=generation, flags, x=reason}`, accepted or
+  refused. A silent refusal would wedge that cell for the rest of the session.
+
+Cost: a back-to-back edit of the same cell within one 1 ms pump tick waits one
+frame. Benefit: the daemon's displacement diff is exact by construction.
+
+The client keeps two copies of the table in its own memory — `shadow_` (what
+the engine is believed to hold) and `pending_` (written, not yet acknowledged) —
+because the control region dies with the engine and the whole point of the
+shadow is to outlive one. On a refused write the client unwinds: the blocks it
+optimistically marked `Live` go back to `Quiescent`, nothing is displaced, and
+the cell unblocks.
+
+### 10.5 Validation: the one place a number becomes a pointer
+
+`translateClip()` runs on 120 bytes another process last stored at a shared
+address. Under a crashed or compromised GUI that is any 120 bytes at all, so the
+rule is absolute: **no path may produce an `RtClip` whose `data` or `notes` is
+anything but a pointer into the mapped pool, backed by a block that is
+allocated, of the right kind, and at least as large as the clip says it will
+read.** In order:
+
+| check | catches |
+|---|---|
+| `ref != 0`, `ref % 64 == 0` | null and misaligned handles |
+| `ref` inside `[arenaStart + 128, arenaEnd)` | anything outside the arena |
+| `ref <= bump` | offsets past the allocator's high-water mark, where a stale magic could survive in a reused page |
+| `magic == kPoolBlockMagic ^ ref` | wrong-offset, stale and invented handles |
+| `bytes` positive, 64-aligned, inside the arena and inside `bump` | a wild size field turning a valid block into an arbitrary read |
+| `state != Free` | a freed block being republished |
+| `kind` matches | a notes offset arriving where sample data was expected |
+| `needBytes <= bytes` | `frames * channels` reading past the block |
+| clip scalars: `channels ∈ [1,2]`, `frames ≥ 0`, `0 ≤ loopStart ≤ loopEnd ≤ frames`, finite `f64`s, `warp`/`follow`/`quantumIdx` in range, `prob ∈ [0,1]` | the multipliers — a wild `loopEnd` walks `fetch()` off the end just as effectively as a wild offset |
+
+Every failure is a refusal with a named reason, a rate-limited log line, an
+`EvCommandRejected` and an `EvClipAck{refused}`; never a clamped pointer.
+`daemon_test` §10 fires seven of them — including an offset one block past a
+valid one, a misaligned offset, `~0ull`, and a *valid* block asked to yield a
+megabyte — and then checks that a good clip still works, which is what proves
+the refusals left nothing broken behind them.
+
+### 10.6 Deliberate deviations from §3.5
+
+1. **No `Cmd::PoolGrow`/`Ev::PoolGrown`, and no `PROT_NONE` reservation.** The
+   pool is sized once. On tmpfs a large sparse file is free, so growth buys
+   nothing and costs a handshake that has to be got right on the audio side.
+2. **Descriptors are inline, not a `BlockDesc[]` table** (§10.2).
+3. **No `memfd`, no `SCM_RIGHTS`, no `adopt(int fd)`.** They need the socket.
+   `ShmRegion::create(..., seal)` asks for `F_SEAL_SHRINK` anyway so the
+   upgrade is a one-line change when the fd arrives from `memfd_create`.
+4. **No `Cmd::ReleaseSample`.** §3.5 step 2 has the GUI announce a release and
+   the engine count references. With `src/audio` frozen the engine cannot count
+   anything, so the daemon derives the same information from the clip table it
+   already has to shadow: a block is retiring when no cell names it. Same rule,
+   one fewer message, and the count lives on the side that can see all of it.
+5. **The retirement echo is one event per block, not per cell.** `EvBlockRetired`
+   carries the offset, the kind, and the cell it was displaced from.
+6. **`ShmRegion::adoptOwnership()` is still not there.** `release()` (detach
+   without unlinking) and `SamplePool::attach()` are the two halves it would be
+   built from, and both ship here; the missing piece is the daemon confirming
+   sole-client status, which is a §4.3 concern with no socket to have it over.
+
+### 10.7 Test coverage
+
+`tests/daemon_test.cpp`, 200 checks, all against a real spawned
+`latticed --driver null`:
+
+| § | what |
+|---|---|
+| 1–5 | phase 1's: handshake, beat clock vs wall clock, metronome/master through the rendered audio, the refusal paths, a 3000-command burst |
+| 6 | pool create, `/dev/shm` presence, daemon attach, a second handle onto the same region, layout-hash and version mismatches refused |
+| 7 | a DC clip synthesised here → `poolWrite` → `SetClip` → `LaunchClip` → `slotState` Playing, `clipPhase` advancing, **and the track meter reading 0.5000 for a 0.5 DC clip** — a measurement, not a liveness check |
+| 8 | `free()` refused on a live block; `ClearClip` → `EvBlockRetired` echoing the offset → `Quiescent` → `poolRelease` frees → bump retracted, free list empty, **reallocating the same size returns the same offset**; and a block shared by two cells surviving the loss of one |
+| 9 | a MIDI clip through the notes pool: Playing, `clipPhase` advancing, then a notes repush retired through the *exact* `Ev::NotesRetired` path with `eventsDropped` still zero |
+| 10 | seven bad offsets refused, daemon still alive, a good clip still works afterwards |
+| 11 | `SIGKILL` with the pool attached: pool survives in `/dev/shm`, block still `Live`, samples intact, content key still matches; orphan control region reaped without touching the pool; respawn, automatic pool re-announce, `republishClips()`, relaunch, **same offset, same 0.5 at the meter** |
+| 12 | `SIGTERM`: control region unlinked, **pool still there** (it is the session's), nothing else in `/dev/shm`; then `closePool()` unlinks it |
+| 13 | `/dev/shm` clean |
+
+Green over six consecutive runs, and clean under ASan+UBSan with both the daemon
+and the test sanitised. `make test` is green end to end (252 + 54 + 200).
+
+### 10.8 Still deferred
+
+- **Publishing from the engine instead of the mirror thread** (§9's step 1). It
+  edits `src/audio`; the mirror still costs one copy per 4 ms.
+- **Mixer scalars in `SharedState`.** Still unpublished by `Engine::publish()`,
+  so a reattaching GUI still cannot read back vol/pan/mute/solo/arm.
+- **Chains, devices, the param table, recording** — phase 3, unchanged.
+- **The AF_UNIX socket**, and with it `memfd` + `SCM_RIGHTS` and the plugin
+  catalog.
+- **GUI-crash reattach** (§4.3). The region survives a GUI crash by
+  construction and `SamplePool::attach()` can adopt it, but nothing negotiates
+  the unlink obligation back.
+- **`Engine` counting its own command drains**, which would replace the
+  retirement deadline with a proof (§10.3).
+- **The GUI itself.** `src/ui` still owns an in-process `Engine`;
+  `EngineClient` still has no callers outside the test. That is the next step —
+  §9's step 4, now unblocked.

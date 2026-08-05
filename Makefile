@@ -196,7 +196,7 @@ build/engine_test: tests/engine_test.cpp src/audio/engine.cpp src/core/common.cp
 # does not use TOOL_CF/TOOL_LIBS: no sndfile, no lilv, and warnings left on.
 # -lrt is only needed for shm_open on glibc < 2.34; harmless after.
 IPC_CF := -std=c++20 -O2 $(WARN)
-IPC_H  := src/ipc/shm.h src/ipc/control.h src/ipc/client.h
+IPC_H  := src/ipc/shm.h src/ipc/pool.h src/ipc/control.h src/ipc/client.h
 build/ipc_test: tests/ipc_test.cpp src/ipc/shm.h
 	@mkdir -p build
 	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
