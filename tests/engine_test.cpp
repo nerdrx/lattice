@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,19 +53,38 @@ static constexpr i64 kBar120  = 4 * kBeat120;
 struct Host {
     Engine e;
     std::vector<f32> bl, br;      // per-block scratch
+    std::vector<f32> il, ir;      // synthetic capture input for this block
     std::vector<f32> outL, outR;  // everything rendered so far
     int block = kBlock;
+
+    // Optional capture generator, called once per block with the absolute
+    // frame index the block starts at. When unset the engine is handed nulls,
+    // which is exactly what a backend without an input device does.
+    std::function<void(i64 startFrame, int n, f32* l, f32* r)> input;
 
     void init(f64 sr = kSR, int blk = kBlock) {
         block = blk;
         e.prepare(sr, blk);
         bl.assign((size_t)blk, 0.f);
         br.assign((size_t)blk, 0.f);
+        il.assign((size_t)blk, 0.f);
+        ir.assign((size_t)blk, 0.f);
         outL.clear(); outR.clear();
+        input = nullptr;
     }
     void push(Cmd t, i32 a = 0, i32 b = 0, f64 x = 0.0) {
         Command c; c.type = t; c.a = a; c.b = b; c.x = x;
         e.pushCommand(c);
+    }
+    // Cmd::RecordSlot needs the pointer and capacity payload push() cannot carry.
+    void pushRec(int track, int slot, f32* buf, i64 cap) {
+        Command c; c.type = Cmd::RecordSlot; c.a = track; c.b = slot;
+        c.p = (void*)buf; c.x = (f64)cap;
+        e.pushCommand(c);
+    }
+    void pushMidi(u8 status, u8 d1, u8 d2, i32 frame = 0) {
+        MidiMsg m; m.status = status; m.d1 = d1; m.d2 = d2; m.frame = frame;
+        e.pushMidi(m);
     }
     void setClip(int track, int slot, const RtClip& cl) {
         Command c; c.type = Cmd::SetClip; c.a = track; c.b = slot; c.clip = cl;
@@ -81,7 +101,13 @@ struct Host {
     size_t run(i64 frames) {
         const size_t mark = outL.size();
         for (i64 done = 0; done < frames; done += block) {
-            e.process(nullptr, nullptr, bl.data(), br.data(), block);
+            const f32* pl = nullptr;
+            const f32* pr = nullptr;
+            if (input) {
+                input((i64)outL.size(), block, il.data(), ir.data());
+                pl = il.data(); pr = ir.data();
+            }
+            e.process(pl, pr, bl.data(), br.data(), block);
             outL.insert(outL.end(), bl.begin(), bl.end());
             outR.insert(outR.end(), br.begin(), br.end());
         }
@@ -739,6 +765,608 @@ static void testDeviceChains() {
 }
 
 // ---------------------------------------------------------------------------
+// 10. recording
+// ---------------------------------------------------------------------------
+
+// The capture signal. Both channels are periodic but with coprime periods and
+// different shapes, so a buffer written in the wrong interleave order, at the
+// wrong offset, or from the wrong channel cannot accidentally match.
+static f32 capL(i64 i) { return (f32)(i % 1024) * (1.f / 1024.f) - 0.5f; }
+static f32 capR(i64 i) { return 0.25f - (f32)(i % 777) * (1.f / 777.f); }
+
+static void feedCapture(Host& h) {
+    h.input = [](i64 start, int n, f32* l, f32* r) {
+        for (int i = 0; i < n; ++i) { l[i] = capL(start + i); r[i] = capR(start + i); }
+    };
+}
+
+static std::vector<Event> drainEvents(Engine& e) {
+    std::vector<Event> v;
+    Event ev;
+    while (e.popEvent(ev)) v.push_back(ev);
+    return v;
+}
+static const Event* findEvent(const std::vector<Event>& v, Ev t) {
+    for (const Event& e : v) if (e.type == t) return &e;
+    return nullptr;
+}
+static int countEvents(const std::vector<Event>& v, Ev t) {
+    int n = 0;
+    for (const Event& e : v) if (e.type == t) ++n;
+    return n;
+}
+
+// Recovers the absolute frame the take began on by matching its first frame
+// against the generator, so a boundary that lands a sample either side of the
+// ideal beat (double accumulation over hundreds of blocks) is not a failure.
+static i64 findCaptureOffset(const std::vector<f32>& buf, i64 expect, i64 slack) {
+    for (i64 d = 0; d <= slack; ++d)
+        for (i64 s : {expect + d, expect - d})
+            if (buf[0] == capL(s) && buf[1] == capR(s)) return s;
+    return -1;
+}
+
+// a. quantized start and stop, and the captured audio itself
+static void recQuantizedTake() {
+    Host h; h.init();
+    feedCapture(h);
+    std::vector<f32> rec((size_t)300000 * 2, 0.f);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120 * 2);                         // land mid-bar
+    drainEvents(h.e);
+
+    h.pushRec(0, 0, rec.data(), 300000);
+    h.run(60000);                                // well past the bar line
+    std::vector<Event> evs = drainEvents(h.e);
+    const Event* started = findEvent(evs, Ev::RecordStarted);
+    CHECK(started != nullptr, "a mid-bar RecordSlot produces Ev::RecordStarted");
+    CHECK(started && started->a == 0 && started->b == 0,
+          "RecordStarted names track 0 slot 0 (%d/%d)",
+          started ? started->a : -1, started ? started->b : -1);
+    CHECK(started && std::fabs(started->x - 4.0) < 1e-6,
+          "the take begins on the bar line, beat %.6f (expected 4.0)",
+          started ? started->x : -1.0);
+    CHECK(h.e.recState[0].load() == 2, "recState reports 2 (recording), got %d",
+          h.e.recState[0].load());
+    CHECK(h.e.recSlotIdx[0].load() == 0, "recSlotIdx reports slot 0, got %d",
+          h.e.recSlotIdx[0].load());
+
+    // Toggle: a second RecordSlot on the same slot stops on the next bar.
+    h.pushRec(0, 0, rec.data(), 300000);
+    h.run(120000);
+    evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::RecordFinished);
+    CHECK(fin != nullptr, "the toggle produces Ev::RecordFinished");
+    CHECK(fin && fin->p == (void*)rec.data(),
+          "RecordFinished hands back the buffer the GUI supplied (%p vs %p)",
+          fin ? fin->p : nullptr, (void*)rec.data());
+    CHECK(fin && fin->b == 0, "RecordFinished names slot 0 (%d)", fin ? fin->b : -1);
+    // One bar at 120 BPM is 96000 frames; the two boundaries are a bar apart.
+    CHECK(fin && std::llabs((long long)fin->x - (long long)kBar120) <= 2,
+          "the take is exactly one bar long: %lld frames (expected %lld)",
+          fin ? (long long)fin->x : -1, (long long)kBar120);
+    CHECK(h.e.recState[0].load() == 0, "recState returns to 0 (idle), got %d",
+          h.e.recState[0].load());
+
+    const i64 off = findCaptureOffset(rec, kBar120, 4);
+    CHECK(off >= 0 && std::llabs((long long)off - (long long)kBar120) <= 2,
+          "capture starts at the bar line: frame %lld (expected %lld)",
+          (long long)off, (long long)kBar120);
+
+    // Every recorded frame must be the input verbatim, in L,R interleave.
+    i64 bad = -1;
+    const i64 len = fin ? (i64)fin->x : 0;
+    if (off >= 0)
+        for (i64 k = 0; k < len; ++k)
+            if (rec[(size_t)k * 2] != capL(off + k) || rec[(size_t)k * 2 + 1] != capR(off + k)) {
+                bad = k; break;
+            }
+    CHECK(off >= 0 && len > 0 && bad < 0,
+          "all %lld captured frames match the input exactly, L then R (first mismatch %lld)",
+          (long long)len, (long long)bad);
+    // Nothing may be written past the take.
+    CHECK(len > 0 && rec[(size_t)len * 2] == 0.f && rec[(size_t)len * 2 + 1] == 0.f,
+          "the engine wrote nothing past the take's last frame");
+}
+
+// b. a full buffer ends the take on the spot
+static void recCapacityStop() {
+    Host h; h.init();
+    feedCapture(h);
+    std::vector<f32> rec(1000 * 2, 0.f);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                  // None: start at once
+    h.pushRec(0, 0, rec.data(), 1000);
+    h.runBlocks(8);                              // 2048 frames, twice the capacity
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::RecordFinished);
+    CHECK(fin != nullptr, "a full buffer auto-stops the take");
+    CHECK(fin && (i64)fin->x == 1000,
+          "the take stops exactly at capacity: %lld frames (expected 1000)",
+          fin ? (long long)fin->x : -1);
+    CHECK(h.e.recState[0].load() == 0, "the track is idle again after an auto-stop (%d)",
+          h.e.recState[0].load());
+    // 1000 frames of a 1000-frame buffer: the last slot must be the 1000th
+    // input frame and not a wild write.
+    CHECK(rec[999 * 2] == capL(999) && rec[999 * 2 + 1] == capR(999),
+          "the last frame in the buffer is the last frame of input");
+}
+
+// c. stopping the transport ends any take immediately
+static void recTransportStop() {
+    Host h; h.init();
+    feedCapture(h);
+    std::vector<f32> rec((size_t)100000 * 2, 0.f);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // a bar away: nowhere near
+    h.pushRec(0, 0, rec.data(), 100000);
+    h.runBlocks(4);
+    drainEvents(h.e);
+
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(1);
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::RecordFinished);
+    CHECK(fin != nullptr, "stopping the transport finishes the take at once");
+    CHECK(fin && (i64)fin->x == 4 * kBlock,
+          "it hands back what was captured: %lld frames (expected %d)",
+          fin ? (long long)fin->x : -1, 4 * kBlock);
+    CHECK(fin && fin->p == (void*)rec.data(), "with the right buffer");
+    CHECK(h.e.recState[0].load() == 0, "and the track is idle (%d)", h.e.recState[0].load());
+}
+
+// d. a RecordSlot aimed elsewhere hands over on one boundary
+static void recSlotHandover() {
+    Host h; h.init();
+    feedCapture(h);
+    std::vector<f32> recA((size_t)300000 * 2, 0.f);
+    std::vector<f32> recB((size_t)300000 * 2, 0.f);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.pushRec(0, 0, recA.data(), 300000);        // starts at beat 0
+    h.run(kBeat120 * 2);
+    drainEvents(h.e);
+
+    h.pushRec(0, 1, recB.data(), 300000);        // different slot, mid-bar
+    h.run(kBar120);
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::RecordFinished);
+    CHECK(fin != nullptr, "switching slots finishes the running take");
+    CHECK(fin && fin->b == 0 && fin->p == (void*)recA.data(),
+          "the finished take is slot 0's, with slot 0's buffer (%d, %p)",
+          fin ? fin->b : -1, fin ? fin->p : nullptr);
+    CHECK(fin && std::llabs((long long)fin->x - (long long)kBar120) <= 2,
+          "it ran to the bar line: %lld frames (expected %lld)",
+          fin ? (long long)fin->x : -1, (long long)kBar120);
+    CHECK(countEvents(evs, Ev::RecordStarted) == 1,
+          "the new take starts on the same boundary (%d RecordStarted)",
+          countEvents(evs, Ev::RecordStarted));
+    CHECK(h.e.recSlotIdx[0].load() == 1 && h.e.recState[0].load() == 2,
+          "the track is now recording slot %d in state %d (expected 1 / 2)",
+          h.e.recSlotIdx[0].load(), h.e.recState[0].load());
+
+    // No gap: the new take's first frame is the frame after the old one's last.
+    const i64 offB = findCaptureOffset(recB, kBar120, 4);
+    CHECK(offB >= 0 && std::llabs((long long)offB - (long long)kBar120) <= 2,
+          "the hand-over is gapless: slot 1 starts at frame %lld (expected %lld)",
+          (long long)offB, (long long)kBar120);
+}
+
+// e. a take queued but not yet begun can be cancelled, and input monitoring
+static void recCancelAndMonitor() {
+    {
+        Host h; h.init();
+        feedCapture(h);
+        std::vector<f32> rec((size_t)100000 * 2, 0.f);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(kBeat120);
+        h.pushRec(0, 0, rec.data(), 100000);     // queued for the bar line
+        h.runBlocks(1);
+        CHECK(h.e.recState[0].load() == 1, "a queued take reports recState 1 (%d)",
+              h.e.recState[0].load());
+        h.pushRec(0, 0, rec.data(), 100000);     // toggle before it begins
+        h.run(kBar120 * 2);
+        const std::vector<Event> evs = drainEvents(h.e);
+        CHECK(countEvents(evs, Ev::RecordStarted) == 0 &&
+              countEvents(evs, Ev::RecordFinished) == 0,
+              "cancelling a queued take is silent: no start, no finish (%d/%d)",
+              countEvents(evs, Ev::RecordStarted), countEvents(evs, Ev::RecordFinished));
+        CHECK(h.e.recState[0].load() == 0, "and the track is idle (%d)",
+              h.e.recState[0].load());
+    }
+    {
+        // Monitoring is pre-chain: a 0.5x device halves what you hear.
+        Host h; h.init();
+        h.input = [](i64, int n, f32* l, f32* r) {
+            for (int i = 0; i < n; ++i) { l[i] = 0.4f; r[i] = 0.2f; }
+        };
+        FakeFx half(0.5f);
+        RtChain chain; chain.fx[0] = &half; chain.count = 1;
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.setChain(0, &chain);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.run(4000);
+        CHECK(std::fabs(tailLevel(h.outL) - 0.2f) < 0.005f,
+              "an armed track monitors its input through the chain -> %.4f (expected 0.20)",
+              (double)tailLevel(h.outL));
+        CHECK(std::fabs(tailLevel(h.outR) - 0.1f) < 0.005f,
+              "right channel carries the right input -> %.4f (expected 0.10)",
+              (double)tailLevel(h.outR));
+
+        h.outL.clear(); h.outR.clear();
+        h.push(Cmd::TrackArm, 0, 0);
+        h.run(4000);
+        CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+              "disarming stops the monitoring -> %.3g", (double)tailLevel(h.outL));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+    {
+        // A backend with no capture device hands the engine nulls; a take must
+        // still run, and record silence, rather than dereferencing them.
+        Host h; h.init();                        // h.input stays unset
+        std::vector<f32> rec(2000 * 2, 1.f);     // pre-filled, so silence shows
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.push(Cmd::TrackArm, 0, 1);
+        h.pushRec(0, 0, rec.data(), 2000);
+        h.runBlocks(4);
+        const std::vector<Event> evs = drainEvents(h.e);
+        CHECK(findEvent(evs, Ev::RecordStarted) != nullptr,
+              "a take starts even with no capture device");
+        bool silent = true;
+        for (int i = 0; i < 4 * kBlock * 2; ++i) if (rec[(size_t)i] != 0.f) silent = false;
+        CHECK(silent, "null input records as silence, not as garbage");
+    }
+}
+
+static void testRecording() {
+    banner("10. recording");
+    note("RecordSlot toggles: first send queues a quantized start, the second a");
+    note("quantized stop. The engine appends raw input and never frees the buffer.");
+    recQuantizedTake();
+    recCapacityStop();
+    recTransportStop();
+    recSlotHandover();
+    recCancelAndMonitor();
+}
+
+// ---------------------------------------------------------------------------
+// 11. follow actions and launch probability
+// ---------------------------------------------------------------------------
+
+static RtClip mkFollow(const std::vector<f32>& buf, int ch, f32 gain, bool loop,
+                       Follow action, f64 followBeats, f64 prob = 1.0) {
+    RtClip c = mkClip(buf, ch, gain, Warp::Off, loop, 120.0);
+    c.followAction = (int)action;
+    c.followBeats  = followBeats;
+    c.prob         = prob;
+    return c;
+}
+
+// a. Again re-fires on its own beat
+static void followAgain() {
+    Host h; h.init();
+    // A short one-shot: silence between repeats is what makes each re-launch
+    // visible in the output.
+    auto buf = dcBuf(12000, 1, 1.0f);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setClip(0, 0, mkFollow(buf, 1, 0.5f, /*loop*/false, Follow::Again, 2.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 8);                         // four repeats
+
+    CHECK(std::fabs(h.outL[6000] - 0.5f) < 0.01f,
+          "the first pass sounds (%.4f at frame 6000)", (double)h.outL[6000]);
+    CHECK(std::fabs(h.outL[30000]) < 1e-4f,
+          "and has died away before the follow beat (%.3g at frame 30000)",
+          (double)h.outL[30000]);
+
+    // followBeats 2 at 120 BPM is 48000 frames.
+    const i64 second = firstWhere(h.outL, 20000, nonZero);
+    CHECK(second >= 0 && std::llabs((long long)second - (long long)(kBeat120 * 2)) <= 8,
+          "Again re-fires at beat 2: frame %lld (expected %lld)",
+          (long long)second, (long long)(kBeat120 * 2));
+    const i64 third = firstWhere(h.outL, (size_t)(kBeat120 * 2 + 20000), nonZero);
+    CHECK(third >= 0 && std::llabs((long long)third - (long long)(kBeat120 * 4)) <= 8,
+          "and again at beat 4 without drifting: frame %lld (expected %lld)",
+          (long long)third, (long long)(kBeat120 * 4));
+}
+
+// b. Next steps to the following slot with a clip in it, wrapping
+static void followNext() {
+    Host h; h.init();
+    auto pos = dcBuf(300000, 1,  1.0f);
+    auto neg = dcBuf(300000, 1, -1.0f);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    // Slot 1 is deliberately empty, so Next has to skip it.
+    h.setClip(0, 0, mkFollow(pos, 1, 0.5f, true, Follow::Next, 2.0));
+    h.setClip(0, 2, mkFollow(neg, 1, 0.5f, true, Follow::None, 0.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 4);
+
+    const i64 sw = firstWhere(h.outL, 1000, departsFromSteady);
+    CHECK(sw >= 0 && std::llabs((long long)sw - (long long)(kBeat120 * 2)) <= 8,
+          "Next fires at beat 2: frame %lld (expected %lld)",
+          (long long)sw, (long long)(kBeat120 * 2));
+    CHECK(h.e.activeSlot[0].load() == 2,
+          "Next skipped the empty slot 1 and landed on slot 2 (got %d)",
+          h.e.activeSlot[0].load());
+    CHECK(tailLevel(h.outL) < -0.4f,
+          "the new clip is the one sounding -> %.4f (expected -0.50)",
+          (double)tailLevel(h.outL));
+}
+
+// c. a follow action rolls the *target* clip's probability, Live-style
+static void followRollsTarget() {
+    Host h; h.init();
+    auto pos = dcBuf(300000, 1,  1.0f);
+    auto neg = dcBuf(300000, 1, -1.0f);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setClip(0, 0, mkFollow(pos, 1, 0.5f, true, Follow::Next, 1.0, 1.0));
+    h.setClip(0, 1, mkFollow(neg, 1, 0.5f, true, Follow::None, 0.0, /*prob*/0.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 16);                        // sixteen chances to misfire
+
+    CHECK(h.e.activeSlot[0].load() == 0,
+          "a follow into a prob = 0 clip never takes (activeSlot %d)",
+          h.e.activeSlot[0].load());
+    CHECK(tailLevel(h.outL) > 0.4f,
+          "and the source clip is undisturbed -> %.4f (expected 0.50)",
+          (double)tailLevel(h.outL));
+}
+
+// c. Stop as a follow action
+static void followStop() {
+    Host h; h.init();
+    auto buf = dcBuf(300000, 1, 1.0f);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setClip(0, 0, mkFollow(buf, 1, 0.5f, true, Follow::Stop, 2.0));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * 4);
+    CHECK(h.e.activeSlot[0].load() == -1,
+          "Follow::Stop stops the track (activeSlot %d)", h.e.activeSlot[0].load());
+    CHECK(std::fabs(tailLevel(h.outL)) < 1e-4f,
+          "and the track is silent afterwards -> %.3g", (double)tailLevel(h.outL));
+}
+
+// d. probability gates a launch without disturbing what is playing
+static void launchProbability() {
+    {
+        Host h; h.init();
+        auto pos = dcBuf(300000, 1,  1.0f);
+        auto neg = dcBuf(300000, 1, -1.0f);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setClip(0, 0, mkFollow(pos, 1, 0.5f, true, Follow::None, 0.0, 1.0));
+        h.setClip(0, 1, mkFollow(neg, 1, 0.5f, true, Follow::None, 0.0, 0.0));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(8000);
+        // Try the impossible clip repeatedly; it must never take over.
+        for (int k = 0; k < 32; ++k) { h.push(Cmd::LaunchClip, 0, 1); h.run(2000); }
+        CHECK(h.e.activeSlot[0].load() == 0,
+              "a prob = 0 clip never launches, even over 32 tries (activeSlot %d)",
+              h.e.activeSlot[0].load());
+        CHECK(tailLevel(h.outL) > 0.4f,
+              "and the clip that was playing keeps playing -> %.4f (expected 0.50)",
+              (double)tailLevel(h.outL));
+    }
+    {
+        Host h; h.init();
+        auto pos = dcBuf(300000, 1,  1.0f);
+        auto neg = dcBuf(300000, 1, -1.0f);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setClip(0, 0, mkFollow(pos, 1, 0.5f, true, Follow::None, 0.0, 1.0));
+        h.setClip(0, 1, mkFollow(neg, 1, 0.5f, true, Follow::None, 0.0, 1.0));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(8000);
+        h.push(Cmd::LaunchClip, 0, 1);
+        h.run(8000);
+        CHECK(h.e.activeSlot[0].load() == 1,
+              "a prob = 1 clip always launches (activeSlot %d)", h.e.activeSlot[0].load());
+        CHECK(tailLevel(h.outL) < -0.4f,
+              "and it is the one sounding -> %.4f (expected -0.50)",
+              (double)tailLevel(h.outL));
+    }
+    {
+        // A queued *stop* is never gated, whatever the clip's probability.
+        Host h; h.init();
+        auto buf = dcBuf(300000, 1, 1.0f);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 0);
+        h.setClip(0, 0, mkFollow(buf, 1, 0.5f, true, Follow::None, 0.0, 0.0));
+        // prob 0 blocks the launch, so put the clip on the grid with prob 1
+        // first and only then make it improbable.
+        RtClip c = mkFollow(buf, 1, 0.5f, true, Follow::None, 0.0, 1.0);
+        h.setClip(0, 0, c);
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(8000);
+        c.prob = 0.0;
+        h.setClip(0, 0, c);
+        h.push(Cmd::StopTrack, 0);
+        h.run(8000);
+        CHECK(h.e.activeSlot[0].load() == -1,
+              "a stop fires regardless of prob (activeSlot %d)", h.e.activeSlot[0].load());
+    }
+}
+
+// e. the same session rendered twice is the same audio, dice and all
+static void followDeterminism() {
+    auto renderOnce = [](std::vector<f32>& outL, std::vector<f32>& outR) {
+        Host h; h.init();
+        std::vector<std::vector<f32>> bufs;
+        for (int s = 0; s < 4; ++s) bufs.push_back(dcBuf(200000, 1, 0.2f * (f32)(s + 1)));
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 6);              // 1/4: plenty of boundaries
+        for (int s = 0; s < 4; ++s)
+            h.setClip(0, s, mkFollow(bufs[(size_t)s], 1, 0.5f, true,
+                                     Follow::Random, 1.0, 0.5));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(200000);
+        outL = h.outL; outR = h.outR;
+    };
+    std::vector<f32> aL, aR, bL, bR;
+    renderOnce(aL, aR);
+    renderOnce(bL, bR);
+    CHECK(aL.size() == bL.size() && !aL.empty(), "both runs produced the same amount of audio");
+    bool same = aL.size() == bL.size();
+    if (same) for (size_t i = 0; i < aL.size(); ++i)
+        if (aL[i] != bL[i] || aR[i] != bR[i]) { same = false; break; }
+    CHECK(same, "two identical runs of a prob 0.5 / Random-follow set are sample-identical");
+
+    // A 0.5 gate that never fires, or always fires, would be a broken RNG
+    // rather than a deterministic one.
+    f32 lo = 1e9f, hi = -1e9f;
+    for (size_t i = 0; i < aL.size(); i += 997) { lo = std::min(lo, aL[i]); hi = std::max(hi, aL[i]); }
+    CHECK(hi - lo > 0.05f,
+          "the set actually moved between clips (levels %.3f..%.3f)", (double)lo, (double)hi);
+}
+
+static void testFollowActions() {
+    banner("11. follow actions and launch probability");
+    note("a follow action schedules through the same quantized path a user launch");
+    note("takes, probability included, so a chain of follows stays on the grid.");
+    followAgain();
+    followNext();
+    followRollsTarget();
+    followStop();
+    launchProbability();
+    followDeterminism();
+}
+
+// ---------------------------------------------------------------------------
+// 12. MIDI routing
+// ---------------------------------------------------------------------------
+
+// Counts what reaches midi(). Unlike FakeFx it owns its descriptor, because
+// which devices receive is decided from desc().hasMidiIn / desc().kind.
+class FakeMidiFx : public PluginInstance {
+public:
+    FakeMidiFx(bool hasMidiIn, PluginKind kind) {
+        d_.hasMidiIn = hasMidiIn;
+        d_.kind = kind;
+    }
+
+    int count = 0;
+    int lastFrame = -1;
+    int lastLen = 0;
+    u8  lastStatus = 0, lastD1 = 0, lastD2 = 0;
+    int maxFrame = -1;
+    // How many messages had already arrived when process() last ran. Ordering
+    // matters: a note has to be in before the block it belongs to is rendered.
+    int countAtLastProcess = -1;
+
+    bool prepare(f64, int) override { return true; }
+    void process(const f32* const*, f32* const*, int, int) override {
+        countAtLastProcess = count;
+    }
+    void midi(const u8* data, int len, int frameOffset) override {
+        ++count;
+        lastLen = len;
+        lastStatus = data[0];
+        lastD1 = len > 1 ? data[1] : 0;
+        lastD2 = len > 2 ? data[2] : 0;
+        lastFrame = frameOffset;
+        if (frameOffset > maxFrame) maxFrame = frameOffset;
+    }
+
+    int              paramCount() const override   { return 0; }
+    const ParamInfo& paramInfo(int) const override { static ParamInfo p; return p; }
+    f32              getParam(int) const override  { return 0.f; }
+    void             setParam(int, f32) override   {}
+    const PluginDesc& desc() const override        { return d_; }
+    void             setBypassed(bool b) override  { bypassed_ = b; }
+    bool             bypassed() const override     { return bypassed_; }
+
+private:
+    PluginDesc d_;
+    bool bypassed_ = false;
+};
+
+static void testMidiRouting() {
+    banner("12. MIDI routing");
+    note("armed tracks only, and only to devices that asked for notes:");
+    note("desc().hasMidiIn or desc().kind == Instrument.");
+
+    Host h; h.init();
+    FakeMidiFx inst(false, PluginKind::Instrument);   // instrument, no hasMidiIn
+    FakeMidiFx mfx(true,  PluginKind::Effect);        // effect that wants MIDI
+    FakeMidiFx plain(false, PluginKind::Effect);      // ordinary effect
+    RtChain chain;
+    chain.fx[0] = &inst; chain.fx[1] = &mfx; chain.fx[2] = &plain; chain.count = 3;
+
+    FakeMidiFx idle(false, PluginKind::Instrument);   // on an unarmed track
+    RtChain chain2; chain2.fx[0] = &idle; chain2.count = 1;
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.setChain(0, &chain);
+    h.setChain(1, &chain2);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.runBlocks(1);                                   // let the chains land
+
+    h.pushMidi(0x90, 60, 100);
+    h.pushMidi(0x80, 60, 0);
+    h.pushMidi(0xB0, 74, 32);
+    h.pushMidi(0xE0, 0x00, 0x40);
+    h.runBlocks(1);
+
+    CHECK(inst.count == 4, "an instrument on an armed track gets every message (%d of 4)",
+          inst.count);
+    CHECK(mfx.count == 4, "so does an effect with hasMidiIn (%d of 4)", mfx.count);
+    CHECK(plain.count == 0, "an ordinary effect gets none (%d)", plain.count);
+    CHECK(idle.count == 0, "an unarmed track gets none (%d)", idle.count);
+    CHECK(inst.countAtLastProcess == 4 && mfx.countAtLastProcess == 4,
+          "all four arrived before the chain's process() for that block (%d / %d)",
+          inst.countAtLastProcess, mfx.countAtLastProcess);
+    CHECK(inst.lastStatus == 0xE0 && inst.lastD1 == 0x00 && inst.lastD2 == 0x40,
+          "the bytes arrive intact (%02X %02X %02X)",
+          inst.lastStatus, inst.lastD1, inst.lastD2);
+    CHECK(inst.lastLen == 3, "a pitch bend is 3 bytes (%d)", inst.lastLen);
+
+    // Two-byte channel messages must report length 2.
+    inst.count = 0;
+    h.pushMidi(0xC0, 7, 0);
+    h.runBlocks(1);
+    CHECK(inst.count == 1 && inst.lastLen == 2,
+          "a program change is delivered as 2 bytes (%d calls, len %d)",
+          inst.count, inst.lastLen);
+
+    // Frame offsets are clamped into the block, however wild the hint.
+    inst.count = 0; inst.maxFrame = -1;
+    h.pushMidi(0x90, 62, 90, 1000000);
+    h.pushMidi(0x90, 64, 90, -50);
+    h.runBlocks(1);
+    CHECK(inst.count == 2 && inst.maxFrame == h.block - 1,
+          "an out-of-range frame hint is clamped to the block (%d, max %d, block %d)",
+          inst.count, inst.maxFrame, h.block);
+
+    // Disarming stops delivery; the chain keeps running.
+    inst.count = 0;
+    h.push(Cmd::TrackArm, 0, 0);
+    h.runBlocks(1);
+    h.pushMidi(0x90, 65, 90);
+    h.runBlocks(1);
+    CHECK(inst.count == 0, "disarming the track stops delivery (%d)", inst.count);
+
+    h.setChain(0, nullptr);
+    h.setChain(1, nullptr);
+    h.runBlocks(2);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("lattice engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -752,6 +1380,9 @@ int main() {
     testFiniteOutput();
     testRingSaturation();
     testDeviceChains();
+    testRecording();
+    testFollowActions();
+    testMidiRouting();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

@@ -120,4 +120,37 @@ SampleRef loadSample(const std::string& path, f64 engineRate) {
     return sb;
 }
 
+SampleRef sampleFromRecording(const f32* interleaved, i64 frames, f64 engineRate,
+                              f64 sessionBpm, const std::string& name) {
+    if (!interleaved || frames <= 0 || engineRate <= 0.0) return nullptr;
+
+    auto sb = std::make_shared<SampleBuffer>();
+    sb->channels = 2;                    // the engine always captures stereo
+    sb->frames   = frames;
+    sb->rate     = engineRate;
+    sb->name     = name;
+    sb->path.clear();                    // nothing on disk yet
+
+    // One extra frame so linear interpolation can always read pos+1, exactly
+    // as loadSample() pads: the realtime fetch path makes no special case for
+    // recorded buffers.
+    sb->data.assign((size_t)(frames + 1) * 2, 0.f);
+    std::memcpy(sb->data.data(), interleaved, (size_t)frames * 2 * sizeof(f32));
+
+    // A recording was made against the session clock, so its tempo is known
+    // rather than guessed — guessLoopTempo() would be throwing that away. The
+    // length is snapped to a sixteenth to absorb the sub-block rounding of the
+    // quantized start and stop; a take is always a musical number of beats.
+    const f64 bpm   = (sessionBpm > 0.0) ? sessionBpm : 120.0;
+    const f64 beats = (f64)frames / engineRate / 60.0 * bpm;
+    sb->guessedBpm   = bpm;
+    sb->guessedBeats = std::max(0.25, std::round(beats * 4.0) / 4.0);
+
+    sb->buildPeaks();
+    LOGI("recorded %s  %lldf  %.2fs  %.0f BPM / %.2f beats",
+         sb->name.c_str(), (long long)frames, (f64)frames / engineRate,
+         sb->guessedBpm, sb->guessedBeats);
+    return sb;
+}
+
 } // namespace lat

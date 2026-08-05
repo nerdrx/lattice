@@ -33,6 +33,12 @@ public:
         outR_ = jack_port_register(client_, "out_R", JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
         if (!outL_ || !outR_) { jack_client_close(client_); client_ = nullptr; return false; }
 
+        // Capture is optional: losing it costs recording and monitoring, not
+        // playback, so a failure here is a warning and the engine gets nulls.
+        inL_ = jack_port_register(client_, "in_L", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+        inR_ = jack_port_register(client_, "in_R", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+        if (!inL_ || !inR_) LOGW("JACK: no input ports, recording disabled");
+
         jack_set_process_callback(client_, &JackBackend::processCb, this);
         jack_set_sample_rate_callback(client_, &JackBackend::srCb, this);
         if (jack_activate(client_)) { jack_client_close(client_); client_ = nullptr; return false; }
@@ -44,6 +50,19 @@ public:
             if (ports[0]) jack_connect(client_, jack_port_name(outL_), ports[0]);
             if (ports[1]) jack_connect(client_, jack_port_name(outR_), ports[1]);
             jack_free(ports);
+        }
+        // Same for capture. A physical *source* is an output port from the
+        // graph's point of view, which is why the mask is inverted here.
+        if (inL_ && inR_) {
+            if (const char** ports = jack_get_ports(client_, nullptr, JACK_DEFAULT_AUDIO_TYPE,
+                                                    JackPortIsPhysical | JackPortIsOutput)) {
+                if (ports[0]) jack_connect(client_, ports[0], jack_port_name(inL_));
+                // A mono interface exposes one capture port; feed it to both
+                // sides so a mono source still records as centred stereo.
+                if (ports[1]) jack_connect(client_, ports[1], jack_port_name(inR_));
+                else if (ports[0]) jack_connect(client_, ports[0], jack_port_name(inR_));
+                jack_free(ports);
+            }
         }
         LOGI("JACK backend up: %.0f Hz, %d frames", sr_, bs_);
         return true;
@@ -65,7 +84,9 @@ private:
         auto* self = (JackBackend*)arg;
         auto* l = (f32*)jack_port_get_buffer(self->outL_, n);
         auto* r = (f32*)jack_port_get_buffer(self->outR_, n);
-        self->engine_->process(nullptr, nullptr, l, r, (int)n);
+        const f32* il = self->inL_ ? (const f32*)jack_port_get_buffer(self->inL_, n) : nullptr;
+        const f32* ir = self->inR_ ? (const f32*)jack_port_get_buffer(self->inR_, n) : nullptr;
+        self->engine_->process(il, ir, l, r, (int)n);
         return 0;
     }
     static int srCb(jack_nframes_t n, void* arg) {
@@ -77,6 +98,7 @@ private:
 
     jack_client_t* client_ = nullptr;
     jack_port_t *outL_ = nullptr, *outR_ = nullptr;
+    jack_port_t *inL_  = nullptr, *inR_  = nullptr;
     Engine* engine_ = nullptr;
     f64 sr_ = 48000.0;
     int bs_ = 1024;
@@ -115,6 +137,11 @@ public:
         l_.resize((size_t)bs_);
         r_.resize((size_t)bs_);
         inter_.resize((size_t)bs_ * 2);
+        capL_.assign((size_t)bs_, 0.f);
+        capR_.assign((size_t)bs_, 0.f);
+        capInter_.assign((size_t)bs_ * 2, 0.f);
+
+        openCapture();
 
         run_.store(true);
         thread_ = std::thread(&AlsaBackend::loop, this);
@@ -126,6 +153,7 @@ public:
         if (!pcm_) return;
         run_.store(false);
         if (thread_.joinable()) thread_.join();
+        if (cap_) { snd_pcm_drop(cap_); snd_pcm_close(cap_); cap_ = nullptr; }
         snd_pcm_drop(pcm_);
         snd_pcm_close(pcm_);
         pcm_ = nullptr;
@@ -136,6 +164,68 @@ public:
     const char* name() const override { return "ALSA"; }
 
 private:
+    // Capture rides alongside playback on the same device, rate and period so
+    // the two streams stay in lockstep without a resampler or a ring buffer in
+    // between. It is strictly optional: a machine with no input (or an input
+    // that will not do float/stereo) still plays back, it just cannot record.
+    void openCapture() {
+        if (snd_pcm_open(&cap_, "default", SND_PCM_STREAM_CAPTURE, 0) < 0) {
+            cap_ = nullptr;
+            LOGW("ALSA: no capture device, recording and input monitoring disabled");
+            return;
+        }
+        snd_pcm_hw_params_t* hw;
+        snd_pcm_hw_params_alloca(&hw);
+        snd_pcm_hw_params_any(cap_, hw);
+        snd_pcm_hw_params_set_access(cap_, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(cap_, hw, SND_PCM_FORMAT_FLOAT_LE);
+        snd_pcm_hw_params_set_channels(cap_, hw, 2);
+
+        unsigned rate = (unsigned)sr_;
+        snd_pcm_hw_params_set_rate_near(cap_, hw, &rate, nullptr);
+        snd_pcm_uframes_t period = (snd_pcm_uframes_t)bs_;
+        snd_pcm_hw_params_set_period_size_near(cap_, hw, &period, nullptr);
+        unsigned periods = 3;
+        snd_pcm_hw_params_set_periods_near(cap_, hw, &periods, nullptr);
+
+        // A capture stream that disagrees about rate or period would drift
+        // against playback; better no input than input that slides.
+        if (snd_pcm_hw_params(cap_, hw) < 0 || (f64)rate != sr_ || (int)period != bs_) {
+            LOGW("ALSA: capture cannot match %.0f Hz / %d frames, recording disabled", sr_, bs_);
+            snd_pcm_close(cap_);
+            cap_ = nullptr;
+            return;
+        }
+        snd_pcm_prepare(cap_);
+        snd_pcm_start(cap_);
+        LOGI("ALSA capture up: %.0f Hz, %d frames", sr_, bs_);
+    }
+
+    // Fills capL_/capR_ for this cycle. Returns false once capture is gone, in
+    // which case the engine is handed nulls from here on.
+    bool readCapture() {
+        if (!cap_) return false;
+        const snd_pcm_sframes_t got = snd_pcm_readi(cap_, capInter_.data(), (snd_pcm_uframes_t)bs_);
+        if (got < 0) {
+            if (snd_pcm_recover(cap_, (int)got, 1) < 0) {
+                LOGW("ALSA: capture stream lost, continuing without input");
+                snd_pcm_close(cap_);
+                cap_ = nullptr;
+                return false;
+            }
+            // A recovered xrun has no samples to show for this cycle.
+            std::fill(capL_.begin(), capL_.end(), 0.f);
+            std::fill(capR_.begin(), capR_.end(), 0.f);
+            return true;
+        }
+        for (int i = 0; i < bs_; ++i) {
+            const bool have = i < (int)got;
+            capL_[(size_t)i] = have ? capInter_[(size_t)i * 2]     : 0.f;
+            capR_[(size_t)i] = have ? capInter_[(size_t)i * 2 + 1] : 0.f;
+        }
+        return true;
+    }
+
     void loop() {
         // Best effort: ask for realtime priority, carry on without it.
         sched_param sp{};
@@ -143,7 +233,10 @@ private:
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 
         while (run_.load(std::memory_order_relaxed)) {
-            engine_->process(nullptr, nullptr, l_.data(), r_.data(), bs_);
+            const bool haveIn = readCapture();
+            engine_->process(haveIn ? capL_.data() : nullptr,
+                             haveIn ? capR_.data() : nullptr,
+                             l_.data(), r_.data(), bs_);
             for (int i = 0; i < bs_; ++i) { inter_[i * 2] = l_[i]; inter_[i * 2 + 1] = r_[i]; }
             const snd_pcm_sframes_t w = snd_pcm_writei(pcm_, inter_.data(), (snd_pcm_uframes_t)bs_);
             if (w < 0) {
@@ -153,10 +246,12 @@ private:
     }
 
     snd_pcm_t* pcm_ = nullptr;
+    snd_pcm_t* cap_ = nullptr;
     Engine* engine_ = nullptr;
     std::thread thread_;
     std::atomic<bool> run_{false};
     std::vector<f32> l_, r_, inter_;
+    std::vector<f32> capL_, capR_, capInter_;
     f64 sr_ = 48000.0;
     int bs_ = 256;
 };
