@@ -26,6 +26,21 @@ namespace {
 // is every set written before this version existed -- again saves exactly the
 // bytes version 3 saved apart from the header line.
 //
+// Version 5 adds clip automation. A clip block gains, after its notes, zero or
+// more `env <address>` ... `endenv` blocks:
+//
+//     env t:7/dev:12/p:3
+//       pt 0 200
+//       pt 2 4000
+//     endenv
+//
+// with an optional `off` line marking a deactivated lane. Every part of it is
+// sparse in the same way everything above is -- a clip with no envelopes writes
+// nothing, a lane with no points is dropped, `off` appears only when the lane
+// is disabled and the curve byte only when it is non-zero -- so a set that uses
+// none of it saves exactly the bytes version 4 saved apart from the header
+// line. See writeClip and validAddress for the details.
+//
 // There is deliberately ONE parser for all versions rather than a reader per
 // version. The additions are all new keys with defaults, so an older file
 // simply never mentions them and comes out with the defaults; the version
@@ -39,7 +54,7 @@ namespace {
 // token of the first line both identifies the format and carries the version.
 // The product was called Lattice through versions 1..4, so that token was
 // `lattice`; it is `nxtakt` from the rename on. Both spellings name the SAME
-// format in the SAME version space (1..4 and counting) -- the rename did not
+// format in the SAME version space (1..5 and counting) -- the rename did not
 // fork the format, and a `nxtakt 4` file is byte-identical to the `lattice 4`
 // file it replaced apart from that one word.
 //
@@ -54,7 +69,7 @@ namespace {
 // word that was read so a re-save preserves it. Load-and-save flips the header
 // to the new spelling, and that is the only thing it flips. See
 // kHeaderWord/isHeaderWord below.
-constexpr int kFormatVersion = 4;
+constexpr int kFormatVersion = 5;
 constexpr int kMinFormatVersion = 1;
 
 // What saveProject writes. Reading accepts this and every spelling in
@@ -190,6 +205,170 @@ f64 clNoteLen(f64 v)  { return std::isfinite(v) ? clampv(v, kMinNoteLen, 1e7) : 
 // note, hence the floor of 1.
 u8 clPitch(i64 v)     { return (u8)clampv(v, (i64)0, (i64)127); }
 u8 clVel(i64 v)       { return (u8)clampv(v, (i64)1, (i64)127); }
+
+// Automation breakpoints. Same symmetry, same reasoning.
+//
+// A breakpoint's value is in the TARGET'S OWN units (AUTOMATION.md §2.3) -- a
+// fader position, a pan, a plugin parameter in whatever range that plugin
+// declared -- so there is no range this layer could clamp it to that would not
+// be wrong for some target. Only non-finite is folded, exactly as clParam does
+// for a device parameter, and for the same reason: NaN is not a value, and the
+// range check belongs to the publisher, which has the ParamInfo.
+f64 clEnvBeat(f64 v)  { return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
+f32 clEnvValue(f32 v) { return std::isfinite(v) ? v : 0.f; }
+// The curve byte is PRESERVED, not normalized. `curve` is reserved and every
+// shape but 0 (linear) is unimplemented, so the tempting thing is to clamp it
+// to 0 -- and that would be wrong. AUTOMATION.md §2.1 is explicit: "a reader
+// that meets a non-zero curve renders it as linear and writes it back
+// unchanged", which is what makes the byte a forward-compatibility slot rather
+// than dead weight. A newer build writes `pt 0 1 3`; this build must load that
+// set, draw the segment straight, and hand the 3 back on the next save instead
+// of silently flattening somebody's ease curve into a file that can never say
+// so again. So the clamp is to the field's own width and nothing more -- the
+// parameter is widened to i64 so a negative in a file is caught here rather
+// than wrapping, exactly as clPitch does.
+u8 clCurve(i64 v)     { return (u8)clampv(v, (i64)0, (i64)255); }
+
+// ---------------------------------------------------------------------------
+// parameter addresses -- SHAPE ONLY
+// ---------------------------------------------------------------------------
+//
+// An automation lane names its target by canonical address (docs/PARAM-ADDRESS.md,
+// plus the `send:` segment AUTOMATION.md §4.1 adds). The reader checks that
+// text against the grammar and NOTHING ELSE. It never asks whether track uid 7
+// exists, whether device uid 12 is in the set, or whether the plugin declaring
+// param 3 is installed on this machine -- resolution lives GUI-side, and
+// PARAM-ADDRESS.md's "dangling addresses resolve to nothing and must fail soft"
+// is the whole reason the address is stored as text in the first place.
+//
+// That gives the two halves of AUTOMATION.md §7.2, which is the same split
+// `send <idx> <level>` already makes one screen up:
+//
+//   * Syntactically malformed -> the load FAILS. It is structure. There is no
+//     right answer for what `t:7//vol` or `t:seven/vol` meant, and guessing
+//     would silently move somebody's automation onto a different parameter.
+//   * Syntactically valid but naming a uid nothing answers to -> KEPT, and
+//     written back unchanged on the next save. Losing a filter sweep because
+//     the set was opened on a machine without the plugin is the worst bug this
+//     feature can have; it is the same promise ClipModel::path makes for a
+//     missing sample and DeviceModel::lostParams for a missing plugin.
+//
+// Grammar, from PARAM-ADDRESS.md:
+//
+//     address   := scope ( "/" segment )?
+//     scope     := "master" | "t:" UID | "s:" UID
+//     segment   := "vol" | "pan" | "mute" | "solo" | "arm" | "launch"
+//                | "send:" INDEX
+//                | "dev:" UID "/p:" PARAMID
+//                | "clip:" UID "/" clipfield
+//     clipfield := gain | prob | follow | followBeats | warp | loop
+//
+// Three readings of that grammar are decisions rather than transcription, and
+// all three lean the same way -- toward accepting -- because a false reject
+// costs the user the whole file while a false accept costs a lane that
+// resolves to nothing:
+//
+//   * The document writes the segment list as `( "/" segment )*`. It is read
+//     here as "at most one": every alternative is already a complete leaf and
+//     no two of them compose, so `t:7/vol/pan` is a typo, not a nesting.
+//   * A bare scope (`master`, `t:7`) has zero segments and is ACCEPTED. It
+//     names no field, so it resolves to nothing -- which is a resolution
+//     outcome, handled by the rule above, not a shape error.
+//   * `launch` appears in PARAM-ADDRESS.md only as the reserved `s:4/launch`
+//     example and not in the segment list at all. It is accepted for any
+//     scope: policing which fields belong to which scope is resolution, and
+//     rejecting a reserved spelling that a future build emits would be exactly
+//     the failure mode this function exists to avoid.
+//
+// Ranges are not checked either, for the same reason: `t:7/send:99` names a bus
+// this build does not have, and that is a dangling address, not a broken one.
+// (Contrast the track's own `send 99 0.5` line, which IS rejected -- there the
+// index is a slot in a fixed array this file is writing into, so there is
+// nowhere to put it. Here it is text that round-trips.)
+
+// A decimal u64 with at least one digit and nothing else. Leading zeros are
+// fine -- the text is written back verbatim, so `t:007` costs nothing -- but a
+// value that is not representable is not a uid.
+bool addrUid(const std::string& s) {
+    if (s.empty() || s.size() > 20) return false;
+    for (char c : s) if (c < '0' || c > '9') return false;
+    errno = 0;
+    (void)std::strtoull(s.c_str(), nullptr, 10);
+    return errno != ERANGE;
+}
+
+// A decimal u32: ParamInfo::id and a send index are both that width.
+bool addrIndex(const std::string& s) {
+    if (s.empty() || s.size() > 10) return false;
+    for (char c : s) if (c < '0' || c > '9') return false;
+    return std::strtoull(s.c_str(), nullptr, 10) <= (unsigned long long)UINT32_MAX;
+}
+
+bool validAddress(const std::string& a) {
+    // "Addresses are ASCII, no spaces" -- which also keeps them safe as an OSC
+    // path and as the tail of a line in this file. A control character or a
+    // space here means the line was not an address at all.
+    if (a.empty()) return false;
+    for (unsigned char c : a) if (c <= 0x20 || c >= 0x7f) return false;
+
+    std::vector<std::string> tok;
+    for (size_t start = 0;;) {
+        const size_t sl = a.find('/', start);
+        tok.push_back(a.substr(start, sl == std::string::npos ? sl : sl - start));
+        if (sl == std::string::npos) break;
+        start = sl + 1;
+    }
+    // Catches "t:7/", "/vol" and "t:7//vol" in one line.
+    for (const std::string& t : tok) if (t.empty()) return false;
+
+    size_t i = 0;
+    const std::string scope = tok[i++];
+    if (scope != "master") {
+        if (scope.compare(0, 2, "t:") != 0 && scope.compare(0, 2, "s:") != 0) return false;
+        if (!addrUid(scope.substr(2))) return false;
+    }
+    if (i == tok.size()) return true;               // bare scope; see above
+
+    const std::string seg = tok[i++];
+    if (seg == "vol" || seg == "pan" || seg == "mute" || seg == "solo" ||
+        seg == "arm" || seg == "launch") {
+        // a leaf field
+    } else if (seg.compare(0, 5, "send:") == 0) {
+        if (!addrIndex(seg.substr(5))) return false;
+    } else if (seg.compare(0, 4, "dev:") == 0) {
+        if (!addrUid(seg.substr(4))) return false;
+        if (i == tok.size()) return false;
+        const std::string p = tok[i++];
+        if (p.compare(0, 2, "p:") != 0 || !addrIndex(p.substr(2))) return false;
+    } else if (seg.compare(0, 5, "clip:") == 0) {
+        if (!addrUid(seg.substr(5))) return false;
+        if (i == tok.size()) return false;
+        const std::string f = tok[i++];
+        if (f != "gain" && f != "prob" && f != "follow" && f != "followBeats" &&
+            f != "warp" && f != "loop") return false;
+    } else {
+        return false;
+    }
+    return i == tok.size();                         // nothing may trail a leaf
+}
+
+// Is this lane worth a block in the file?
+//
+// Two suppressions, both round-trip stable because nothing reads back what
+// they drop:
+//
+//   * An EMPTY LANE is dropped (AUTOMATION.md §7.3). A lane with an address and
+//     no points is UI state -- the user picked a parameter in the chooser and
+//     has not drawn anything yet -- not content.
+//   * A lane whose address is MALFORMED is dropped, for the reason writeClip
+//     gates `note` on the clip kind: the reader refuses such a lane, so writing
+//     one would produce a file this build cannot load back. It cannot arise
+//     from a loaded set (the load would have failed) -- only from a model
+//     someone built in memory -- but ClipModel is public and the writer must
+//     not be the thing that makes an unreadable file.
+bool laneWorthWriting(const AutoLane& l) {
+    return !l.points.empty() && validAddress(l.address);
+}
 
 // A slot counts as occupied if it holds audio, remembers a source file, was
 // given a name, or is a MIDI clip. There is no explicit "used" flag in
@@ -352,6 +531,45 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
                               fmtF64(clNoteLen(n.len)) + " " +
                               std::to_string((int)clPitch(n.pitch)) + " " +
                               std::to_string((int)clVel(n.vel)));
+    // Envelopes after the notes, for the reason the notes come after the
+    // scalars: the block reads header-then-content, and a clip with 400 notes
+    // and 3 lanes still shows its settings at the top.
+    //
+    // NOT gated on the kind, unlike `note` (AUTOMATION.md §7.1). An audio clip
+    // has nowhere to keep notes, but an envelope is meaningful on both kinds --
+    // clip gain, a track fader, a device parameter -- and the reader accepts one
+    // inside an audio clip today so that wave 8's audio-clip lanes are a UI
+    // change and not a format change.
+    //
+    // Lane order and point order are the model's, preserved on both ends and
+    // sorted by neither (§7.3): the editor holds the sorted-by-beat invariant,
+    // the writer emits what it is given, the reader keeps what it finds. A
+    // hand-shuffled file therefore still round-trips byte-identically and
+    // merely loads as a session whose vectors are unsorted -- the same contract
+    // `note` has, for the same reason.
+    for (const auto& lane : c.envelopes) {
+        if (!laneWorthWriting(lane)) continue;
+        kv(o, "    ", "env", lane.address);
+        // Sparse, like every flag in this file: `enabled` is true on every lane
+        // anyone has ever drawn, so the common case emits nothing and only a
+        // deactivated lane costs a line. Round-trip stable because the value a
+        // missing `off` loads as (true) is exactly the value that suppresses it.
+        // It leads the block so a human scanning a diff sees the lane is dead
+        // before reading 200 breakpoints.
+        if (!lane.enabled) kv(o, "      ", "off", std::string());
+        for (const auto& p : lane.points) {
+            // The curve byte is written only when non-zero -- the same
+            // discipline prob/follow/send use and, again, for the same
+            // round-trip reason: the value a missing field loads as (0, linear)
+            // is exactly the value that suppresses it. Note it is preserved,
+            // not normalized; see clCurve.
+            const u8 curve = clCurve((i64)p.curve);
+            std::string ln = fmtF64(clEnvBeat(p.beat)) + " " + fmtF32(clEnvValue(p.value));
+            if (curve) ln += " " + std::to_string((int)curve);
+            kn(o, "      ", "pt", ln);
+        }
+        o += "    endenv\n";
+    }
     o += "  endclip\n";
 }
 
@@ -478,9 +696,18 @@ struct Scan {
         out = neg ? 0 : (u64)v;
         return true;
     }
+    // Is there anything but whitespace left on the line? Only `pt` needs this,
+    // because it is the one line in the format with an OPTIONAL numeric field:
+    // "absent" and "present but not a number" have to be told apart, and
+    // strtoll cannot do it on its own.
+    bool exhausted() const {
+        const char* q = p;
+        while (*q == ' ' || *q == '\t') ++q;
+        return *q == '\0';
+    }
 };
 
-enum class St { Top, Track, Device, Clip, Scene, Return, Master };
+enum class St { Top, Track, Device, Clip, Env, Scene, Return, Master };
 
 bool readWholeFile(const std::string& path, std::string& out, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -890,6 +1117,24 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             } else if (key == "followbeats") {
                 f64 v; if (!sc.num(v)) return fail("clip followbeats: expected a number");
                 c.followBeats = clFollowBeats(v);
+            } else if (key == "env") {
+                // The address is the whole rest of the line, escaped like
+                // `name` and `plugin`, and validated AFTER unescaping because
+                // the unescaped text is what the model holds and what the next
+                // save writes back.
+                //
+                // Malformed -> the load fails. See validAddress for the full
+                // argument; the short version is that it is structure, and a
+                // repaired address is automation silently moved onto some other
+                // parameter. A *dangling* address -- well-formed, naming a uid
+                // nothing answers to -- is content and is kept.
+                //
+                // Not gated on the clip kind: an audio clip may carry lanes.
+                const std::string addr = unesc(rest);
+                if (!validAddress(addr))
+                    return fail("env: malformed parameter address '" + addr + "'");
+                c.envelopes.push_back(AutoLane{addr, {}, true});
+                st = St::Env;
             } else if (key == "endclip") {
                 // Checked here rather than at the offending line so the block
                 // may be written in any order: `note` before `kind midi` is
@@ -917,6 +1162,54 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 st = St::Track;
             } else {
                 return fail("unexpected '" + key + "' inside clip");
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
+        // An envelope block, opened from St::Clip and closing back to it. The
+        // lane is always envelopes.back(): `env` is reachable only from a clip,
+        // ti/ci stay valid for the whole block, and nothing else appends to that
+        // vector in between.
+        //
+        // No count is enforced here. kMaxClipLanes and kMaxClipAutoPoints are
+        // real ceilings, but AUTOMATION.md §2.1 puts them on the editor and the
+        // publisher and says "never by the parser" -- deliberately, and it is
+        // the same call `device` makes one block up: refusing a file, or
+        // silently truncating a user's automation at load time, is a worse
+        // failure than a set the publisher will clamp anyway. The engine's
+        // fixed-width lane array is the publisher's problem, not the format's.
+        case St::Env: {
+            AutoLane& lane = out.tracks[(size_t)ti].slots[ci].envelopes.back();
+            if (key == "pt") {
+                // Structure rejected, values clamped -- as for `note`, `param`
+                // and every scalar. `beat` and `value` are required, so a line
+                // missing either, or spelling one as something that is not a
+                // number, is a broken line with no sane guess behind it.
+                //
+                // `curve` is optional, and that is the one place this line is
+                // stricter than `note`: `note` ignores whatever trails its four
+                // fields, but here "nothing follows" is itself meaningful (curve
+                // 0, linear), so trailing text that is NOT a number cannot be
+                // waved through -- it would be an unreadable third field
+                // silently loading as the value that suppresses it.
+                f64 beat = 0.0, value = 0.0;
+                if (!sc.num(beat) || !sc.num(value))
+                    return fail("pt: expected a beat and a value");
+                i64 curve = 0;
+                if (!sc.exhausted() && !sc.integer(curve))
+                    return fail("pt: curve must be an integer");
+                lane.points.push_back(AutoPoint{clEnvBeat(beat), clEnvValue((f32)value),
+                                                clCurve(curve), {}});
+            } else if (key == "off") {
+                // Presence is the whole statement, like `master`. A value is not
+                // read and not required: the line exists only when the lane is
+                // deactivated, so "off 0" would be a contradiction the writer
+                // can never produce.
+                lane.enabled = false;
+            } else if (key == "endenv") {
+                st = St::Clip;
+            } else {
+                return fail("unexpected '" + key + "' inside env");
             }
             break;
         }
@@ -981,7 +1274,8 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
 
     if (!sawHeader) return fail("empty or truncated project file");
     if (st != St::Top) {
-        const char* what = (st == St::Clip)   ? "endclip"
+        const char* what = (st == St::Env)    ? "endenv"
+                         : (st == St::Clip)   ? "endclip"
                          : (st == St::Device) ? "enddevice"
                          : (st == St::Track)  ? "endtrack"
                          : (st == St::Return) ? "endreturn"

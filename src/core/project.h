@@ -30,7 +30,16 @@
 // header. Devices in a return or on the master are the same passive
 // SavedDevice blocks a track writes, read and written through the same code.
 //
-// Saving always writes the current version; versions 1 through 4 all load,
+// Version 5 adds clip automation. A clip block gains, after its notes, zero or
+// more `env <address>` ... `endenv` blocks, each holding an optional `off` line
+// (the lane is deactivated) and one `pt <beat> <value> [curve]` line per
+// breakpoint. A clip with no envelopes emits nothing, an envelope with no
+// points is dropped, and the curve byte is written only when non-zero -- so a
+// set that uses none of this again produces the same bytes version 4 produced
+// apart from the header. Envelopes are NOT gated on clip kind: an audio clip
+// may carry them too.
+//
+// Saving always writes the current version; versions 1 through 5 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 //
