@@ -1,0 +1,179 @@
+# Lattice CI
+#
+# Two jobs:
+#   test         build everything (GUI included) and run the headless suite
+#   render-music rebuild the deviceless tools and actually render the demo set
+#
+# Nothing here needs a display, a compositor or an audio device. tools/
+# headless_test.sh is deliberately NOT used: it needs gamescope, which no hosted
+# runner has.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch cancels the run it superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build + headless tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Package names below are chosen to resolve on both 22.04 and 24.04:
+      #
+      #   libfreetype-dev     modern name since freetype 2.10 (bullseye/jammy);
+      #                       libfreetype6-dev is the transitional alias.
+      #   libfontconfig1-dev  deliberately the *old* name -- fontconfig only
+      #                       gained libfontconfig-dev in 2.14 (noble), while
+      #                       libfontconfig1-dev still exists there as a
+      #                       transitional package. So this one name works on
+      #                       both; libfontconfig-dev would break on 22.04.
+      #   libgl-dev/libglx-dev/libegl-dev
+      #                       libglvnd's dev packages (focal onwards). These own
+      #                       gl.pc / egl.pc; libgl1-mesa-dev is now just a
+      #                       transitional wrapper around libgl-dev.
+      #   libjack-jackd2-dev  jack.pc; conflicts with jack1's libjack-dev, which
+      #                       is not installed on the runners.
+      #   lv2-dev             lilv's pkg-config pulls in the LV2 headers.
+      #
+      # The wayland block is optional: without it the Makefile sets
+      # HAVE_WAYLAND=0, drops src/ui/window_wayland.cpp and still links a
+      # working X11-only binary. We install it anyway so the Wayland backend is
+      # compiled on every push instead of silently rotting. libwayland-bin is
+      # listed explicitly because it -- not libwayland-dev -- ships
+      # wayland-scanner, and --no-install-recommends could otherwise skip it.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libjack-jackd2-dev libasound2-dev \
+            libsndfile1-dev libsamplerate0-dev \
+            libfreetype-dev libfontconfig1-dev \
+            libgl-dev libglx-dev libx11-dev libxcursor-dev \
+            liblilv-dev lv2-dev \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libxkbcommon-dev libegl-dev
+
+      # Prints which window backend and which xdg protocols were detected --
+      # the first thing to look at when a build behaves differently in CI.
+      - name: Show detected configuration
+        run: make config
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      # engine unit tests, ipc/shm tests, gen_demo round-trip, a real render
+      # that must not be silent, and an LV2/CLAP plugin scan. The runner has no
+      # LV2 plugins installed, so the scan legitimately reports 0 -- it is
+      # exercising lilv discovery, not asserting a plugin count.
+      - name: Headless test suite
+        run: make test
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-linux-x64
+          path: build/lattice
+          retention-days: 14
+          if-no-files-found: error
+
+  render-music:
+    name: render the demo set
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # gen_demo and render link only sndfile/samplerate/lilv -- no GUI, no
+      # JACK, no X11 -- so this job installs a much smaller set than `test`.
+      # `needs: test` is ordering only (don't publish audio from a broken
+      # commit); rebuilding the two tools takes ~3s, which is cheaper and less
+      # fragile than shipping executables between jobs as artifacts.
+      - name: Install render dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libsndfile1-dev libsamplerate0-dev liblilv-dev lv2-dev \
+            flac
+
+      - name: Build the deviceless tools
+        run: make build/gen_demo build/render
+
+      - name: Generate the demo set
+        run: |
+          mkdir -p demo-out
+          ./build/gen_demo demo-out
+
+      # Every scene of the demo set (0 Intro, 1 Beat, 2 Full, 3 Break) at 4 bars,
+      # plus a 16-bar pass over the full scene. render exits non-zero if a render
+      # comes out silent, so this is a real assertion, not just decoration.
+      # Its peak/rms lines are teed into the log, the job summary and the
+      # artifact, so every push shows its numbers.
+      - name: Render all scenes
+        run: |
+          set -euo pipefail
+          {
+            for scene in 0 1 2 3; do
+              ./build/render demo-out/demo.lattice "demo-out/scene-$scene.wav" \
+                --scene "$scene" --bars 4
+            done
+            ./build/render demo-out/demo.lattice demo-out/full-scene2-16bars.wav \
+              --scene 2 --bars 16
+          } | tee demo-out/render-stats.txt
+
+      - name: Publish render stats to the job summary
+        run: |
+          {
+            echo '### Render stats'
+            echo '```'
+            cat demo-out/render-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # FLAC via the `flac` CLI rather than sndfile-convert: on Ubuntu
+      # sndfile-convert lives in a separate sndfile-programs package and is not
+      # guaranteed to be present, while `flac` is its own package and handles
+      # the 24-bit/48k stereo output verbatim. If conversion fails for any
+      # reason we keep the wavs and still upload -- the audio is the point, the
+      # container is not.
+      #
+      # Only the renders are converted; the four generated source loops stay as
+      # wav so the artifact ships demo.lattice next to the exact clips it
+      # references (its paths are relative to the demo-out directory).
+      - name: Convert renders to FLAC
+        run: |
+          set -uo pipefail
+          ok=1
+          for w in demo-out/scene-*.wav demo-out/full-*.wav; do
+            flac --best --totally-silent -f -o "${w%.wav}.flac" "$w" || ok=0
+          done
+          if [ "$ok" = 1 ]; then
+            rm -f demo-out/scene-*.wav demo-out/full-*.wav
+            echo "renders converted to flac"
+          else
+            echo "flac conversion failed somewhere; keeping wav"
+          fi
+          ls -l demo-out
+
+      - name: Upload rendered audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-demo-audio
+          path: demo-out/
+          retention-days: 14
+          if-no-files-found: error

@@ -1,5 +1,7 @@
 # Lattice
 
+[![CI](https://github.com/nerdrx/lattice/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nerdrx/lattice/actions/workflows/ci.yml)
+
 A native, session-first DAW for Linux. Written from scratch in C++20 — no
 framework, no toolkit, no runtime. Wayland-first, Windows secondary.
 
@@ -89,6 +91,15 @@ tools/headless_test.sh --wayland -o /tmp/shot.png    # exercise the native path
 
 Without `--wayland` the child gets XWayland and takes the X11 backend; with it,
 gamescope exposes its own Wayland socket. Both paths are worth testing.
+
+Every push and pull request runs [the CI
+workflow](.github/workflows/ci.yml): it builds the full application including
+the Wayland backend, runs the whole headless suite (`make test` — engine unit
+tests, lock-free IPC tests, project round-trip, a render that fails if it comes
+out silent, and a plugin scan), and then renders the demo set. All four scenes
+plus a 16-bar pass are rendered to FLAC and uploaded as an artifact, with the
+peak and RMS of each printed into the run summary — the CI does not just compile
+this DAW, it plays its output and hands you the audio.
 
 ## Environment
 
