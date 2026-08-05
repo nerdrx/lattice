@@ -18,6 +18,14 @@ namespace {
 // MIDI in it saves exactly the bytes version 2 saved -- only the header line
 // moves.
 //
+// Version 4 adds the mixer's bus topology: `send <idx> <level>` lines inside a
+// track, `return <idx>` ... `endreturn` blocks and one `master` ... `endmaster`
+// block between the tracks and the scenes. Every one of those constructs is
+// emitted only when it carries something (see writeTrack's send loop,
+// returnWorthWriting and writeMaster), so a set that uses none of them -- which
+// is every set written before this version existed -- again saves exactly the
+// bytes version 3 saved apart from the header line.
+//
 // There is deliberately ONE parser for all versions rather than a reader per
 // version. The additions are all new keys with defaults, so an older file
 // simply never mentions them and comes out with the defaults; the version
@@ -26,7 +34,7 @@ namespace {
 // only punish someone who hand-edited the header, and buys no safety: an old
 // Lattice already refuses every one of those keys, so no half-understood file
 // can be read either way. Saving always writes the current version.
-constexpr int kFormatVersion = 3;
+constexpr int kFormatVersion = 4;
 constexpr int kMinFormatVersion = 1;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +122,11 @@ f32 clFader(f32 v)      { return std::isfinite(v) ? clampv(v, 0.f, 1.f) : 0.85f;
 f32 clPan(f32 v)        { return std::isfinite(v) ? clampv(v, -1.f, 1.f) : 0.f; }
 f32 clGain(f32 v)       { return std::isfinite(v) ? clampv(v, 0.f, 8.f) : 1.f; }
 f32 clWidth(f32 v)      { return std::isfinite(v) ? clampv(v, 24.f, 1024.f) : 94.f; }
+// A send level is a linear gain into a return bus, 0 meaning "off". Like the
+// clip's generative fields it is written sparsely, so the non-finite arm has to
+// fold to exactly the value that suppresses the line: a NaN send must not be
+// written as "send 0 0" when the next save would omit it.
+f32 clSend(f32 v)       { return std::isfinite(v) ? clampv(v, 0.f, 1.f) : 0.f; }
 int clWarp(int v)       { return clampv(v, (int)Warp::Off, (int)Warp::Beats); }
 i64 clFrame(i64 v)      { return v < 0 ? 0 : v; }
 f32 clParam(f32 v)      { return std::isfinite(v) ? v : 0.f; }
@@ -318,12 +331,75 @@ void writeTrack(std::string& o, const TrackModel& t, int idx) {
     kn(o, "  ", "pan",   fmtF32(clPan(t.pan)));
     kn(o, "  ", "flags", std::string(t.mute ? "1" : "0") + " " +
                          (t.solo ? "1" : "0") + " " + (t.arm ? "1" : "0"));
+    // Post-fader sends, immediately after the rest of the mixer scalars and
+    // sparse: 0 is both the default and the "this bus gets nothing" value, and
+    // a set of 32 tracks should not carry 128 lines saying so. The suppression
+    // is round-trip stable for the same reason the clip's generative fields are
+    // -- the value a missing line loads as is exactly the value that suppresses
+    // the line -- and it is what makes a v3 set re-save with only the header
+    // line changed.
+    for (int i = 0; i < kMaxReturns; ++i) {
+        const f32 lvl = clSend(t.sends[i]);
+        if (lvl != 0.f) kn(o, "  ", "send", std::to_string(i) + " " + fmtF32(lvl));
+    }
     kn(o, "  ", "width", fmtF32(clWidth(t.width)));
     // The chain sits between the track scalars and the clips.
     for (const auto& d : t.savedDevices) writeDevice(o, d);
     for (int i = 0; i < kMaxScenes; ++i)
         if (clipOccupied(t.slots[i])) writeClip(o, t.slots[i], i);
     o += "endtrack\n";
+}
+
+// Is this return bus worth a block in the file?
+//
+// The returns are a fixed array, not a list: every set has kMaxReturns of them
+// whether the user touched one or not. Writing all four unconditionally would
+// put ~20 lines into every project that has never used a send, and would make
+// the v3 -> v4 re-save diff far more than the header line it is required to be.
+// So a return is written exactly when it differs from a freshly constructed one
+// in any respect a file can carry: it has an identity, a chain, a renamed bus
+// or a moved fader.
+//
+// The predicate is deliberately "differs from the default" and not "has
+// devices": a user who renames Return B and pulls its fader down has said
+// something about the set even with an empty chain, and losing that on the next
+// save would be a bug. It is round-trip stable because everything it tests is
+// also what the block writes, so a skipped return loads back as the default
+// that made it skippable, and a written one loads back as itself.
+//
+// Not tested: ReturnModel::devices. Live instances never reach this file --
+// the App serializes devices -> savedDevices before saving, exactly as it does
+// for tracks -- so a return whose chain exists only as instances is, correctly,
+// a return this layer knows nothing about.
+bool returnWorthWriting(const ReturnModel& r) {
+    const ReturnModel deflt{};
+    return r.uid != 0 || !r.savedDevices.empty() || r.name != deflt.name ||
+           clFader(r.fader) != clFader(deflt.fader);
+}
+
+// Same shape as a track's mixer half: identity, name, fader, then the chain.
+// No clips, no sends (a return that fed a return would be a feedback path the
+// engine has no cycle detection for), and no index inside the block -- the
+// index is on the `return` line, because unlike device blocks these are not
+// positional: skipping the untouched ones is the whole point.
+void writeReturn(std::string& o, const ReturnModel& r, int idx) {
+    o += "return " + std::to_string(idx) + "\n";
+    writeUid(o, "  ", r.uid);
+    kv(o, "  ", "name", r.name);
+    kn(o, "  ", "fader", fmtF32(clFader(r.fader)));
+    for (const auto& d : r.savedDevices) writeDevice(o, d);
+    o += "endreturn\n";
+}
+
+// The master chain. Device blocks and nothing else: Session carries no master
+// fader, name or uid, and inventing lines for state the model does not have
+// would be inventing state. An empty chain writes nothing at all, which is
+// what keeps a set with no master processing byte-identical to its v3 self.
+void writeMaster(std::string& o, const std::vector<SavedDevice>& devices) {
+    if (devices.empty()) return;
+    o += "master\n";
+    for (const auto& d : devices) writeDevice(o, d);
+    o += "endmaster\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -371,7 +447,7 @@ struct Scan {
     }
 };
 
-enum class St { Top, Track, Device, Clip, Scene };
+enum class St { Top, Track, Device, Clip, Scene, Return, Master };
 
 bool readWholeFile(const std::string& path, std::string& out, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -413,6 +489,15 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     const size_t nTracks = std::min(s.tracks.size(), (size_t)kMaxTracks);
     for (size_t i = 0; i < nTracks; ++i) writeTrack(o, s.tracks[i], (int)i);
 
+    // Buses sit between the tracks and the scenes: after the things that send
+    // into them, before the things that launch. Both are sparse -- see
+    // returnWorthWriting and writeMaster -- so a set that uses neither adds not
+    // one byte here.
+    size_t nReturns = 0;
+    for (int i = 0; i < kMaxReturns; ++i)
+        if (returnWorthWriting(s.returns[i])) { writeReturn(o, s.returns[i], i); ++nReturns; }
+    writeMaster(o, s.masterSavedDevices);
+
     const size_t nScenes = std::min(sceneRowCount(s), (size_t)kMaxScenes);
     const SceneModel deflt{};
     for (size_t i = 0; i < nScenes; ++i) {
@@ -449,7 +534,8 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     // is bookkeeping about the save itself, so it is updated here rather than
     // making every caller remember to do it.
     const_cast<Session&>(s).path = path;
-    LOGI("saved %zu tracks / %zu scenes -> %s", nTracks, nScenes, path.c_str());
+    LOGI("saved %zu tracks / %zu scenes / %zu returns%s -> %s", nTracks, nScenes, nReturns,
+         s.masterSavedDevices.empty() ? "" : " + master chain", path.c_str());
     return true;
 }
 
@@ -474,7 +560,21 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
 
     St st = St::Top;
     bool sawHeader = false;
-    int  ti = -1, ci = -1, sci = -1;
+    int  ti = -1, ci = -1, sci = -1, ri = -1;
+    // Device blocks now appear in three places (a track, a return, the master
+    // chain), so St::Device no longer knows where it is on its own: the owning
+    // vector and the state to fall back to at `enddevice` are recorded when the
+    // block opens. The pointer is only dereferenced between `device` and
+    // `enddevice`, and the only thing that grows that vector in between is the
+    // emplace_back that opened the block, so it cannot dangle.
+    std::vector<SavedDevice>* devOwner = nullptr;
+    St devPrev = St::Track;
+    auto openDevice = [&](std::vector<SavedDevice>& owner, St back) {
+        owner.emplace_back();
+        devOwner = &owner;
+        devPrev  = back;
+        st = St::Device;
+    };
     std::string clipFile;
     bool clipSawRange = false, clipSawBpm = false, clipSawBeats = false, clipSawName = false;
     int  missing = 0;
@@ -579,6 +679,20 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 if ((size_t)v >= out.scenes.size()) out.scenes.resize((size_t)v + 1);
                 sci = v;
                 st = St::Scene;
+            } else if (key == "return") {
+                int v; if (!sc.integer(v)) return fail("return: expected an index");
+                // Structure, not a value: the returns are a fixed array, so an
+                // index past the end names a bus this build does not have.
+                // Clamping it would silently move somebody's chain onto a
+                // different bus, which is worse than refusing the file.
+                if (v < 0 || v >= kMaxReturns)
+                    return fail("return index " + std::to_string(v) + " out of range");
+                ri = v;
+                st = St::Return;
+            } else if (key == "master") {
+                // No index and no scalars of its own; the block exists only to
+                // scope the device chain.
+                st = St::Master;
             } else {
                 return fail("unexpected '" + key + "' at top level");
             }
@@ -606,6 +720,18 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 if (!sc.integer(m) || !sc.integer(so) || !sc.integer(a))
                     return fail("flags: expected three integers (mute solo arm)");
                 t.mute = m != 0; t.solo = so != 0; t.arm = a != 0;
+            } else if (key == "send") {
+                int idx = 0; f64 v = 0.0;
+                if (!sc.integer(idx) || !sc.num(v))
+                    return fail("send: expected an index and a level");
+                // The same split as everywhere else: structure is rejected, the
+                // value is clamped. An index naming a bus that does not exist
+                // cannot be repaired -- there is no right answer for which of
+                // the four it meant -- while a level of 2 or of NaN is a line
+                // that says something, just not something a linear gain can be.
+                if (idx < 0 || idx >= kMaxReturns)
+                    return fail("send index " + std::to_string(idx) + " out of range");
+                t.sends[idx] = clSend((f32)v);
             } else if (key == "width") {
                 f64 v; if (!sc.num(v)) return fail("width: expected a number");
                 t.width = clWidth((f32)v);
@@ -614,8 +740,7 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 // imposed here -- the App decides how many of these it can
                 // actually instantiate; silently dropping the tail of a user's
                 // chain at load time would be the worse failure.
-                t.savedDevices.emplace_back();
-                st = St::Device;
+                openDevice(t.savedDevices, St::Track);
             } else if (key == "clip") {
                 int v; if (!sc.integer(v)) return fail("clip: expected an index");
                 if (v < 0 || v >= kMaxScenes)
@@ -635,7 +760,7 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         }
         // ---------------------------------------------------------------
         case St::Device: {
-            SavedDevice& d = out.tracks[(size_t)ti].savedDevices.back();
+            SavedDevice& d = devOwner->back();
             if (key == "uid") {
                 u64 v; if (!sc.uid(v)) return fail("device uid: expected an integer");
                 d.uid = v;
@@ -652,7 +777,10 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                     return fail("param: expected an id and a value");
                 d.params.emplace_back((u32)clampv(id, (i64)0, (i64)UINT32_MAX), clParam((f32)v));
             } else if (key == "enddevice") {
-                st = St::Track;
+                // Back to whichever block opened this one, not unconditionally
+                // to St::Track: the same device grammar serves tracks, returns
+                // and the master chain.
+                st = devPrev;
             } else {
                 return fail("unexpected '" + key + "' inside device");
             }
@@ -775,6 +903,43 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             }
             break;
         }
+        // ---------------------------------------------------------------
+        case St::Return: {
+            ReturnModel& r = out.returns[(size_t)ri];
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("return uid: expected an integer");
+                r.uid = v;
+            } else if (key == "name") {
+                r.name = unesc(rest);
+            } else if (key == "fader") {
+                f64 v; if (!sc.num(v)) return fail("return fader: expected a number");
+                r.fader = clFader((f32)v);
+            } else if (key == "device") {
+                openDevice(r.savedDevices, St::Return);
+            } else if (key == "endreturn") {
+                ri = -1;
+                st = St::Top;
+            } else {
+                // A nested `return`, a `send`, a `clip` -- anything that is not
+                // one of the four lines above lands here and fails the load.
+                // There is no half-understood middle ground: a return that
+                // contained a clip is a file this format cannot represent, and
+                // skipping the line would drop it on the next save.
+                return fail("unexpected '" + key + "' inside return");
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
+        case St::Master: {
+            if (key == "device") {
+                openDevice(out.masterSavedDevices, St::Master);
+            } else if (key == "endmaster") {
+                st = St::Top;
+            } else {
+                return fail("unexpected '" + key + "' inside master");
+            }
+            break;
+        }
         }
     }
 
@@ -782,7 +947,9 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
     if (st != St::Top) {
         const char* what = (st == St::Clip)   ? "endclip"
                          : (st == St::Device) ? "enddevice"
-                         : (st == St::Track)  ? "endtrack" : "endscene";
+                         : (st == St::Track)  ? "endtrack"
+                         : (st == St::Return) ? "endreturn"
+                         : (st == St::Master) ? "endmaster" : "endscene";
         return fail(std::string("unexpected end of file, missing '") + what + "'");
     }
 

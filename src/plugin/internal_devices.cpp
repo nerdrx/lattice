@@ -55,6 +55,22 @@ public:
     }
 
     const PluginDesc& desc() const override { return desc_; }
+
+    // Stated explicitly rather than inherited from the default in host.h, so
+    // that "these devices are sample-aligned with their own input" is a
+    // property of the devices and not an accident of what the base class
+    // happens to return today.
+    //
+    // It is true by construction for both: the Saturator is a memoryless
+    // waveshaper (out[i] depends only on in[i]), and Pulse is a generator whose
+    // first sample of a voice lands on the frame the note-on asked for. Neither
+    // has a lookahead buffer, an FFT window or an oversampling filter, which
+    // are the three things that produce latency. Any future internal device
+    // that does acquire one must override this again with its real figure --
+    // the engine's delay compensation trusts it, so reporting 0 while actually
+    // delaying would smear transients across every parallel path.
+    int latencyFrames() const override      { return 0; }
+
     void setBypassed(bool b) override       { bypassed_ = b; }
     bool bypassed() const override          { return bypassed_; }
 

@@ -19,7 +19,18 @@
 // roll edits -- included. Notes are written and read in vector order; keeping
 // them sorted by beat is the editor's job, not the format's.
 //
-// Saving always writes the current version; versions 1 through 3 all load,
+// Version 4 adds the mixer's bus topology. A track gains sparse
+// `send <idx> <level>` lines (only the buses it actually feeds), and two new
+// top-level blocks sit between the tracks and the scenes: `return <idx>` ...
+// `endreturn`, carrying a uid, a name, a fader and a device chain, and one
+// `master` ... `endmaster` carrying nothing but a device chain. Both are
+// emitted only when they hold something -- a return that is still the default
+// bus, and an empty master chain, write nothing at all -- so a set that uses
+// none of this produces the same bytes version 3 produced apart from the
+// header. Devices in a return or on the master are the same passive
+// SavedDevice blocks a track writes, read and written through the same code.
+//
+// Saving always writes the current version; versions 1 through 4 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 #pragma once

@@ -6,6 +6,9 @@
 //     midi() is forged into a real atom:Sequence on every atom input port that
 //     declares midi:MidiEvent support, so instruments actually play. Atom
 //     *outputs* are still discarded: nothing downstream consumes notes yet.
+//   * the latency report: a control output designated lv2:latency (or carrying
+//     the older lv2:reportsLatency property) is read once, after activation and
+//     one silent block, and served from latencyFrames(). See settleLatency().
 //   * features: urid:map, urid:unmap, options:options, log:log,
 //     buf-size:boundedBlockLength. A plugin whose *required* feature list
 //     contains anything else is logged and skipped rather than loaded and
@@ -111,6 +114,7 @@ struct World {
     LilvNode *toggled = nullptr, *integer = nullptr, *enumeration = nullptr;
     LilvNode *sampleRateProp = nullptr, *logarithmic = nullptr;
     LilvNode *unitsUnit = nullptr, *unitsSymbol = nullptr;
+    LilvNode *reportsLatency = nullptr, *designation = nullptr, *latency = nullptr;
 
     void init() {
         world = lilv_world_new();
@@ -134,6 +138,12 @@ struct World {
         logarithmic    = n(LV2_PORT_PROPS__logarithmic);
         unitsUnit      = n(LV2_UNITS__unit);
         unitsSymbol    = n(LV2_UNITS__symbol);
+        // Latency reporting. Two spellings are in the wild: the old
+        // lv2:portProperty lv2:reportsLatency, and lv2:designation lv2:latency
+        // (which the spec now prefers). Both are looked for; see latencyPortOf.
+        reportsLatency = n(LV2_CORE__reportsLatency);
+        designation    = n(LV2_CORE__designation);
+        latency        = n(LV2_CORE__latency);
     }
 };
 
@@ -207,6 +217,45 @@ bool nodeFloat(const LilvNode* n, f32& out) {
     return false;
 }
 
+// The index of the control-output port a plugin reports its latency on, or -1.
+//
+// LV2 has two spellings for this and both are still in the wild: the original
+// lv2:portProperty lv2:reportsLatency, and lv2:designation lv2:latency, which
+// the spec now prefers. Both are accepted here. lilv's own answer is consulted
+// last so a bundle using a spelling we have not thought of still works, and it
+// is range-checked because lilv documents get_latency_port_index() as
+// meaningful only when has_latency() is true.
+//
+// Only control *outputs* qualify. An input port carrying the same property
+// would be a host-to-plugin channel and writing a latency into it is not our
+// job; treating one as a report would also mean reading back whatever default
+// we had just put there.
+int latencyPortOf(const LilvPlugin* p) {
+    World& w = world();
+    const uint32_t n = lilv_plugin_get_num_ports(p);
+    for (uint32_t i = 0; i < n; ++i) {
+        const LilvPort* port = lilv_plugin_get_port_by_index(p, i);
+        if (!lilv_port_is_a(p, port, w.controlPort) || !lilv_port_is_a(p, port, w.outputPort))
+            continue;
+        if (lilv_port_has_property(p, port, w.reportsLatency)) return (int)i;
+        LilvNodes* des = lilv_port_get_value(p, port, w.designation);
+        bool isLatency = false;
+        if (des) {
+            LILV_FOREACH (nodes, it, des) {
+                const LilvNode* d = lilv_nodes_get(des, it);
+                if (d && lilv_node_equals(d, w.latency)) { isLatency = true; break; }
+            }
+            lilv_nodes_free(des);
+        }
+        if (isLatency) return (int)i;
+    }
+    if (lilv_plugin_has_latency(p)) {
+        const uint32_t i = lilv_plugin_get_latency_port_index(p);
+        if (i < n) return (int)i;
+    }
+    return -1;
+}
+
 // Where each LV2 port index points once we have connected it.
 enum class PortKind : u8 { Ignored, ControlIn, ControlOut, AudioIn, AudioOut, Cv, AtomIn, AtomOut };
 struct PortSlot {
@@ -269,6 +318,7 @@ public:
 
         connectPorts();
         lilv_instance_activate(inst_);
+        settleLatency();
         return true;
     }
 
@@ -353,11 +403,24 @@ public:
     }
 
     const PluginDesc& desc() const override { return desc_; }
+
+    // Filled in by settleLatency() at the end of prepare() and constant
+    // afterwards, so this is a plain load with no synchronisation, exactly as
+    // the contract in host.h asks for.
+    int latencyFrames() const override      { return latency_; }
+
     void setBypassed(bool b) override       { bypassed_ = b; }
     bool bypassed() const override          { return bypassed_; }
 
 private:
     static constexpr size_t kAtomBufBytes = 8192;
+    // Sanity ceiling on what a plugin may claim, ~22 s at 48 kHz. Real latency
+    // is milliseconds (lookahead) to a few hundred ms (long convolution); a
+    // number past this is a plugin writing garbage into its port, and honouring
+    // it would make the engine's delay compensation reserve a buffer nobody
+    // asked for. Rejected values become 0 and are logged, which is the same
+    // answer we would have given before the plugin said anything.
+    static constexpr int kMaxLatencyFrames = 1 << 20;
     // One block's worth of note traffic. A human plus an arpeggiator cannot
     // produce 256 messages in 5 ms; anything beyond that is a runaway sender and
     // dropping is better than allocating on the audio thread.
@@ -388,6 +451,8 @@ private:
             inst_ = nullptr;
         }
         slots_.clear();
+        latencyPort_ = -1;
+        latency_ = 0;
         audioIn_.clear();
         audioOut_.clear();
         atomIn_.clear();
@@ -469,10 +534,62 @@ private:
         // ignore an event type it does not know.
         if (midiPorts_.empty() && nAtomIn == 1 && desc_.hasMidiIn)
             midiPorts_.push_back(0);
+        // Which port (if any) the plugin reports its latency on. Only a port we
+        // actually classified as a control output counts: the fallback inside
+        // latencyPortOf() can name a port we chose to treat differently, and
+        // reading a float out of, say, an atom buffer would be nonsense.
+        latencyPort_ = latencyPortOf(plug_);
+        if (latencyPort_ >= 0 &&
+            (size_t)latencyPort_ < slots_.size() &&
+            slots_[(size_t)latencyPort_].kind != PortKind::ControlOut)
+            latencyPort_ = -1;
+
         // The descriptor may have been produced by an older scan; keep the
         // authoritative counts from the actual instance.
         desc_.audioIn  = nAudioIn;
         desc_.audioOut = nAudioOut;
+    }
+
+    // Reads the plugin's reported latency once, at the end of prepare().
+    //
+    // The value lives in the control-out buffer we connected, and a plugin only
+    // ever writes it from run(), so before the first run the port still holds
+    // the 0 buildParams() put there. One silent block at the prepared block
+    // size settles it -- which is exactly what "pre-roll to compute latency"
+    // means in the LV2 spec's own words -- and after that latencyFrames() is
+    // the constant the engine's delay compensation needs.
+    //
+    // Deliberate limitation: a plugin that varies its latency at run time (an
+    // oversampling toggle, a lookahead knob) is recorded at its prepare-time
+    // value and never re-read. Following it would mean republishing chains and
+    // re-aligning every parallel path from the audio thread; the contract in
+    // host.h says constant-after-prepare, so the prepare-time value is the
+    // honest answer and a plugin that moves is a plugin that is misaligned
+    // until the chain is rebuilt.
+    //
+    // Nothing runs at all when there is no latency port: the overwhelming
+    // majority of plugins have none, and they must not pay a block of DSP (or
+    // have their state advanced by one block) for a question they never answer.
+    void settleLatency() {
+        latency_ = 0;
+        if (!inst_ || latencyPort_ < 0) return;
+
+        // Silence: the audio buffers were zeroed when they were allocated and
+        // connectPorts() left every atom input as a valid empty sequence.
+        lilv_instance_run(inst_, (uint32_t)maxBlock_);
+        resetAtomBuffers();
+
+        const f32 v = ctrl_[(size_t)latencyPort_];
+        // The negated comparison also catches NaN, which some plugins leave in
+        // an output port they never got round to writing.
+        if (!(v >= 0.f) || v > (f32)kMaxLatencyFrames) {
+            LOGW("lv2: %s reports an implausible latency (%.3f frames), treating it as 0",
+                 desc_.uri.c_str(), (double)v);
+            return;
+        }
+        latency_ = (int)(v + 0.5f);
+        if (latency_ > 0)
+            LOGI("lv2: %s reports %d frames of latency", desc_.uri.c_str(), latency_);
     }
 
     // Control input ports become ParamInfo entries, in port order.
@@ -627,6 +744,8 @@ private:
     bool bypassed_ = false;
 
     std::vector<PortSlot>  slots_;
+    int latencyPort_ = -1;               // port index of the latency report, or -1
+    int latency_ = 0;                    // frames, settled at the end of prepare()
     std::vector<f32>       ctrl_;        // one float per port index; control ports point here
     std::vector<ParamInfo> params_;
     std::vector<int>       paramPort_;   // param index -> LV2 port index

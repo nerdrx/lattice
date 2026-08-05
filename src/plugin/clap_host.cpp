@@ -4,8 +4,12 @@
 //   * clap.audio-ports (float32 / data32 only), clap.params, clap.note-ports.
 //     MIDI handed to midi() is translated into note/MIDI events on the
 //     plugin's first note input port, in whichever dialect that port prefers.
-//   * host extensions offered to plugins: clap.log and clap.thread-check.
-//     Everything else returns null, which is always a legal answer.
+//   * clap.latency: queried once after activate() and served from
+//     latencyFrames(). The host side of the extension is accepted and ignored;
+//     see kHostLatency for why dynamic latency is out of scope.
+//   * host extensions offered to plugins: clap.log, clap.thread-check and
+//     clap.latency. Everything else returns null, which is always a legal
+//     answer.
 //   * parameter changes travel as CLAP_EVENT_PARAM_VALUE through in_events.
 //     CLAP forbids writing parameter memory behind the plugin's back, so the
 //     GUI thread posts into a lock-free ring that process() drains.
@@ -83,11 +87,32 @@ void CLAP_ABI hostLogFn(const clap_host_t*, clap_log_severity sev, const char* m
 }
 const clap_host_log_t kHostLog = { hostLogFn };
 
+// clap.latency, host side. The spec allows latency to change only during
+// activate(), and requires an already-active plugin to follow the notification
+// with request_restart(). Acting on either would mean tearing the instance
+// down, re-preparing it and republishing the chain -- and then re-aligning
+// every parallel path feeding the master sum, because a changed latency
+// invalidates the compensation the engine computed. None of that machinery
+// exists yet, and PluginInstance::latencyFrames() is documented as constant
+// after prepare(), so the honest thing is to accept the call and do nothing
+// with it. The value we keep is the one read at prepare() time.
+//
+// This is still worth exposing rather than answering null: a plugin that finds
+// no clap.latency host extension may conclude the host does not do delay
+// compensation at all and quietly change what it reports.
+//
+// TODO(dynamic latency): re-query the extension on restart, republish the
+// chain, and recompute the PDC alignment. Until then a plugin that moves its
+// latency after activation is misaligned until the chain is rebuilt.
+void CLAP_ABI hostLatencyChanged(const clap_host_t*) {}
+const clap_host_latency_t kHostLatency = { hostLatencyChanged };
+
 const void* CLAP_ABI hostGetExtension(const clap_host_t*, const char* id) {
     if (!id) return nullptr;
     if (strcmp(id, CLAP_EXT_LOG) == 0)          return &kHostLog;
     if (strcmp(id, CLAP_EXT_THREAD_CHECK) == 0) return &kThreadCheck;
-    return nullptr;   // params/gui/state/latency/... not wired up yet
+    if (strcmp(id, CLAP_EXT_LATENCY) == 0)      return &kHostLatency;
+    return nullptr;   // params/gui/state/... not wired up yet
 }
 
 // request_* can arrive from any thread including the audio thread, so they may
@@ -347,6 +372,7 @@ public:
             return false;
         }
         active_ = true;
+        readLatency();
 
         if (!plug_->start_processing(plug_)) {
             LOGE("clap: start_processing failed for %s", id_.c_str());
@@ -462,6 +488,12 @@ public:
     }
 
     const PluginDesc& desc() const override { return desc_; }
+
+    // Cached by readLatency() during prepare() and constant afterwards, so this
+    // is a plain load with no synchronisation. See the note on kHostLatency for
+    // why a plugin that changes its latency later is not followed.
+    int latencyFrames() const override      { return latency_; }
+
     void setBypassed(bool b) override       { bypassed_ = b; }
     bool bypassed() const override          { return bypassed_; }
 
@@ -479,6 +511,10 @@ private:
     static constexpr int kQueueSize     = 256;
     static constexpr int kMaxMidiEvents = 256;
     static constexpr int kMaxEvents     = kQueueSize + kMaxMidiEvents;
+    // ~22 s at 48 kHz. A plugin claiming more than this is writing garbage, and
+    // honouring it would make delay compensation reserve a buffer nobody asked
+    // for. Matches the LV2 backend's ceiling so both formats lie the same way.
+    static constexpr int kMaxLatencyFrames = 1 << 20;
 
     // in_events is one flat, time-ordered list, so every event type shares one
     // array. The members overlap on clap_event_header_t, which the spec
@@ -590,6 +626,28 @@ private:
         e.data[2]         = msg.len > 2 ? msg.data[2] : 0;
     }
 
+    // clap.latency is documented as [main-thread & (being-activated | active)],
+    // so it is asked exactly once: here, on the GUI thread, immediately after a
+    // successful activate() and before processing starts. No extension (the
+    // common case) means no latency, which is also what the spec says a silent
+    // plugin is claiming.
+    void readLatency() {
+        latency_ = 0;
+        const auto* ext = (const clap_plugin_latency_t*)plug_->get_extension(plug_, CLAP_EXT_LATENCY);
+        if (!ext || !ext->get) return;
+        const uint32_t frames = ext->get(plug_);
+        // uint32_t means a negative value is impossible, but a plugin returning
+        // something absurd is not, and the engine would have to reserve a delay
+        // line for it. Same ceiling and same reasoning as the LV2 backend.
+        if (frames > (uint32_t)kMaxLatencyFrames) {
+            LOGW("clap: %s reports an implausible latency (%u frames), treating it as 0",
+                 id_.c_str(), frames);
+            return;
+        }
+        latency_ = (int)frames;
+        if (latency_ > 0) LOGI("clap: %s reports %d frames of latency", id_.c_str(), latency_);
+    }
+
     void teardown() {
         if (plug_) {
             if (processing_) plug_->stop_processing(plug_);
@@ -607,6 +665,7 @@ private:
         midiCount_ = 0;
         notePort_ = -1;
         noteDialectClap_ = false;
+        latency_ = 0;
         steady_ = 0;
     }
 
@@ -740,6 +799,7 @@ private:
     int  maxBlock_ = kMaxBlock;
     bool bypassed_ = false;
     bool active_ = false, processing_ = false;
+    int  latency_ = 0;                 // frames, read once during prepare()
     i64  steady_ = 0;
 
     int inChans_ = 0, outChans_ = 0;

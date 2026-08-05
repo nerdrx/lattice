@@ -1,4 +1,4 @@
-// Internal device and plugin-MIDI tests.
+// Internal device, plugin-MIDI and latency-reporting tests.
 //
 // Everything here goes through the public registry path — scan(), find(),
 // instantiate() — so the tests exercise the same code the browser and the
@@ -11,6 +11,7 @@
 //       -o internal_device_test $(pkg-config --libs lilv-0) -ldl
 #include "../src/plugin/host.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
@@ -78,6 +79,11 @@ static int paramIndex(const PluginInstance& p, const char* name) {
     for (int i = 0; i < p.paramCount(); ++i)
         if (p.paramInfo(i).name == name) return i;
     return -1;
+}
+
+static std::string lower(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +344,110 @@ static void testHostedInstrument(PluginRegistry& reg, PluginFormat fmt, const ch
 }
 
 // ---------------------------------------------------------------------------
+// Latency reporting (PluginInstance::latencyFrames).
+//
+// Two halves. The internal devices are a fixed contract -- both are
+// zero-latency by construction and must say so. The LV2 half proves the other
+// direction, that a plugin which *does* report latency is actually read: no
+// URI is hard-coded, because the point is to work on whatever the machine has.
+// Candidates are discovered by name (the effects that classically carry
+// lookahead or a linear-phase filter), a handful are instantiated, and the
+// first one that reports a nonzero figure is the witness. If nothing on this
+// system reports latency the section notes it and passes -- a missing plugin is
+// not a failing host.
+// ---------------------------------------------------------------------------
+
+static void testInternalLatency(PluginRegistry& reg) {
+    banner("latency: internal devices");
+
+    for (const char* uri : { "lattice:saturator", "lattice:pulse" }) {
+        const PluginDesc* d = reg.find(uri);
+        CHECK(d != nullptr, "%s: in the registry", uri);
+        if (!d) continue;
+        auto inst = reg.instantiate(*d, kSR, kBlock);
+        CHECK(inst != nullptr, "%s: instantiate + prepare", uri);
+        if (!inst) continue;
+        CHECK(inst->latencyFrames() == 0, "%s reports 0 frames of latency (%d)",
+              uri, inst->latencyFrames());
+        // Zero at any block size and rate, not just the one we prepared with:
+        // neither device has anything that could scale with either.
+        CHECK(inst->prepare(44100.0, 64) && inst->latencyFrames() == 0,
+              "%s still reports 0 at 44.1 kHz / 64 frames", uri);
+    }
+}
+
+static void testLv2Latency(PluginRegistry& reg) {
+    banner("latency: LV2 (real plugin, reportsLatency port)");
+
+    // Words that show up in the names of plugins that delay their output: a
+    // lookahead limiter, x42's digital peak limiter (dpl), a linear-phase EQ,
+    // a convolver. Searched in this order, so the cheapest and most commonly
+    // installed candidates are tried first.
+    static const char* kHints[] = {
+        "limiter", "lookahead", "look-ahead", "dpl", "delayline",
+        "linear phase", "linearphase", "convol", "oversampl",
+    };
+
+    std::vector<const PluginDesc*> candidates;
+    for (const char* hint : kHints) {
+        for (const PluginDesc& d : reg.plugins()) {
+            if (d.format != PluginFormat::LV2 || d.audioOut == 0) continue;
+            if (lower(d.name + " " + d.uri).find(hint) == std::string::npos) continue;
+            if (std::find(candidates.begin(), candidates.end(), &d) == candidates.end())
+                candidates.push_back(&d);
+        }
+    }
+
+    if (candidates.empty()) {
+        note("no plugin on this system looks like it would report latency; skipping");
+        return;
+    }
+
+    // Bounded: every attempt dlopen()s a plugin binary, and one witness is all
+    // the backend needs to prove.
+    const int kTries = (int)candidates.size() < 12 ? (int)candidates.size() : 12;
+    for (int c = 0; c < kTries; ++c) {
+        const PluginDesc* d = candidates[(size_t)c];
+        auto inst = reg.instantiate(*d, kSR, kBlock);
+        if (!inst) { note((d->name + ": would not instantiate, trying the next").c_str()); continue; }
+
+        const int lat = inst->latencyFrames();
+        // Every plugin, latent or not, has to give a sane answer.
+        CHECK(lat >= 0, "%s: latency is not negative (%d)", d->name.c_str(), lat);
+        if (lat <= 0) continue;
+
+        CHECK(lat > 0, "%s: reports %d frames of latency after prepare (%.2f ms at %.0f Hz)",
+              d->name.c_str(), lat, 1000.0 * lat / kSR, kSR);
+
+        // Constant after prepare, which is the whole contract: preparing the
+        // same instance again at the same rate and block size has to produce
+        // the same number, and so does a second, independent instance. The
+        // first catches a value that leaks state from the settling block; the
+        // second catches one that depends on load order.
+        const bool re = inst->prepare(kSR, kBlock);
+        CHECK(re, "%s: re-prepares at the same rate/block", d->name.c_str());
+        CHECK(re && inst->latencyFrames() == lat,
+              "%s: latency is stable across two prepares (%d then %d)",
+              d->name.c_str(), lat, inst->latencyFrames());
+
+        auto other = reg.instantiate(*d, kSR, kBlock);
+        CHECK(other && other->latencyFrames() == lat,
+              "%s: a second instance agrees (%d)", d->name.c_str(),
+              other ? other->latencyFrames() : -1);
+
+        // And it must survive actually running: latencyFrames() is read from
+        // the engine after the chain is published, long after the first block.
+        Buf in, out;
+        for (int b = 0; b < 4; ++b) { out.clear(); inst->process(in.p, out.p, 2, kBlock); }
+        CHECK(inst->latencyFrames() == lat, "%s: latency unchanged after processing (%d)",
+              d->name.c_str(), inst->latencyFrames());
+        return;
+    }
+
+    note("no installed LV2 plugin reported a nonzero latency; the read path is unverified here");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("internal device tests\n");
@@ -357,6 +467,8 @@ int main() {
 
     testSaturator(reg);
     testPulse(reg);
+    testInternalLatency(reg);
+    testLv2Latency(reg);
     testHostedInstrument(reg, PluginFormat::LV2, "LV2 instrument (real plugin, atom MIDI path)");
     testHostedInstrument(reg, PluginFormat::CLAP, "CLAP instrument (real plugin, note events)");
 
