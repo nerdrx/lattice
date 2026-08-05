@@ -7,6 +7,7 @@
 #include "../audio/engine.h"
 #include "../audio/sample.h"
 #include "../audio/backend.h"
+#include "../audio/midi_in.h"
 #include "../plugin/host.h"
 #include "../gfx/renderer.h"
 #include "widgets.h"
@@ -50,6 +51,11 @@ struct DeviceModel {
     PluginDesc desc;
     std::unique_ptr<PluginInstance> inst;
     bool bypass = false;
+    // Set only when `inst` is null: the plugin named by desc.uri was not on
+    // this machine when the set loaded. The device keeps its slot in the chain
+    // (silent, skipped by publishChain) and carries its saved parameters here
+    // so that saving the set again does not throw them away.
+    std::vector<std::pair<u32, f32>> lostParams;
 };
 
 // A device as it sits in a saved set: no instance, just what's needed to
@@ -162,6 +168,19 @@ private:
     void  addTrack();
     void  addScene();
 
+    // --- recording ---
+    void  startRecording(int track, int slot);   // allocate + arm a take
+    void  stopRecording(int track);              // second RecordSlot = stop
+    void  finishRecording(const Event& e);       // Ev::RecordFinished -> clip
+
+    // --- project ---
+    bool  openProject(const std::string& path);
+    void  saveProjectTo(const std::string& path);
+    void  assignUids();                          // fill in any uid still 0
+    void  serializeDevices();                    // devices -> savedDevices
+    void  materializeDevices();                  // savedDevices -> devices
+    void  releaseAllChains();                    // hand every instance to retiring_
+
     // --- transport helpers ---
     void  send(Cmd t, i32 a = 0, i32 b = 0, f64 x = 0.0);
     void  setTempo(f64 bpm);
@@ -177,6 +196,30 @@ private:
     Font     fSmall_, fBody_, fBold_, fBig_;
     Engine   engine_;
     std::unique_ptr<AudioBackend> audio_;
+    // MIDI reader. Started after the audio backend and stopped before it: the
+    // reader pushes into the engine's ring from its own thread, so it must be
+    // joined before anything begins tearing the engine down.
+    MidiInput midi_;
+
+    // --- recording ---------------------------------------------------------
+    // A take in flight. The capture buffer is GUI-owned for its whole life:
+    // Cmd::RecordSlot only lends it to the engine, which appends into it and
+    // hands the pointer back in Ev::RecordFinished. Nothing here is freed on
+    // any other path while the audio thread runs (shutdown() being the
+    // exception, and only after the backend has been joined).
+    struct PendingRec {
+        f32* buf = nullptr;
+        i64  capFrames = 0;
+        int  track = -1, slot = -1;
+    };
+    std::vector<PendingRec> pendingRecs_;
+    // The global record button arms the *intent* to record, exactly like Live's
+    // session record: while it is lit, clicking an empty slot on an armed track
+    // starts a take there; while it is unlit, the same click only selects the
+    // slot. It is not itself a transport action.
+    bool recIntent_ = false;
+    int  recTakeNo_ = 1;                          // names takes "Rec 1", "Rec 2", ...
+    f64  recStartBeat_[kMaxTracks]{};             // from Ev::RecordStarted
 
     // --- plugin hosting -------------------------------------------------
     // Chain lifecycle: publishChain(t) heap-allocates an RtChain from

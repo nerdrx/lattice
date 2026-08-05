@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -23,6 +24,12 @@ constexpr f32 masterW     = 92.f;
 constexpr f32 mixerH      = 152.f;
 constexpr f32 gutter      = 1.f;
 }
+
+// How much audio a single take can hold. Two minutes of interleaved stereo
+// floats is ~46 MB at 48 kHz: cheap enough to allocate up front, long enough
+// that no realistic loop or verse runs out of room. The engine stops at the
+// capacity it was given, so overrunning truncates rather than corrupts.
+constexpr f64 kRecordSeconds = 120.0;
 
 static f64 nowSeconds() {
     using namespace std::chrono;
@@ -87,11 +94,19 @@ bool App::init(int argc, char** argv) {
         engine_.prepare(48000.0, 1024);
     }
 
+    // MIDI comes up after the audio backend: the reader thread pushes straight
+    // into the engine's ring, so the engine must already be prepared. Missing
+    // hardware or a missing sequencer device is not an error - a set can be
+    // played entirely from the mouse.
+    if (midi_.start(engine_)) LOGI("midi in: alsa seq client %d:0", midi_.clientId());
+    else                      LOGW("no MIDI input - continuing without it");
+
     // Default set: eight audio tracks, eight scenes, same as a fresh Live set.
     ses_.tracks.resize(8);
     for (size_t i = 0; i < ses_.tracks.size(); ++i) {
         char buf[32];
         snprintf(buf, sizeof buf, "%zu Audio", i + 1);
+        ses_.tracks[i].uid = ses_.newUid();
         ses_.tracks[i].name = buf;
         ses_.tracks[i].colorIdx = (int)(i * 3 + 4) % pal::clipColorCount;
     }
@@ -99,6 +114,7 @@ bool App::init(int argc, char** argv) {
     for (size_t i = 0; i < ses_.scenes.size(); ++i) {
         char buf[32];
         snprintf(buf, sizeof buf, "Scene %zu", i + 1);
+        ses_.scenes[i].uid = ses_.newUid();
         ses_.scenes[i].name = buf;
     }
 
@@ -107,13 +123,13 @@ bool App::init(int argc, char** argv) {
     if (browserItems_.empty()) browseTo(homeDir());
 
     // A project path on the command line loads instead of the default set.
+    // openProject() pushes the whole restored set to the engine itself, so only
+    // the default-set path needs the initial sync here.
     if (argc > 1) {
-        std::string err;
-        if (!loadProject(ses_, argv[1], engine_.sampleRate(), &err))
-            LOGW("could not load %s: %s", argv[1], err.c_str());
+        if (!openProject(argv[1])) LOGW("could not load %s: %s", argv[1], status_.c_str());
+    } else {
+        pushAll();
     }
-
-    pushAll();
     status_ = "Ready";
 
     // Headless verification hook. With LATTICE_DEBUG_ADDFX=<substring> set, the
@@ -141,15 +157,24 @@ bool App::init(int argc, char** argv) {
 }
 
 void App::shutdown() {
-    // Order matters. Stopping the backend joins the audio thread, so once it
-    // returns nothing can be inside process() and nothing can be following a
-    // published chain. Only then is it safe to free chains without the
-    // Ev::ChainRetired handshake — the events still sitting in the ring will
-    // never be drained, so waiting for them here would deadlock or leak.
+    // Order matters. The MIDI reader goes first: it pushes into the engine's
+    // ring from its own thread, so it has to be joined before anything else
+    // starts tearing the engine down, or a push could land in a ring nobody
+    // owns any more.
+    midi_.stop();
+
+    // Stopping the backend joins the audio thread, so once it returns nothing
+    // can be inside process() and nothing can be following a published chain
+    // or writing into a capture buffer. Only then is it safe to free either
+    // without the Ev::ChainRetired / Ev::RecordFinished handshake — the events
+    // still sitting in the ring will never be drained, so waiting for them here
+    // would deadlock or leak.
     if (audio_) { audio_->stop(); audio_.reset(); }
     for (const RtChain*& c : published_) { delete c; c = nullptr; }
     for (RetiredChain& rc : retiring_) delete rc.chain;
     retiring_.clear();          // frees the instances the chains had dropped
+    for (PendingRec& p : pendingRecs_) delete[] p.buf;
+    pendingRecs_.clear();
     // Instances still on tracks die with ses_ when App is destroyed, which is
     // after this point and therefore also after the audio thread is gone.
 
@@ -184,18 +209,21 @@ void App::pushClip(int track, int slot) {
     if (!m.valid()) { c.type = Cmd::ClearClip; engine_.pushCommand(c); return; }
 
     RtClip rc;
-    rc.data        = m.sample->data.data();
-    rc.frames      = m.sample->frames;
-    rc.channels    = m.sample->channels;
-    rc.loopStart   = m.loopStart;
-    rc.loopEnd     = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
-    rc.clipBpm     = m.clipBpm;
-    rc.lengthBeats = m.lengthBeats;
-    rc.gain        = m.gain;
-    rc.warp        = (int)m.warp;
-    rc.loop        = m.loop;
-    rc.quantumIdx  = m.quantumIdx;
-    rc.valid       = true;
+    rc.data         = m.sample->data.data();
+    rc.frames       = m.sample->frames;
+    rc.channels     = m.sample->channels;
+    rc.loopStart    = m.loopStart;
+    rc.loopEnd      = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
+    rc.clipBpm      = m.clipBpm;
+    rc.lengthBeats  = m.lengthBeats;
+    rc.gain         = m.gain;
+    rc.warp         = (int)m.warp;
+    rc.loop         = m.loop;
+    rc.quantumIdx   = m.quantumIdx;
+    rc.prob         = m.prob;
+    rc.followAction = (int)m.followAction;
+    rc.followBeats  = m.followBeats;
+    rc.valid        = true;
     c.clip = rc;
     engine_.pushCommand(c);
 }
@@ -239,8 +267,24 @@ void App::pumpEngineEvents() {
             retiring_.erase(it);
             continue;
         }
-        // Everything else is reserved for undo/recording hooks; the UI polls
-        // atomics for transport and clip state.
+        if (e.type == Ev::RecordStarted) {
+            // The quantized start has fired. Remember the beat it began on so
+            // the slot can count elapsed beats without the engine having to
+            // publish another atomic.
+            if (e.a >= 0 && e.a < kMaxTracks) recStartBeat_[e.a] = e.x;
+            char buf[80];
+            snprintf(buf, sizeof buf, "Recording %s  scene %d",
+                     (e.a >= 0 && e.a < (int)ses_.tracks.size()) ? ses_.tracks[e.a].name.c_str() : "?",
+                     e.b + 1);
+            status_ = buf;
+            continue;
+        }
+        if (e.type == Ev::RecordFinished) {
+            finishRecording(e);
+            continue;
+        }
+        // Everything else is reserved for undo hooks; the UI polls atomics for
+        // transport and clip state.
     }
 }
 
@@ -306,6 +350,7 @@ void App::addDeviceToTrack(int track, const PluginDesc& d) {
     }
 
     DeviceModel dm;
+    dm.uid = ses_.newUid();
     dm.desc = d;
     dm.inst = std::move(inst);
     t.devices.push_back(std::move(dm));
@@ -373,6 +418,220 @@ void App::ensurePluginScan() {
     status_ = buf;
 }
 
+// ---------------------------------------------------------------------------
+// project: identity, device materialization, load / save
+// ---------------------------------------------------------------------------
+
+// Anything that reaches the App without an identity gets one here: entities
+// built before UIDs existed, and anything a future loader forgets to stamp.
+// The counter is also pulled past every UID actually in use, so a legacy file
+// with hand-written IDs can never collide with the ones we hand out next.
+void App::assignUids() {
+    u64 seen = 0;
+    auto note = [&](u64 id) { if (id > seen) seen = id; };
+    for (const TrackModel& t : ses_.tracks) {
+        note(t.uid);
+        for (int s = 0; s < kMaxScenes; ++s) note(t.slots[s].uid);
+        for (const DeviceModel& d : t.devices)   note(d.uid);
+        for (const SavedDevice& d : t.savedDevices) note(d.uid);
+    }
+    for (const SceneModel& s : ses_.scenes) note(s.uid);
+    if (ses_.nextUid <= seen) ses_.nextUid = seen + 1;
+
+    for (TrackModel& t : ses_.tracks) {
+        if (!t.uid) t.uid = ses_.newUid();
+        for (int s = 0; s < kMaxScenes; ++s) {
+            ClipModel& c = t.slots[s];
+            // An empty slot is not an entity: only a clip that exists, or one
+            // whose audio went missing but whose reference survived, gets one.
+            if (!c.uid && (c.valid() || !c.path.empty())) c.uid = ses_.newUid();
+        }
+        for (DeviceModel& d : t.devices)        if (!d.uid) d.uid = ses_.newUid();
+        for (SavedDevice& d : t.savedDevices)   if (!d.uid) d.uid = ses_.newUid();
+    }
+    for (SceneModel& s : ses_.scenes) if (!s.uid) s.uid = ses_.newUid();
+}
+
+// devices -> savedDevices. The project layer only ever sees the passive form,
+// so this is the one place that reads a live instance for persistence.
+void App::serializeDevices() {
+    for (TrackModel& t : ses_.tracks) {
+        t.savedDevices.clear();
+        t.savedDevices.reserve(t.devices.size());
+        for (DeviceModel& d : t.devices) {
+            if (!d.uid) d.uid = ses_.newUid();
+            SavedDevice sd;
+            sd.uid = d.uid;
+            sd.uri = d.desc.uri;
+            sd.name = d.desc.name;
+            sd.bypass = d.bypass;
+            if (d.inst) {
+                const int n = d.inst->paramCount();
+                sd.params.reserve((size_t)n);
+                for (int i = 0; i < n; ++i)
+                    sd.params.push_back({d.inst->paramInfo(i).id, d.inst->getParam(i)});
+            } else {
+                // A device whose plugin was missing at load time. Its saved
+                // values were parked on the model rather than thrown away, so
+                // the set round-trips unchanged on a machine that does not have
+                // the plugin and works again on one that does.
+                sd.params = d.lostParams;
+            }
+            t.savedDevices.push_back(std::move(sd));
+        }
+    }
+}
+
+// savedDevices -> devices. Every entry keeps its slot in the chain even if the
+// plugin is gone, so the order a set was saved with is the order it comes back
+// with once the missing plugin is installed.
+void App::materializeDevices() {
+    bool any = false;
+    for (const TrackModel& t : ses_.tracks) if (!t.savedDevices.empty()) { any = true; break; }
+    if (!any) return;
+    // The scan is chatty about its progress in the status bar; a load that goes
+    // through cleanly should still read as a load when it is done.
+    const std::string prevStatus = status_;
+    ensurePluginScan();
+
+    int missing = 0;
+    for (size_t ti = 0; ti < ses_.tracks.size(); ++ti) {
+        TrackModel& t = ses_.tracks[ti];
+        if (t.savedDevices.empty()) continue;
+
+        for (SavedDevice& sd : t.savedDevices) {
+            DeviceModel dm;
+            dm.uid = sd.uid;
+            dm.bypass = sd.bypass;
+
+            const PluginDesc* found = registry_.find(sd.uri);
+            std::unique_ptr<PluginInstance> inst;
+            if (found) inst = registry_.instantiate(*found, engine_.sampleRate(), kMaxBlock);
+
+            if (!inst) {
+                ++missing;
+                LOGW("plugin not available: %s (%s)", sd.name.c_str(), sd.uri.c_str());
+                if (found) dm.desc = *found;
+                else {
+                    dm.desc.uri = sd.uri;
+                    dm.desc.name = sd.name;
+                }
+                dm.lostParams = sd.params;
+                t.devices.push_back(std::move(dm));
+                continue;
+            }
+
+            // Parameters are matched on ParamInfo::id, not on index: a plugin
+            // can gain or reorder controls between versions, and dropping the
+            // ones we no longer recognise beats applying them to the wrong
+            // control.
+            const int n = inst->paramCount();
+            for (const std::pair<u32, f32>& pv : sd.params) {
+                for (int i = 0; i < n; ++i) {
+                    if (inst->paramInfo(i).id != pv.first) continue;
+                    inst->setParam(i, pv.second);
+                    break;
+                }
+            }
+            inst->setBypassed(sd.bypass);
+
+            dm.desc = *found;
+            dm.inst = std::move(inst);
+            t.devices.push_back(std::move(dm));
+        }
+
+        // The live models are now the truth; the passive copies are rebuilt
+        // from them at the next save, missing plugins included.
+        t.savedDevices.clear();
+        publishChain((int)ti);
+    }
+
+    if (missing > 0) {
+        char buf[80];
+        snprintf(buf, sizeof buf, "%d device%s could not be loaded - kept in the set",
+                 missing, missing == 1 ? "" : "s");
+        status_ = buf;
+    } else {
+        status_ = prevStatus;
+    }
+}
+
+// Hands every published chain and every instance over to the retirement flow.
+// Used before a load replaces the session wholesale: the tracks are about to be
+// destroyed, and destroying a PluginInstance the audio thread is still running
+// is the one thing the chain protocol exists to prevent.
+void App::releaseAllChains() {
+    for (int t = 0; t < kMaxTracks; ++t) {
+        const bool hasDevices = t < (int)ses_.tracks.size() && !ses_.tracks[t].devices.empty();
+        if (!published_[t] && !hasDevices) continue;
+
+        RtChain* empty = new RtChain();
+        Command c;
+        c.type = Cmd::SetChain;
+        c.a = t;
+        c.p = empty;
+        const bool sent = engine_.pushCommand(c);
+        if (!sent) {
+            LOGW("command ring full - track %d keeps running its old chain", t);
+            delete empty;
+        }
+
+        RetiredChain rc;
+        if (hasDevices)
+            for (DeviceModel& d : ses_.tracks[t].devices)
+                if (d.inst) rc.dying.push_back(std::move(d.inst));
+
+        if (sent) {
+            rc.chain = published_[t];       // may be null: nothing was published
+            published_[t] = empty;
+        }
+        // rc.chain stays null when nothing was ever published, or when the send
+        // failed and the engine is therefore still following the old chain.
+        // Either way no Ev::ChainRetired will ever match this entry, so it sits
+        // in retiring_ until shutdown() - which is after the audio thread is
+        // joined, and the only moment freeing it unilaterally is safe.
+        if (rc.chain || !rc.dying.empty()) retiring_.push_back(std::move(rc));
+    }
+}
+
+bool App::openProject(const std::string& path) {
+    // Load into a scratch session first. loadProject() leaves its target alone
+    // on a parse error, but the session is only *ours* to throw away once we
+    // know a replacement exists - and throwing it away means retiring chains,
+    // which is not something to do speculatively.
+    Session next;
+    std::string err;
+    if (!loadProject(next, path, engine_.sampleRate(), &err)) {
+        status_ = "Load failed: " + err;
+        return false;
+    }
+
+    releaseAllChains();
+    ses_ = std::move(next);
+
+    // Identity first: everything below hands out fresh UIDs, and they must come
+    // from a counter that has already been pulled past whatever the file used.
+    assignUids();
+
+    // A set with nothing in it would leave the views indexing past the end.
+    if (ses_.tracks.empty()) addTrack();
+    if (ses_.scenes.empty()) addScene();
+    selTrack_ = clampv(selTrack_, 0, (int)ses_.tracks.size() - 1);
+    selSlot_  = clampv(selSlot_,  0, (int)ses_.scenes.size() - 1);
+    selDevice_ = -1;
+
+    status_ = "Loaded " + path;
+    materializeDevices();          // may replace the status with its own warning
+    pushAll();
+    return true;
+}
+
+void App::saveProjectTo(const std::string& path) {
+    serializeDevices();
+    std::string err;
+    status_ = saveProject(ses_, path, &err) ? ("Saved " + path) : ("Save failed: " + err);
+}
+
 void App::setTempo(f64 bpm) {
     ses_.tempo = clampv(bpm, 20.0, 999.0);
     send(Cmd::SetTempo, 0, 0, ses_.tempo);
@@ -391,6 +650,10 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
     if (!sb) { status_ = "Could not load " + path; return; }
 
     ClipModel& m = ses_.tracks[track].slots[slot];
+    // A slot that already held a clip keeps its identity: the material behind
+    // it changed, but anything pointing at the clip (automation, a controller
+    // mapping) still means this clip.
+    if (!m.uid) m.uid = ses_.newUid();
     m.sample = sb;
     m.path = path;
     m.name = sb->name;
@@ -419,6 +682,7 @@ void App::addTrack() {
     TrackModel t;
     char buf[32];
     snprintf(buf, sizeof buf, "%zu Audio", ses_.tracks.size() + 1);
+    t.uid = ses_.newUid();
     t.name = buf;
     t.colorIdx = (int)(ses_.tracks.size() * 3 + 4) % pal::clipColorCount;
     ses_.tracks.push_back(std::move(t));   // TrackModel is move-only (devices)
@@ -430,8 +694,123 @@ void App::addScene() {
     SceneModel s;
     char buf[32];
     snprintf(buf, sizeof buf, "Scene %zu", ses_.scenes.size() + 1);
+    s.uid = ses_.newUid();
     s.name = buf;
     ses_.scenes.push_back(s);
+}
+
+// ---------------------------------------------------------------------------
+// recording
+//
+// Live's semantics: an empty slot on an armed track is a record target while
+// the global record button is lit. The first click queues a take (quantized by
+// the engine like any launch), the second stops it. The capture buffer is
+// allocated here and stays ours until Ev::RecordFinished brings it back; see
+// the Cmd::RecordSlot contract in engine.h.
+// ---------------------------------------------------------------------------
+
+void App::startRecording(int track, int slot) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
+    if (engine_.recState[track].load() != 0) {
+        status_ = "Track is already recording";
+        return;
+    }
+
+    const i64 cap = (i64)std::llround(engine_.sampleRate() * kRecordSeconds);
+    // Zeroed rather than raw: a take that stops early leaves the tail unwritten,
+    // and silence is a far better failure than whatever was on that page.
+    f32* buf = new (std::nothrow) f32[(size_t)cap * 2]();
+    if (!buf) {
+        status_ = "Out of memory - recording not started";
+        return;
+    }
+
+    Command c;
+    c.type = Cmd::RecordSlot;
+    c.a = track; c.b = slot;
+    c.p = buf;
+    c.x = (f64)cap;
+    if (!engine_.pushCommand(c)) {
+        // The engine never saw the buffer, so it is still solely ours.
+        delete[] buf;
+        status_ = "Engine busy - recording not started";
+        return;
+    }
+
+    pendingRecs_.push_back(PendingRec{buf, cap, track, slot});
+    selTrack_ = track; selSlot_ = slot;
+    status_ = "Record armed";
+}
+
+void App::stopRecording(int track) {
+    for (const PendingRec& p : pendingRecs_) {
+        if (p.track != track) continue;
+        // The same command toggles. Resend the buffer it was started with
+        // rather than a null: the stop is a second RecordSlot for this slot,
+        // and repeating the payload means an engine that simply reassigns
+        // recBuf lands on exactly what it already had.
+        Command c;
+        c.type = Cmd::RecordSlot;
+        c.a = track; c.b = p.slot;
+        c.p = p.buf;
+        c.x = (f64)p.capFrames;
+        if (!engine_.pushCommand(c)) status_ = "Engine busy - still recording";
+        return;
+    }
+}
+
+void App::finishRecording(const Event& e) {
+    f32* buf = (f32*)e.p;
+    if (!buf) return;
+
+    auto it = pendingRecs_.begin();
+    for (; it != pendingRecs_.end(); ++it) if (it->buf == buf) break;
+    if (it == pendingRecs_.end()) {
+        LOGW("RecordFinished for an unknown buffer %p - leaking it rather than "
+             "freeing a pointer we do not own", (const void*)buf);
+        return;
+    }
+
+    const int track = e.a, slot = e.b;
+    const i64 frames = (i64)e.x;
+    const bool inRange = track >= 0 && track < (int)ses_.tracks.size() &&
+                         slot  >= 0 && slot  < (int)ses_.scenes.size();
+
+    if (frames > 0 && inRange) {
+        char name[32];
+        snprintf(name, sizeof name, "Rec %d", recTakeNo_++);
+        SampleRef sb = sampleFromRecording(buf, frames, engine_.sampleRate(), ses_.tempo, name);
+        if (sb) {
+            ClipModel& m = ses_.tracks[track].slots[slot];
+            m = ClipModel{};
+            m.uid = ses_.newUid();
+            m.sample = sb;
+            m.name = name;
+            m.colorIdx = ses_.tracks[track].colorIdx;
+            // The take was played to the session clock, so its tempo is the
+            // session tempo by construction - nothing to guess here.
+            m.clipBpm = ses_.tempo;
+            m.lengthBeats = sb->guessedBeats;
+            m.loopStart = 0;
+            m.loopEnd = sb->frames;
+            m.gain = 1.f;
+            m.warp = Warp::Beats;
+            m.loop = true;
+            pushClip(track, slot);
+            selTrack_ = track; selSlot_ = slot;
+            status_ = std::string("Recorded ") + name;
+        } else {
+            status_ = "Recording failed";
+        }
+    } else if (frames <= 0) {
+        // Stopped before the quantized start ever fired: nothing was captured,
+        // so there is no clip to make and the slot stays empty.
+        status_ = "Recording cancelled";
+    }
+
+    delete[] buf;
+    pendingRecs_.erase(it);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +937,8 @@ void App::handleShortcuts() {
     }
 
     if (in.keyPressed['s'] && in.ctrl()) {
-        std::string err;
         const std::string p = ses_.path.empty() ? (homeDir() + "/" + ses_.name + ".lattice") : ses_.path;
-        status_ = saveProject(ses_, p, &err) ? ("Saved " + p) : ("Save failed: " + err);
+        saveProjectTo(p);
     }
 }
 
@@ -627,9 +1005,21 @@ void App::drawControlBar(const Rect& r) {
     ui_.stopSquare(stopR, pal::text);
     x += stopR.w + 3 * s;
 
+    // Session record. This is an *intent*, not a transport action: while it is
+    // lit, clicking an empty slot on an armed track starts a take in that slot;
+    // while it is unlit, the same click only moves the selection. The circle
+    // additionally lights while any track is actually capturing, so the bar
+    // says what the engine is doing and not just what was asked for.
     Rect recR{x, cy, 30 * s, h};
-    ui_.button(uiId(1, 6), recR, "");
-    rend_.circle(recR.cx(), recR.cy(), 5 * s, pal::recRed);
+    bool anyRec = false;
+    for (size_t t = 0; t < ses_.tracks.size(); ++t)
+        if (engine_.recState[t].load() != 0) { anyRec = true; break; }
+    // A dark plate under a bright circle while capturing; the plain armed plate
+    // otherwise, so the two states never read as the same light.
+    const Col recPlate = anyRec ? pal::recRed.scale(0.4f) : pal::armRed;
+    if (ui_.button(uiId(1, 6), recR, "", recIntent_ || anyRec, recPlate)) recIntent_ = !recIntent_;
+    rend_.circle(recR.cx(), recR.cy(), 5 * s,
+                 anyRec ? pal::recRed : (recIntent_ ? pal::textOnClip : pal::recRed.scale(0.55f)));
     x += recR.w + 12 * s;
 
     // --- position readout ---
@@ -883,12 +1273,44 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     const bool playing = (state == (int)SlotState::Playing || state == (int)SlotState::StopQueued) && active == si;
     const bool queued  = pending == si;
 
+    // Recording truth comes from the engine, not from what we asked for: the
+    // start is quantized, so a slot can sit queued for a bar before it captures.
+    const int recPhase = engine_.recState[ti].load();
+    const bool recHere = recPhase != 0 && engine_.recSlotIdx[ti].load() == si;
+
     if (!m.valid()) {
-        rend_.roundRect(cell, 2 * s, hot ? pal::slotHover : pal::slotEmpty);
+        const bool target = recIntent_ && ses_.tracks[ti].arm;
+        if (recHere && recPhase >= 2) {
+            // Capturing. Solid red, with the beats it has been running for.
+            rend_.roundRect(cell, 2 * s, pal::recRed);
+            rend_.circle(cell.x + 8 * s, cell.cy(), 3.5f * s, pal::textOnClip);
+            char buf[24];
+            snprintf(buf, sizeof buf, "%.1f",
+                     std::max(0.0, engine_.beat.load() - recStartBeat_[ti]));
+            rend_.textIn(fSmall_, {cell.x + 14 * s, cell.y, cell.w - 18 * s, cell.h},
+                         buf, pal::textOnClip, Align::Right, 0);
+        } else if (recHere) {
+            // Queued: a pulsing ring, the record-side counterpart of the
+            // blinking clip a launch shows while it waits for the quantum.
+            const f32 ph = (f32)(0.5 + 0.5 * std::sin(nowSeconds() * 8.0));
+            rend_.roundRect(cell, 2 * s, pal::slotEmpty);
+            rend_.roundRectOutline(cell, 2 * s, 1.5f * s,
+                                   pal::recRed.scale(0.35f + 0.4f * ph));
+        } else {
+            rend_.roundRect(cell, 2 * s, hot ? pal::slotHover : pal::slotEmpty);
+            // Armed track, record intent lit: this slot is a take waiting to
+            // happen, so say so before the click rather than after.
+            if (target) rend_.circle(cell.x + 8 * s, cell.cy(), 3 * s,
+                                     pal::recRed.scale(hot ? 0.9f : 0.55f));
+        }
         if (sel) rend_.roundRectOutline(cell, 2 * s, 1 * s, pal::accent);
         if (hot) {
             ui_.cursor = Cursor::Hand;
-            if (in.pressed[0]) { selTrack_ = ti; selSlot_ = si; }
+            if (in.pressed[0]) {
+                selTrack_ = ti; selSlot_ = si;
+                if (recHere)      stopRecording(ti);       // second click stops
+                else if (target)  startRecording(ti, si);
+            }
         }
         return;
     }
@@ -1216,6 +1638,39 @@ void App::drawClipDetail(const Rect& r) {
         }
         y += rowH + 4 * s;
     }
+    {   // Generative launch: probability, follow action, follow length.
+        // The engine rolls `prob` on every launch and fires the follow action
+        // after `followBeats` of playback, so all three are pure clip state and
+        // ride across in the same RtClip as everything else here.
+        Rect row{ctrl.x, y, ctrl.w, rowH};
+        label("LAUNCH", row);
+
+        f64 pct = m.prob * 100.0;
+        Rect pr{row.x + lblW, row.y, 48 * s, row.h};
+        if (ui_.dragNumber(uiId(13, 0), pr, &pct, 0.0, 100.0, 0.4, "%.0f%%")) {
+            m.prob = clampv(pct * 0.01, 0.0, 1.0);
+            pushClip(selTrack_, selSlot_);
+        }
+
+        int fa = (int)m.followAction;
+        Rect fr{pr.right() + 6 * s, row.y, 58 * s, row.h};
+        if (ui_.selector(uiId(13, 1), fr, &fa, kFollowNames, kFollowCount)) {
+            m.followAction = (Follow)clampv(fa, 0, kFollowCount - 1);
+            pushClip(selTrack_, selSlot_);
+        }
+
+        // 0 beats means "when the clip itself ends", which reads as Auto rather
+        // than as a length. Whole beats only: a follow length between beats is
+        // a tempo problem, not a musical choice.
+        f64 fb = m.followBeats;
+        Rect br{fr.right() + 6 * s, row.y, 52 * s, row.h};
+        if (ui_.dragNumber(uiId(13, 2), br, &fb, 0.0, 128.0, 0.06, "%.0f bt",
+                           Align::Center, "Auto", 1.0)) {
+            m.followBeats = fb;
+            pushClip(selTrack_, selSlot_);
+        }
+        y += rowH + 4 * s;
+    }
     {   // Read-out of what the engine will actually do
         Rect row{ctrl.x, y, ctrl.w, rowH};
         char buf[96];
@@ -1270,7 +1725,8 @@ void App::drawPluginBrowser(const Rect& r) {
     ui_.textField(fid, filter, &pluginFilter_, pal::appBg, pal::text, Align::Left, false);
     // textField only writes back on commit, but a filter has to narrow as you
     // type, so read the live edit buffer while this field owns the caret.
-    const std::string& query = (ui_.editId == fid) ? ui_.editBuf : pluginFilter_;
+    const std::string* live = ui_.liveText(fid);
+    const std::string& query = live ? *live : pluginFilter_;
     if (query.empty())
         rend_.textIn(fSmall_, filter, "filter plugins", pal::textFaint, Align::Left, 5 * s);
 
@@ -1422,7 +1878,18 @@ void App::drawDeviceStrip(const Rect& r) {
 
         Rect body{box.x + 4 * s, title.bottom() + 2 * s, box.w - 8 * s,
                   box.bottom() - title.bottom() - 6 * s};
-        if (!d.inst) continue;
+        if (!d.inst) {
+            // A device restored from a set whose plugin is not installed here.
+            // It holds its place and its saved values (see DeviceModel), so the
+            // chain comes back intact on a machine that has the plugin.
+            rend_.pushClip(body);
+            rend_.textIn(fSmall_, {body.x, body.y + 2 * s, body.w, 12 * s},
+                         "plugin not installed", pal::armRed, Align::Left, 0);
+            rend_.textIn(fSmall_, {body.x, body.y + 15 * s, body.w, 12 * s},
+                         d.desc.uri.c_str(), pal::textFaint, Align::Left, 0);
+            rend_.popClip();
+            continue;
+        }
 
         if (!sel) {
             // Unselected devices stay compact; only one chain slot is edited at
@@ -1542,12 +2009,18 @@ void App::drawStatusBar(const Rect& r) {
     rend_.rect({r.x, r.y, r.w, 1 * s}, pal::divider);
     rend_.textIn(fSmall_, r, status_.c_str(), pal::textFaint, Align::Left, 8 * s);
 
-    char buf[160];
-    snprintf(buf, sizeof buf, "%s · %s %.0f Hz / %d fr · %.0f fps · %d draws",
+    // The MIDI tag carries the sequencer client id: nothing is auto-connected,
+    // so the number is what the user needs to hand aconnect or qpwgraph.
+    char midiTag[32] = "";
+    if (midi_.running()) snprintf(midiTag, sizeof midiTag, " · MIDI %d:0", midi_.clientId());
+
+    char buf[192];
+    snprintf(buf, sizeof buf, "%s · %s %.0f Hz / %d fr%s · %.0f fps · %d draws",
              win_.backendName(),
              audio_ ? audio_->name() : "silent",
              audio_ ? audio_->sampleRate() : 0.0,
              audio_ ? audio_->bufferSize() : 0,
+             midiTag,
              fps_, rend_.drawCalls());
     rend_.textIn(fSmall_, r, buf, pal::textFaint, Align::Right, 8 * s);
 }

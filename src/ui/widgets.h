@@ -61,13 +61,24 @@ struct Ui {
     // Vertical fader with a stepped scale, like Live's mixer.
     bool vFader(u64 id, const Rect& b, f32* t);
     // Draggable numeric readout (tempo, gain, ...). Vertical drag.
+    // `zeroLabel`, when given, replaces the formatted number at exactly zero:
+    // a DAW is full of fields where 0 means "follow something else" and reads
+    // as "Auto" or "Off" rather than as a quantity. `step`, when > 0, snaps the
+    // value to a multiple of itself, which also keeps such a field landing on
+    // an exact 0 instead of drifting past it.
     bool dragNumber(u64 id, const Rect& b, f64* v, f64 lo, f64 hi, f64 perPixel,
-                    const char* fmt, Align align = Align::Center);
+                    const char* fmt, Align align = Align::Center,
+                    const char* zeroLabel = nullptr, f64 step = 0.0);
     // Click cycles through `options`; right-click steps backwards.
     bool selector(u64 id, const Rect& b, int* idx, const char* const* options, int count);
     // Editable text. Returns true when the value was committed.
     bool textField(u64 id, const Rect& b, std::string* value, Col bg, Col fg,
                    Align align = Align::Left, bool activateOnDouble = true);
+    // What `id` currently has in the edit buffer, or null when it does not own
+    // the caret. textField only writes back on commit, so a field whose owner
+    // has to react per keystroke (a filter narrowing as you type) reads the
+    // live text through here rather than reaching into editBuf itself.
+    const std::string* liveText(u64 id) const { return editId == id ? &editBuf : nullptr; }
 
     // --- drawing helpers --------------------------------------------------
     void meterV(const Rect& b, f32 lvl, f32 peak);   // vertical peak meter

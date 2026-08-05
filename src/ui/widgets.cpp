@@ -337,7 +337,7 @@ bool Ui::vFader(u64 id, const Rect& b, f32* t) {
 // ---------------------------------------------------------------------------
 
 bool Ui::dragNumber(u64 id, const Rect& b, f64* v, f64 lo, f64 hi, f64 perPixel,
-                    const char* fmt, Align align) {
+                    const char* fmt, Align align, const char* zeroLabel, f64 step) {
     if (!v || !r) return false;
     setHot(id, b);
     const bool hotNow = isHot(id);
@@ -350,7 +350,11 @@ bool Ui::dragNumber(u64 id, const Rect& b, f64* v, f64 lo, f64 hi, f64 perPixel,
     }
     if (active == id && in->dy != 0.f) {
         dragAccum += -in->dy * (in->shift() ? 0.1f : 1.f);   // drag up = increase
-        const f64 nv = clampv(dragStart + (f64)dragAccum * perPixel, lo, hi);
+        f64 nv = dragStart + (f64)dragAccum * perPixel;
+        // Snap before clamping, so the endpoints of the range stay reachable
+        // even when they are not multiples of the step.
+        if (step > 0.0) nv = std::floor(nv / step + 0.5) * step;
+        nv = clampv(nv, lo, hi);
         if (nv != *v) { *v = nv; changed = true; }
     }
     if (in->released[0] && active == id) active = 0;
@@ -360,7 +364,8 @@ bool Ui::dragNumber(u64 id, const Rect& b, f64* v, f64 lo, f64 hi, f64 perPixel,
     Font* f = fBody ? fBody : fSmall;
     if (f) {
         char buf[80];
-        std::snprintf(buf, sizeof buf, fmt ? fmt : "%.2f", *v);
+        if (zeroLabel && std::fabs(*v) < 1e-9) std::snprintf(buf, sizeof buf, "%s", zeroLabel);
+        else                                   std::snprintf(buf, sizeof buf, fmt ? fmt : "%.2f", *v);
         r->textIn(*f, b, buf, (hotNow || active == id) ? pal::text : pal::textDim, align, 3.f);
     }
 
