@@ -41,6 +41,8 @@ public:
 
         jack_set_process_callback(client_, &JackBackend::processCb, this);
         jack_set_sample_rate_callback(client_, &JackBackend::srCb, this);
+        jack_set_buffer_size_callback(client_, &JackBackend::bufSizeCb, this);
+        jack_set_xrun_callback(client_, &JackBackend::xrunCb, this);
         if (jack_activate(client_)) { jack_client_close(client_); client_ = nullptr; return false; }
 
         // Auto-connect to the system playback ports so there is sound without
@@ -89,10 +91,48 @@ private:
         self->engine_->process(il, ir, l, r, (int)n);
         return 0;
     }
+    // JACK's sample rate is fixed for the lifetime of an active client on jack2
+    // (and PipeWire's libjack shim): it is read once at start() and cannot change
+    // under a running process callback. The old body called Engine::prepare()
+    // straight from here — concurrently with process(), which JACK does NOT
+    // serialise the sample-rate callback against — tearing RtClip cells a live
+    // voice was mid-read, racing ~2 MB of stores, calling calloc()/fprintf() from
+    // a callback, and nulling every chain with no retirement (RT-AUDIT §1.1,
+    // CRITICAL). The race is simply removed: this is now a no-op that logs if
+    // JACK ever contradicts the prepared rate. Honouring a live rate change would
+    // require stopping the client and rebuilding every plugin off the audio
+    // thread, which the daemon owns; there is nothing safe to do from here.
     static int srCb(jack_nframes_t n, void* arg) {
         auto* self = (JackBackend*)arg;
-        self->sr_ = (f64)n;
+        if ((f64)n != self->sr_)
+            LOGW("JACK sample rate changed %.0f -> %u Hz while active; not honoured, "
+                 "restart required (engine stays prepared at %.0f Hz)",
+                 self->sr_, (unsigned)n, self->sr_);
+        return 0;
+    }
+    // Buffer size, unlike sample rate, CAN change at runtime (jack_set_buffer_size,
+    // and PipeWire renegotiates on its own). JACK suspends the process cycle for
+    // the duration of this callback and explicitly permits allocation here, so —
+    // unlike srCb — it is safe to re-prepare the engine between blocks
+    // (RT-AUDIT §4.1). prepare() resets engine state and drops device chains
+    // without retiring them, on the same contract as a rate change: the owner
+    // (daemon/GUI) republishes every chain afterwards. Blocks over kMaxBlock are
+    // still clamped by process(); plugin instances prepared at the old size must
+    // be rebuilt by the daemon to process the new size, or they degrade to
+    // passthrough — that rebuild is out of this backend's reach.
+    static int bufSizeCb(jack_nframes_t n, void* arg) {
+        auto* self = (JackBackend*)arg;
+        if ((int)n == self->bs_) return 0;
+        LOGW("JACK buffer size %d -> %u frames; re-preparing engine (chains must be "
+             "republished by the owner)", self->bs_, (unsigned)n);
+        self->bs_ = (int)n;
         self->engine_->prepare(self->sr_, self->bs_);
+        return 0;
+    }
+    // A dropout the JACK server observed. Called from JACK's own thread, not the
+    // RT cycle; reportXrun() is a relaxed atomic increment, safe from anywhere.
+    static int xrunCb(void* arg) {
+        ((JackBackend*)arg)->engine_->reportXrun();
         return 0;
     }
 
@@ -207,6 +247,7 @@ private:
         if (!cap_) return false;
         const snd_pcm_sframes_t got = snd_pcm_readi(cap_, capInter_.data(), (snd_pcm_uframes_t)bs_);
         if (got < 0) {
+            engine_->reportXrun();               // a capture over/underrun is a dropout
             if (snd_pcm_recover(cap_, (int)got, 1) < 0) {
                 LOGW("ALSA: capture stream lost, continuing without input");
                 snd_pcm_close(cap_);
@@ -240,6 +281,7 @@ private:
             for (int i = 0; i < bs_; ++i) { inter_[i * 2] = l_[i]; inter_[i * 2 + 1] = r_[i]; }
             const snd_pcm_sframes_t w = snd_pcm_writei(pcm_, inter_.data(), (snd_pcm_uframes_t)bs_);
             if (w < 0) {
+                engine_->reportXrun();           // playback underrun: the audible dropout
                 if (snd_pcm_recover(pcm_, (int)w, 1) < 0) break;
             }
         }

@@ -1,8 +1,15 @@
 #include "engine.h"
 #include "../plugin/host.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+// FTZ/DAZ (denormal flushing) is x86-only here; other ISAs no-op. See process().
+#if defined(__x86_64__) || defined(__i386__)
+#include <pmmintrin.h>   // _MM_SET_DENORMALS_ZERO_MODE (DAZ)
+#include <xmmintrin.h>   // _MM_SET_FLUSH_ZERO_MODE (FTZ)
+#endif
 
 namespace lat {
 
@@ -23,6 +30,88 @@ static constexpr int kMidiPerBlock = 256;
 // into a spin and the overdub wrap below into a division by ~zero. Both paths
 // use this one constant so "plays" and "can be overdubbed into" never disagree.
 static constexpr f64 kMinLoopBeats = 1.0 / 64.0;
+
+// ---------------------------------------------------------------------------
+// resilient critical events (RT-AUDIT §1.6)
+//
+// RecordFinished / MidiRecordFinished / ChainRetired / NotesRetired each carry a
+// heap pointer back to the GUI and are the ONLY channel that returns it: a
+// dropped RecordFinished loses a recording *and* leaks its buffer, unrecoverably
+// (the cosmetic events — ClipStarted, meters, ... — either self-heal from the
+// mirrored atomics or are re-derivable by the drain proof). The event ring is
+// SPSC and a full ring makes push() fail silently, so a failed push of one of
+// these is instead PARKED here, audio-thread-owned, and retried at the top of
+// every process() before the ring is touched again.
+//
+// engine.h is a frozen contract with no room for this, so — exactly like the PDC
+// state below — it lives in a side-table keyed by the Engine's address. The
+// parking buffer is fixed and audio-thread-only; overflowing it (the GUI wedged
+// for >kCap critical events) bumps a counter rather than allocating.
+namespace {
+
+struct PendingEv {
+    static constexpr int kCap = 128;
+    Event ev[kCap];
+    int   len = 0;
+    std::atomic<u64> dropped{0};
+};
+
+struct PendTable {
+    static constexpr int kSlots = 4;   // app, daemon, renderer, tests: one each
+    std::atomic<const Engine*> owner[kSlots];
+    PendingEv* slot[kSlots] = {};
+    ~PendTable() { for (auto* p : slot) delete p; }
+};
+PendTable gPend;
+
+// Audio thread: a handful of pointer compares. Null => never prepared.
+PendingEv* pendFind(const Engine* e) {
+    for (int i = 0; i < PendTable::kSlots; ++i)
+        if (gPend.owner[i].load(std::memory_order_acquire) == e) return gPend.slot[i];
+    return nullptr;
+}
+
+// GUI thread, from prepare(): claim a slot (allocating on first use) and clear it.
+PendingEv* pendAcquire(const Engine* e) {
+    int idx = -1;
+    for (int i = 0; i < PendTable::kSlots; ++i)
+        if (gPend.owner[i].load(std::memory_order_relaxed) == e) { idx = i; break; }
+    if (idx < 0)
+        for (int i = 0; i < PendTable::kSlots; ++i)
+            if (!gPend.owner[i].load(std::memory_order_relaxed)) { idx = i; break; }
+    if (idx < 0) idx = 0;               // four is more than any process needs
+    if (!gPend.slot[idx]) {
+        gPend.slot[idx] = new (std::nothrow) PendingEv();
+        if (!gPend.slot[idx]) return nullptr;
+    }
+    gPend.slot[idx]->len = 0;
+    gPend.owner[idx].store(e, std::memory_order_release);
+    return gPend.slot[idx];
+}
+
+// Push a critical event, falling back to the parking buffer. If anything is
+// already parked this event must queue behind it to keep order.
+void emitCritical(const Engine* e, Ring<Event, 1024>& evts, const Event& ev) {
+    PendingEv* pe = pendFind(e);
+    if ((!pe || pe->len == 0) && evts.push(ev)) return;
+    if (!pe) return;                    // no slot (allocation failed): nothing to do
+    if (pe->len < PendingEv::kCap) pe->ev[pe->len++] = ev;
+    else pe->dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Retry parked critical events, in order, before any fresh event this block.
+void flushPendingEv(const Engine* e, Ring<Event, 1024>& evts) {
+    PendingEv* pe = pendFind(e);
+    if (!pe || pe->len == 0) return;
+    int i = 0;
+    while (i < pe->len && evts.push(pe->ev[i])) ++i;    // deliver a prefix
+    if (i == 0) return;                                 // ring still full
+    const int remain = pe->len - i;
+    for (int j = 0; j < remain; ++j) pe->ev[j] = pe->ev[i + j];
+    pe->len = remain;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // generative scheduling: deterministic "randomness"
@@ -224,18 +313,23 @@ static inline f64 overdubNoteLen(f64 from, f64 to, f64 L) {
     return len > kMinNoteLen ? len : kMinNoteLen;
 }
 
-// Appends to the take buffer keeping it sorted by start beat. Notes close in
-// note-off order, which for anything a human plays is almost start order, so
-// the backwards scan below normally stops on its first compare. Sorting as we
-// write rather than in one pass at the stop boundary keeps the work per event
-// small and spread out, instead of handing the audio thread an O(n^2) burst on
-// the single block a take happens to end on.
-static bool insertNote(RtNote* buf, i64& len, i64 cap, const RtNote& n) {
+// Appends one note to the take buffer, O(1). (RT-AUDIT §1.5)
+//
+// This used to insertion-sort each note into place to keep the buffer ordered.
+// The stated premise — "notes close in note-off order, which for a human is
+// almost start order, so the backward scan stops on its first compare" — is
+// FALSE for an overdub pass: there the beat is wrapBeat(...) reduced modulo the
+// clip loop, so pass 3 can land a note at beat 0.5 after pass 2 landed one at
+// beat 3.9. A single wrapped note-off then memmoves the whole buffer (~96 KB at
+// 4000 notes) inside process(). So append here — O(1), bounded, no memmove —
+// and sort ONCE at the stop boundary in finishRec(), which is a single bounded
+// (<= recCap, one-time) sort instead of a per-note burst. The buffer only ever
+// leaves via the finish event, and finishRec sorts before pushing it, so the
+// GUI still receives it ordered; nothing in the engine reads note order in the
+// meantime.
+static bool appendNote(RtNote* buf, i64& len, i64 cap, const RtNote& n) {
     if (!buf || len >= cap) return false;
-    i64 i = len;
-    while (i > 0 && buf[i - 1].beat > n.beat) { buf[i] = buf[i - 1]; --i; }
-    buf[i] = n;
-    ++len;
+    buf[len++] = n;
     return true;
 }
 
@@ -270,7 +364,8 @@ static void cancelRec(TrackT& t) {
 // still held close against it the same way they would have closed against a
 // note-off — wrap and over-long hold clamped to the loop end.
 template <class TrackT, class EvRing>
-static void finishRec(int ti, TrackT& t, EvRing& evts, f64 endBeat, f64 loopLen = 0.0) {
+static void finishRec(const Engine* eng, int ti, TrackT& t, EvRing& evts, f64 endBeat,
+                      f64 loopLen = 0.0) {
     if (t.recMidi) {
         // recBuf is the f32* the Cmd contract gives us; a MIDI take stores
         // RtNote through it and recCap/recLen count notes. See the note on
@@ -285,12 +380,21 @@ static void finishRec(int ti, TrackT& t, EvRing& evts, f64 endBeat, f64 loopLen 
                           : ((endBeat - o.beat) > kMinNoteLen ? (endBeat - o.beat) : kMinNoteLen);
             n.pitch = o.pitch;
             n.vel   = o.vel;
-            insertNote(notes, t.recLen, t.recCap, n);
+            appendNote(notes, t.recLen, t.recCap, n);
             o.used = false;
         }
-        evts.push({Ev::MidiRecordFinished, ti, t.recSlot, (f64)t.recLen, (void*)t.recBuf});
+        // Notes were appended unsorted during capture (see appendNote); sort by
+        // start beat here, once, at the boundary. std::sort is in-place introsort
+        // — no allocation — and bounded by recCap, versus the per-note memmove
+        // the old insertion sort ran inside the sub-block loop.
+        if (notes && t.recLen > 1)
+            std::sort(notes, notes + t.recLen,
+                      [](const RtNote& a, const RtNote& b) { return a.beat < b.beat; });
+        emitCritical(eng, evts, {Ev::MidiRecordFinished, ti, t.recSlot, (f64)t.recLen,
+                                 (void*)t.recBuf});
     } else {
-        evts.push({Ev::RecordFinished, ti, t.recSlot, (f64)t.recLen, (void*)t.recBuf});
+        emitCritical(eng, evts, {Ev::RecordFinished, ti, t.recSlot, (f64)t.recLen,
+                                 (void*)t.recBuf});
     }
     t.recBuf = nullptr;
     t.recCap = 0;
@@ -604,6 +708,11 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
     else LOGW("pdc: delay compensation unavailable, latent chains will not be aligned");
     latencyFrames.store(0);
 
+    // Claim (and clear) the parking buffer for resilient critical events. Same
+    // discipline as the PDC state: GUI thread, before the audio thread exists.
+    if (!pendAcquire(this))
+        LOGW("engine: no slot for resilient events; a full ring may drop a take");
+
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
 
@@ -696,8 +805,8 @@ void Engine::drainCommands() {
                         // the voice's beatPos is still the position the stop
                         // lands on.
                         const RtClip* oc = overdubVoice(clips_[ti], t);
-                        if (oc) finishRec(ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
-                        else    finishRec(ti, t, evts_, stopBeat - t.recStartBeat);
+                        if (oc) finishRec(this, ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
+                        else    finishRec(this, ti, t, evts_, stopBeat - t.recStartBeat);
                     } else if (t.recPhase == 1) cancelRec(t);
                 }
                 evts_.push({Ev::TransportStopped, 0, 0, 0.0});
@@ -776,7 +885,7 @@ void Engine::drainCommands() {
                 dst = c.clip;
                 if (t.voice.clip == &dst && t.voice.active) reseekNotes(t.voice, dst);
                 if (t.prev.clip  == &dst && t.prev.active)  reseekNotes(t.prev,  dst);
-                if (changed) evts_.push({Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
+                if (changed) emitCritical(this, evts_, {Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
             }
             break;
         // A pointer swap and nothing else. The audio thread must never free a
@@ -793,7 +902,7 @@ void Engine::drainCommands() {
             // good until the chain is replaced — and replacing it comes through
             // here. Compensation may change, which the block below resolves.
             if (pdc) { pdc->trackLat[c.a] = chainLatency(t.chain); pdc->dirty = true; }
-            if (old) evts_.push({Ev::ChainRetired, c.a, 0, 0.0, (void*)old});
+            if (old) emitCritical(this, evts_, {Ev::ChainRetired, c.a, 0, 0.0, (void*)old});
             break;
         }
 
@@ -808,14 +917,14 @@ void Engine::drainCommands() {
             const RtChain* old = rt.chain;
             rt.chain = (const RtChain*)c.p;
             if (pdc) { pdc->retLat[c.a] = chainLatency(rt.chain); pdc->dirty = true; }
-            if (old) evts_.push({Ev::ChainRetired, kMaxTracks + c.a, 0, 0.0, (void*)old});
+            if (old) emitCritical(this, evts_, {Ev::ChainRetired, kMaxTracks + c.a, 0, 0.0, (void*)old});
             break;
         }
         case Cmd::SetMasterChain: {
             const RtChain* old = masterChain_;
             masterChain_ = (const RtChain*)c.p;
             if (pdc) { pdc->masterLat = chainLatency(masterChain_); pdc->dirty = true; }
-            if (old) evts_.push({Ev::ChainRetired, -1, 0, 0.0, (void*)old});
+            if (old) emitCritical(this, evts_, {Ev::ChainRetired, -1, 0, 0.0, (void*)old});
             break;
         }
         // Both ends checked, as everywhere else here: a stray index would have
@@ -843,7 +952,7 @@ void Engine::drainCommands() {
                 dropVoice(t, t.prev,  c.a, false, &dst);
                 dropVoice(t, t.voice, c.a, true,  &dst);
                 dst = RtClip{};
-                if (old) evts_.push({Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
+                if (old) emitCritical(this, evts_, {Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
             }
             break;
 
@@ -1018,8 +1127,8 @@ void Engine::fireDue(f64 atBeat) {
             // position inside the loop — what an overdub's held notes close
             // against. The clip keeps playing; only the take ends here.
             const RtClip* oc = overdubVoice(clips_[ti], t);
-            if (oc) finishRec(ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
-            else    finishRec(ti, t, evts_, boundary - t.recStartBeat);
+            if (oc) finishRec(this, ti, t, evts_, t.voice.beatPos, oc->lengthBeats);
+            else    finishRec(this, ti, t, evts_, boundary - t.recStartBeat);
             // A take displaced by a Record*Slot into another slot hands over
             // here, on the very same grid line it stopped on.
             if (t.pendBuf) {
@@ -1355,6 +1464,29 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
 void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int nframes) {
     const auto t0 = std::chrono::steady_clock::now();
 
+    // Denormals in feedback/reverb tails and the multiplicative meter decays cost
+    // orders of magnitude on the audio thread. MXCSR is per-thread state, so arm
+    // FTZ/DAZ here on the first call on this thread rather than once at startup:
+    // that covers the in-process app AND the daemon (which never armed it at all,
+    // yet is where all plugin DSP now runs — RT-AUDIT §1.7). x86 only; on other
+    // ISAs (e.g. AArch64 FPCR) this is a no-op and denormals remain enabled.
+#if defined(__x86_64__) || defined(__i386__)
+    static thread_local bool ftzArmed = false;
+    if (!ftzArmed) {
+        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+        ftzArmed = true;
+    }
+#endif
+
+    // A liveness heartbeat independent of transport: advances every callback so
+    // the GUI/daemon can tell the audio thread is running even when stopped.
+    blocksRendered.fetch_add(1, std::memory_order_relaxed);
+
+    // Retry any critical events parked because the ring was full last block,
+    // before anything else touches it, so they keep their order (RT-AUDIT §1.6).
+    flushPendingEv(this, evts_);
+
     drainCommands();
     std::memset(outL, 0, (size_t)nframes * sizeof(f32));
     std::memset(outR, 0, (size_t)nframes * sizeof(f32));
@@ -1371,6 +1503,13 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     MidiMsg midi[kMidiPerBlock];
     int midiCount = 0;
     { MidiMsg m; while (midiCount < kMidiPerBlock && midi_.pop(m)) midi[midiCount++] = m; }
+    // Second producer, second SPSC ring: the GUI (computer keyboard, note
+    // preview) has its own so it never races the hardware reader's head pointer
+    // — sharing one ring drops messages, and a lost note-off is a stuck note
+    // (RT-AUDIT §1.2). Drain it into the same per-block list under the same cap.
+    // No frame-order merge is needed: both rings are same-block, and every
+    // consumer (captureMidiRange, the chain fan-out) already keys off m.frame.
+    { MidiMsg m; while (midiCount < kMidiPerBlock && midiGui_.pop(m)) midi[midiCount++] = m; }
 
     // Decide up front which tracks take part in this block, and clear their
     // scratch before any voice writes into it. A track is live if it has audio
@@ -1428,7 +1567,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             }
             // The engine cannot grow a GUI-owned buffer and must not write past
             // it, so a full buffer ends the take here and now.
-            if (t.recLen >= t.recCap) finishRec(ti, t, evts_, 0.0);
+            if (t.recLen >= t.recCap) finishRec(this, ti, t, evts_, 0.0);
         }
     };
 
@@ -1499,7 +1638,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                             nn.pitch = o.pitch;
                             nn.vel   = o.vel;
                             o.used = false;
-                            insertNote(notes, t.recLen, t.recCap, nn);
+                            appendNote(notes, t.recLen, t.recCap, nn);
                         }
                     int k = -1;
                     for (int j = 0; j < 32; ++j) if (!t.recOpen[j].used) { k = j; break; }
@@ -1523,7 +1662,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                         nn.pitch = o.pitch;
                         nn.vel   = o.vel;
                         o.used = false;
-                        insertNote(notes, t.recLen, t.recCap, nn);
+                        appendNote(notes, t.recLen, t.recCap, nn);
                         break;
                     }
                 }
@@ -1532,7 +1671,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                 // and must not write past it, so a full one ends the take. The
                 // notes still held close against this event's position, which
                 // for an overdub is already the in-loop one.
-                if (t.recLen >= t.recCap) { finishRec(ti, t, evts_, at, loopLen); break; }
+                if (t.recLen >= t.recCap) { finishRec(this, ti, t, evts_, at, loopLen); break; }
             }
         }
     };

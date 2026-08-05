@@ -92,6 +92,12 @@ struct Host {
         MidiMsg m; m.status = status; m.d1 = d1; m.d2 = d2; m.frame = frame;
         e.pushMidi(m);
     }
+    // The GUI's own MIDI producer (computer keyboard, note preview): a second
+    // SPSC ring the engine also drains, distinct from the hardware reader's.
+    void pushMidiFromGui(u8 status, u8 d1, u8 d2, i32 frame = 0) {
+        MidiMsg m; m.status = status; m.d1 = d1; m.d2 = d2; m.frame = frame;
+        e.pushMidiFromGui(m);
+    }
     void setClip(int track, int slot, const RtClip& cl) {
         Command c; c.type = Cmd::SetClip; c.a = track; c.b = slot; c.clip = cl;
         e.pushCommand(c);
@@ -3175,6 +3181,192 @@ static void testPdc() {
 }
 
 // ---------------------------------------------------------------------------
+// 20. two MIDI producers, two SPSC rings  (RT-AUDIT §1.2)
+// ---------------------------------------------------------------------------
+// The hardware reader (pushMidi) and the GUI (pushMidiFromGui) each own a ring;
+// process() drains both. Sharing one ring raced their head pointers and dropped
+// a message — and a lost note-off is a stuck note. Prove both are delivered, in
+// the same block, by capturing a MIDI take fed from both producers at once.
+
+static void testTwoRingMidi() {
+    banner("20. two MIDI producers each get their own ring");
+    note("pushMidi (hardware reader) and pushMidiFromGui (GUI) are separate SPSC");
+    note("rings the engine drains together; neither can overwrite the other.");
+
+    Host h; h.init();
+    std::vector<RtNote> take(16);
+    for (RtNote& n : take) { n.pitch = 0; n.vel = 0; }
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                   // None: the take starts at once
+    h.push(Cmd::TrackArm, 0, 1);
+    h.push(Cmd::SetPlaying, 1);
+    h.pushRecMidi(0, 0, take.data(), 16);
+    h.runBlocks(1);
+    CHECK(h.e.recState[0].load() == 2, "the MIDI take is running (%d)", h.e.recState[0].load());
+
+    // Both note-ons in the SAME block, one per ring: the hardware plays 60, the
+    // GUI plays 64. If the two shared a ring one of these would be lost.
+    h.pushMidi(0x90, 60, 100);                    // hardware reader ring
+    h.pushMidiFromGui(0x90, 64, 90);              // GUI ring
+    h.run(kBeat120 / 2);
+    // And both note-offs together, again one per ring.
+    h.pushMidi(0x80, 60, 0);
+    h.pushMidiFromGui(0x80, 64, 0);
+    h.run(kBeat120 / 2);
+
+    h.pushRecMidi(0, 0, take.data(), 16);         // toggle: stop
+    h.runBlocks(2);
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    CHECK(fin != nullptr, "the take finishes with Ev::MidiRecordFinished");
+    const int got = fin ? (int)fin->x : 0;
+    CHECK(got == 2, "both producers' notes were captured: %d (expected 2)", got);
+    const RtNote* nh = takeNote(take, got, 60);   // from the hardware ring
+    const RtNote* ng = takeNote(take, got, 64);   // from the GUI ring
+    CHECK(nh != nullptr, "the hardware reader's note (pitch 60) survived");
+    CHECK(ng != nullptr, "the GUI's note (pitch 64) survived");
+    CHECK(nh && nh->vel == 100 && ng && ng->vel == 90,
+          "each kept its own velocity (%d / %d)", nh ? nh->vel : -1, ng ? ng->vel : -1);
+}
+
+// ---------------------------------------------------------------------------
+// 21. a full event ring never loses a finished take  (RT-AUDIT §1.6)
+// ---------------------------------------------------------------------------
+// Ev::RecordFinished is the ONLY channel returning a take's buffer; a silent
+// drop loses the recording and leaks the buffer. So a critical event that cannot
+// be pushed is parked, audio-thread-owned, and retried at the top of every
+// process(). Fill the ring, auto-finish a take, and prove the RecordFinished
+// still arrives once the ring has room again.
+
+static void testEventResilience() {
+    banner("21. a full event ring cannot swallow a finished take");
+    note("critical events (RecordFinished/ChainRetired/...) that fail to push are");
+    note("parked and retried; only cosmetic events are ever dropped on overflow.");
+
+    Host h; h.init();
+    feedCapture(h);
+    std::vector<f32> rec((size_t)64 * 2, 0.f);
+    const auto clip = dcBuf(300000, 1, 1.0f);
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                   // None
+    h.push(Cmd::SetPlaying, 1);
+    // Clips on many tracks so launching/stopping a scene emits a burst of events.
+    for (int t = 1; t <= 16; ++t) {
+        h.setClip(t, 0, mkClip(clip, 1, 0.2f, Warp::Off, true, 120.0));
+        h.setClip(t, 1, mkClip(clip, 1, 0.2f, Warp::Off, true, 120.0));
+    }
+    h.runBlocks(1);
+
+    // Flood the event ring WITHOUT draining it: alternate scene launches, each of
+    // which stops one row (ClipStopped x16) and starts the other (ClipStarted
+    // x16). The ring holds 1023; 60 launches is ~1900 events, so it saturates.
+    for (int c = 0; c < 200; ++c) {
+        h.push(Cmd::LaunchScene, c & 1);
+        h.runBlocks(1);
+    }
+
+    // Start an audio take with a tiny buffer so it auto-finishes almost at once.
+    // Its RecordStarted (non-critical) may be dropped; the take's RecordFinished
+    // (critical) must not be.
+    h.pushRec(0, 0, rec.data(), 64);
+    h.runBlocks(2);
+
+    // At this point the take has finished but the ring is still full, so the
+    // RecordFinished had to be parked rather than pushed: draining now must NOT
+    // surface it.
+    std::vector<Event> flooded = drainEvents(h.e);
+    CHECK(flooded.size() >= 1020,
+          "the ring really was saturated (%zu events drained, cap 1023)", flooded.size());
+    CHECK(findEvent(flooded, Ev::RecordFinished) == nullptr,
+          "with the ring full, RecordFinished was parked, not pushed");
+
+    // One more block, now that the ring has room: flushPendingEv delivers it.
+    h.runBlocks(1);
+    std::vector<Event> after = drainEvents(h.e);
+    const Event* fin = findEvent(after, Ev::RecordFinished);
+    CHECK(fin != nullptr, "the parked RecordFinished arrives once the ring drains");
+    CHECK(fin && fin->p == (void*)rec.data(),
+          "and it still carries the GUI's buffer (%p vs %p)",
+          fin ? fin->p : nullptr, (void*)rec.data());
+}
+
+// ---------------------------------------------------------------------------
+// 22. overdub notes are appended unsorted, then sorted at the boundary
+// ---------------------------------------------------------------------------
+// RT-AUDIT §1.5: overdub wraps each beat modulo the loop, so arrival order and
+// beat order disagree; the old per-note insertion sort memmoved the buffer
+// inside process(). Notes are now appended O(1) and sorted once in finishRec.
+// Play three notes whose in-loop positions arrive OUT of order and prove the
+// finished buffer is fully sorted and lost nothing.
+
+static void testOverdubSort() {
+    banner("22. overdub take comes back sorted after an append-then-sort");
+    note("in-loop positions played 0.75, 0.25, 0.50 must come back 0.25 < 0.50 <");
+    note("0.75 — the sort at the stop boundary orders what capture only appended.");
+
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    std::vector<RtNote> host(1);
+    host[0].beat = 0.0; host[0].len = 0.25; host[0].pitch = 48; host[0].vel = 100;
+    std::vector<RtNote> take(16);
+    for (RtNote& n : take) { n.beat = -1.0; n.pitch = 0; n.vel = 0; }
+
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                   // None: boundaries land at once
+    h.setChain(0, &chain);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.setClip(0, 0, mkMidiClip(host, 1.0, true)); // a 1-beat loop, launched at 0
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(1);
+    h.pushRecMidi(0, 0, take.data(), 16);         // overdub pass into the playing clip
+    h.runBlocks(1);
+    drainEvents(h.e);
+
+    // pitch, lap, in-loop target — arrival order is 0.75, 0.25, 0.50.
+    struct P { u8 pitch; i64 lap; f64 pos; };
+    const P plan[3] = { {72, 0, 0.75}, {74, 1, 0.25}, {76, 2, 0.50} };
+    f64 arrived[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) {
+        const i64 target = plan[k].lap * kBeat120 + (i64)(plan[k].pos * (f64)kBeat120);
+        while ((i64)h.outL.size() < target) h.runBlocks(1);
+        const i64 on = (i64)h.outL.size();
+        arrived[k] = inLoop(on);
+        h.pushMidi(0x90, plan[k].pitch, (u8)(100 - k));
+        h.run(kBeat120 / 16);
+        h.pushMidi(0x80, plan[k].pitch, 0);
+        h.runBlocks(1);
+    }
+    // The premise: capture really did see them out of beat order.
+    CHECK(arrived[0] > arrived[1] && arrived[2] > arrived[1] && arrived[0] > arrived[2],
+          "the three notes arrived out of in-loop order (%.3f %.3f %.3f)",
+          arrived[0], arrived[1], arrived[2]);
+
+    h.pushRecMidi(0, 0, take.data(), 16);         // toggle: stop -> finishRec sorts
+    h.runBlocks(4);
+
+    const std::vector<Event> evs = drainEvents(h.e);
+    const Event* fin = findEvent(evs, Ev::MidiRecordFinished);
+    CHECK(fin != nullptr, "the overdub pass finishes with Ev::MidiRecordFinished");
+    const int got = fin ? (int)fin->x : 0;
+    CHECK(got == 3, "all three appended notes are kept: %d (expected 3)", got);
+    CHECK(got == 3 && take[0].beat <= take[1].beat && take[1].beat <= take[2].beat,
+          "the buffer comes back sorted by beat (%.4f %.4f %.4f)",
+          take[0].beat, take[1].beat, take[2].beat);
+    CHECK(got == 3 && take[0].pitch == 74 && take[1].pitch == 76 && take[2].pitch == 72,
+          "the sort put the pitches in beat order (%d %d %d, expected 74 76 72)",
+          take[0].pitch, take[1].pitch, take[2].pitch);
+    // A permutation, not a corruption: every played pitch is present exactly once.
+    CHECK(takeNote(take, got, 72) && takeNote(take, got, 74) && takeNote(take, got, 76),
+          "the sort lost none of the three notes");
+    CHECK(takeNote(take, got, 48) == nullptr,
+          "and the clip's own note is not in the take buffer");
+}
+
+// ---------------------------------------------------------------------------
 // 19. the command drain counter
 // ---------------------------------------------------------------------------
 
@@ -3260,6 +3452,9 @@ int main() {
     testOverdub();
     testBuses();
     testPdc();
+    testTwoRingMidi();
+    testEventResilience();
+    testOverdubSort();
     testDrains();
 
     std::printf("\n----------------------------------------\n");

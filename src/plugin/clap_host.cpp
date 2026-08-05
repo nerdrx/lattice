@@ -51,29 +51,44 @@ namespace fs = std::filesystem;
 
 // --- thread identity -------------------------------------------------------
 // clap.thread-check must answer honestly or plugins that assert on it will
-// abort. "Main" is whichever thread first entered the backend, which by the
-// contract in host.h is the GUI thread; "audio" is any thread currently inside
-// ClapInstance::process(). Constant-initialised so reading it emits no guard.
+// abort. "audio" is any thread currently inside ClapInstance::process().
+// Constant-initialised so reading it emits no guard.
 thread_local bool tlsInProcess = false;
 
-std::thread::id& mainThreadId() {
-    static std::thread::id id;
-    return id;
-}
-// Called from scanCLAP()/instantiateCLAP(), both documented GUI-thread only.
-void rememberMainThread() {
-    if (mainThreadId() == std::thread::id{}) mainThreadId() = std::this_thread::get_id();
-}
+// "Main" identity is PER INSTANCE, not global (RT-AUDIT §2.3). The old code
+// latched the first thread to touch the backend as "the main thread" for every
+// instance. In the daemon that first toucher is the *scan* thread (scanCLAP runs
+// on scanThread_), which is then joined and destroyed — so every later create /
+// init / activate / get_info on the *pump* thread was told is_main_thread ==
+// false and any plugin that asserts it there aborts, and worse, a recycled
+// std::thread::id could compare equal by accident. Because each instance carries
+// its own clap_host_t with host_data == the instance, we can answer honestly:
+// "main thread" == the exact thread that created THIS instance (captured in
+// prepare(), before create_plugin). That thread is whichever control thread
+// drives the instance's lifecycle — pump in the daemon, GUI in-process — and is
+// never the audio thread. A plugin-spawned worker compares unequal and is
+// correctly told it is not the main thread.
+std::thread::id clapInstanceMainThread(const void* host_data);   // defined after ClapInstance
 
-bool CLAP_ABI hostIsMainThread(const clap_host_t*) {
-    return !tlsInProcess && std::this_thread::get_id() == mainThreadId();
+bool CLAP_ABI hostIsMainThread(const clap_host_t* h) {
+    if (tlsInProcess) return false;                  // inside process(): audio thread
+    // Probe host used during scan carries no host_data; scan is single-threaded
+    // and never the audio thread, so its caller is the main thread by construction.
+    if (!h || !h->host_data) return true;
+    return std::this_thread::get_id() == clapInstanceMainThread(h->host_data);
 }
 bool CLAP_ABI hostIsAudioThread(const clap_host_t*) { return tlsInProcess; }
 
 const clap_host_thread_check_t kThreadCheck = { hostIsMainThread, hostIsAudioThread };
 
-// The spec forbids logging from the audio thread, so this is main-thread only
-// in practice and may take the same liberties LV2's log feature does.
+// clap.log is deliberately NOT exposed (RT-AUDIT §1.3): the sink below is
+// fprintf(stderr) — an unbuffered flockfile()+write(2) syscall — and although
+// the spec forbids logging from the audio thread, CLAP_LOG_PLUGIN_MISBEHAVING /
+// CLAP_LOG_HOST_MISBEHAVING are exactly the severities a plugin emits when
+// something goes wrong *inside* process(). hostGetExtension returns null for
+// CLAP_EXT_LOG (below), so a plugin has no handle to call this on the RT thread;
+// we drop plugin log messages, which is acceptable. The function is kept for a
+// possible non-RT diagnostic build.
 void CLAP_ABI hostLogFn(const clap_host_t*, clap_log_severity sev, const char* msg) {
     if (!msg) return;
     switch (sev) {
@@ -109,10 +124,10 @@ const clap_host_latency_t kHostLatency = { hostLatencyChanged };
 
 const void* CLAP_ABI hostGetExtension(const clap_host_t*, const char* id) {
     if (!id) return nullptr;
-    if (strcmp(id, CLAP_EXT_LOG) == 0)          return &kHostLog;
+    // CLAP_EXT_LOG intentionally not exposed (RT-AUDIT §1.3): see kHostLog.
     if (strcmp(id, CLAP_EXT_THREAD_CHECK) == 0) return &kThreadCheck;
     if (strcmp(id, CLAP_EXT_LATENCY) == 0)      return &kHostLatency;
-    return nullptr;   // params/gui/state/... not wired up yet
+    return nullptr;   // log/params/gui/state/... not wired up
 }
 
 // request_* can arrive from any thread including the audio thread, so they may
@@ -348,6 +363,10 @@ public:
         if (maxBlock <= 0) maxBlock = kMaxBlock;
         sr_ = sampleRate;
         maxBlock_ = maxBlock;
+        // Capture the control thread driving this lifecycle as our "main thread"
+        // (RT-AUDIT §2.3) before the plugin can call clap.thread-check from init/
+        // activate. In the daemon this is the pump thread; in-process, the GUI.
+        mainThread_ = std::this_thread::get_id();
 
         plug_ = factory_->create_plugin(factory_, &host_, id_.c_str());
         if (!plug_) {
@@ -500,6 +519,8 @@ public:
     void requestRestart()  { restartRequested_ = true; }
     void requestProcess()  { processRequested_ = true; }
     void requestCallback() { callbackRequested_ = true; }
+    // This instance's "main thread" for clap.thread-check (see hostIsMainThread).
+    std::thread::id mainThread() const { return mainThread_; }
 
 private:
     struct ParamMsg { u32 index; f32 value; };
@@ -794,6 +815,9 @@ private:
     std::string                  id_;
     const clap_plugin_t*         plug_ = nullptr;
     clap_host_t                  host_{};
+    // The thread that created this instance (captured in prepare(), before
+    // create_plugin) — this instance's "main thread" for clap.thread-check.
+    std::thread::id              mainThread_{};
 
     f64  sr_ = 48000.0;
     int  maxBlock_ = kMaxBlock;
@@ -826,6 +850,12 @@ private:
     std::atomic<bool> processRequested_{false};
     std::atomic<bool> callbackRequested_{false};
 };
+
+// Resolves the per-instance main thread for hostIsMainThread() (declared above,
+// before ClapInstance existed). host_data is set to the instance in its ctor.
+std::thread::id clapInstanceMainThread(const void* host_data) {
+    return ((const ClapInstance*)host_data)->mainThread();
+}
 
 void CLAP_ABI hostRequestRestart(const clap_host_t* h) {
     if (h && h->host_data) ((ClapInstance*)h->host_data)->requestRestart();
@@ -920,8 +950,10 @@ void scanFile(const std::string& path, std::vector<PluginDesc>& out, int& found,
 
 // --- scan ------------------------------------------------------------------
 void scanCLAP(std::vector<PluginDesc>& out) {
-    rememberMainThread();
-
+    // No global main-thread latch any more (RT-AUDIT §2.3): "main" is per
+    // instance, captured in ClapInstance::prepare(). Scan-time probe instances
+    // use the probe host (no host_data), for which hostIsMainThread answers true
+    // on any non-audio thread — correct, since scanning is single-threaded.
     std::vector<std::string> files;
     for (const std::string& dir : searchPaths()) {
         std::error_code ec;
@@ -935,8 +967,6 @@ void scanCLAP(std::vector<PluginDesc>& out) {
 }
 
 std::unique_ptr<PluginInstance> instantiateCLAP(const PluginDesc& d, f64 sampleRate, int maxBlock) {
-    rememberMainThread();
-
     std::string path;
     uint32_t index = 0;
     if (!splitUri(d.uri, path, index)) {

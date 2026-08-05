@@ -40,6 +40,7 @@
 
 #include <dlfcn.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cstring>
 #include <deque>
@@ -52,24 +53,84 @@ namespace {
 
 // --- URID map --------------------------------------------------------------
 // Shared by every instance so URIDs stay comparable across plugins, which the
-// spec requires. Mapping happens at instantiate time; plugins that map during
-// run() are rare and would take the mutex, so we deliberately pre-map the URIs
-// we need before activation.
+// spec requires.
+//
+// RT-AUDIT §1.4: the old map() took a std::mutex and allocated (std::string,
+// unordered_map/deque nodes) unconditionally — and that mutex is shared with the
+// plugin *scanner* running on another thread, so an audio thread mapping a URID
+// from run() could block on a scan of every bundle on the system: unbounded
+// priority inversion.
+//
+// Fix: the read path is now lock-free. An open-addressed table (published under
+// the mutex off the RT thread, read with acquire loads and no lock) answers
+// every already-mapped lookup — which is what run()-time maps almost always are,
+// since a well-behaved plugin maps each URID it needs during instantiate. A
+// genuine miss on the audio thread (tlsLv2InRun) neither locks nor allocates: it
+// returns 0 ("no URID"), a legal answer strictly better than blocking, and bumps
+// rtMisses so the rare offender is visible. Writes (instantiate + scan) still
+// serialise on the mutex and are the only place the heap is touched.
+//
+// Set true only around lilv_instance_run() on the audio thread (see process()).
+thread_local bool tlsLv2InRun = false;
+
 struct UridStore {
     std::mutex mtx;
     std::deque<std::string> uris;                     // deque: element addresses are stable
     std::unordered_map<std::string, LV2_URID> index;
 
+    // Lock-free read cache. Keys are interned pointers from `uris` (stable for
+    // the process lifetime, never freed), published with release and read with
+    // acquire. Power-of-two for masking; 16k slots is ample for any plugin set.
+    static constexpr size_t kCap = 1u << 14;
+    struct Slot { std::atomic<const char*> key{nullptr}; LV2_URID id = 0; };
+    Slot table[kCap];
+    std::atomic<u64> rtMisses{0};
+
+    static size_t hashStr(const char* s) {            // FNV-1a
+        size_t h = 1469598103934665603ull;
+        for (; *s; ++s) { h ^= (unsigned char)*s; h *= 1099511628211ull; }
+        return h;
+    }
+    LV2_URID lookup(const char* uri) const {
+        const size_t h = hashStr(uri) & (kCap - 1);
+        for (size_t probe = 0; probe < kCap; ++probe) {
+            const size_t i = (h + probe) & (kCap - 1);
+            const char* k = table[i].key.load(std::memory_order_acquire);
+            if (!k) return 0;                          // empty slot: not present
+            if (std::strcmp(k, uri) == 0) return table[i].id;
+        }
+        return 0;
+    }
+    void publish(const char* internedKey, LV2_URID id) {   // caller holds mtx
+        const size_t h = hashStr(internedKey) & (kCap - 1);
+        for (size_t probe = 0; probe < kCap; ++probe) {
+            const size_t i = (h + probe) & (kCap - 1);
+            if (table[i].key.load(std::memory_order_relaxed) == nullptr) {
+                table[i].id = id;                      // id visible before key,
+                table[i].key.store(internedKey, std::memory_order_release);  // via release
+                return;
+            }
+        }
+    }
+
     LV2_URID map(const char* uri) {
+        if (LV2_URID id = lookup(uri)) return id;      // fast path: lock-free
+        if (tlsLv2InRun) {                             // RT miss: never lock/alloc
+            rtMisses.fetch_add(1, std::memory_order_relaxed);
+            return 0;                                  // legal "no URID"
+        }
         std::lock_guard<std::mutex> lk(mtx);
-        auto it = index.find(uri);
+        auto it = index.find(uri);                     // recheck under the lock
         if (it != index.end()) return it->second;
         uris.emplace_back(uri);
         const LV2_URID id = (LV2_URID)uris.size();     // 0 is reserved as "no URID"
         index.emplace(uris.back(), id);
+        publish(uris.back().c_str(), id);
         return id;
     }
     const char* unmap(LV2_URID id) {
+        // Resolving a URID back to its string is a main-thread operation in
+        // practice; keep it simple under the same lock.
         std::lock_guard<std::mutex> lk(mtx);
         if (id == 0 || id > uris.size()) return nullptr;
         return uris[id - 1].c_str();
@@ -307,7 +368,17 @@ public:
         fLog_     = { LV2_LOG__log, &log_ };
         fOptions_ = { LV2_OPTIONS__options, options_.data() };
         fBounded_ = { LV2_BUF_SIZE__boundedBlockLength, nullptr };
-        const LV2_Feature* feats[] = { &fMap_, &fUnmap_, &fLog_, &fOptions_, &fBounded_, nullptr };
+        // log:log is deliberately NOT advertised (RT-AUDIT §1.3): our log sink is
+        // fprintf(stderr) — an unbuffered flockfile()+write(2) syscall — and the
+        // LV2 log extension carries no thread restriction, so a plugin calling it
+        // from run() (parameter-clamp / denormal / buffer-size gripes fire from
+        // exactly there) would do a blocking syscall on the audio thread. log:log
+        // is an *optional* feature (never listed as required by any conformant
+        // plugin), so withholding it is legal; we drop plugin log messages, which
+        // is acceptable. The feature struct (fLog_/log_) is kept only so its
+        // callbacks stay available if a non-RT diagnostic build wants them.
+        (void)fLog_;
+        const LV2_Feature* feats[] = { &fMap_, &fUnmap_, &fOptions_, &fBounded_, nullptr };
 
         pinPluginLibrary(plug_);
         inst_ = lilv_plugin_instantiate(plug_, sr_, feats);
@@ -353,7 +424,11 @@ public:
 
         resetAtomBuffers();
         forgeMidi();
+        // Mark the audio thread so a urid:map miss from inside run() returns 0
+        // instead of locking/allocating (see UridStore::map, RT-AUDIT §1.4).
+        tlsLv2InRun = true;
         lilv_instance_run(inst_, (uint32_t)nframes);
+        tlsLv2InRun = false;
         // The plugin has consumed this block's events. Emptying the sequences
         // now (rather than only before the next run) means a plugin that peeks
         // at its input port outside run() never sees stale notes, and a missed
