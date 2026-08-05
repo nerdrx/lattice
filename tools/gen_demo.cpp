@@ -1,6 +1,9 @@
-// Generates a demo set: four 2-bar loops at 120 BPM plus a .lattice project
-// that references them. Doubles as an end-to-end check of the whole chain --
-// sndfile write -> loadSample -> Session -> saveProject.
+// Generates a demo set: four 2-bar loops at 120 BPM, a fifth track that plays
+// Lattice's own Pulse synth from a MIDI pattern, and a .lattice project that
+// ties them together. Doubles as an end-to-end check of the whole chain --
+// sndfile write -> loadSample -> Session -> saveProject -- and, because the
+// keys track has no audio file behind it, of devices and MIDI clips surviving
+// a round trip.
 //
 //   build/gen_demo [outdir]      (default ~/Music/Lattice Demo)
 #include "../src/ui/app.h"
@@ -37,6 +40,25 @@ static void writeWav(const std::string& path, const std::vector<f32>& mono) {
 
 // One beat in frames.
 static int beatFrames() { return (int)(kSR * 60.0 / kBpm); }
+
+// --- the keys track --------------------------------------------------------
+// The one track with no wav behind it: a Pulse instrument and a one-bar A minor
+// line, which is all it takes to make a MIDI clip sound. Kept out of the intro
+// scene so the demo still has a scene that is pure audio.
+static constexpr int   kKeysTrack  = 4;
+static constexpr int   kKeysColor  = 2;
+static constexpr f64   kMelodyBeats = 4.0;
+static const char*     kPulseUri   = "lattice:pulse";
+
+struct DemoNote { f64 beat, len; u8 pitch, vel; };
+// A3 C4 E4 D4 | C4 A3 G3 E3 -- the same line the hand-written jam set plays.
+static const DemoNote kMelody[] = {
+    {0.0, 0.5, 57, 100}, {0.5, 0.5, 60, 92},
+    {1.0, 0.5, 64, 100}, {1.5, 0.5, 62, 88},
+    {2.0, 0.5, 60, 100}, {2.5, 0.5, 57, 88},
+    {3.0, 0.5, 55, 100}, {3.5, 0.5, 52, 88},
+};
+static constexpr int kMelodyNotes = (int)(sizeof kMelody / sizeof kMelody[0]);
 
 static std::vector<f32> makeKick() {
     std::vector<f32> v((size_t)kFrames, 0.f);
@@ -131,7 +153,7 @@ int main(int argc, char** argv) {
     Session s;
     s.name = "Lattice Demo";
     s.tempo = kBpm;
-    s.tracks.resize(4);
+    s.tracks.resize(5);                    // four loops plus the keys track
     s.scenes.resize(4);
     for (int i = 0; i < 4; ++i) {
         s.tracks[i].name = loops[i].name;
@@ -168,6 +190,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The keys track. A SavedDevice is all a set carries for a plugin -- the
+    // URI, and whatever parameters were touched -- so this is exactly what the
+    // app writes and exactly what render materializes; Pulse's own defaults do
+    // the rest, which is why no `param` lines are needed to make it sing.
+    TrackModel& keys = s.tracks[kKeysTrack];
+    keys.name = "keys";
+    keys.colorIdx = kKeysColor;
+    SavedDevice pulse;
+    pulse.uid  = s.newUid();
+    pulse.uri  = kPulseUri;
+    pulse.name = "Pulse";
+    keys.savedDevices.push_back(pulse);
+    // Scenes 1-3: the intro stays a chord on its own, and the melody comes in
+    // with the beat.
+    for (int sc = 1; sc < 4; ++sc) {
+        ClipModel& m = keys.slots[sc];
+        m.uid = s.newUid();
+        m.kind = ClipKind::Midi;
+        m.name = "melody";
+        m.colorIdx = kKeysColor;
+        m.lengthBeats = kMelodyBeats;
+        m.loop = true;
+        for (const DemoNote& n : kMelody)
+            m.notes.push_back(NoteModel{n.beat, n.len, n.pitch, n.vel});
+        ++placed;
+    }
+    std::printf("  keys track: Pulse + %d notes in scenes 1-3\n", kMelodyNotes);
+
     const std::string proj = dir + "/demo.lattice";
     std::string err;
     if (!saveProject(s, proj, &err)) {
@@ -182,12 +232,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "loadProject failed: %s\n", err.c_str());
         return 1;
     }
-    int clips = 0;
+    int clips = 0, notes = 0;
     for (auto& t : back.tracks)
-        for (int i = 0; i < kMaxScenes; ++i)
-            if (t.slots[i].valid()) ++clips;
-    std::printf("reloaded: %zu tracks, %zu scenes, %d clips (placed %d), tempo %.1f\n",
-                back.tracks.size(), back.scenes.size(), clips, placed, back.tempo);
-    // The round-trip is the assertion: every clip we placed must come back.
-    return (loaded == 4 && clips == placed) ? 0 : 1;
+        for (int i = 0; i < kMaxScenes; ++i) {
+            if (!t.slots[i].valid()) continue;
+            ++clips;
+            notes += (int)t.slots[i].notes.size();
+        }
+    // The device and the notes are the only part of the set with nothing on
+    // disk backing it, so they are the part worth checking by hand.
+    if (back.tracks.size() != 5) {
+        std::fprintf(stderr, "reloaded %zu tracks, expected 5\n", back.tracks.size());
+        return 1;
+    }
+    const TrackModel& bk = back.tracks[kKeysTrack];
+    const bool keysOk = bk.savedDevices.size() == 1 &&
+                        bk.savedDevices[0].uri == kPulseUri &&
+                        notes == kMelodyNotes * 3;
+    std::printf("reloaded: %zu tracks, %zu scenes, %d clips (placed %d), "
+                "%d notes, %zu device(s) on '%s', tempo %.1f\n",
+                back.tracks.size(), back.scenes.size(), clips, placed, notes,
+                bk.savedDevices.size(), bk.name.c_str(), back.tempo);
+    // The round-trip is the assertion: every clip we placed must come back, and
+    // so must the instrument that makes three of them audible.
+    return (loaded == 4 && clips == placed && keysOk) ? 0 : 1;
 }

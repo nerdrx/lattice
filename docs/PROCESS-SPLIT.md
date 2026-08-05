@@ -1,6 +1,6 @@
 # Splitting Lattice into an engine process and a GUI process
 
-Status: **design, wave 2 not started.** Wave 1 landed the transport
+Status: **phase 1 shipped — latticed daemon with a scalar control plane (§9).** Wave 1 landed the transport
 (`src/ipc/shm.h`, `tests/ipc_test.cpp`) and this document. Nothing in
 `src/audio` or `src/ui` has been touched yet.
 
@@ -741,3 +741,165 @@ Two additions `ShmRegion` will need in wave 2, both small and both already
 called out above: `adopt(int fd)` for the `memfd` + `SCM_RIGHTS` path (§3.5),
 and `adoptOwnership()` for transferring the unlink obligation to a replacement
 GUI (§4.3).
+
+---
+
+## 9. Phase 1 shipped
+
+Wave 2 built the daemon rather than the in-process shm swap. That is a
+deliberate reordering of §6: the doc's phase 1 rewires `App`/`Engine` onto
+`ShmSpscRing` inside one process, and its phase 4 splits the processes. We did
+the *lifecycle* first — `latticed` exists, creates the control region, and
+serves a real second process — with the protocol restricted to the eighteen
+commands that already cross cleanly. The reason is that the risky half of the
+split turned out to be lifecycle (who creates, who unlinks, who notices a
+death), not message shape, and lifecycle is far cheaper to get right against a
+protocol with nothing in it that needs a sample pool. Nothing in `src/audio`,
+`src/ui`, `src/core` or `src/plugin` changed; the in-process GUI is untouched
+and still the shipping path.
+
+### What exists now
+
+- **`src/daemon/latticed.cpp`** — the engine daemon.
+  - `latticed [--session NAME] [--driver null|auto|jack|alsa] [--rate HZ]
+    [--block FRAMES] [--verbose]`. The region is `/lattice-engine-<session>`;
+    the session defaults to `$LATTICE_SESSION`, then `"default"`.
+  - Owns an `Engine` and either a real backend via `createBackend()` (honouring
+    `LATTICE_AUDIO`, same knob the GUI uses) or the **null driver**: no audio
+    device, one thread calling `Engine::process(nullptr, nullptr, l, r, 256)`
+    against `CLOCK_MONOTONIC` at block cadence. Jitter is expected and
+    irrelevant; what the null driver guarantees is the *average* rate, because
+    the beat clock is derived from frames rendered. It is deadline-based and
+    renders the blocks it owes after a scheduling hiccup (up to 32 at once,
+    then it resynchronises and logs) rather than quietly losing musical time.
+    That is what makes "beats per wall-clock second == tempo/60" a testable
+    property on a loaded CI box.
+  - Three threads: the audio thread (backend callback or null driver), the
+    **pump** (main, 1 ms) and the **mirror** (4 ms). The pump drains the command
+    ring into `Engine::pushCommand`, the MIDI ring into `Engine::pushMidi`, and
+    `Engine::popEvent` into the event ring. The mirror copies Engine's published
+    atomics into `SharedState` and stamps the heartbeat.
+  - Claims the region with `create()` (`O_CREAT|O_EXCL`) *before* opening the
+    audio device, so two daemons racing for one session resolve exactly as §4.1
+    describes: the loser exits 1 and says so.
+  - `SIGTERM`/`SIGINT`/`SIGHUP` → stop the mirror, stop the backend, publish
+    `engineState = StateStopping` plus `ControlHeader::shutdown`, push
+    `EvEngineStopping`, unlink. A still-attached client keeps its mapping and
+    can therefore tell "went away cleanly" from "died" with no socket. A fatal
+    signal unlinks the name from the handler and re-raises, so a crash leaves no
+    orphan either — and when even that is impossible (`SIGKILL`), the next
+    `create()`/`attach()` reaps it via `reapIfStale()`.
+- **`src/ipc/control.h`** — the protocol: `WireCommand`/`WireEvent` (32 B each,
+  pointer-free, with the `ref` field the pool handle and device id will use),
+  `WireMidi`, `ControlHeader`, the region map, and the layout hash. Also the
+  phase-1 policy tables (`commandIsScalar`, `eventIsScalar`) that both sides
+  agree on by construction.
+- **`src/ipc/client.h`** — `EngineClient`: `attach()` with the three-layer
+  handshake, `pushCommand`/`popEvent`/`pushMidi`, `state()`, heartbeat- and
+  pid-based `alive(tolerance)`, `reapStale()`, and a `fork`+`execv`
+  `spawnDaemon()`/`waitFor()` pair. Dependency-light on purpose: `core/`,
+  `audio/engine.h` for the enums, libc. This is the API the GUI adopts next.
+- **`tests/daemon_test.cpp`** — 85 checks against a real spawned daemon:
+  handshake, beat clock vs wall clock, metronome and `MasterVol` round-tripped
+  through the *rendered audio* via the published master meter, every refusal
+  path, a 3000-command burst that must be deferred rather than dropped, `SIGKILL`
+  → `alive()` false → orphan reaped → respawn, `SIGTERM` → exit 0 → `/dev/shm`
+  clean. Runs under `make test`; clean under ASan+UBSan.
+- **`Makefile`** — `build/latticed` (daemon + `engine.cpp` + `backend.cpp` +
+  `common.cpp`, no GUI and no plugin sources: `engine.cpp`'s use of
+  `PluginInstance` is header-only virtual dispatch) and `build/daemon_test`,
+  both in `test`. `src/daemon` is filtered out of the GUI app's `SRC` sweep.
+
+### Deliberate deviations from the design above
+
+1. **No AF_UNIX socket yet (§3.2).** The handshake lives in `ControlHeader`
+   (protocol version, pid, driver name) and the audio format in `SharedState`.
+   Everything the socket is *for* — strings, fds, the plugin catalog — belongs
+   to features phase 1 does not have. Crash detection therefore uses the
+   heartbeat and `processAlive()` rather than EOF; that path had to exist
+   anyway for the wedged-but-alive case.
+2. **The region map has five sections, not three** (§3.3): `ControlHeader`
+   ahead of `SharedState`, and a third ring for MIDI. `ShmHeader` is the
+   transport's header and must not grow protocol fields — `kShmVersion` and
+   `kProtocolVersion` change for different reasons. The MIDI ring exists
+   because `Engine::pushMidi()` already does, and a daemon that could not carry
+   MIDI would be a regression against the in-process build.
+3. **`Engine` keeps its own `lat::Ring`s.** The daemon bridges shm ring →
+   engine ring instead of the engine consuming the shm ring directly, and the
+   mirror thread copies the published atomics instead of `Engine::publish()`
+   writing `SharedState`. Both are the doc's phase 1 proper and both require
+   editing `src/audio`, which this wave did not own. The cost is one extra copy
+   per command and a ≤4 ms staleness on the state block; the wire protocol the
+   GUI will speak is already the final one, so this is an internal detail to
+   delete later, not a design decision to revisit.
+4. **`Cmd::ClearClip` is refused** even though §2.1 lists it as clean. In phase
+   1 no clip can exist (its `SetClip` is refused), so it has nothing to clear,
+   and clearing a clip with notes pushes `Ev::NotesRetired`, which hands a GUI
+   pointer back across the boundary. It becomes legal in phase 2 with the clip
+   table.
+5. **`WireCommand` is 32 B, not the 48 B sketched in §3.4** — same fields, real
+   packing.
+6. **`SharedStateT` gained `recState[]`/`recSlotIdx[]`** so it mirrors Engine's
+   published atomics exactly; `kShmVersion` is now 2.
+7. **`EngineClient::attach()` reaps stale regions after a failed attach, never
+   before it.** `reapIfStale()` treats an existing-but-unsized region as an
+   orphan, which is precisely what a daemon between `shm_open()` and
+   `ftruncate()` looks like, so the tidy-looking pre-emptive reap can unlink a
+   live engine's region microseconds after it claimed the name. §4.1's ordering
+   should be read as "reap when connect fails", which is what this does.
+8. **`generation` is bumped with release ordering**, not relaxed, so a reader
+   that samples on a generation change sees the values that went with it. That
+   is what lets `daemon_test` measure the beat clock without a seqlock, and it
+   costs one store barrier per 4 ms on a non-RT thread.
+
+### Explicitly deferred
+
+- **The sample pool and the clip table** (§3.5, §3.4). `Cmd::SetClip` is
+  refused at the boundary with `RejectPointerPayload`; no audio material can
+  reach the daemon, so the only sound it can make is the metronome.
+- **Chains, devices and the param table** (§3.6, §3.7). `Cmd::SetChain` is
+  refused; `Ev::ChainRetired` is dropped and counted. The daemon hosts no
+  plugins and runs no scan.
+- **Recording.** `RecordSlot`/`RecordMidiSlot` carry GUI-owned buffers and are
+  refused. `SharedState` already carries the record indicators, unused.
+- **The session region**, `ShmRegion::adopt(int fd)`, `adoptOwnership()`,
+  `memfd` + `F_SEAL_SHRINK`, and GUI-crash reattach (§4.3). None of it is
+  reachable until there is a pool to put in it.
+- **`SharedState::xruns` and `blocksRendered` for device backends.** The null
+  driver publishes its block count; a real backend's is not observable without
+  editing `src/audio`.
+- **Mixer scalars in `SharedState`.** `Engine::publish()` does not publish
+  vol/pan/mute/solo/arm, so `TrackVol`/`TrackMute` are only observable at the
+  boundary's own counters today. Phase 2 should publish them, since a
+  reattaching GUI needs them anyway (§4.3 step 5).
+- **The GUI itself.** `src/ui` still owns an in-process `Engine`. `EngineClient`
+  has no callers outside the test.
+
+### The exact next step for phase 2
+
+In order, each step leaving the tree green:
+
+1. **Publish from the engine, not the mirror.** Give `Engine` an optional
+   `ipc::SharedState*` and have `Engine::publish()` write it directly (adding
+   vol/pan/mute/solo/arm and the xrun counter while the file is open). Delete
+   the daemon's mirror thread. This is the first edit inside `src/audio` and it
+   is a pure relocation of stores that already exist.
+2. **The clip table.** `WireClip clips[32][32]` in the control region, written
+   by the client, with `Cmd::SetClip{track, slot}` telling the engine which
+   cell changed — the idempotent-table form §3.4 prefers, because
+   republish-after-engine-restart then becomes a `memcpy`. `poolRef` stays 0
+   until step 3, so this step ships with silence and a bounds check.
+3. **The sample pool.** Session region created by the client, `PoolHeader` +
+   `BlockDesc[]` + bump allocator with in-region metadata,
+   `Cmd::PoolGrow`/`Ev::PoolGrown`, `Cmd::ReleaseSample`/`Ev::SampleRetired`,
+   and `RtClip::data` = `pool_ + poolRef` resolved at command-drain time with a
+   bounds check against the committed size. Un-refuse `SetClip`/`ClearClip`.
+   ASan soak: add and remove clips under playback.
+4. **Point the GUI at `EngineClient` behind `LATTICE_ENGINE=inproc|daemon`,
+   default `inproc`.** `App` keeps its `Engine` for the in-process path; the
+   daemon path spawns/attaches per §4.1. This is where the "GUI crash no longer
+   stops the audio" claim first becomes true, and it needs real hours before it
+   becomes the default.
+
+Devices by id, the param table and the socket follow as the doc's phases 3–5,
+unchanged.

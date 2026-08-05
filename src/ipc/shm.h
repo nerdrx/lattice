@@ -56,7 +56,10 @@ inline constexpr u64 kShmMagic = 0x4C54435F53484D31ull;
 // Bump on ANY change to ShmHeader, ShmSpscRing or SharedStateT layout, or to
 // the meaning of a field. A mismatched attacher must fail rather than
 // misinterpret; that is the whole point of the field.
-inline constexpr u32 kShmVersion = 1;
+//
+//   v2 — SharedStateT gained recState[]/recSlotIdx[] so the block mirrors
+//        Engine's published atomics exactly (wave 2, the engine daemon).
+inline constexpr u32 kShmVersion = 2;
 
 // Indices and payload sit on separate lines so the producer's write index does
 // not invalidate the consumer's cache line on every push. Cross-process this
@@ -598,6 +601,14 @@ struct SharedStateT {
     std::atomic<f32> masterMeterL;
     std::atomic<f32> masterMeterR;
 
+    // Recording, mirroring Engine::recState/recSlotIdx: 0 idle, 1 queued,
+    // 2 recording (a take with a stop already queued still reads 2), and the
+    // slot the take is aimed at, -1 when idle. Here because the daemon mirrors
+    // the *whole* published block or the GUI would have to keep a second,
+    // in-process source of truth for two of its indicators.
+    std::atomic<i32> recState[NTracks];
+    std::atomic<i32> recSlotIdx[NTracks];
+
     enum : u32 { StateBooting = 0, StateRunning = 1, StateDraining = 2, StateStopping = 3 };
 
     // Creator only, before publishReady(). Defaults match Engine's, including
@@ -623,6 +634,8 @@ struct SharedStateT {
             clipPhase[i].store(0.0, std::memory_order_relaxed);
             meterL[i].store(0.f, std::memory_order_relaxed);
             meterR[i].store(0.f, std::memory_order_relaxed);
+            recState[i].store(0, std::memory_order_relaxed);
+            recSlotIdx[i].store(-1, std::memory_order_relaxed);
         }
         masterMeterL.store(0.f, std::memory_order_relaxed);
         masterMeterR.store(0.f, std::memory_order_relaxed);

@@ -89,6 +89,9 @@ SRC := $(shell find src -name '*.cpp' | sort)
 ifneq ($(HAVE_WAYLAND),1)
 SRC := $(filter-out src/ui/window_wayland.cpp,$(SRC))
 endif
+# src/daemon is a separate program with its own main(); it is built by the
+# build/latticed rule below and must never be swept into the GUI's link.
+SRC := $(filter-out src/daemon/%,$(SRC))
 
 OBJ := $(patsubst src/%.cpp,build/obj/%.o,$(SRC))
 
@@ -173,7 +176,10 @@ tools: build/gen_demo build/render build/pitch_check build/plugin_scan
 build/gen_demo: tools/gen_demo.cpp $(CORE_SRC)
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS)
-build/render: tools/render.cpp $(CORE_SRC)
+# render materialises a project's device chains, so unlike gen_demo it needs the
+# plugin backends linked in.
+build/render: tools/render.cpp $(CORE_SRC) src/plugin/host.cpp src/plugin/lv2_host.cpp \
+              src/plugin/clap_host.cpp src/plugin/internal_devices.cpp
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS)
 build/pitch_check: tools/pitch_check.cpp
@@ -190,15 +196,35 @@ build/engine_test: tests/engine_test.cpp src/audio/engine.cpp src/core/common.cp
 # does not use TOOL_CF/TOOL_LIBS: no sndfile, no lilv, and warnings left on.
 # -lrt is only needed for shm_open on glibc < 2.34; harmless after.
 IPC_CF := -std=c++20 -O2 $(WARN)
+IPC_H  := src/ipc/shm.h src/ipc/control.h src/ipc/client.h
 build/ipc_test: tests/ipc_test.cpp src/ipc/shm.h
+	@mkdir -p build
+	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
+
+# The engine daemon: Engine + a backend + the control region, and no GUI.
+# engine.cpp's use of PluginInstance is header-only virtual dispatch, so this
+# links without src/plugin — the same property build/engine_test relies on.
+DAEMON_SRC := src/daemon/latticed.cpp src/audio/engine.cpp src/audio/backend.cpp \
+              src/core/common.cpp
+DAEMON_CF  := -std=c++20 -O2 $(WARN) $(shell pkg-config --cflags jack alsa)
+DAEMON_LD  := $(shell pkg-config --libs jack alsa) -lrt -lpthread -lm
+
+build/latticed: $(DAEMON_SRC) $(IPC_H) src/audio/engine.h src/audio/backend.h
+	@mkdir -p build
+	$(CXX) $(DAEMON_CF) $(DAEMON_SRC) -o $@ $(DAEMON_LD)
+
+# daemon_test spawns ./build/latticed, so the binary is a build dependency of
+# the test rather than something the test is trusted to find.
+build/daemon_test: tests/daemon_test.cpp $(IPC_H) src/audio/engine.h build/latticed
 	@mkdir -p build
 	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
 
 # Full headless check: engine unit tests, then a real render that must not be
 # silent, then a plugin scan.
-test: build/engine_test build/ipc_test build/render build/gen_demo build/plugin_scan
+test: build/engine_test build/ipc_test build/daemon_test build/render build/gen_demo build/plugin_scan
 	./build/engine_test
 	./build/ipc_test
+	./build/daemon_test
 	./build/gen_demo /tmp/lattice-selftest >/dev/null
 	./build/render /tmp/lattice-selftest/demo.lattice /tmp/lattice-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3

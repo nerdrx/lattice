@@ -2,6 +2,12 @@
 // writes the result to a wav.
 //
 //   build/render <project.lattice> <out.wav> [--scene N] [--bars N] [--tempo BPM]
+//                                            [--solo T] [--stem T] [--warp N]
+//
+// Devices and MIDI clips are part of the render. The set's saved plugins are
+// instantiated and published as chains, and MIDI clips ship their notes across,
+// exactly as the app does after a load -- so a pattern that sings in the UI
+// sings here too, and a set that is nothing but instruments is not silent.
 //
 // Because the engine never allocates and its scheduling is sample-accurate,
 // this render is deterministic: the same project and arguments produce a
@@ -13,26 +19,65 @@
 #include <clocale>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
 using namespace lat;
 
-static void pushClip(Engine& e, const Session& s, int t, int slot) {
+static constexpr int kBlock = 512;
+
+// Everything this render owns on the engine's behalf. The audio thread only
+// ever borrows chains and note arrays (see the RtChain / RtNote protocols in
+// engine.h), and a synchronous offline loop has no audio thread to race: the
+// last process() has returned by the time this is destroyed, so freeing here --
+// once, at the end -- is exactly as safe as the retirement handshake the app
+// needs and a great deal shorter.
+struct Owned {
+    std::vector<std::unique_ptr<PluginInstance>> insts;
+    std::vector<RtChain*> chains;
+    std::vector<RtNote*>  notes;
+    ~Owned() {
+        for (RtChain* c : chains) delete c;
+        for (RtNote* n : notes) delete[] n;
+    }
+};
+
+static void pushClip(Engine& e, const Session& s, int t, int slot, Owned& own) {
     const ClipModel& m = s.tracks[t].slots[slot];
     Command c;
     c.a = t; c.b = slot;
     if (!m.valid()) { c.type = Cmd::ClearClip; e.pushCommand(c); return; }
     c.type = Cmd::SetClip;
     RtClip rc;
-    rc.data        = m.sample->data.data();
-    rc.frames      = m.sample->frames;
-    rc.channels    = m.sample->channels;
-    rc.loopStart   = m.loopStart;
-    rc.loopEnd     = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
-    rc.clipBpm     = m.clipBpm;
+    if (m.kind == ClipKind::Midi) {
+        // The engine reads this array for as long as it holds the clip, so it
+        // cannot be the session's live vector.
+        if (!m.notes.empty()) {
+            RtNote* fresh = new RtNote[m.notes.size()];
+            for (size_t i = 0; i < m.notes.size(); ++i) {
+                const NoteModel& n = m.notes[i];
+                fresh[i].beat  = n.beat;
+                fresh[i].len   = n.len;
+                fresh[i].pitch = n.pitch;
+                fresh[i].vel   = n.vel;
+            }
+            own.notes.push_back(fresh);
+            rc.notes     = fresh;
+            rc.noteCount = (int)m.notes.size();
+        }
+        rc.isMidi = true;
+    } else {
+        rc.data      = m.sample->data.data();
+        rc.frames    = m.sample->frames;
+        rc.channels  = m.sample->channels;
+        rc.loopStart = m.loopStart;
+        rc.loopEnd   = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
+        rc.clipBpm   = m.clipBpm;
+        rc.warp      = (int)m.warp;
+    }
     rc.lengthBeats = m.lengthBeats;
     rc.gain        = m.gain;
-    rc.warp        = (int)m.warp;
     rc.loop        = m.loop;
     rc.quantumIdx  = m.quantumIdx;
     rc.valid       = true;
@@ -40,15 +85,95 @@ static void pushClip(Engine& e, const Session& s, int t, int slot) {
     e.pushCommand(c);
 }
 
+// savedDevices -> live instances -> one RtChain per track: the essence of
+// App::materializeDevices followed by App::publishChain, with no GUI around it.
+// A device whose plugin is not on this machine is reported and dropped, rather
+// than keeping its slot -- nothing here will ever save the set back out, so the
+// only thing a placeholder could do is confuse the chain order.
+static void materializeDevices(Engine& e, const Session& s, PluginRegistry& reg,
+                               f64 sr, Owned& own) {
+    for (size_t t = 0; t < s.tracks.size(); ++t) {
+        const TrackModel& tr = s.tracks[t];
+        if (tr.savedDevices.empty()) continue;
+
+        RtChain* chain = new RtChain();
+        std::string line;
+        for (const SavedDevice& sd : tr.savedDevices) {
+            if (chain->count >= kMaxChainFx) {
+                std::fprintf(stderr, "render: track %zu has more than %d devices"
+                             " - the extras will not sound\n", t, kMaxChainFx);
+                break;
+            }
+            const PluginDesc* found = reg.find(sd.uri);
+            std::unique_ptr<PluginInstance> inst;
+            if (found) inst = reg.instantiate(*found, sr, kBlock);
+            if (!inst) {
+                std::fprintf(stderr, "render: plugin not available, skipping: %s (%s)\n",
+                             sd.name.empty() ? "?" : sd.name.c_str(), sd.uri.c_str());
+                continue;
+            }
+
+            // Parameters are matched on ParamInfo::id, not on index: a plugin
+            // can gain or reorder controls between versions, and dropping the
+            // ones we no longer recognise beats applying them to the wrong one.
+            const int n = inst->paramCount();
+            int applied = 0;
+            for (const std::pair<u32, f32>& pv : sd.params)
+                for (int i = 0; i < n; ++i) {
+                    if (inst->paramInfo(i).id != pv.first) continue;
+                    inst->setParam(i, pv.second);
+                    ++applied;
+                    break;
+                }
+            inst->setBypassed(sd.bypass);
+
+            if (!line.empty()) line += ", ";
+            line += found->name.empty() ? sd.uri : found->name;
+            if (applied > 0) {
+                char buf[32];
+                std::snprintf(buf, sizeof buf, " [%d param%s]", applied, applied == 1 ? "" : "s");
+                line += buf;
+            }
+            if (sd.bypass) line += " (bypassed)";
+
+            chain->fx[chain->count++] = inst.get();
+            own.insts.push_back(std::move(inst));
+        }
+
+        if (chain->count == 0) { delete chain; continue; }
+        Command c;
+        c.type = Cmd::SetChain;
+        c.a = (i32)t;
+        c.p = chain;
+        if (!e.pushCommand(c)) {
+            std::fprintf(stderr, "render: command ring full - track %zu has no chain\n", t);
+            delete chain;
+            continue;
+        }
+        own.chains.push_back(chain);
+        std::printf("  %s: %s\n", tr.name.c_str(), line.c_str());
+    }
+}
+
+static void usage(FILE* f) {
+    std::fprintf(f,
+        "usage: render <project.lattice> <out.wav> [options]\n"
+        "  --scene N     scene to launch (default 0)\n"
+        "  --bars N      bars to render (default 8)\n"
+        "  --tempo BPM   render at this tempo instead of the project's\n"
+        "  --solo T      render track T alone\n"
+        "  --stem T      the same as --solo, named for what it is for:\n"
+        "                one track on its own, to be mixed elsewhere\n"
+        "  --warp N      force every clip to warp mode N\n");
+}
+
 int main(int argc, char** argv) {
     std::setlocale(LC_ALL, "");
     std::setlocale(LC_NUMERIC, "C");
 
-    if (argc < 3) {
-        std::fprintf(stderr,
-            "usage: render <project.lattice> <out.wav> [--scene N] [--bars N] [--tempo BPM]\n");
-        return 2;
-    }
+    for (int i = 1; i < argc; ++i)
+        if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+    if (argc < 3) { usage(stderr); return 2; }
     const char* projPath = argv[1];
     const char* outPath  = argv[2];
     int scene = 0, bars = 8, solo = -1, warpOverride = -1;
@@ -58,6 +183,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--bars") && i + 1 < argc) bars = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--tempo") && i + 1 < argc) tempoOverride = atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--solo") && i + 1 < argc) solo = atoi(argv[++i]);
+        // A stem is one track rendered on its own, which is a solo render with
+        // a name that says why you asked for it.
+        else if (!std::strcmp(argv[i], "--stem") && i + 1 < argc) solo = atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--warp") && i + 1 < argc) warpOverride = atoi(argv[++i]);
     }
 
@@ -76,7 +204,20 @@ int main(int argc, char** argv) {
             for (int sl = 0; sl < kMaxScenes; ++sl) tr.slots[sl].warp = (Warp)warpOverride;
 
     Engine eng;
-    eng.prepare(sr, 512);
+    eng.prepare(sr, kBlock);
+    Owned own;
+
+    // The scan walks every LV2 bundle on the system, which costs the better
+    // part of a second; a set with no devices in it should not pay that.
+    bool anyDevices = false;
+    for (const TrackModel& tr : s.tracks) if (!tr.savedDevices.empty()) { anyDevices = true; break; }
+    if (anyDevices) {
+        PluginRegistry reg;
+        reg.scan();
+        std::printf("devices:\n");
+        materializeDevices(eng, s, reg, sr, own);
+    }
+
     Command c;
     c.type = Cmd::SetTempo; c.x = s.tempo; eng.pushCommand(c);
     c = Command{}; c.type = Cmd::SetQuantum; c.a = s.quantumIdx; eng.pushCommand(c);
@@ -86,19 +227,18 @@ int main(int argc, char** argv) {
         c = Command{}; c.type = Cmd::TrackPan;  c.a = (i32)t; c.x = tr.pan;  eng.pushCommand(c);
         c = Command{}; c.type = Cmd::TrackMute; c.a = (i32)t; c.b = tr.mute; eng.pushCommand(c);
         c = Command{}; c.type = Cmd::TrackSolo; c.a = (i32)t; c.b = tr.solo; eng.pushCommand(c);
-        for (int sl = 0; sl < (int)s.scenes.size(); ++sl) pushClip(eng, s, (int)t, sl);
+        for (int sl = 0; sl < (int)s.scenes.size(); ++sl) pushClip(eng, s, (int)t, sl, own);
     }
     c = Command{}; c.type = Cmd::LaunchScene; c.a = scene; eng.pushCommand(c);
 
     const i64 total = (i64)(sr * 60.0 / s.tempo * s.sigNum * bars);
-    const int block = 512;
-    std::vector<f32> l(block), r(block), inter;
+    std::vector<f32> l(kBlock), r(kBlock), inter;
     inter.reserve((size_t)total * 2);
 
     f32 peak = 0.f;
     f64 sumSq = 0.0;
-    for (i64 done = 0; done < total; done += block) {
-        const int n = (int)std::min<i64>(block, total - done);
+    for (i64 done = 0; done < total; done += kBlock) {
+        const int n = (int)std::min<i64>(kBlock, total - done);
         eng.process(nullptr, nullptr, l.data(), r.data(), n);
         for (int i = 0; i < n; ++i) {
             inter.push_back(l[i]);
@@ -107,6 +247,14 @@ int main(int argc, char** argv) {
             sumSq += (f64)l[i] * l[i] + (f64)r[i] * r[i];
         }
     }
+
+    // Nothing will call process() again, so every borrow is over. Drain the
+    // event ring first anyway: retirement events are how the engine says it is
+    // done with a chain or a note array, and reading them keeps this loop
+    // honest about the protocol it is short-circuiting. `own` frees the rest
+    // when it goes out of scope.
+    Event ev;
+    while (eng.popEvent(ev)) {}
 
     SF_INFO info{};
     info.samplerate = (int)sr;
