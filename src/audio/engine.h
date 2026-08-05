@@ -124,6 +124,13 @@ enum class Cmd : u32 {
     // timestamps incoming MidiMsg against the beat clock, pairs ons with offs
     // (unpaired notes are closed at the stop boundary), and returns the
     // buffer via Ev::MidiRecordFinished with the note count in x.
+    //
+    // OVERDUB: when the target slot already holds a valid MIDI clip, the take
+    // is a looper pass — the clip is (re)launched at the record start
+    // boundary and keeps playing while incoming notes are captured with
+    // their beats wrapped modulo the clip's lengthBeats, so a note played in
+    // any pass lands at its in-loop position. The finish event still returns
+    // only the NEW notes; the GUI merges them into the clip and re-pushes.
     RecordMidiSlot,
 };
 
