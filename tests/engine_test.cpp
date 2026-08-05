@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -3430,6 +3431,726 @@ static void testDrains() {
 }
 
 // ---------------------------------------------------------------------------
+// 23. automation: the shared evaluator
+//
+// docs/AUTOMATION.md §2.4/§3. autoValueAt is the ONE function the engine and
+// (later) the UI both call, which is what makes the displayed value and the
+// applied value incapable of disagreeing. engine.h is frozen for this pass and
+// does not declare it yet, so the test names it exactly as the UI will once the
+// declaration lands beside the Rt structs.
+// ---------------------------------------------------------------------------
+
+namespace lat { f32 autoValueAt(const RtAutoSet&, const RtAutoLane&, f64, f32); }
+
+// One allocation holding the set followed by its points, which is the shape
+// App::publishAutos will build and the shape the retirement protocol frees:
+// `delete[] (char*)set`. Building it any other way here would test a layout
+// the engine will never actually be handed.
+static RtAutoSet* mkAutoSet(const std::vector<RtAutoLane>& lanes,
+                            const std::vector<RtAutoPoint>& pts) {
+    const size_t bytes = sizeof(RtAutoSet) + pts.size() * sizeof(RtAutoPoint);
+    char* blk = new char[bytes];
+    RtAutoSet* s = new (blk) RtAutoSet();
+    RtAutoPoint* p = (RtAutoPoint*)(blk + sizeof(RtAutoSet));
+    for (size_t i = 0; i < pts.size(); ++i) p[i] = pts[i];
+    s->points     = pts.empty() ? nullptr : p;
+    s->pointCount = (int)pts.size();
+    s->laneCount  = (int)(lanes.size() < (size_t)kMaxRtAutoLanes ? lanes.size()
+                                                                 : (size_t)kMaxRtAutoLanes);
+    for (int i = 0; i < s->laneCount; ++i) s->lanes[i] = lanes[(size_t)i];
+    return s;
+}
+static void freeAutoSet(const RtAutoSet* s) { delete[] (char*)s; }
+
+static RtAutoPoint pt(f64 beat, f32 v) { RtAutoPoint p; p.beat = beat; p.value = v; return p; }
+
+static RtAutoLane mkLane(AutoTarget tgt, int first, int count, f32 lo, f32 hi,
+                         AutoXform xf = AutoXform::Direct, int index = 0, int devSlot = -1) {
+    RtAutoLane l;
+    l.target  = (i32)tgt;
+    l.index   = index;
+    l.devSlot = devSlot;
+    l.xform   = (i32)xf;
+    l.first   = first;
+    l.count   = count;
+    l.lo      = lo;
+    l.hi      = hi;
+    return l;
+}
+
+static void evaluatorShape() {
+    // 0.0 at beat 0, up to 1.0 at beat 2, down to 0.5 at beat 4.
+    RtAutoSet* s = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 3, 0.f, 1.f)},
+                             {pt(0.0, 0.f), pt(2.0, 1.f), pt(4.0, 0.5f)});
+    const RtAutoLane& l = s->lanes[0];
+    auto at = [&](f64 b) { return autoValueAt(*s, l, b, -9.f); };
+
+    CHECK(std::fabs(at(-5.0) - 0.f) < 1e-6f,
+          "before the first point holds the first value (%.4f)", (double)at(-5.0));
+    CHECK(std::fabs(at(0.0) - 0.f) < 1e-6f, "exactly on the first point (%.4f)", (double)at(0.0));
+    CHECK(std::fabs(at(1.0) - 0.5f) < 1e-6f, "mid segment interpolates (%.4f)", (double)at(1.0));
+    CHECK(std::fabs(at(2.0) - 1.f) < 1e-6f, "exactly on an interior point (%.4f)", (double)at(2.0));
+    CHECK(std::fabs(at(3.0) - 0.75f) < 1e-6f,
+          "the second segment interpolates its own endpoints (%.4f)", (double)at(3.0));
+    CHECK(std::fabs(at(4.0) - 0.5f) < 1e-6f, "exactly on the last point (%.4f)", (double)at(4.0));
+    CHECK(std::fabs(at(400.0) - 0.5f) < 1e-6f,
+          "after the last point holds the last value (%.4f)", (double)at(400.0));
+    // A hundred beats sampled across the span: monotone in, monotone out, and
+    // never outside the two points bracketing it.
+    bool bracketed = true;
+    for (int k = 0; k <= 100; ++k) {
+        const f64 b = 4.0 * (f64)k / 100.0;
+        const f32 v = at(b);
+        if (!(v >= -1e-6f && v <= 1.f + 1e-6f)) bracketed = false;
+    }
+    CHECK(bracketed, "every sampled beat lands inside the envelope's own range");
+    freeAutoSet(s);
+}
+
+static void evaluatorEdges() {
+    // A single point is a legal constant envelope, not an error.
+    RtAutoSet* one = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 1, 0.f, 1.f)}, {pt(2.0, 0.3f)});
+    CHECK(std::fabs(autoValueAt(*one, one->lanes[0], 0.0, -9.f) - 0.3f) < 1e-6f,
+          "a single point is constant before itself");
+    CHECK(std::fabs(autoValueAt(*one, one->lanes[0], 99.0, -9.f) - 0.3f) < 1e-6f,
+          "a single point is constant after itself");
+    freeAutoSet(one);
+
+    // An empty lane is UI state, not content: it must be a no-op rather than a
+    // jump to zero, so it evaluates to the caller's un-automated value.
+    RtAutoSet* none = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 0, 0.f, 1.f)}, {});
+    CHECK(std::fabs(autoValueAt(*none, none->lanes[0], 1.0, 0.77f) - 0.77f) < 1e-6f,
+          "an empty lane returns the fallback (%.4f)",
+          (double)autoValueAt(*none, none->lanes[0], 1.0, 0.77f));
+    freeAutoSet(none);
+
+    // Clamping to the lane's resolved range, so a stale envelope cannot drive a
+    // parameter outside what its ParamInfo declared.
+    RtAutoSet* wide = mkAutoSet({mkLane(AutoTarget::DeviceParam, 0, 2, 0.2f, 0.8f)},
+                                {pt(0.0, -3.f), pt(4.0, 9.f)});
+    CHECK(std::fabs(autoValueAt(*wide, wide->lanes[0], 0.0, -9.f) - 0.2f) < 1e-6f,
+          "a value under lo clamps up (%.4f)", (double)autoValueAt(*wide, wide->lanes[0], 0.0, -9.f));
+    CHECK(std::fabs(autoValueAt(*wide, wide->lanes[0], 4.0, -9.f) - 0.8f) < 1e-6f,
+          "a value over hi clamps down (%.4f)", (double)autoValueAt(*wide, wide->lanes[0], 4.0, -9.f));
+    bool inRange = true;
+    for (int k = 0; k <= 64; ++k)
+        if (!(autoValueAt(*wide, wide->lanes[0], 4.0 * k / 64.0, -9.f) >= 0.2f - 1e-6f &&
+              autoValueAt(*wide, wide->lanes[0], 4.0 * k / 64.0, -9.f) <= 0.8f + 1e-6f))
+            inRange = false;
+    CHECK(inRange, "the interpolated segment stays inside [lo,hi] throughout");
+    freeAutoSet(wide);
+
+    // A window that runs off the end of the point array is answered with the
+    // fallback rather than a read outside the block: the set is public memory
+    // and may arrive from the other side of a process boundary.
+    RtAutoSet* bad = mkAutoSet({mkLane(AutoTarget::TrackVol, 1, 4, 0.f, 1.f)},
+                               {pt(0.0, 0.1f), pt(1.0, 0.2f)});
+    CHECK(std::fabs(autoValueAt(*bad, bad->lanes[0], 0.5, 0.66f) - 0.66f) < 1e-6f,
+          "a window past pointCount falls back instead of reading out of bounds");
+    freeAutoSet(bad);
+
+    // Unsorted input is defined, not undefined: some point's value, in range,
+    // no crash. The editor holds the sorted invariant; this is what happens
+    // when a hand-edited file does not.
+    RtAutoSet* mess = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 3, 0.f, 1.f)},
+                                {pt(3.0, 0.9f), pt(1.0, 0.1f), pt(2.0, 0.5f)});
+    bool sane = true;
+    for (int k = 0; k <= 40; ++k) {
+        const f32 v = autoValueAt(*mess, mess->lanes[0], 4.0 * k / 40.0, -9.f);
+        if (!(v >= 0.f && v <= 1.f)) sane = false;
+    }
+    CHECK(sane, "unsorted points evaluate to something in range rather than something undefined");
+
+    // Two points on the same beat: a zero-width segment resolves to the later
+    // one instead of dividing by zero.
+    RtAutoSet* dup = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 3, 0.f, 1.f)},
+                               {pt(0.0, 0.f), pt(2.0, 0.25f), pt(2.0, 0.75f)});
+    const f32 d = autoValueAt(*dup, dup->lanes[0], 2.0, -9.f);
+    CHECK(std::isfinite(d) && d >= 0.f && d <= 1.f,
+          "a zero-width segment is finite and in range (%.4f)", (double)d);
+    freeAutoSet(mess);
+    freeAutoSet(dup);
+
+    // curve is reserved: a non-zero shape renders as linear in this wave (§2.1)
+    // rather than being refused or drawn some other way.
+    std::vector<RtAutoPoint> cp = {pt(0.0, 0.f), pt(4.0, 1.f)};
+    cp[0].curve = 3;
+    RtAutoSet* curved = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)}, cp);
+    CHECK(std::fabs(autoValueAt(*curved, curved->lanes[0], 2.0, -9.f) - 0.5f) < 1e-6f,
+          "a non-zero curve byte renders as linear (%.4f)",
+          (double)autoValueAt(*curved, curved->lanes[0], 2.0, -9.f));
+    freeAutoSet(curved);
+}
+
+static void testEvaluator() {
+    banner("23. the shared automation evaluator");
+    note("One function, called by the engine now and by the moving knob later.");
+    note("Before the first point and after the last it HOLDS; an empty lane is a");
+    note("no-op that returns the caller's un-automated value.");
+    evaluatorShape();
+    evaluatorEdges();
+}
+
+// ---------------------------------------------------------------------------
+// 24. automation: class A (engine-owned scalars)
+// ---------------------------------------------------------------------------
+
+// A 4-beat DC clip at 120 BPM: 96000 frames, so the clip beat at frame i is
+// exactly (i mod 96000) / 24000 and the oracle needs no tolerance of its own.
+static constexpr i64 kClipFrames = 96000;
+
+static RtClip mkAutoClip(const std::vector<f32>& buf, f32 gain, const RtAutoSet* set) {
+    RtClip c = mkClip(buf, 1, gain, Warp::Off, true, 120.0);
+    c.autos = set;
+    return c;
+}
+
+// The clip beat the engine evaluated at, for a frame that begins a block.
+static f64 clipBeatAt(size_t frame) {
+    return (f64)((i64)frame % kClipFrames) / (f64)kClipFrames * 4.0;
+}
+
+static void autoVolRamps(const std::vector<f32>& buf) {
+    // Fader 0.0 at beat 0 rising to 1.0 at beat 4 — §9's gate envelope. Clip
+    // gain 0.4 keeps the top of the fader's +6 dB inside the master clamp, so
+    // what is measured is the envelope and not the limiter.
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f, AutoXform::Fader)},
+        {pt(0.0, 0.f), pt(4.0, 1.f)});
+
+    Host h; h.init();
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 0.4f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(8 * 4 * kBeat120);                       // 8 bars = 8 laps of the clip
+
+    // 1. Match the oracle. At a block boundary the intra-block ramp is exactly
+    //    at its start value, which is the envelope evaluated at that beat — so
+    //    this is a test of APPLICATION, with no approximation to allow for.
+    f64 worst = 0.0;
+    size_t worstAt = 0;
+    for (size_t i = (size_t)h.block; i + 1 < h.outL.size(); i += (size_t)h.block) {
+        const f32 want = 0.4f * faderToGain(autoValueAt(*set, set->lanes[0], clipBeatAt(i), 0.f));
+        const f64 err = std::fabs((f64)h.outL[i] - (f64)want);
+        if (err > worst) { worst = err; worstAt = i; }
+    }
+    CHECK(worst < 1e-4, "every block boundary sits on the envelope (worst %.3g at frame %lld)",
+          worst, (long long)worstAt);
+
+    // 2. It audibly moves, and in the right direction.
+    CHECK(h.outL[(size_t)(kBeat120 / 2)] < 0.02f,
+          "half a beat in, the fader is still near the bottom (%.4f)",
+          (double)h.outL[(size_t)(kBeat120 / 2)]);
+    CHECK(h.outL[(size_t)(3 * kBeat120 + kBeat120 / 2)] > 0.2f,
+          "three and a half beats in, it is near the top (%.4f)",
+          (double)h.outL[(size_t)(3 * kBeat120 + kBeat120 / 2)]);
+    bool rising = true;
+    for (int b = 1; b < 4; ++b)
+        if (!(h.outL[(size_t)(b * kBeat120)] > h.outL[(size_t)((b - 1) * kBeat120)])) rising = false;
+    CHECK(rising, "the first lap rises beat over beat");
+
+    // 3. Track::vol was never written. §1's whole rule, asserted: stop the clip
+    //    and the fader is the user's, with no cleanup having been needed.
+    h.push(Cmd::StopTrack, 0);
+    h.run(4 * (i64)h.block);
+    h.outL.clear(); h.outR.clear();
+    h.setClip(0, 1, mkClip(buf, 1, 0.4f, Warp::Off, true, 120.0));
+    h.push(Cmd::LaunchClip, 0, 1);
+    h.run(8000);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.4f) < 0.005f,
+          "an un-automated clip on the same track plays at the untouched fader (%.4f)",
+          (double)tailLevel(h.outL));
+
+    freeAutoSet(set);
+}
+
+static void autoVolWraps(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f, AutoXform::Fader)},
+        {pt(0.0, 0.f), pt(4.0, 1.f)});
+
+    Host h; h.init();
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 0.4f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(8 * 4 * kBeat120);
+
+    // Seven wraps in eight bars. The envelope has to restart at every one of
+    // them, and no ramp may span the wrap: a ramp that did would carry the
+    // top-of-lap value across into the next lap and overshoot.
+    const f32 ceiling = 0.4f * faderToGain(1.f);
+    bool restarts = true, bounded = true;
+    for (int lap = 1; lap < 8; ++lap) {
+        const size_t w = (size_t)(lap * kClipFrames);
+        if (!(h.outL[w - 1] > 0.7f * ceiling)) restarts = false;    // top of the old lap
+        if (!(h.outL[w + (size_t)h.block] < 0.02f)) restarts = false; // bottom of the new one
+    }
+    for (size_t i = 0; i < h.outL.size(); ++i)
+        if (!(h.outL[i] >= -1e-6f && h.outL[i] <= ceiling + 1e-6f)) bounded = false;
+    CHECK(restarts, "the envelope restarts at each of the seven loop wraps");
+    CHECK(bounded, "no sample overshoots the envelope's own range across a wrap (ceiling %.4f)",
+          (double)ceiling);
+    freeAutoSet(set);
+}
+
+static void autoDeterminism(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::TrackVol, 0, 3, 0.f, 1.f, AutoXform::Fader),
+         mkLane(AutoTarget::TrackPan, 3, 2, -1.f, 1.f)},
+        {pt(0.0, 0.2f), pt(1.5, 0.9f), pt(4.0, 0.4f), pt(0.0, -1.f), pt(4.0, 1.f)});
+
+    std::vector<f32> a, b;
+    for (int pass = 0; pass < 2; ++pass) {
+        Host h; h.init();
+        tempoNoQuantum(h);
+        h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(3 * 4 * kBeat120);
+        (pass == 0 ? a : b) = h.outL;
+        if (pass == 0) b.reserve(h.outL.size());
+    }
+    CHECK(a.size() == b.size() && !a.empty() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(f32)) == 0,
+          "the same automated set rendered twice is bit-identical (%zu frames)", a.size());
+
+    // The pan lane really did something, or the identity above proves nothing.
+    Host h; h.init();
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(4 * kBeat120);
+    const size_t early = (size_t)(kBeat120 / 2);
+    const size_t late  = (size_t)(3 * kBeat120 + kBeat120 / 2);
+    CHECK(h.outL[early] > h.outR[early] * 3.f,
+          "the pan envelope is hard left at beat 0.5 (L %.4f, R %.4f)",
+          (double)h.outL[early], (double)h.outR[early]);
+    CHECK(h.outR[late] > h.outL[late] * 3.f,
+          "and hard right by beat 3.5 (L %.4f, R %.4f)",
+          (double)h.outL[late], (double)h.outR[late]);
+    freeAutoSet(set);
+}
+
+static void autoSendMovesSignal(const std::vector<f32>& buf) {
+    // A send lane from silence to unity over the clip, with the user's own send
+    // level left at zero: the envelope alone has to bring the return bus to
+    // life, including clearing its scratch for the block.
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::TrackSend, 0, 2, 0.f, 1.f, AutoXform::Direct, 0)},
+        {pt(0.0, 0.f), pt(4.0, 1.f)});
+
+    Host h; h.init();
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.push(Cmd::ReturnVol, 0, 0, 1.0);
+    h.run(2 * 4 * kBeat120);
+
+    // Dry 0.50 plus the return's copy of it, scaled by the envelope.
+    f64 worst = 0.0;
+    for (size_t i = (size_t)h.block; i + 1 < h.outL.size(); i += (size_t)h.block) {
+        const f32 s = autoValueAt(*set, set->lanes[0], clipBeatAt(i), 0.f);
+        const f64 err = std::fabs((f64)h.outL[i] - (0.5 + 0.5 * (f64)s));
+        if (err > worst) worst = err;
+    }
+    CHECK(worst < 1e-4, "the automated send tracks the envelope into the return (worst %.3g)",
+          worst);
+    CHECK(h.outL[(size_t)(kBeat120 / 4)] < 0.55f,
+          "at the start of a lap the return is closed (%.4f)",
+          (double)h.outL[(size_t)(kBeat120 / 4)]);
+    CHECK(h.outL[(size_t)(3 * kBeat120 + kBeat120 / 2)] > 0.90f,
+          "by beat 3.5 it is nearly fully open (%.4f)",
+          (double)h.outL[(size_t)(3 * kBeat120 + kBeat120 / 2)]);
+    CHECK(h.e.returnMeterL[0].load() > 0.3f,
+          "and the return bus meters what it was handed (%.4f)",
+          (double)h.e.returnMeterL[0].load());
+    freeAutoSet(set);
+}
+
+static void testAutomationClassA() {
+    banner("24. automation of engine-owned scalars (vol / pan / send)");
+    note("Evaluated at the block's start and end beat and applied as an intra-block");
+    note("ramp of the DERIVED value. Track::vol/pan/send are never written: the");
+    note("effective value exists for one block and reaches nothing but the mixdown.");
+    const auto buf = dcBuf(kClipFrames, 1, 1.0f);
+    autoVolRamps(buf);
+    autoVolWraps(buf);
+    autoDeterminism(buf);
+    autoSendMovesSignal(buf);
+}
+
+// ---------------------------------------------------------------------------
+// 25. automation: class B (device parameters)
+// ---------------------------------------------------------------------------
+
+// A device whose single parameter is its gain, so an envelope on it is audible,
+// and which records exactly what reached it and how. `rt` decides whether the
+// backend has a realtime parameter path at all — a backend that has none must
+// produce one Ev::AutoLaneInert and never be called again.
+class ParamFx : public PluginInstance {
+public:
+    explicit ParamFx(bool rt, f32 initial = 1.f) : rt_(rt), v_(initial) {
+        info_.name = "Drive";
+        info_.min = 0.f; info_.max = 1.f; info_.def = 1.f;
+        rtValues.reserve(4096);
+        blockValues.reserve(4096);
+    }
+
+    int rtCalls = 0;
+    std::vector<f32> rtValues;       // what setParamRT accepted
+    std::vector<f32> blockValues;    // what each process() actually ran with
+
+    bool prepare(f64, int) override { return true; }
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        blockValues.push_back(v_);
+        if (bypassed_) return;
+        for (int c = 0; c < channels; ++c) {
+            if (!out[c] || !in[c]) continue;
+            for (int i = 0; i < nframes; ++i) out[c][i] = in[c][i] * v_;
+        }
+    }
+    int              paramCount() const override     { return 1; }
+    const ParamInfo& paramInfo(int) const override   { return info_; }
+    f32              getParam(int i) const override  { return i == 0 ? v_ : 0.f; }
+    void             setParam(int i, f32 v) override { if (i == 0) v_ = clampv(v, 0.f, 1.f); }
+    bool setParamRT(int i, f32 v) override {
+        ++rtCalls;
+        if (!rt_) return false;                 // "this backend has no realtime path"
+        if (i == 0) { v_ = clampv(v, 0.f, 1.f); rtValues.push_back(v_); }
+        return true;
+    }
+    const PluginDesc& desc() const override          { static PluginDesc d; return d; }
+    void             setBypassed(bool b) override    { bypassed_ = b; }
+    bool             bypassed() const override       { return bypassed_; }
+
+private:
+    bool      rt_ = true;
+    bool      bypassed_ = false;
+    f32       v_ = 1.f;
+    ParamInfo info_;
+};
+
+static int countEvents(Engine& e, Ev want, std::vector<Event>* out = nullptr) {
+    int n = 0;
+    Event ev;
+    while (e.popEvent(ev)) {
+        if (ev.type != want) continue;
+        ++n;
+        if (out) out->push_back(ev);
+    }
+    return n;
+}
+
+static void devParamPerBlock(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::DeviceParam, 0, 2, 0.f, 1.f, AutoXform::Direct, 0, 0)},
+        {pt(0.0, 0.25f), pt(4.0, 1.f)});
+
+    Host h; h.init();
+    ParamFx fx(true, 1.f);
+    RtChain chain; chain.fx[0] = &fx; chain.count = 1;
+    h.setChain(0, &chain);
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(1);
+
+    const int after1 = fx.rtCalls;
+    CHECK(after1 == 1, "one block, one setParamRT (%d)", after1);
+    h.runBlocks(16);
+    CHECK(fx.rtCalls == after1 + 16, "sixteen more blocks, sixteen more calls (%d)",
+          fx.rtCalls - after1);
+    CHECK((int)fx.blockValues.size() == 17,
+          "the chain ran once per block over the same window (%zu)", fx.blockValues.size());
+
+    // Applied BEFORE the block it belongs to, and at that block's start beat —
+    // the same ordering constraint MIDI already has.
+    bool matches = true;
+    for (size_t b = 1; b < fx.blockValues.size(); ++b) {
+        const f64 beat = clipBeatAt(b * (size_t)h.block);
+        const f32 want = autoValueAt(*set, set->lanes[0], beat, 0.f);
+        if (std::fabs(fx.blockValues[b] - want) > 1e-6f) matches = false;
+    }
+    CHECK(matches, "each block ran with the envelope's value at its own start beat");
+    CHECK(fx.blockValues.back() > fx.blockValues[1] + 0.001f,
+          "and the parameter climbed over the window (%.4f -> %.4f)",
+          (double)fx.blockValues[1], (double)fx.blockValues.back());
+
+    // Audible: the DC clip comes out at clip gain times the parameter.
+    const size_t i = h.outL.size() - 1;
+    const f32 want = 0.5f * fx.blockValues.back();
+    CHECK(std::fabs(h.outL[i] - want) < 0.01f,
+          "the output follows the automated parameter (%.4f, expected ~%.4f)",
+          (double)h.outL[i], (double)want);
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    freeAutoSet(set);
+}
+
+static void devParamInert(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkAutoSet(
+        {mkLane(AutoTarget::DeviceParam, 0, 2, 0.f, 1.f, AutoXform::Direct, 0, 0)},
+        {pt(0.0, 0.25f), pt(4.0, 1.f)});
+
+    Host h; h.init();
+    ParamFx fx(false, 0.5f);                     // no realtime parameter path
+    RtChain chain; chain.fx[0] = &fx; chain.count = 1;
+    h.setChain(0, &chain);
+    tempoNoQuantum(h);
+    h.setClip(0, 0, mkAutoClip(buf, 1.0f, set));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(1);
+
+    std::vector<Event> evs;
+    const int inert = countEvents(h.e, Ev::AutoLaneInert, &evs);
+    CHECK(fx.rtCalls == 1, "the engine tries the backend exactly once (%d)", fx.rtCalls);
+    CHECK(inert == 1, "one Ev::AutoLaneInert for the published set (%d)", inert);
+    CHECK(inert == 1 && evs[0].a == 0 && evs[0].b == 0 && (int)evs[0].x == 0,
+          "and it names track 0, slot 0, lane 0 (a=%d b=%d x=%.0f)",
+          inert ? evs[0].a : -1, inert ? evs[0].b : -1, inert ? evs[0].x : -1.0);
+
+    h.runBlocks(32);
+    CHECK(fx.rtCalls == 1, "and never calls again for that set (%d)", fx.rtCalls);
+    CHECK(countEvents(h.e, Ev::AutoLaneInert) == 0, "nor reports it a second time");
+    CHECK(std::fabs(fx.getParam(0) - 0.5f) < 1e-6f,
+          "the parameter is untouched, so there is no audio change (%.4f)",
+          (double)fx.getParam(0));
+    CHECK(std::fabs(tailLevel(h.outL) - 0.5f) < 0.005f,
+          "the track plays at the un-automated level (%.4f)", (double)tailLevel(h.outL));
+
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    freeAutoSet(set);
+}
+
+// One Host per function, per the note above section 9: an Engine is ~2 MB by
+// value and ASan does not overlap the stack slots of sibling scopes, so four
+// restore cases in one frame is four engines in one frame.
+static RtAutoSet* mkDriveSet() {
+    return mkAutoSet({mkLane(AutoTarget::DeviceParam, 0, 2, 0.f, 1.f, AutoXform::Direct, 0, 0)},
+                     {pt(0.0, 0.25f), pt(4.0, 1.f)});
+}
+
+// a. the clip stops
+static void devParamRestoreOnStop(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkDriveSet();
+    {
+        Host h; h.init();
+        ParamFx fx(true, 1.f);
+        fx.setParam(0, 0.42f);                   // the user's own value
+        RtChain chain; chain.fx[0] = &fx; chain.count = 1;
+        h.setChain(0, &chain);
+        tempoNoQuantum(h);
+        h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(2 * kBeat120);
+        CHECK(std::fabs(fx.getParam(0) - 0.42f) > 0.05f,
+              "the envelope has taken the parameter over (%.4f)", (double)fx.getParam(0));
+        h.push(Cmd::StopTrack, 0);
+        h.runBlocks(6);
+        CHECK(std::fabs(fx.getParam(0) - 0.42f) < 1e-6f,
+              "stopping the clip hands the parameter back (%.4f, expected 0.42)",
+              (double)fx.getParam(0));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+
+    freeAutoSet(set);
+}
+
+// b. the transport stops
+static void devParamRestoreOnTransportStop(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkDriveSet();
+    {
+        Host h; h.init();
+        ParamFx fx(true, 1.f);
+        fx.setParam(0, 0.42f);
+        RtChain chain; chain.fx[0] = &fx; chain.count = 1;
+        h.setChain(0, &chain);
+        tempoNoQuantum(h);
+        h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(2 * kBeat120);
+        h.push(Cmd::SetPlaying, 0);
+        h.runBlocks(6);
+        CHECK(std::fabs(fx.getParam(0) - 0.42f) < 1e-6f,
+              "stopping the transport hands it back too (%.4f)", (double)fx.getParam(0));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+
+    freeAutoSet(set);
+}
+
+// c. the clip is cleared under the voice
+static void devParamRestoreOnClear(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkDriveSet();
+    {
+        Host h; h.init();
+        ParamFx fx(true, 1.f);
+        fx.setParam(0, 0.42f);
+        RtChain chain; chain.fx[0] = &fx; chain.count = 1;
+        h.setChain(0, &chain);
+        tempoNoQuantum(h);
+        h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(2 * kBeat120);
+        Command cc; cc.type = Cmd::ClearClip; cc.a = 0; cc.b = 0;
+        h.e.pushCommand(cc);
+        h.runBlocks(4);
+        CHECK(std::fabs(fx.getParam(0) - 0.42f) < 1e-6f,
+              "clearing the clip hands it back (%.4f)", (double)fx.getParam(0));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+
+    freeAutoSet(set);
+}
+
+// d. Cmd::SetChain replaces the chain mid-envelope. §3.5 warns this is the one
+//    that gets forgotten: the restore has to happen BEFORE the pointer moves,
+//    because afterwards the instance may be one the engine no longer references
+//    and the GUI is free to delete.
+static void devParamRestoreOnChainSwap(const std::vector<f32>& buf) {
+    RtAutoSet* set = mkDriveSet();
+    {
+        Host h; h.init();
+        ParamFx fx(true, 1.f);
+        fx.setParam(0, 0.42f);
+        RtChain chainA; chainA.fx[0] = &fx; chainA.count = 1;
+        ParamFx fx2(true, 1.f);
+        RtChain chainB; chainB.fx[0] = &fx2; chainB.count = 1;
+        h.setChain(0, &chainA);
+        tempoNoQuantum(h);
+        h.setClip(0, 0, mkAutoClip(buf, 0.5f, set));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(2 * kBeat120);
+        h.setChain(0, &chainB);
+        h.runBlocks(1);
+        CHECK(std::fabs(fx.getParam(0) - 0.42f) < 1e-6f,
+              "swapping the chain restores the outgoing device first (%.4f)",
+              (double)fx.getParam(0));
+        h.setChain(0, nullptr);
+        h.runBlocks(2);
+    }
+    freeAutoSet(set);
+}
+
+static void testAutomationClassB() {
+    banner("25. automation of device parameters");
+    note("A plugin has one storage slot per parameter and no notion of an effective");
+    note("value, so this is the one target where the engine writes what it automates —");
+    note("and therefore the one that owes a restore when it stops.");
+    const auto buf = dcBuf(kClipFrames, 1, 1.0f);
+    devParamPerBlock(buf);
+    devParamInert(buf);
+    devParamRestoreOnStop(buf);
+    devParamRestoreOnTransportStop(buf);
+    devParamRestoreOnClear(buf);
+    devParamRestoreOnChainSwap(buf);
+}
+
+// ---------------------------------------------------------------------------
+// 26. automation: retirement
+// ---------------------------------------------------------------------------
+
+static void testAutosRetirement() {
+    banner("26. an envelope set replaced under a playing clip comes home");
+    note("Verbatim the RtNote protocol: the audio thread never frees GUI memory,");
+    note("so a displaced set rides Ev::AutosRetired back and only then may go.");
+
+    const auto buf = dcBuf(kClipFrames, 1, 1.0f);
+    const std::vector<RtAutoLane> lanes = {
+        mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f, AutoXform::Fader)};
+    const std::vector<RtAutoPoint> pts = {pt(0.0, 0.2f), pt(4.0, 0.9f)};
+
+    Host h; h.init();
+    tempoNoQuantum(h);
+    RtAutoSet* first = mkAutoSet(lanes, pts);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, first));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(4);
+    CHECK(countEvents(h.e, Ev::AutosRetired) == 0,
+          "publishing the first set retires nothing");
+
+    RtAutoSet* second = mkAutoSet(lanes, pts);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, second));
+    h.runBlocks(2);
+    std::vector<Event> evs;
+    const int n1 = countEvents(h.e, Ev::AutosRetired, &evs);
+    CHECK(n1 == 1, "replacing it retires exactly one set (%d)", n1);
+    CHECK(n1 == 1 && evs[0].p == (void*)first, "and it is the displaced pointer");
+    CHECK(n1 == 1 && evs[0].a == 0 && evs[0].b == 0, "named by track and slot (a=%d b=%d)",
+          n1 ? evs[0].a : -1, n1 ? evs[0].b : -1);
+    freeAutoSet(first);
+
+    // Re-pushing the SAME pointer must announce nothing: an entry that would
+    // never be announced must not be queued, and one that is announced twice
+    // would be a double free on the other side.
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, second));
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::AutosRetired) == 0,
+          "re-pushing the same set announces nothing");
+
+    // A clip with no envelopes at all pushed over one that had them still has
+    // to hand the old one back.
+    RtAutoSet* third = mkAutoSet(lanes, pts);
+    h.setClip(0, 0, mkAutoClip(buf, 0.5f, third));
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::AutosRetired, &evs) == 1 && evs[0].p == (void*)second,
+          "and a third publication retires the second");
+    freeAutoSet(second);
+
+    // Clearing the slot: the incoming set is null, so "differs from the
+    // incoming one" is simply "there was one".
+    Command cc; cc.type = Cmd::ClearClip; cc.a = 0; cc.b = 0;
+    h.e.pushCommand(cc);
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::AutosRetired, &evs) == 1 && evs[0].p == (void*)third,
+          "clearing the clip retires the set it carried");
+    freeAutoSet(third);
+
+}
+
+// §9's gate: republish while it plays and account for every set.
+static void autosRetirementUnderChurn() {
+    const auto buf = dcBuf(kClipFrames, 1, 1.0f);
+    const std::vector<RtAutoLane> lanes = {
+        mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f, AutoXform::Fader)};
+    const std::vector<RtAutoPoint> pts = {pt(0.0, 0.2f), pt(4.0, 0.9f)};
+    Host g; g.init();
+    tempoNoQuantum(g);
+    std::vector<RtAutoSet*> live;
+    RtAutoSet* cur = mkAutoSet(lanes, pts);
+    live.push_back(cur);
+    g.setClip(0, 0, mkAutoClip(buf, 0.5f, cur));
+    g.push(Cmd::LaunchClip, 0, 0);
+    g.runBlocks(2);
+    int retired = 0;
+    for (int k = 0; k < 100; ++k) {
+        RtAutoSet* next = mkAutoSet(lanes, pts);
+        live.push_back(next);
+        g.setClip(0, 0, mkAutoClip(buf, 0.5f, next));
+        g.runBlocks(1);
+        std::vector<Event> got;
+        retired += countEvents(g.e, Ev::AutosRetired, &got);
+        for (const Event& e : got) {
+            bool known = false;
+            for (RtAutoSet*& p : live)
+                if (p == (RtAutoSet*)e.p) { known = true; freeAutoSet(p); p = nullptr; break; }
+            if (!known) CHECK(false, "an unowned pointer came back through AutosRetired");
+        }
+    }
+    CHECK(retired == 100, "a hundred republications retire a hundred sets (%d)", retired);
+    int leaked = 0;
+    for (RtAutoSet* p : live) if (p) { ++leaked; freeAutoSet(p); }
+    CHECK(leaked == 1, "exactly one set is still published and none leaked (%d outstanding)",
+          leaked);
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -3456,6 +4177,11 @@ int main() {
     testEventResilience();
     testOverdubSort();
     testDrains();
+    testEvaluator();
+    testAutomationClassA();
+    testAutomationClassB();
+    testAutosRetirement();
+    autosRetirementUnderChurn();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

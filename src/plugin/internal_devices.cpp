@@ -82,6 +82,19 @@ public:
         pv_[(size_t)i] = clampv(v, info_[(size_t)i].min, info_[(size_t)i].max);
     }
 
+    // REALTIME (host.h): the automation path. Literally setParam's body, and
+    // that is the honest answer for this backend rather than a shortcut —
+    // there is no queue to have a second producer on, only a clamp and a
+    // 4-byte aligned plain store into pv_[], which is precisely what the file
+    // header already argues is safe for the GUI-side writer. Two writers
+    // instead of one changes nothing about tearing: the value a run() reads is
+    // always one of the two that were written, never a mixture.
+    bool setParamRT(int i, f32 v) override {
+        if (i < 0 || i >= n_) return true;    // out of range, not "no RT path"
+        pv_[(size_t)i] = clampv(v, info_[(size_t)i].min, info_[(size_t)i].max);
+        return true;
+    }
+
     const PluginDesc& desc() const override { return desc_; }
 
     // Stated explicitly rather than inherited from the default in host.h, so

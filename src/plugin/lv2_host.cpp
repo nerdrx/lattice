@@ -477,6 +477,19 @@ public:
         ctrl_[(size_t)paramPort_[(size_t)i]] = clampv(v, pi.min, pi.max);
     }
 
+    // REALTIME (host.h): the automation path. Identical to setParam above, and
+    // safe for the identical reason — an LV2 control port IS a float the
+    // plugin reads once per run(), so this is a clamp and a plain store with
+    // no queue, no allocation and nothing to lock. ctrl_ is sized once in
+    // prepare() and never resized while the audio thread can be in here, so
+    // the vector indexing is a plain load of a stable pointer.
+    bool setParamRT(int i, f32 v) override {
+        if (i < 0 || i >= (int)paramPort_.size()) return true;
+        const ParamInfo& pi = params_[(size_t)i];
+        ctrl_[(size_t)paramPort_[(size_t)i]] = clampv(v, pi.min, pi.max);
+        return true;
+    }
+
     const PluginDesc& desc() const override { return desc_; }
 
     // Filled in by settleLatency() at the end of prepare() and constant

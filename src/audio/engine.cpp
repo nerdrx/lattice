@@ -441,6 +441,228 @@ static inline void fetch(const RtClip& c, f64 pos, f32& outL, f32& outR) {
 }
 
 // ---------------------------------------------------------------------------
+// automation (docs/AUTOMATION.md §3)
+//
+// The rule everything below serves: the engine never writes an automated value
+// into the field it is automating. Track::vol/pan/send stay whatever the user's
+// fader last said; an envelope produces an *effective* value that exists for
+// one block and reaches nothing but the mixdown. Device parameters are the one
+// documented exception (§3.4/§3.5) — a plugin has a single storage slot and no
+// notion of "effective" — and that is exactly why they carry a restore
+// obligation, discharged below.
+// ---------------------------------------------------------------------------
+
+// Value of one lane at a clip-relative beat. Pure, allocation-free and safe on
+// the audio thread; deliberately the same function the UI will call to draw the
+// moving knob, so the displayed value and the applied value cannot disagree
+// (§2.4).
+//
+// LINKAGE: engine.h is frozen for this pass and does not declare it, so it is
+// defined here with external linkage. A `f32 autoValueAt(const RtAutoSet&,
+// const RtAutoLane&, f64, f32);` declaration belongs beside the Rt structs the
+// next time the header opens; until then the UI (and the tests) declare it
+// themselves and link against this definition. Nothing about the body changes
+// when that happens.
+//
+// Semantics, all three load-bearing:
+//   * before the first point: the first point's value (there is no "nowhere" to
+//     ramp in from at clip start);
+//   * after the last point: the last point's value, held to the loop end;
+//   * a lane with no points evaluates to `fallback` — the caller's
+//     un-automated value. An empty lane is UI state, not content, so it must be
+//     a no-op rather than a jump to zero. `fallback` is returned unclamped: it
+//     is a value the lane has no opinion about.
+//
+// The search is a bisection rather than the cursor-scan §2.4 sketched, because
+// the signature the contract froze carries no cursor and a shared pure function
+// cannot own one: the GUI calls it at arbitrary beats for whatever clip the
+// mouse is over. At kMaxClipAutoPoints (4096) that is at most 12 compares once
+// per block per lane, against a scan whose worst case is 4096 of them.
+// `curve` is reserved: any non-zero shape renders as linear in this wave (§2.1).
+f32 autoValueAt(const RtAutoSet& s, const RtAutoLane& l, f64 beat, f32 fallback) {
+    const int n = l.count;
+    // The window is validated here and not trusted: the set is public memory
+    // built on the other side of a process boundary, and a bad first/count must
+    // be an inert lane rather than a read outside the block.
+    if (!s.points || n <= 0 || l.first < 0 || l.first > s.pointCount - n) return fallback;
+    const RtAutoPoint* p = s.points + l.first;
+
+    // A publisher that inverted lo/hi would otherwise turn clampv into a value
+    // that is neither bound.
+    const f32 lo = l.lo <= l.hi ? l.lo : l.hi;
+    const f32 hi = l.lo <= l.hi ? l.hi : l.lo;
+
+    if (!(beat > p[0].beat))     return clampv(p[0].value, lo, hi);      // NaN lands here
+    if (beat >= p[n - 1].beat)   return clampv(p[n - 1].value, lo, hi);
+
+    // Last index whose beat is <= `beat`. Unsorted input gives some point's
+    // value rather than an out-of-range read — defined, if ugly, which is what
+    // §4.2 asks for.
+    int a = 0, b = n - 1;
+    while (b - a > 1) {
+        const int m = (a + b) >> 1;
+        if (p[m].beat <= beat) a = m; else b = m;
+    }
+    const f64 span = p[b].beat - p[a].beat;
+    if (!(span > 0.0)) return clampv(p[b].value, lo, hi);
+    f64 t = (beat - p[a].beat) / span;
+    t = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+    return clampv((f32)((f64)p[a].value + ((f64)p[b].value - (f64)p[a].value) * t), lo, hi);
+}
+
+// The clip-relative position of a voice. ONE definition, so the number the UI
+// draws the playhead at and the number an envelope is evaluated against are
+// provably the same quantity (§3.1) — clipPhase's stores go through it too.
+template <class VoiceT>
+static inline f64 voiceClipPhase(const VoiceT& v, const RtClip& c) {
+    if (c.isMidi) return c.lengthBeats > 0.0 ? v.beatPos / c.lengthBeats : 0.0;
+    const f64 loopLen = (f64)(c.loopEnd - c.loopStart);
+    return loopLen > 0.0 ? (v.srcPos - (f64)c.loopStart) / loopLen : 0.0;
+}
+template <class VoiceT>
+static inline f64 voiceClipBeat(const VoiceT& v, const RtClip& c) {
+    if (c.isMidi) return v.beatPos;                 // already in clip beats
+    return voiceClipPhase(v, c) * c.lengthBeats;
+}
+
+namespace {
+
+// Engine-side automation state.
+//
+// Two things have to persist across blocks and neither can live where §3
+// wanted it (Track::autoA, Track::autoHold): engine.h is frozen. So, exactly as
+// the PDC and parked-event state above already do, it sits in a side table
+// keyed by the Engine's address, claimed in prepare() and only ever read and
+// written by the audio thread afterwards.
+//
+//   * `inert` — the lanes this engine has given up on. The published lane flags
+//     carry kAutoInert, but the published RtAutoSet is *const*: the engine may
+//     not write into GUI-owned memory, so it keeps its own bitmap. One u32 is
+//     one bit per lane and kMaxRtAutoLanes is 16.
+//   * `hold`  — the pre-automation value of every device parameter this track's
+//     envelopes have taken over (§3.5), captured with getParam() the first time
+//     a lane writes one and written back when the lane stops applying.
+//
+// Both are scoped to `set`, the published RtAutoSet they belong to. That is
+// what makes "emit Ev::AutoLaneInert once per published set" exact and what
+// makes the restore fire on every event that ends the application — the clip
+// stopping (no voice, so no set), the clip being cleared (autos gone), the set
+// being republished (a different pointer), the transport stopping (the voice
+// releases and dies). Cmd::SetChain is the one trigger that cannot be derived
+// from the set pointer, and it is handled where it happens, before the swap.
+struct AutoTrack {
+    const RtAutoSet* set = nullptr;
+    u32 inert = 0;
+    struct Hold { i32 devSlot = -1; i32 param = -1; f32 was = 0.f; bool used = false; };
+    Hold hold[kMaxRtAutoLanes];
+    bool anyHold = false;
+};
+
+struct AutoState {
+    AutoTrack t[kMaxTracks];
+};
+
+struct AutoTable {
+    static constexpr int kSlots = 4;   // app, daemon, renderer, tests: one each
+    std::atomic<const Engine*> owner[kSlots];
+    AutoState* slot[kSlots]  = {};
+    u64        stamp[kSlots] = {};
+    u64        clock = 0;
+    // Freed at exit so a leak checker has nothing to say. By then the backend
+    // has stopped and no audio thread is inside process().
+    ~AutoTable() { for (auto*& p : slot) { delete p; p = nullptr; } }
+};
+AutoTable gAuto;
+
+// Audio thread: a handful of pointer compares. Null => never prepared, which
+// every caller reads as "this engine applies no automation".
+AutoState* autoFind(const Engine* e) {
+    for (int i = 0; i < AutoTable::kSlots; ++i)
+        if (gAuto.owner[i].load(std::memory_order_acquire) == e) return gAuto.slot[i];
+    return nullptr;
+}
+
+// GUI thread, from prepare(). Allocates on first use and reuses the slot on
+// every re-prepare, like pdcAcquire.
+AutoState* autoAcquire(const Engine* e) {
+    int idx = -1;
+    for (int i = 0; i < AutoTable::kSlots; ++i)
+        if (gAuto.owner[i].load(std::memory_order_relaxed) == e) { idx = i; break; }
+    if (idx < 0)
+        for (int i = 0; i < AutoTable::kSlots; ++i)
+            if (!gAuto.owner[i].load(std::memory_order_relaxed)) { idx = i; break; }
+    if (idx < 0) {                      // table full: take the oldest slot over
+        idx = 0;
+        for (int i = 1; i < AutoTable::kSlots; ++i)
+            if (gAuto.stamp[i] < gAuto.stamp[idx]) idx = i;
+        // The engine that held it applies no automation from here on, which is
+        // the safe degradation: its scalars are the user's own values and its
+        // device parameters were restored when its clips stopped. A fifth
+        // *concurrently prepared* Engine has never existed in this tree; the
+        // real fix is a member in engine.h next time it thaws.
+        LOGW("auto: no free automation slot, taking the oldest (engine %p)", (const void*)e);
+    }
+    if (!gAuto.slot[idx]) {
+        gAuto.slot[idx] = new (std::nothrow) AutoState();
+        if (!gAuto.slot[idx]) return nullptr;
+    }
+    *gAuto.slot[idx] = AutoState{};
+    gAuto.stamp[idx] = ++gAuto.clock;
+    gAuto.owner[idx].store(e, std::memory_order_release);
+    return gAuto.slot[idx];
+}
+
+// Hands the parameters an outgoing set took over back to what they were.
+//
+// This is the engine cleaning up what the engine started, which is the same
+// obligation flushOffs() discharges for note-offs, and it fails the same way if
+// skipped: silently, and only sometimes. `fresh` is the set taking over, if
+// any: a parameter the incoming set marks kAutoOverridden is *dropped* rather
+// than written back, because the user's hand on the knob is the newer statement
+// (§3.6) and the value they are dragging must not be stamped over.
+void autoRestore(AutoTrack& at, const RtChain* chain, const RtAutoSet* fresh) {
+    if (!at.anyHold) return;
+    const int freshLanes =
+        fresh ? (fresh->laneCount < kMaxRtAutoLanes ? fresh->laneCount : kMaxRtAutoLanes) : 0;
+    for (auto& h : at.hold) {
+        if (!h.used) continue;
+        bool overridden = false;
+        for (int i = 0; i < freshLanes; ++i) {
+            const RtAutoLane& l = fresh->lanes[i];
+            if (l.target == (i32)AutoTarget::DeviceParam && l.devSlot == h.devSlot &&
+                l.index == h.param && (l.flags & kAutoOverridden)) { overridden = true; break; }
+        }
+        if (!overridden && chain && h.devSlot >= 0 && h.devSlot < kMaxChainFx &&
+            h.devSlot < chain->count)
+            if (PluginInstance* fx = chain->fx[h.devSlot]) fx->setParamRT(h.param, h.was);
+        h.used = false;
+        h.devSlot = -1;
+        h.param = -1;
+    }
+    at.anyHold = false;
+}
+
+// What one block of class-A automation says about one track. Block-local: it is
+// computed at the top of process() and consumed by the mixdown at the bottom,
+// and nothing about it outlives the callback — which is the whole of §1's rule
+// expressed as a lifetime. `any` false is the ordinary case and costs the
+// mixdown exactly nothing (see the branch in process()).
+struct AutoBlock {
+    bool any = false;
+    bool hasVol = false, hasPan = false;
+    f32  vol0 = 0.f, vol1 = 0.f;      // DERIVED: gain, already through faderToGain
+    f32  pan0 = 0.f, pan1 = 0.f;
+    u32  sendMask = 0;
+    f32  snd0[kMaxReturns] = {}, snd1[kMaxReturns] = {};
+};
+
+// A pan position that cannot poison the mix. NaN lands on centre, exactly as
+// busGain lands a NaN send on silence.
+inline f32 autoPan(f32 p) { return (p >= -1.f && p <= 1.f) ? p : 0.f; }
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // mixer topology and plugin delay compensation
 //
 // The graph, and what every path from a voice to the master sum costs in
@@ -713,6 +935,12 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
     if (!pendAcquire(this))
         LOGW("engine: no slot for resilient events; a full ring may drop a take");
 
+    // Automation state, on the same discipline again. Without it the engine
+    // simply applies no envelopes, which is the correct degradation: the sound
+    // is the un-automated one rather than a crash or a stuck parameter.
+    if (!autoAcquire(this))
+        LOGW("engine: no slot for automation state; clip envelopes will not apply");
+
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
 
@@ -762,6 +990,7 @@ void Engine::startVoice(Track& t, const RtClip& c) {
 void Engine::drainCommands() {
     Command c;
     Pdc* pdc = pdcFind(this);
+    AutoState* aut = autoFind(this);
     // Retires a voice that is losing the clip under it. Note-offs first: the
     // array it reads is about to go away and a release ramp it cannot hear will
     // not deliver them for us. Frame 0 because a GUI edit has no grid line of
@@ -878,6 +1107,14 @@ void Engine::drainCommands() {
                 RtClip& dst = clips_[c.a][c.b];
                 const RtNote* old = dst.notes;
                 const bool changed = old && old != c.clip.notes;
+                // An envelope set rides the same protocol, for the same reason:
+                // it can be edited, and recorded into, while the clip plays. The
+                // "only when it differs" condition is publishNotes' — an entry
+                // that would never be announced must not be queued — and the
+                // event is critical because a lost one leaks GUI memory with no
+                // second channel to notice it by.
+                const RtAutoSet* oldAutos = dst.autos;
+                const bool autosChanged = oldAutos && oldAutos != c.clip.autos;
                 if (changed) {
                     if (t.voice.clip == &dst && t.voice.active) flushOffs(t, t.voice, 0);
                     if (t.prev.clip  == &dst && t.prev.active)  flushOffs(t, t.prev,  0);
@@ -886,6 +1123,8 @@ void Engine::drainCommands() {
                 if (t.voice.clip == &dst && t.voice.active) reseekNotes(t.voice, dst);
                 if (t.prev.clip  == &dst && t.prev.active)  reseekNotes(t.prev,  dst);
                 if (changed) emitCritical(this, evts_, {Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
+                if (autosChanged)
+                    emitCritical(this, evts_, {Ev::AutosRetired, c.a, c.b, 0.0, (void*)oldAutos});
             }
             break;
         // A pointer swap and nothing else. The audio thread must never free a
@@ -896,6 +1135,11 @@ void Engine::drainCommands() {
             if (c.a < 0 || c.a >= kMaxTracks) break;
             Track& t = tracks_[c.a];
             const RtChain* old = t.chain;
+            // Restore BEFORE the pointer moves (§3.5). After the swap the
+            // instance a hold names may be one the engine no longer references,
+            // and writing the captured value into it would be a write through a
+            // pointer the GUI is about to free.
+            if (aut) autoRestore(aut->t[c.a], old, nullptr);
             t.chain = (const RtChain*)c.p;
             // The one place a chain's latency is read. It is const after
             // prepare() per the PluginInstance contract, so the cached copy is
@@ -943,6 +1187,7 @@ void Engine::drainCommands() {
                 Track& t = tracks_[c.a];
                 RtClip& dst = clips_[c.a][c.b];
                 const RtNote* old = dst.notes;
+                const RtAutoSet* oldAutos = dst.autos;
                 if (t.playing == c.b) { t.voice.releasing = true; t.playing = -1;
                                         t.fireBeat = kNoFollow; }
                 if (t.queued  == c.b) { t.queued = -2; t.fireBeat = kNoFollow; }
@@ -953,6 +1198,10 @@ void Engine::drainCommands() {
                 dropVoice(t, t.voice, c.a, true,  &dst);
                 dst = RtClip{};
                 if (old) emitCritical(this, evts_, {Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
+                // The cleared slot's incoming `autos` is null, so "differs from
+                // the incoming one" is simply "there was one".
+                if (oldAutos)
+                    emitCritical(this, evts_, {Ev::AutosRetired, c.a, c.b, 0.0, (void*)oldAutos});
             }
             break;
 
@@ -1364,7 +1613,9 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
                 if (o.used) { o.beat -= L; if (o.beat < 0.0) o.beat = 0.0; }
         }
 
-        if (primary) clipPhase[ti].store(v.beatPos / L, std::memory_order_relaxed);
+        // Through voiceClipPhase so the playhead the UI draws and the beat an
+        // envelope is evaluated against are the same quantity (§3.1).
+        if (primary) clipPhase[ti].store(voiceClipPhase(v, c), std::memory_order_relaxed);
     };
 
     // Renders one voice into the track scratch. Called for the live voice and,
@@ -1431,7 +1682,7 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
         // Only the live voice drives the UI progress bar; the fading one is
         // already off-screen as far as the grid is concerned.
         if (primary && loopLen > 0.0)
-            clipPhase[ti].store((v.srcPos - (f64)c.loopStart) / loopLen, std::memory_order_relaxed);
+            clipPhase[ti].store(voiceClipPhase(v, c), std::memory_order_relaxed);
     };
 
     for (int ti = 0; ti < kMaxTracks; ++ti) {
@@ -1543,6 +1794,156 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             std::memset(t.fxR, 0, (size_t)n * sizeof(f32));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Automation pass (§3.3). One pass over the tracks, here and not later, for
+    // two non-negotiable reasons:
+    //
+    //   1. Class B (device parameters) must reach the plugin BEFORE this
+    //      block's process() runs — the same ordering constraint MIDI already
+    //      has, and the reason this cannot live in the post stage.
+    //   2. The block's end beat is computed FORWARD from its start beat, not
+    //      read back after rendering. Reading the voice's position afterwards
+    //      would fold the loop wrap into the ramp and produce a jump; computing
+    //      it forward and clamping to the loop end makes the wrap a known case
+    //      — the last block of a lap ramps to the envelope's end value and the
+    //      next block starts from its start value, which is what a loop *is*.
+    //
+    // Only the primary voice drives envelopes. Track::prev — the clip fading
+    // out across a switch — does not: two clips' envelopes fighting over one
+    // gain across a 6 ms crossfade produce a value that is neither, and holding
+    // the outgoing one's last applied value for the length of the fade is
+    // correct. A track with no active primary voice applies nothing at all; its
+    // scalars are whatever the user set, which is what makes §1's rule free.
+    AutoBlock autoA[kMaxTracks];
+    AutoState* aut = autoFind(this);
+
+    // `launchOnly` is the second call, made after the sub-block loop for tracks
+    // whose clip started part-way through this very block: they had no voice
+    // when the first call ran, so without it a clip whose envelope begins at
+    // silence would sound one block at the user's own fader — a click, and the
+    // one thing the whole feature is supposed to make impossible. Those tracks
+    // get the envelope's value at their FIRST beat, held constant for the
+    // block: a few milliseconds early, inaudible inside the voice's 3 ms attack
+    // ramp, and exactly what §3.3 documents. It still lands before the chain
+    // runs, so class B keeps its ordering guarantee.
+    auto autoPass = [&](bool launchOnly) {
+        if (!aut) return;
+        const f64 bps = playing_ ? (tempo_ / 60.0 / sr_) : 0.0;
+        for (int ti = 0; ti < kMaxTracks; ++ti) {
+            Track& t = tracks_[ti];
+            AutoTrack& at = aut->t[ti];
+            // Already applied above: at.set is non-null exactly when the first
+            // call found a set for this track.
+            if (launchOnly && at.set) continue;
+
+            const RtClip* c = (t.voice.active && t.voice.clip) ? t.voice.clip : nullptr;
+            const RtAutoSet* set =
+                (c && c->autos && c->autos->laneCount > 0) ? c->autos : nullptr;
+
+            // Every event that ends an application shows up here as a change of
+            // set pointer: the voice stopped (null), the clip was cleared (its
+            // autos went with it), the set was republished (a new pointer). One
+            // condition, one restore, and the inert bitmap resets with it so
+            // "once per published set" stays exact.
+            if (at.set != set) {
+                autoRestore(at, t.chain, set);
+                at.set = set;
+                at.inert = 0;
+            }
+            if (!set) continue;                  // the ordinary case, and free
+
+            const f64 L  = c->lengthBeats;
+            f64 b0 = 0.0, b1 = 0.0;
+            if (!launchOnly) {
+                b0 = voiceClipBeat(t.voice, *c);
+                b1 = b0 + (f64)n * bps;
+                if (L > 0.0 && b1 > L) b1 = L;   // clamp the ramp to the loop end
+            }
+
+            AutoBlock& ab = autoA[ti];
+            const int lanes = set->laneCount < kMaxRtAutoLanes ? set->laneCount
+                                                              : kMaxRtAutoLanes;
+            for (int li = 0; li < lanes; ++li) {
+                const RtAutoLane& l = set->lanes[li];
+                // The user's hand and a lane the engine has given up on are
+                // both "not applying". An empty lane is skipped rather than
+                // evaluated against a fallback: the fallback for a class-A
+                // target is the un-automated value, and not applying the lane
+                // *is* that value, exactly and for free.
+                if (l.flags & (kAutoOverridden | kAutoInert)) continue;
+                if (at.inert & (1u << li)) continue;
+                if (l.count <= 0) continue;
+
+                switch ((AutoTarget)l.target) {
+                case AutoTarget::TrackVol: {
+                    // The ramp interpolates the DERIVED value. Interpolating
+                    // the fader position and mapping per sample would be a pow
+                    // and a log10 per sample, and would make the ramp's shape
+                    // depend on the block size in a way this does not.
+                    const f32 v0 = autoValueAt(*set, l, b0, 0.f);
+                    const f32 v1 = autoValueAt(*set, l, b1, 0.f);
+                    ab.vol0 = busGain((f64)(l.xform == (i32)AutoXform::Fader ? faderToGain(v0) : v0));
+                    ab.vol1 = busGain((f64)(l.xform == (i32)AutoXform::Fader ? faderToGain(v1) : v1));
+                    ab.hasVol = ab.any = true;
+                    break;
+                }
+                case AutoTarget::TrackPan:
+                    ab.pan0 = autoPan(autoValueAt(*set, l, b0, 0.f));
+                    ab.pan1 = autoPan(autoValueAt(*set, l, b1, 0.f));
+                    ab.hasPan = ab.any = true;
+                    break;
+                case AutoTarget::TrackSend: {
+                    if (l.index < 0 || l.index >= kMaxReturns) break;
+                    ab.snd0[l.index] = busGain((f64)autoValueAt(*set, l, b0, 0.f));
+                    ab.snd1[l.index] = busGain((f64)autoValueAt(*set, l, b1, 0.f));
+                    ab.sendMask |= 1u << l.index;
+                    ab.any = true;
+                    break;
+                }
+                case AutoTarget::DeviceParam: {
+                    // Not ramped, because there is nothing to ramp: a plugin
+                    // parameter is one value handed over once, and every
+                    // backend's own smoothing is the plugin's business.
+                    if (!t.chain || l.devSlot < 0 || l.devSlot >= kMaxChainFx ||
+                        l.devSlot >= t.chain->count) break;
+                    PluginInstance* fx = t.chain->fx[l.devSlot];
+                    if (!fx || l.index < 0 || l.index >= fx->paramCount()) break;
+
+                    // The one place §1's rule cannot hold, so the first write
+                    // takes a copy of what it is destroying. getParam() is a
+                    // plain load in every backend in the tree, which is what
+                    // makes this safe here.
+                    AutoTrack::Hold& h = at.hold[li];
+                    if (!h.used) {
+                        h.devSlot = l.devSlot;
+                        h.param   = l.index;
+                        h.was     = fx->getParam(l.index);
+                        h.used    = true;
+                        at.anyHold = true;
+                    }
+
+                    const f32 v = autoValueAt(*set, l, b0, 0.f);
+                    if (!fx->setParamRT(l.index, v)) {
+                        // This backend has no realtime parameter path. Say so
+                        // once — a silently ignored lane is the worst outcome:
+                        // the envelope is drawn, the sound does not move, and
+                        // nothing says why — and never call again for this set.
+                        // The hold is dropped without a write-back: nothing was
+                        // ever applied, so there is nothing to undo.
+                        at.inert |= 1u << li;
+                        h.used = false; h.devSlot = -1; h.param = -1;
+                        emitCritical(this, evts_,
+                                     {Ev::AutoLaneInert, ti, t.playing, (f64)li});
+                    }
+                    break;
+                }
+                default: break;                  // None, and the reserved codes
+                }
+            }
+        }
+    };
+    autoPass(false);
 
     // Appends [from, to) of the capture input to every take in progress. This
     // runs inside the sub-block loop so a take starts and ends on the exact
@@ -1709,6 +2110,10 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
         if (anyTail) renderRange(outL, outR, 0, n);
     }
 
+    // Clips that started inside the block just rendered. See the note on
+    // autoPass: still before any chain runs, so class B keeps its ordering.
+    autoPass(true);
+
     // Per-track post stage. The launch-boundary loop above splits *voice*
     // rendering only; everything from here runs exactly once over the whole
     // block, because a plugin must see one contiguous run per callback and
@@ -1732,8 +2137,12 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
         retLive[r] = returns_[r].chain && returns_[r].chain->count > 0;
     for (int ti = 0; ti < kMaxTracks; ++ti) {
         if (!live[ti]) continue;
+        // An automated send counts even when the user's own level is zero:
+        // moving signal into a return is exactly what the envelope is for, and
+        // a return whose scratch was never cleared would sum this block's
+        // contribution on top of the last one's.
         for (int r = 0; r < kMaxReturns; ++r)
-            if (tracks_[ti].send[r] != 0.f) retLive[r] = true;
+            if (tracks_[ti].send[r] != 0.f || (autoA[ti].sendMask & (1u << r))) retLive[r] = true;
     }
     for (int r = 0; r < kMaxReturns; ++r)
         if (retLive[r]) {
@@ -1802,38 +2211,95 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
         if (comp) pdcDelay(*pdc, ti, t.fxL, t.fxR, n, pdc->maxTrackLat - pdc->trackLat[ti]);
 
         const bool audible = !t.mute && (!anySolo || t.solo);
-        const f32 pgL = t.pan <= 0.f ? 1.f : 1.f - t.pan;
-        const f32 pgR = t.pan >= 0.f ? 1.f : 1.f + t.pan;
-        const f32 gL = audible ? t.vol * pgL : 0.f;
-        const f32 gR = audible ? t.vol * pgR : 0.f;
+        const AutoBlock& ab = autoA[ti];
 
-        // Meters are post-fader: what the user sees is what the master gets.
-        f32 pkL = 0.f, pkR = 0.f;
-        for (int i = 0; i < n; ++i) {
-            const f32 l = t.fxL[i] * gL;
-            const f32 r = t.fxR[i] * gR;
-            outL[i] += l;
-            outR[i] += r;
-            const f32 al = std::fabs(l), ar = std::fabs(r);
-            if (al > pkL) pkL = al;
-            if (ar > pkR) pkR = ar;
-        }
-        if (pkL > t.mL) t.mL = pkL;
-        if (pkR > t.mR) t.mR = pkR;
+        // The two branches below are the same mixdown twice, and the split is
+        // deliberate: a track with no class-A lane must keep the constant-gain
+        // path it has always had, byte for byte, which is the same "the
+        // ordinary case stays free" discipline the delay compensation states
+        // for comp == false. The render gates prove it.
+        if (!ab.any) {
+            const f32 pgL = t.pan <= 0.f ? 1.f : 1.f - t.pan;
+            const f32 pgR = t.pan >= 0.f ? 1.f : 1.f + t.pan;
+            const f32 gL = audible ? t.vol * pgL : 0.f;
+            const f32 gR = audible ? t.vol * pgR : 0.f;
 
-        // Post-fader sends, Live's default tap: what the return hears is what
-        // the master hears from this track, scaled. Pan, mute and solo are all
-        // already in gL/gR, so a muted track sends nothing and a track silenced
-        // by someone else's solo sends nothing either — audibility is one
-        // decision, made once, for both destinations.
-        for (int r = 0; r < kMaxReturns; ++r) {
-            const f32 s = t.send[r];
-            if (s == 0.f || !retLive[r]) continue;
-            Return& rt = returns_[r];
-            const f32 sL = gL * s, sR = gR * s;
+            // Meters are post-fader: what the user sees is what the master gets.
+            f32 pkL = 0.f, pkR = 0.f;
             for (int i = 0; i < n; ++i) {
-                rt.fxL[i] += t.fxL[i] * sL;
-                rt.fxR[i] += t.fxR[i] * sR;
+                const f32 l = t.fxL[i] * gL;
+                const f32 r = t.fxR[i] * gR;
+                outL[i] += l;
+                outR[i] += r;
+                const f32 al = std::fabs(l), ar = std::fabs(r);
+                if (al > pkL) pkL = al;
+                if (ar > pkR) pkR = ar;
+            }
+            if (pkL > t.mL) t.mL = pkL;
+            if (pkR > t.mR) t.mR = pkR;
+
+            // Post-fader sends, Live's default tap: what the return hears is what
+            // the master hears from this track, scaled. Pan, mute and solo are all
+            // already in gL/gR, so a muted track sends nothing and a track silenced
+            // by someone else's solo sends nothing either — audibility is one
+            // decision, made once, for both destinations.
+            for (int r = 0; r < kMaxReturns; ++r) {
+                const f32 s = t.send[r];
+                if (s == 0.f || !retLive[r]) continue;
+                Return& rt = returns_[r];
+                const f32 sL = gL * s, sR = gR * s;
+                for (int i = 0; i < n; ++i) {
+                    rt.fxL[i] += t.fxL[i] * sL;
+                    rt.fxR[i] += t.fxR[i] * sR;
+                }
+            }
+        } else {
+            // The automated track: the same arithmetic with the gain moving.
+            // A step in a gain once per callback is a zipper, and the ramp is
+            // free — this loop already runs per sample and already multiplies
+            // by gL/gR, so it costs two adds. The interpolated quantity is the
+            // derived one (§3.2): the fader position has already been through
+            // faderToGain, and t.vol/t.pan are untouched.
+            const f32 v0 = ab.hasVol ? ab.vol0 : t.vol;
+            const f32 v1 = ab.hasVol ? ab.vol1 : t.vol;
+            const f32 p0 = ab.hasPan ? ab.pan0 : t.pan;
+            const f32 p1 = ab.hasPan ? ab.pan1 : t.pan;
+            const f32 gL0 = audible ? v0 * (p0 <= 0.f ? 1.f : 1.f - p0) : 0.f;
+            const f32 gR0 = audible ? v0 * (p0 >= 0.f ? 1.f : 1.f + p0) : 0.f;
+            const f32 gL1 = audible ? v1 * (p1 <= 0.f ? 1.f : 1.f - p1) : 0.f;
+            const f32 gR1 = audible ? v1 * (p1 >= 0.f ? 1.f : 1.f + p1) : 0.f;
+            const f32 dL = (gL1 - gL0) / (f32)n, dR = (gR1 - gR0) / (f32)n;
+
+            f32 gL = gL0, gR = gR0, pkL = 0.f, pkR = 0.f;
+            for (int i = 0; i < n; ++i) {
+                const f32 l = t.fxL[i] * gL;
+                const f32 r = t.fxR[i] * gR;
+                outL[i] += l;
+                outR[i] += r;
+                const f32 al = std::fabs(l), ar = std::fabs(r);
+                if (al > pkL) pkL = al;
+                if (ar > pkR) pkR = ar;
+                gL += dL; gR += dR;
+            }
+            if (pkL > t.mL) t.mL = pkL;
+            if (pkR > t.mR) t.mR = pkR;
+
+            // The send tap re-walks the same fader ramp — the same adds in the
+            // same order, so the two agree sample for sample — and rides its
+            // own send ramp on top of it.
+            for (int r = 0; r < kMaxReturns; ++r) {
+                const bool autoSend = (ab.sendMask & (1u << r)) != 0;
+                const f32 s0 = autoSend ? ab.snd0[r] : t.send[r];
+                const f32 s1 = autoSend ? ab.snd1[r] : t.send[r];
+                if ((s0 == 0.f && s1 == 0.f) || !retLive[r]) continue;
+                Return& rt = returns_[r];
+                const f32 ds = (s1 - s0) / (f32)n;
+                f32 sgL = gL0, sgR = gR0, s = s0;
+                for (int i = 0; i < n; ++i) {
+                    rt.fxL[i] += t.fxL[i] * (sgL * s);
+                    rt.fxR[i] += t.fxR[i] * (sgR * s);
+                    sgL += dL; sgR += dR; s += ds;
+                }
             }
         }
     }

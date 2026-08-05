@@ -412,6 +412,7 @@ public:
         // audio thread, so we refuse instead. Same rule as the LV2 backend.
         if (bypassed_ || !processing_ || nframes > maxBlock_ || outChans_ == 0) {
             midiCount_ = 0;                   // events belong to this block only
+            rtParamCount_ = 0;                // and so do automation writes
             passthrough(in, out, channels, nframes);
             return;
         }
@@ -506,6 +507,30 @@ public:
             LOGW("clap: param queue full, %s dropped", pi.name.c_str());
     }
 
+    // REALTIME (host.h): the automation path, and the one backend where it is
+    // NOT setParam's body. queue_ is a Ring that tolerates exactly one
+    // producer, and that producer is the GUI thread; the audio thread pushing
+    // to it as well would race the head pointer, which is the same bug the two
+    // MIDI rings exist to avoid. So the audio thread gets an array it owns
+    // outright, exactly as midi() already has — appended to here, drained and
+    // zeroed in buildEventList(), never grown.
+    //
+    // values_ is written too so getParam() stays truthful: it is what the UI
+    // reads and what the engine captures as the pre-automation value.
+    bool setParamRT(int i, f32 v) override {
+        if (i < 0 || i >= (int)params_.size()) return true;
+        const ParamInfo& pi = params_[(size_t)i];
+        const f32 clamped = clampv(v, pi.min, pi.max);
+        values_[(size_t)i] = clamped;
+        // Past the cap the value is dropped rather than the array grown. 64 is
+        // four times kMaxRtAutoLanes, so reaching it means something other than
+        // clip envelopes is driving this, and one block of staleness is the
+        // right failure for that.
+        if (rtParamCount_ < kMaxRtParams)
+            rtParams_[rtParamCount_++] = ParamMsg{ (u32)i, clamped };
+        return true;
+    }
+
     const PluginDesc& desc() const override { return desc_; }
 
     // Cached by readLatency() during prepare() and constant afterwards, so this
@@ -598,6 +623,33 @@ private:
             e.value           = (double)m.value;
         }
 
+        // The audio thread's own parameter writes, emitted AFTER the GUI queue
+        // and before any note traffic. Both sit at time 0 so the list stays
+        // sorted, and the order between them is the precedence decision: when a
+        // stale queued knob value and an automated value land in the same
+        // block, the automated one is what the plugin ends the block with.
+        // (CLAP events carry header.time, so this is also the backend where
+        // sub-block-accurate automation is free the day someone wants it — the
+        // array entries just need a frame field.)
+        for (int i = 0; i < rtParamCount_ && eventCount_ < (uint32_t)kMaxEvents; ++i) {
+            const ParamMsg& rm = rtParams_[i];
+            if (rm.index >= paramIds_.size()) continue;
+            clap_event_param_value_t& e = events_[eventCount_++].param;
+            e.header.size     = sizeof(clap_event_param_value_t);
+            e.header.time     = 0;
+            e.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            e.header.type     = CLAP_EVENT_PARAM_VALUE;
+            e.header.flags    = 0;
+            e.param_id        = paramIds_[rm.index];
+            e.cookie          = cookies_[rm.index];
+            e.note_id         = -1;
+            e.port_index      = -1;
+            e.channel         = -1;
+            e.key             = -1;
+            e.value           = (double)rm.value;
+        }
+        rtParamCount_ = 0;
+
         uint32_t lastFrame = 0;
         for (int i = 0; i < midiCount_ && eventCount_ < (uint32_t)kMaxEvents; ++i) {
             const MidiMsg& msg = midi_[i];
@@ -684,6 +736,7 @@ private:
         inChans_ = outChans_ = 0;
         eventCount_ = 0;
         midiCount_ = 0;
+        rtParamCount_ = 0;
         notePort_ = -1;
         noteDialectClap_ = false;
         latency_ = 0;
@@ -837,6 +890,12 @@ private:
     std::vector<f32>       values_;
 
     Ring<ParamMsg, kQueueSize> queue_;
+    // The audio thread's own parameter path (setParamRT). Owned outright by
+    // the audio thread — appended in setParamRT, drained in buildEventList —
+    // so it needs no ring, no atomics and no second producer rule.
+    static constexpr int       kMaxRtParams = 64;    // >= kMaxRtAutoLanes, with room
+    ParamMsg                   rtParams_[kMaxRtParams]{};
+    int                        rtParamCount_ = 0;
     Event                      events_[kMaxEvents]{};
     uint32_t                   eventCount_ = 0;
     MidiMsg                    midi_[kMaxMidiEvents]{};

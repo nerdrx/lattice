@@ -562,9 +562,13 @@ inline constexpr bool eventIsScalar(u32 type) {
     switch ((Ev)type) {
         case Ev::ClipStarted: case Ev::ClipStopped: case Ev::TrackStopped:
         case Ev::Xrun: case Ev::TransportStopped: case Ev::RecordStarted:
+        // AutoLaneInert names a lane by index — no payload, so it crosses.
+        case Ev::AutoLaneInert:
             return true;
         case Ev::ChainRetired: case Ev::RecordFinished: case Ev::NotesRetired:
         case Ev::MidiRecordFinished:
+        // AutosRetired carries a pointer into GUI memory, like NotesRetired.
+        case Ev::AutosRetired:
             return false;
     }
     return false;

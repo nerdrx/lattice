@@ -96,6 +96,13 @@ struct RtAutoSet {
     int pointCount = 0;
 };
 
+// The one evaluator, shared by the engine and the UI so a drawn envelope and
+// an applied one cannot disagree. Pure: bisects the lane's sorted window,
+// interpolates linearly (a non-zero `curve` is reserved and renders linear),
+// clamps to the lane's [lo,hi], holds before the first point and after the
+// last, and returns `fallback` unchanged for an empty lane.
+f32 autoValueAt(const RtAutoSet& set, const RtAutoLane& lane, f64 beat, f32 fallback);
+
 // Realtime view of a clip. The GUI fills one of these and ships it across;
 // the audio thread only reads. `data` points into a SampleBuffer the GUI
 // keeps alive for the lifetime of the session; `notes` follows the RtNote
