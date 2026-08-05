@@ -1,4 +1,5 @@
 #include "app.h"
+#include "pianoroll.h"
 #include "../core/project.h"
 #include "../gfx/gl.h"
 #include <algorithm>
@@ -30,6 +31,16 @@ constexpr f32 gutter      = 1.f;
 // that no realistic loop or verse runs out of room. The engine stops at the
 // capacity it was given, so overrunning truncates rather than corrupts.
 constexpr f64 kRecordSeconds = 120.0;
+
+// How many notes a single MIDI take can hold. Four thousand is more than an
+// hour of dense playing, and the array is 24 bytes a note, so the whole buffer
+// is under 100 kB — cheap enough not to bother sizing it to the material.
+constexpr int kRecordNotes = 4096;
+
+// App owns a PianoRoll through a unique_ptr, so the two functions that have to
+// see the whole type live here rather than in the header.
+App::App()  = default;
+App::~App() = default;
 
 static f64 nowSeconds() {
     using namespace std::chrono;
@@ -173,7 +184,11 @@ void App::shutdown() {
     for (const RtChain*& c : published_) { delete c; c = nullptr; }
     for (RetiredChain& rc : retiring_) delete rc.chain;
     retiring_.clear();          // frees the instances the chains had dropped
-    for (PendingRec& p : pendingRecs_) delete[] p.buf;
+    for (auto& row : publishedNotes_)
+        for (const RtNote*& n : row) { delete[] n; n = nullptr; }
+    for (const RtNote* n : retiringNotes_) delete[] n;
+    retiringNotes_.clear();
+    for (PendingRec& p : pendingRecs_) { delete[] p.buf; delete[] p.notes; }
     pendingRecs_.clear();
     // Instances still on tracks die with ses_ when App is destroyed, which is
     // after this point and therefore also after the audio thread is gone.
@@ -201,23 +216,64 @@ void App::send(Cmd t, i32 a, i32 b, f64 x) {
     engine_.pushCommand(c);
 }
 
+void App::publishNotes(int track, int slot, const RtNote* fresh) {
+    const RtNote* old = publishedNotes_[track][slot];
+    publishedNotes_[track][slot] = fresh;
+    // The engine only announces a *replaced* array, and only when it differs
+    // from the incoming one; an entry that would never be announced must not be
+    // queued for a retirement that will never arrive.
+    if (old && old != fresh) retiringNotes_.push_back(old);
+}
+
 void App::pushClip(int track, int slot) {
     Command c;
     c.type = Cmd::SetClip;
     c.a = track; c.b = slot;
     const ClipModel& m = ses_.tracks[track].slots[slot];
-    if (!m.valid()) { c.type = Cmd::ClearClip; engine_.pushCommand(c); return; }
+    const bool midi = m.valid() && m.kind == ClipKind::Midi;
+
+    // Snapshot the notes before anything is sent: the engine reads this array
+    // for as long as it holds the clip, so it cannot be the GUI's live vector.
+    RtNote* fresh = nullptr;
+    if (midi && !m.notes.empty()) {
+        fresh = new (std::nothrow) RtNote[m.notes.size()];
+        if (!fresh) { status_ = "Out of memory - clip not updated"; return; }
+        for (size_t i = 0; i < m.notes.size(); ++i) {
+            const NoteModel& n = m.notes[i];
+            fresh[i].beat  = n.beat;
+            fresh[i].len   = n.len;
+            fresh[i].pitch = n.pitch;
+            fresh[i].vel   = n.vel;
+        }
+    }
+
+    if (!m.valid()) {
+        c.type = Cmd::ClearClip;
+        if (!engine_.pushCommand(c)) {
+            LOGW("command ring full - slot %d/%d not cleared", track, slot);
+            return;
+        }
+        // A cleared MIDI slot retires its notes exactly like a replaced one.
+        publishNotes(track, slot, nullptr);
+        return;
+    }
 
     RtClip rc;
-    rc.data         = m.sample->data.data();
-    rc.frames       = m.sample->frames;
-    rc.channels     = m.sample->channels;
-    rc.loopStart    = m.loopStart;
-    rc.loopEnd      = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
-    rc.clipBpm      = m.clipBpm;
+    if (midi) {
+        rc.isMidi     = true;
+        rc.notes      = fresh;
+        rc.noteCount  = (int)m.notes.size();
+    } else {
+        rc.data       = m.sample->data.data();
+        rc.frames     = m.sample->frames;
+        rc.channels   = m.sample->channels;
+        rc.loopStart  = m.loopStart;
+        rc.loopEnd    = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
+        rc.clipBpm    = m.clipBpm;
+        rc.warp       = (int)m.warp;
+    }
     rc.lengthBeats  = m.lengthBeats;
     rc.gain         = m.gain;
-    rc.warp         = (int)m.warp;
     rc.loop         = m.loop;
     rc.quantumIdx   = m.quantumIdx;
     rc.prob         = m.prob;
@@ -225,7 +281,16 @@ void App::pushClip(int track, int slot) {
     rc.followBeats  = m.followBeats;
     rc.valid        = true;
     c.clip = rc;
-    engine_.pushCommand(c);
+    if (!engine_.pushCommand(c)) {
+        // The engine never saw the array, so it is still solely ours and the
+        // slot keeps whatever it was already playing.
+        LOGW("command ring full - slot %d/%d not updated", track, slot);
+        delete[] fresh;
+        return;
+    }
+    // Unconditional, not only for MIDI clips: a slot that just turned into an
+    // audio clip still has an old note array to hand back.
+    publishNotes(track, slot, fresh);
 }
 
 void App::pushTrack(int t) {
@@ -281,6 +346,27 @@ void App::pumpEngineEvents() {
         }
         if (e.type == Ev::RecordFinished) {
             finishRecording(e);
+            continue;
+        }
+        if (e.type == Ev::MidiRecordFinished) {
+            finishMidiRecording(e);
+            continue;
+        }
+        if (e.type == Ev::NotesRetired) {
+            // The audio thread has stopped reading this array. Same handshake
+            // as ChainRetired, and the same refusal to free a pointer we have
+            // no record of owning.
+            const RtNote* old = (const RtNote*)e.p;
+            if (!old) continue;
+            auto it = retiringNotes_.begin();
+            for (; it != retiringNotes_.end(); ++it) if (*it == old) break;
+            if (it == retiringNotes_.end()) {
+                LOGW("NotesRetired for an unknown array %p - leaking it rather "
+                     "than freeing a pointer we do not own", (const void*)old);
+                continue;
+            }
+            delete[] *it;
+            retiringNotes_.erase(it);
             continue;
         }
         // Everything else is reserved for undo hooks; the UI polls atomics for
@@ -619,6 +705,9 @@ bool App::openProject(const std::string& path) {
     selTrack_ = clampv(selTrack_, 0, (int)ses_.tracks.size() - 1);
     selSlot_  = clampv(selSlot_,  0, (int)ses_.scenes.size() - 1);
     selDevice_ = -1;
+    // The tracks this index referred to are gone; the arms in the loaded set
+    // are the file's, not ours to take back.
+    autoArmed_ = -1;
 
     status_ = "Loaded " + path;
     materializeDevices();          // may replace the status with its own warning
@@ -654,6 +743,10 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
     // it changed, but anything pointing at the clip (automation, a controller
     // mapping) still means this clip.
     if (!m.uid) m.uid = ses_.newUid();
+    // Dropping a sample onto a pattern turns the slot back into an audio clip;
+    // pushClip retires the notes the engine was holding for it.
+    m.kind = ClipKind::Audio;
+    m.notes.clear();
     m.sample = sb;
     m.path = path;
     m.name = sb->name;
@@ -668,13 +761,68 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
     m.warp = Warp::Beats;
     m.loop = true;
     pushClip(track, slot);
-    selTrack_ = track; selSlot_ = slot;
+    selectTrack(track); selSlot_ = slot;
     status_ = "Loaded " + m.name;
 }
 
 void App::clearClip(int track, int slot) {
     ses_.tracks[track].slots[slot] = ClipModel{};
-    send(Cmd::ClearClip, track, slot);
+    // Through pushClip rather than a bare ClearClip: an emptied slot still has
+    // to hand its note array back before anything frees it.
+    pushClip(track, slot);
+}
+
+// Note-capable means the chain can be *played*: an instrument, or an effect
+// that takes MIDI in (an arpeggiator, a MIDI-controlled filter). Either makes
+// the track's empty slots MIDI targets rather than audio ones.
+bool App::trackHasNoteDevice(int track) const {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return false;
+    for (const DeviceModel& d : ses_.tracks[track].devices)
+        if (d.desc.kind == PluginKind::Instrument || d.desc.hasMidiIn) return true;
+    return false;
+}
+
+// An empty MIDI clip is a real, launchable, editable entity — Live's "create
+// empty clip", and the only way to get a pattern without playing one in.
+void App::createMidiClip(int track, int slot) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
+
+    ClipModel& m = ses_.tracks[track].slots[slot];
+    m = ClipModel{};
+    m.uid = ses_.newUid();
+    m.kind = ClipKind::Midi;
+    char buf[32];
+    snprintf(buf, sizeof buf, "MIDI %d", midiClipNo_++);
+    m.name = buf;
+    m.colorIdx = ses_.tracks[track].colorIdx;
+    m.lengthBeats = 4.0;                       // one bar in 4/4, like Live
+    m.loop = true;
+    pushClip(track, slot);
+    selectTrack(track); selSlot_ = slot;
+    detailTab_ = DetailTab::Clip;
+    status_ = "New " + m.name;
+}
+
+// Live's exclusive record-arm, which is what makes the computer keyboard and a
+// controller play the track you just clicked on without a second gesture. The
+// arm this hands out is ours to take back; one the user set by hand is not.
+void App::selectTrack(int track) {
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    selTrack_ = track;
+    if (autoArmed_ == track) return;
+
+    if (autoArmed_ >= 0 && autoArmed_ < (int)ses_.tracks.size()) {
+        TrackModel& prev = ses_.tracks[autoArmed_];
+        if (prev.arm) { prev.arm = false; send(Cmd::TrackArm, autoArmed_, 0); }
+    }
+    autoArmed_ = -1;
+
+    TrackModel& t = ses_.tracks[track];
+    if (t.arm) return;              // armed by hand: leave it, and do not claim it
+    t.arm = true;
+    send(Cmd::TrackArm, track, 1);
+    autoArmed_ = track;
 }
 
 void App::addTrack() {
@@ -717,44 +865,67 @@ void App::startRecording(int track, int slot) {
         return;
     }
 
-    const i64 cap = (i64)std::llround(engine_.sampleRate() * kRecordSeconds);
-    // Zeroed rather than raw: a take that stops early leaves the tail unwritten,
-    // and silence is a far better failure than whatever was on that page.
-    f32* buf = new (std::nothrow) f32[(size_t)cap * 2]();
-    if (!buf) {
-        status_ = "Out of memory - recording not started";
-        return;
-    }
+    // What the track can play decides what the take captures. A chain with an
+    // instrument on it wants the notes, not the microphone.
+    const bool midi = trackHasNoteDevice(track);
 
+    PendingRec pr;
+    pr.track = track; pr.slot = slot; pr.midi = midi;
     Command c;
-    c.type = Cmd::RecordSlot;
     c.a = track; c.b = slot;
-    c.p = buf;
-    c.x = (f64)cap;
+
+    if (midi) {
+        RtNote* notes = new (std::nothrow) RtNote[kRecordNotes]();
+        if (!notes) {
+            status_ = "Out of memory - recording not started";
+            return;
+        }
+        pr.notes = notes;
+        pr.cap = kRecordNotes;
+        c.type = Cmd::RecordMidiSlot;
+        c.p = notes;
+    } else {
+        const i64 cap = (i64)std::llround(engine_.sampleRate() * kRecordSeconds);
+        // Zeroed rather than raw: a take that stops early leaves the tail
+        // unwritten, and silence is a far better failure than whatever was on
+        // that page.
+        f32* buf = new (std::nothrow) f32[(size_t)cap * 2]();
+        if (!buf) {
+            status_ = "Out of memory - recording not started";
+            return;
+        }
+        pr.buf = buf;
+        pr.cap = cap;
+        c.type = Cmd::RecordSlot;
+        c.p = buf;
+    }
+    c.x = (f64)pr.cap;
+
     if (!engine_.pushCommand(c)) {
         // The engine never saw the buffer, so it is still solely ours.
-        delete[] buf;
+        delete[] pr.buf;
+        delete[] pr.notes;
         status_ = "Engine busy - recording not started";
         return;
     }
 
-    pendingRecs_.push_back(PendingRec{buf, cap, track, slot});
-    selTrack_ = track; selSlot_ = slot;
-    status_ = "Record armed";
+    pendingRecs_.push_back(pr);
+    selectTrack(track); selSlot_ = slot;
+    status_ = midi ? "Record armed (MIDI)" : "Record armed";
 }
 
 void App::stopRecording(int track) {
     for (const PendingRec& p : pendingRecs_) {
         if (p.track != track) continue;
         // The same command toggles. Resend the buffer it was started with
-        // rather than a null: the stop is a second RecordSlot for this slot,
+        // rather than a null: the stop is a second Record*Slot for this slot,
         // and repeating the payload means an engine that simply reassigns
         // recBuf lands on exactly what it already had.
         Command c;
-        c.type = Cmd::RecordSlot;
+        c.type = p.midi ? Cmd::RecordMidiSlot : Cmd::RecordSlot;
         c.a = track; c.b = p.slot;
-        c.p = p.buf;
-        c.x = (f64)p.capFrames;
+        c.p = p.midi ? (void*)p.notes : (void*)p.buf;
+        c.x = (f64)p.cap;
         if (!engine_.pushCommand(c)) status_ = "Engine busy - still recording";
         return;
     }
@@ -765,7 +936,7 @@ void App::finishRecording(const Event& e) {
     if (!buf) return;
 
     auto it = pendingRecs_.begin();
-    for (; it != pendingRecs_.end(); ++it) if (it->buf == buf) break;
+    for (; it != pendingRecs_.end(); ++it) if (!it->midi && it->buf == buf) break;
     if (it == pendingRecs_.end()) {
         LOGW("RecordFinished for an unknown buffer %p - leaking it rather than "
              "freeing a pointer we do not own", (const void*)buf);
@@ -798,7 +969,7 @@ void App::finishRecording(const Event& e) {
             m.warp = Warp::Beats;
             m.loop = true;
             pushClip(track, slot);
-            selTrack_ = track; selSlot_ = slot;
+            selectTrack(track); selSlot_ = slot;
             status_ = std::string("Recorded ") + name;
         } else {
             status_ = "Recording failed";
@@ -806,6 +977,83 @@ void App::finishRecording(const Event& e) {
     } else if (frames <= 0) {
         // Stopped before the quantized start ever fired: nothing was captured,
         // so there is no clip to make and the slot stays empty.
+        status_ = "Recording cancelled";
+    }
+
+    delete[] buf;
+    pendingRecs_.erase(it);
+}
+
+// Ev::MidiRecordFinished: the same hand-back as an audio take, but the payload
+// is the note buffer and turning it into a clip is a copy rather than a resample.
+void App::finishMidiRecording(const Event& e) {
+    RtNote* buf = (RtNote*)e.p;
+    if (!buf) return;
+
+    auto it = pendingRecs_.begin();
+    for (; it != pendingRecs_.end(); ++it) if (it->midi && it->notes == buf) break;
+    if (it == pendingRecs_.end()) {
+        LOGW("MidiRecordFinished for an unknown buffer %p - leaking it rather "
+             "than freeing a pointer we do not own", (const void*)buf);
+        return;
+    }
+
+    const int track = e.a, slot = e.b;
+    const int count = clampv((int)e.x, 0, (int)it->cap);
+    const bool inRange = track >= 0 && track < (int)ses_.tracks.size() &&
+                         slot  >= 0 && slot  < (int)ses_.scenes.size();
+
+    if (count > 0 && inRange) {
+        // Length. The engine hands back notes and a count, not a duration, so
+        // the take's musical length is derived from two GUI-side facts and the
+        // longer one wins: how far the transport has moved since the quantized
+        // start reached us in Ev::RecordStarted, and where the last note ends.
+        // (The first is the honest answer for a take that ends in silence; the
+        // second covers a note still sounding as the stop boundary lands, and
+        // is the only one available if RecordStarted was missed.) That is then
+        // rounded UP to a whole bar, so a pattern loops in time with the set
+        // instead of at whatever instant the second click happened.
+        f64 endBeat = 0.0;
+        for (int i = 0; i < count; ++i) endBeat = std::max(endBeat, buf[i].beat + buf[i].len);
+        endBeat = std::max(endBeat, engine_.beat.load() - recStartBeat_[track]);
+        const f64 barBeats = std::max(1, ses_.sigNum);
+        const f64 bars = std::max(1.0, std::ceil(endBeat / barBeats - 1e-9));
+
+        char name[32];
+        snprintf(name, sizeof name, "Rec %d", recTakeNo_++);
+
+        ClipModel& m = ses_.tracks[track].slots[slot];
+        m = ClipModel{};
+        m.uid = ses_.newUid();
+        m.kind = ClipKind::Midi;
+        m.name = name;
+        m.colorIdx = ses_.tracks[track].colorIdx;
+        m.clipBpm = ses_.tempo;
+        m.lengthBeats = bars * barBeats;
+        m.gain = 1.f;
+        m.loop = true;
+        m.notes.reserve((size_t)count);
+        for (int i = 0; i < count; ++i) {
+            NoteModel n;
+            n.beat  = std::max(0.0, buf[i].beat);
+            n.len   = std::max(1.0 / 64.0, buf[i].len);
+            n.pitch = (u8)clampv((int)buf[i].pitch, 0, 127);
+            n.vel   = (u8)clampv((int)buf[i].vel, 1, 127);
+            m.notes.push_back(n);
+        }
+        // The engine pairs ons with offs as they arrive, so a short note inside
+        // a long one comes back out of order. Everything downstream — the roll,
+        // the RtNote array, the engine's own scheduler — wants them by beat.
+        std::stable_sort(m.notes.begin(), m.notes.end(),
+                         [](const NoteModel& a, const NoteModel& b) { return a.beat < b.beat; });
+
+        pushClip(track, slot);
+        selectTrack(track); selSlot_ = slot;
+        detailTab_ = DetailTab::Clip;
+        char st[64];
+        snprintf(st, sizeof st, "Recorded %s  -  %d notes", name, count);
+        status_ = st;
+    } else if (count <= 0) {
         status_ = "Recording cancelled";
     }
 
@@ -944,8 +1192,10 @@ void App::handleShortcuts() {
         clearClip(selTrack_, selSlot_);
 
     const int nt = (int)ses_.tracks.size(), ns = (int)ses_.scenes.size();
-    if (in.keyPressed[KeyLeft])  selTrack_ = clampv(selTrack_ - 1, 0, nt - 1);
-    if (in.keyPressed[KeyRight]) selTrack_ = clampv(selTrack_ + 1, 0, nt - 1);
+    // Through selectTrack so arrowing across the grid arms what it lands on,
+    // exactly as clicking does.
+    if (in.keyPressed[KeyLeft])  selectTrack(clampv(selTrack_ - 1, 0, nt - 1));
+    if (in.keyPressed[KeyRight]) selectTrack(clampv(selTrack_ + 1, 0, nt - 1));
     if (in.keyPressed[KeyUp])    selSlot_  = clampv(selSlot_ - 1, 0, ns - 1);
     if (in.keyPressed[KeyDown])  selSlot_  = clampv(selSlot_ + 1, 0, ns - 1);
     if (in.keyPressed[KeyEnter] && !in.ctrl()) {
@@ -972,10 +1222,21 @@ void App::updateKbdPiano() {
     const KbdPiano::Result res = kbd_.update(in.keyDown, live,
         [this](const MidiMsg& m) { engine_.pushMidi(m); });
 
-    if (res.baseChanged || res.velChanged) {
+    if (res.baseChanged) {
         char buf[96];
         snprintf(buf, sizeof buf, "Keyboard octave C%d · velocity %d", kbd_.octave(), kbd_.velocity());
         status_ = buf;
+    }
+
+    // The commonest way to conclude the keyboard is broken is to switch it on
+    // with nothing armed: the notes reach the engine and go nowhere, silently.
+    // Said once when the condition arrives, not once a frame.
+    bool anyArm = false;
+    for (const TrackModel& t : ses_.tracks) if (t.arm) { anyArm = true; break; }
+    const bool hint = kbdMidi_ && !anyArm;
+    if (hint != kbdNoArmHint_) {
+        kbdNoArmHint_ = hint;
+        if (hint) status_ = "Arm a track to hear the keyboard (auto-arm: click a track)";
     }
 }
 
@@ -984,9 +1245,9 @@ void App::toggleKbdMidi() {
     if (kbdMidi_) {
         char buf[192];
         snprintf(buf, sizeof buf,
-                 "Computer MIDI Keyboard on — ASDFGHJKL white / WETYUOP black, "
-                 "Z X octave (C%d), C V velocity (%d), Ctrl+Shift+K off",
-                 kbd_.octave(), kbd_.velocity());
+                 "Computer MIDI Keyboard on — ZXCVBNM lower octave (C%d), QWERTYU / IOP above, "
+                 "SDGHJ + 23567 90 black, PgUp/PgDn octave, Ctrl+Shift+K off",
+                 kbd_.octave());
         status_ = buf;
     } else {
         // Anything still held has to be let go here: the key release that would
@@ -1122,8 +1383,20 @@ void App::drawControlBar(const Rect& r) {
     // Computer MIDI keyboard. It belongs with the audio/MIDI readouts because
     // it is an input status: while it is lit the letter keys are notes and not
     // shortcuts, and that must be visible without opening anything. The label
-    // carries the octave so Z / X have somewhere to show their work.
+    // carries the octave so PgUp / PgDn have somewhere to show their work, and
+    // velocity sits next to it as a number: the FL layout spends C and V on
+    // notes, so there are no keys left to nudge it with.
     {
+        f64 vel = (f64)kbd_.velocity();
+        Rect vr{rx - 34 * s, cy, 34 * s, h};
+        if (ui_.dragNumber(uiId(16, 0), vr, &vel, 1.0, 127.0, 0.35, "%.0f")) {
+            kbd_.setVelocity((int)std::lround(vel));
+            char buf[64];
+            snprintf(buf, sizeof buf, "Keyboard velocity %d", kbd_.velocity());
+            status_ = buf;
+        }
+        rx = vr.x - 3 * s;
+
         char buf[24];
         snprintf(buf, sizeof buf, "KBD C%d", kbd_.octave());
         Rect kr{rx - 58 * s, cy, 58 * s, h};
@@ -1284,7 +1557,7 @@ void App::drawTrackHeaders(const Rect& r, f32 scrollX) {
 
         if (ui_.textField(uiId(3, 1000 + (int)i), cell, &t.name,
                           Col(0, 0, 0, 0), sel ? pal::text : pal::textDim, Align::Left)) {}
-        if (hot && in.pressed[0]) selTrack_ = (int)i;
+        if (hot && in.pressed[0]) selectTrack((int)i);
     }
 
     // "+" to append a track.
@@ -1380,10 +1653,16 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
         if (hot) {
             ui_.cursor = Cursor::Hand;
             if (in.pressed[0]) {
-                selTrack_ = ti; selSlot_ = si;
+                selectTrack(ti); selSlot_ = si;
                 if (recHere)      stopRecording(ti);       // second click stops
                 else if (target)  startRecording(ti, si);
             }
+            // Double-click on an empty slot of a note-capable track makes an
+            // empty pattern to draw into. Only when the record button is unlit:
+            // with it lit the same slot is a take waiting to happen, and the
+            // first click of the double has already started one.
+            if (in.dblClick && !recIntent_ && !recHere && trackHasNoteDevice(ti))
+                createMidiClip(ti, si);
         }
         return;
     }
@@ -1403,10 +1682,23 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     if (playing) ui_.playTriangle(btn.insetXY(4.5f * s, 4.5f * s), pal::playGreen.scale(0.85f));
     else         ui_.playTriangle(btn.insetXY(4.5f * s, 4.5f * s), pal::textOnClip.alpha(0.55f));
 
-    rend_.textIn(fBody_, {cell.x + btnW, cell.y, cell.w - btnW - 2 * s, cell.h},
+    // A MIDI clip gets a three-dot mark on the right: at 21px of row height a
+    // real piano glyph is a smudge, and the dots read as "notes, not audio"
+    // without competing with the name.
+    f32 nameW = cell.w - btnW - 2 * s;
+    if (m.kind == ClipKind::Midi) {
+        const f32 d = 1.6f * s;
+        const f32 dx0 = cell.right() - 12 * s;
+        for (int i = 0; i < 3; ++i)
+            rend_.rect({dx0 + i * 3.5f * s, cell.cy() - d * 0.5f - (i == 1 ? 2 * s : 0.f), d, d},
+                       pal::textOnClip.alpha(0.6f));
+        nameW -= 14 * s;
+    }
+    rend_.textIn(fBody_, {cell.x + btnW, cell.y, std::max(4 * s, nameW), cell.h},
                  m.name.c_str(), pal::textOnClip, Align::Left, 2 * s);
 
-    // Playback progress along the bottom edge.
+    // Playback progress along the bottom edge. The engine publishes clipPhase
+    // for a MIDI clip exactly as for an audio one, so this needs no special case.
     if (playing) {
         const f64 ph = clampv(engine_.clipPhase[ti].load(), 0.0, 1.0);
         rend_.rect({cell.x, cell.bottom() - 2 * s, cell.w * (f32)ph, 2 * s}, pal::textOnClip.alpha(0.45f));
@@ -1416,14 +1708,14 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     if (hot) {
         ui_.cursor = Cursor::Hand;
         if (in.pressed[0]) {
-            selTrack_ = ti; selSlot_ = si;
+            selectTrack(ti); selSlot_ = si;
             send(Cmd::LaunchClip, ti, si);
             drag_.kind = DragState::Kind::Clip;
             drag_.srcTrack = ti; drag_.srcSlot = si;
             drag_.startX = in.mx; drag_.startY = in.my;
             drag_.armed = false;
         }
-        if (in.pressed[2]) { selTrack_ = ti; selSlot_ = si; clearClip(ti, si); }
+        if (in.pressed[2]) { selectTrack(ti); selSlot_ = si; clearClip(ti, si); }
     }
 
     // Drop target for a drag in flight.
@@ -1510,8 +1802,12 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
             send(Cmd::TrackSolo, (int)ti, t.solo ? 1 : 0);
         // Record-arm is a filled dot in Live, and the glyph atlas is ASCII-only,
         // so draw the dot rather than trying to letter it.
-        if (ui_.squareToggle(uiId(6, (int)ti, 2), ar, "", &t.arm, pal::armRed))
+        if (ui_.squareToggle(uiId(6, (int)ti, 2), ar, "", &t.arm, pal::armRed)) {
             send(Cmd::TrackArm, (int)ti, t.arm ? 1 : 0);
+            // Touched by hand: this arm is the user's now, so selecting another
+            // track must not take it away again.
+            if ((int)ti == autoArmed_) autoArmed_ = -1;
+        }
         rend_.circle(ar.cx(), ar.cy(), 3.5f * s, t.arm ? pal::textOnClip : pal::armRed);
         y += 20 * s;
 
@@ -1637,6 +1933,10 @@ void App::drawClipDetail(const Rect& r) {
                      pal::textFaint, Align::Center);
         return;
     }
+    // A pattern has no sample behind it, so warp, clip tempo and the loop
+    // *range* have nothing to act on; everything else on this panel is about
+    // launching, which a MIDI clip does exactly like an audio one.
+    const bool midi = m.kind == ClipKind::Midi;
 
     const Col ccol = pal::clipColors[m.colorIdx % pal::clipColorCount];
     Rect head{r.x, r.y + 1 * s, r.w, 20 * s};
@@ -1653,24 +1953,29 @@ void App::drawClipDetail(const Rect& r) {
         rend_.textIn(fSmall_, {row.x, row.y, lblW, row.h}, t, pal::textFaint, Align::Left, 0);
     };
 
-    {   // Warp mode
+    {   // Warp mode (audio only) + loop, which both kinds have
         Rect row{ctrl.x, y, ctrl.w, rowH};
-        label("WARP", row);
-        static const char* warpNames[] = {"Off", "Repitch", "Beats"};
-        int wi = (int)m.warp;
-        Rect sel{row.x + lblW, row.y, 84 * s, row.h};
-        if (ui_.selector(uiId(8, 0), sel, &wi, warpNames, 3)) {
-            m.warp = (Warp)wi;
-            send(Cmd::ClipWarp, selTrack_, selSlot_, (f64)wi);
+        Rect lp{row.x + lblW, row.y, 52 * s, row.h};
+        if (!midi) {
+            label("WARP", row);
+            static const char* warpNames[] = {"Off", "Repitch", "Beats"};
+            int wi = (int)m.warp;
+            Rect sel{row.x + lblW, row.y, 84 * s, row.h};
+            if (ui_.selector(uiId(8, 0), sel, &wi, warpNames, 3)) {
+                m.warp = (Warp)wi;
+                send(Cmd::ClipWarp, selTrack_, selSlot_, (f64)wi);
+            }
+            lp = {sel.right() + 6 * s, row.y, 52 * s, row.h};
+        } else {
+            label("PLAY", row);
         }
-        Rect lp{sel.right() + 6 * s, row.y, 52 * s, row.h};
         if (ui_.button(uiId(8, 1), lp, "LOOP", m.loop, pal::accent)) {
             m.loop = !m.loop;
             send(Cmd::ClipLoop, selTrack_, selSlot_, m.loop ? 1.0 : 0.0);
         }
         y += rowH + 4 * s;
     }
-    {   // Clip tempo
+    if (!midi) {   // Clip tempo
         Rect row{ctrl.x, y, ctrl.w, rowH};
         label("CLIP BPM", row);
         f64 bpm = m.clipBpm;
@@ -1747,23 +2052,43 @@ void App::drawClipDetail(const Rect& r) {
     {   // Read-out of what the engine will actually do
         Rect row{ctrl.x, y, ctrl.w, rowH};
         char buf[96];
-        const f64 rate = (m.warp == Warp::Off) ? 1.0 : m.clipBpm / ses_.tempo;
-        snprintf(buf, sizeof buf, "%.2f beats  ·  rate %.3fx  ·  %d ch",
-                 m.lengthBeats, rate, m.sample->channels);
+        if (midi) {
+            snprintf(buf, sizeof buf, "%.2f beats  ·  %zu note%s", m.lengthBeats,
+                     m.notes.size(), m.notes.size() == 1 ? "" : "s");
+        } else {
+            const f64 rate = (m.warp == Warp::Off) ? 1.0 : m.clipBpm / ses_.tempo;
+            snprintf(buf, sizeof buf, "%.2f beats  ·  rate %.3fx  ·  %d ch",
+                     m.lengthBeats, rate, m.sample->channels);
+        }
         rend_.textIn(fSmall_, row, buf, pal::textFaint, Align::Left, 0);
     }
 
-    // --- waveform ---
+    // --- the material: a piano roll for a pattern, a waveform for a sample ---
     Rect wave{ctrl.right() + 12 * s, head.bottom() + 6 * s,
               r.right() - ctrl.right() - 20 * s, r.bottom() - head.bottom() - 12 * s};
+
+    // Where the clip is, in its own beats, so both editors can draw the same
+    // playhead from the same number.
+    const bool active = engine_.activeSlot[selTrack_].load() == selSlot_;
+    const f64  phase  = clampv(engine_.clipPhase[selTrack_].load(), 0.0, 1.0);
+
+    if (midi) {
+        if (!roll_) roll_ = std::make_unique<PianoRoll>();
+        // The roll edits m.notes (and its length) in place and says whether it
+        // touched anything; republishing is ours, and pushClip is what retires
+        // the array the engine is still reading from.
+        if (roll_->draw(ui_, wave, m, active ? phase * m.lengthBeats : 0.0, active))
+            pushClip(selTrack_, selSlot_);
+        return;
+    }
+
     rend_.roundRect(wave, 2 * s, pal::appBg);
     rend_.pushClip(wave.inset(2 * s));
     drawWaveform(wave.inset(3 * s), *m.sample, ccol.scale(0.85f));
 
     // Playhead, when this clip is the one sounding on its track.
-    if (engine_.activeSlot[selTrack_].load() == selSlot_) {
-        const f64 ph = clampv(engine_.clipPhase[selTrack_].load(), 0.0, 1.0);
-        const f32 px = wave.x + 3 * s + (wave.w - 6 * s) * (f32)ph;
+    if (active) {
+        const f32 px = wave.x + 3 * s + (wave.w - 6 * s) * (f32)phase;
         rend_.rect({px, wave.y + 2 * s, 1.5f * s, wave.h - 4 * s}, pal::playGreen);
     }
     rend_.popClip();

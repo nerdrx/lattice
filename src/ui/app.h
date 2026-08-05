@@ -154,33 +154,50 @@ struct DragState {
 // state), and each key remembers the note it started so a note-off is always
 // the note that sounded, even if the octave moved while the key was down.
 struct KbdPiano {
-    static constexpr int kHighestSemi = 15;    // 'p', the top of the mapped range
+    static constexpr int kHighestSemi = 28;    // 'p', the top of the mapped range
     static constexpr int kDefaultBase = 48;    // C3
     static constexpr int kDefaultVel  = 100;
-    static constexpr int kVelStep     = 20;
     static constexpr int kOctave      = 12;
 
-    struct Result { bool baseChanged = false, velChanged = false; };
+    struct Result { bool baseChanged = false; };
 
     KbdPiano() { for (int i = 0; i < KeyCount; ++i) active_[i] = -1; }
 
     // Semitones above the base note for a playing key, -1 if the key is not one.
-    // Live's layout: the home row is the white keys, the row above it the black
-    // ones, so the two rows sit like the two halves of a real keyboard.
+    // FL Studio's layout, which lays two and a bit octaves across the board
+    // instead of Live's one: ZXCVBNM is the lower octave's white keys with
+    // SDGHJ as its blacks, QWERTYU the octave above with 23567, and IOP + 90
+    // carry the run on into a third octave.
     static int semiFor(int key) {
         switch (key) {
-        case 'a': return 0;   case 'w': return 1;   case 's': return 2;   case 'e': return 3;
-        case 'd': return 4;   case 'f': return 5;   case 't': return 6;   case 'g': return 7;
-        case 'y': return 8;   case 'h': return 9;   case 'u': return 10;  case 'j': return 11;
-        case 'k': return 12;  case 'o': return 13;  case 'l': return 14;  case 'p': return 15;
+        // lower octave — white
+        case 'z': return 0;   case 'x': return 2;   case 'c': return 4;
+        case 'v': return 5;   case 'b': return 7;   case 'n': return 9;
+        case 'm': return 11;
+        // lower octave — black
+        case 's': return 1;   case 'd': return 3;   case 'g': return 6;
+        case 'h': return 8;   case 'j': return 10;
+        // upper octave — white
+        case 'q': return 12;  case 'w': return 14;  case 'e': return 16;
+        case 'r': return 17;  case 't': return 19;  case 'y': return 21;
+        case 'u': return 23;
+        // upper octave — black
+        case '2': return 13;  case '3': return 15;  case '5': return 18;
+        case '6': return 20;  case '7': return 22;
+        // and on into the third
+        case 'i': return 24;  case 'o': return 26;  case 'p': return 28;
+        case '9': return 25;  case '0': return 27;
         default:  return -1;
         }
     }
 
     // Keys the piano owns while it is on. Their older unmodified shortcut
     // meanings must not fire underneath a note; unowned keys still pass through.
+    // The octave keys moved to PageUp/PageDown because Z and X are notes now,
+    // and velocity lost its keys entirely (C and V are notes) — it lives on the
+    // control bar beside the KBD chip instead.
     static bool consumes(int key) {
-        return semiFor(key) >= 0 || key == 'z' || key == 'x' || key == 'c' || key == 'v';
+        return semiFor(key) >= 0 || key == KeyPageUp || key == KeyPageDown;
     }
 
     // `enabled` is the whole gate: feature on, no text field focused, no
@@ -208,9 +225,11 @@ struct KbdPiano {
                 }
                 continue;
             }
-            // Down edge. Octave and velocity move once per physical press.
-            if (k == 'z' || k == 'x') { res.baseChanged = shiftOctave(k == 'x' ? kOctave : -kOctave); continue; }
-            if (k == 'c' || k == 'v') { res.velChanged  = shiftVel(k == 'v' ? kVelStep : -kVelStep);  continue; }
+            // Down edge. The octave moves once per physical press.
+            if (k == KeyPageUp || k == KeyPageDown) {
+                res.baseChanged = shiftOctave(k == KeyPageUp ? kOctave : -kOctave);
+                continue;
+            }
             const int semi = semiFor(k);
             if (semi < 0) continue;
             const int note = base_ + semi;         // shiftOctave keeps this in 0..127
@@ -234,22 +253,20 @@ struct KbdPiano {
 
     int base() const { return base_; }
     int velocity() const { return vel_; }
+    // Velocity is a control-bar number now rather than a pair of keys, so the
+    // owner sets it directly. Only notes started after this point take it: a
+    // sounding note keeps the velocity it was struck with.
+    void setVelocity(int v) { vel_ = clampv(v, 1, 127); }
     // The base is always a C (it only ever moves by whole octaves from C3).
     int octave() const { return base_ / kOctave - 1; }
 
 private:
     // Clamped so the whole mapped span stays inside 0..127: the lowest key must
-    // not go under 0 and 'p', fifteen semitones up, must not go over 127.
+    // not go under 0 and 'p', twenty-eight semitones up, must not go over 127.
     bool shiftOctave(int by) {
         const int b = base_ + by;
         if (b < 0 || b + kHighestSemi > 127) return false;
         base_ = b;
-        return true;
-    }
-    bool shiftVel(int by) {
-        const int v = clampv(vel_ + by, 1, 127);
-        if (v == vel_) return false;
-        vel_ = v;
         return true;
     }
 
@@ -259,8 +276,19 @@ private:
     i8   active_[KeyCount];        // note each key started, -1 = silent
 };
 
+// The MIDI note editor. Declared rather than included: pianoroll.h includes
+// *this* header (it edits ClipModel directly), so pulling it in from here would
+// leave PianoRoll incomplete for any translation unit that reached pianoroll.h
+// first. App therefore holds it behind a unique_ptr and defines its destructor
+// out of line, in the one .cpp that has both definitions.
+class PianoRoll;
+
 class App {
 public:
+    // Both out of line: a defaulted constructor still has to be able to unwind
+    // its members, so it needs PianoRoll complete just as the destructor does.
+    App();
+    ~App();
     bool init(int argc, char** argv);
     void run();
     void shutdown();
@@ -298,15 +326,29 @@ private:
     void  loadClipInto(int track, int slot, const std::string& path);
     void  clearClip(int track, int slot);
     void  pushClip(int track, int slot);          // sync one slot to the engine
+    // Hands `fresh` (which may be null) to publishedNotes_[track][slot] and
+    // moves whatever was there into retiringNotes_. Only called once the engine
+    // has actually accepted the clip carrying `fresh`.
+    void  publishNotes(int track, int slot, const RtNote* fresh);
     void  pushTrack(int track);                   // sync mixer state
     void  pushAll();
     void  addTrack();
     void  addScene();
+    // True when the track's chain can be played by notes, which is what makes a
+    // slot a MIDI target rather than an audio one. Judged from the descriptor,
+    // so a device whose plugin is missing today still declares the track's
+    // intent and the set does not silently turn into an audio track.
+    bool  trackHasNoteDevice(int track) const;
+    void  createMidiClip(int track, int slot);    // empty pattern in an empty slot
+    // Every path that moves the selection goes through here: selecting a track
+    // also arms it (see autoArmed_).
+    void  selectTrack(int track);
 
     // --- recording ---
     void  startRecording(int track, int slot);   // allocate + arm a take
     void  stopRecording(int track);              // second RecordSlot = stop
     void  finishRecording(const Event& e);       // Ev::RecordFinished -> clip
+    void  finishMidiRecording(const Event& e);   // Ev::MidiRecordFinished -> clip
 
     // --- project ---
     bool  openProject(const std::string& path);
@@ -342,10 +384,18 @@ private:
     // hands the pointer back in Ev::RecordFinished. Nothing here is freed on
     // any other path while the audio thread runs (shutdown() being the
     // exception, and only after the backend has been joined).
+    // A take is either audio or MIDI, and the two carry different buffer types
+    // back on different events, so every entry says which it is rather than
+    // leaving the pointer to be guessed from whichever event turned up.
     struct PendingRec {
-        f32* buf = nullptr;
-        i64  capFrames = 0;
+        f32*    buf   = nullptr;      // audio take, interleaved stereo
+        RtNote* notes = nullptr;      // MIDI take
+        i64  cap = 0;                 // frames for audio, notes for MIDI
         int  track = -1, slot = -1;
+        bool midi = false;
+        const void* payload() const {
+            return midi ? (const void*)notes : (const void*)buf;
+        }
     };
     std::vector<PendingRec> pendingRecs_;
     // The global record button arms the *intent* to record, exactly like Live's
@@ -355,6 +405,16 @@ private:
     bool recIntent_ = false;
     int  recTakeNo_ = 1;                          // names takes "Rec 1", "Rec 2", ...
     f64  recStartBeat_[kMaxTracks]{};             // from Ev::RecordStarted
+    int  midiClipNo_ = 1;                         // names patterns "MIDI 1", ...
+
+    // --- MIDI clip note arrays ---------------------------------------------
+    // Exactly the RtChain protocol, one array per slot: pushClip() allocates a
+    // fresh RtNote[] for the clip it publishes, parks the pointer here, and
+    // moves whatever it displaced into retiringNotes_. An entry is freed when
+    // its Ev::NotesRetired arrives, and never on any other path while the audio
+    // thread runs — a clip's notes can be edited while that clip is playing.
+    const RtNote* publishedNotes_[kMaxTracks][kMaxScenes] = {};
+    std::vector<const RtNote*> retiringNotes_;
 
     // --- plugin hosting -------------------------------------------------
     // Chain lifecycle: publishChain(t) heap-allocates an RtChain from
@@ -414,6 +474,20 @@ private:
     // The toggle chord's own down edge. keyPressed[] auto-repeats, and a held
     // Ctrl+Shift+K would otherwise flap the mode on and off.
     bool      kbdTogglePrev_ = false;
+    // Latch for the "nothing is armed, so nothing will sound" hint: the state it
+    // describes holds for as long as the user leaves it alone, and re-saying it
+    // every frame would bury whatever else the status bar has to report.
+    bool      kbdNoArmHint_ = false;
+
+    // Live's exclusive arm. Selecting a track arms it and disarms whichever
+    // track *this* mechanism armed last; a track the user armed by hand is not
+    // ours to disarm, so it is left alone and never claimed here. -1 = we hold
+    // no arm at the moment.
+    int       autoArmed_ = -1;
+
+    // The piano roll, shown in the CLIP tab for MIDI clips. Created on first
+    // use; see the forward declaration above for why it is not a plain member.
+    std::unique_ptr<PianoRoll> roll_;
 
     // per-frame UI feedback
     std::string status_;

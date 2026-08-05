@@ -29,8 +29,11 @@ static void usage() {
         "  Ctrl+B         browser                Ctrl+D   clip detail\n"
         "  Ctrl+T         add track              Ctrl+Enter add scene\n"
         "  Ctrl+Shift+K   computer MIDI keyboard (QWERTY plays the armed track)\n"
-        "                 A S D F G H J K L = white keys, W E T Y U O P = black,\n"
-        "                 Z / X octave, C / V velocity\n");
+        "                 FL layout: Z X C V B N M = lower octave white keys,\n"
+        "                            S D   G H J   = its black keys,\n"
+        "                 Q W E R T Y U + I O P    = the two octaves above,\n"
+        "                 2 3   5 6 7   9 0        = their black keys,\n"
+        "                 PgUp / PgDn octave, velocity next to the KBD chip\n");
 }
 
 int main(int argc, char** argv) {
