@@ -30,19 +30,39 @@ make config   # show detected Wayland protocols
   session tempo while preserving pitch; **Repitch** transposes with the tempo;
   **Off** ignores it. Verified: a 55.0 Hz bass reads 55.11 Hz at 120 BPM and
   56.21 Hz at 180 BPM under Beats, and 82.62 Hz under Repitch (exactly 1.5×).
-- Audio backends: JACK (auto-connects to system playback), ALSA fallback.
-- Plugin hosting: **LV2** via lilv — 408 plugins discovered and ASan-clean on a
-  stock Arch box. **CLAP** implemented and verified end to end. VST3 not started.
-- Project format: line-oriented plain text, byte-identical round-trip.
-- Offline render: deterministic, no device and no GUI.
+- Audio backends: JACK (auto-connects playback *and* capture), ALSA fallback
+  with capture.
+- Plugin hosting in the signal path: per-track device chains with a filterable
+  browser, bypass, and parameter knobs. **LV2** via lilv (400+ plugins on a
+  stock Arch box, ASan-clean) and **CLAP**, both with working note input —
+  LV2 instruments sound via real atom sequences. VST3 not started (licensing).
+- Stock devices: `Saturator` (compensated tanh shaper) and `Pulse` (8-voice
+  PolyBLEP morph synth) ride the same PluginInstance machinery as everything
+  else.
+- **Audio recording**: arm a track, click an empty slot — quantized start and
+  stop on the launch grid, takes come back as warped clips at the session
+  tempo, with pre-chain input monitoring.
+- **MIDI in**: ALSA-sequencer port (`aconnect <source> <Lattice:in>`), routed
+  per-block to note-capable devices on armed tracks.
+- **Generative clips**: launch probability and follow actions (Stop / Again /
+  Next / Prev / First / Random), scheduled through the same quantized path and
+  deterministic under offline render.
+- Project format v2: line-oriented plain text, byte-identical round-trip,
+  stable per-entity uids, device chains with parameter snapshots; v1 files
+  still load.
+- Offline render: deterministic, no device and no GUI — CI renders the demo
+  set on every push.
+- Process-split groundwork: shared-memory SPSC rings + crash-orphan reaping
+  (`src/ipc/`, 54 tests, ~10M msgs/sec), design in `docs/PROCESS-SPLIT.md`.
 
 **Not done yet**
 
 - Arrangement View is a navigable placeholder — no recording or timeline edits.
-- No MIDI. Instruments load and run but receive no notes, so they are silent.
-- Plugins are hosted but not yet inserted into the track signal path, and there
-  is no device-chain UI.
-- No undo, no automation, no audio recording, no time-signature changes.
+- No undo, no automation (the parameter address space is reserved:
+  `docs/PARAM-ADDRESS.md`), no sends/returns, no time-signature changes, no
+  overdub, no MIDI clips (notes route live to instruments only).
+- The engine/GUI process split is designed and transport-tested but not yet
+  integrated.
 - Windows backends are written but have never been compiled or run — see
   `docs/PORTING.md`.
 
