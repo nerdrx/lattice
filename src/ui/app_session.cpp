@@ -515,9 +515,23 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
         // before it reports, so each hands its previous value to the entry.
         const bool wasMute = t.mute, wasSolo = t.solo, wasArm = t.arm;
         const f32  wasPan = t.pan, wasFader = t.fader;
+        // Every automatable control on this strip reports its move to
+        // autoCapture as well as to the engine (docs/AUTOMATION.md §5.1). The
+        // call is unconditional by design: whether anything is recorded — the
+        // arm, the transport, which clip is playing, the beat, the thinning —
+        // is one decision and it lives in autoCapture, so a second copy of it
+        // here could only ever come to disagree. The value handed over is what
+        // the widget just wrote into the model, in the target's own units
+        // (§2.3), and the widget's id is the gesture, so one drag is one pass
+        // and one undo entry.
         if (ui_.squareToggle(uiId(6, (int)ti, 0), mr, "M", &t.mute, pal::meterAmber)) {
             undoPointWith("mute", t.mute, wasMute);
             send(Cmd::TrackMute, (int)ti, t.mute ? 1 : 0);
+            // Mute has no AutoTarget yet (it is reserved), so this records into
+            // a lane the publisher will skip until it does. Spelled anyway: the
+            // call site is the part that is easy to forget when it lands.
+            autoCapture(addr::trackField(t.uid, "mute"), t.mute ? 1.f : 0.f,
+                        uiId(6, (int)ti, 0));
         }
         if (ui_.squareToggle(uiId(6, (int)ti, 1), sr, "S", &t.solo, pal::soloBlue)) {
             undoPointWith("solo", t.solo, wasSolo);
@@ -555,6 +569,8 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
                 if (ui_.knob(uiId(6, (int)ti, 10 + rn), kr, &t.sends[rn], 0.f, 1.f, 0.f)) {
                     undoPointWith(kSendUndo[rn], t.sends[rn], wasSend);
                     send(Cmd::SendLevel, (int)ti, rn, t.sends[rn]);
+                    autoCapture(addr::trackSend(t.uid, rn), t.sends[rn],
+                                uiId(6, (int)ti, 10 + rn));
                 }
             }
             y += 2 * rowH + 3 * s;
@@ -565,6 +581,7 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
         if (ui_.knob(uiId(6, (int)ti, 3), pan, &t.pan, -1.f, 1.f, 0.f)) {
             undoPointWith("pan", t.pan, wasPan);
             send(Cmd::TrackPan, (int)ti, 0, t.pan);
+            autoCapture(addr::trackField(t.uid, "pan"), t.pan, uiId(6, (int)ti, 3));
         }
         y += 26 * s;
 
@@ -575,6 +592,9 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
         if (ui_.vFader(uiId(6, (int)ti, 4), fader, &t.fader)) {
             undoPointWith("volume", t.fader, wasFader);
             send(Cmd::TrackVol, (int)ti, 0, faderToGain(t.fader));
+            // The FADER POSITION, not the gain: the envelope stores what the UI
+            // edits and AutoXform::Fader is what turns it into a gain (§2.3).
+            autoCapture(addr::trackField(t.uid, "vol"), t.fader, uiId(6, (int)ti, 4));
         }
 
         const f32 lvl = std::max(engine_.meterL[ti].load(), engine_.meterR[ti].load());

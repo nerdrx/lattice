@@ -19,6 +19,74 @@
 namespace lat {
 
 // ---------------------------------------------------------------------------
+// what a clip may automate
+//
+// The roll must not see a DeviceModel or a ParamInfo (docs/AUTOMATION.md §6.5),
+// so this flattens the selected track's mixer fields and device parameters into
+// strings and floats once a frame. It is a few dozen string builds for the one
+// track whose clip is on screen — the same order of cost as the panel's own
+// labels, and it means the lane's chooser can never name a target the publisher
+// would refuse.
+//
+// Deliberately NOT offered: mute, solo and arm. They are in the address grammar
+// and the capture path spells them, but AutoTarget has no case for them yet, so
+// a lane built from one would draw and never sound. Offering a control that
+// cannot work is worse than not offering it.
+// ---------------------------------------------------------------------------
+
+void App::buildAutoTargets(int track, const ClipModel& clip, AutoTargets& out) const {
+    out.entries.clear();
+    out.inert = 0;
+    out.inertWhy.clear();
+    if (track < 0 || track >= (int)ses_.tracks.size()) return;
+    const TrackModel& t = ses_.tracks[track];
+
+    auto add = [&](const char* group, const char* label, std::string address,
+                   const char* unit, f32 lo, f32 hi, f32 def) {
+        AutoTargets::Entry e;
+        e.group = group;
+        e.label = label;
+        e.address = std::move(address);
+        e.unit = unit;
+        e.lo = lo; e.hi = hi; e.def = def;
+        for (const AutoLane& l : clip.envelopes)
+            if (l.address == e.address) { e.automated = true; break; }
+        out.entries.push_back(std::move(e));
+    };
+
+    // The mixer, in the order the strip has it. The fader's value is its 0..1
+    // POSITION and not a gain -- §2.3, and why AutoXform exists.
+    add("Track", "Volume", addr::trackField(t.uid, "vol"), "", 0.f, 1.f, 0.85f);
+    add("Track", "Pan",    addr::trackField(t.uid, "pan"), "", -1.f, 1.f, 0.f);
+    for (int i = 0; i < kMaxReturns; ++i) {
+        char lbl[16];
+        snprintf(lbl, sizeof lbl, "Send %s", kReturnLetter[i]);
+        add("Track", lbl, addr::trackSend(t.uid, i), "", 0.f, 1.f, 0.f);
+    }
+    // Every parameter of every loaded device on this track. A device whose
+    // plugin is missing contributes nothing -- it has no ParamInfo to describe a
+    // range with -- but any lane already naming it keeps its points and says so
+    // in the lane instead.
+    for (const DeviceModel& d : t.devices) {
+        if (!d.inst) continue;
+        const int n = d.inst->paramCount();
+        for (int p = 0; p < n; ++p) {
+            const ParamInfo& info = d.inst->paramInfo(p);
+            add(d.desc.name.c_str(), info.name.c_str(),
+                addr::deviceParam(t.uid, d.uid, info.id), info.unit.c_str(),
+                info.min, info.max, info.def);
+        }
+    }
+
+    // Which of this clip's lanes the engine has given up on (§3.4). The mask is
+    // by MODEL lane index, which is what the roll draws; inertAutos_ is keyed by
+    // address, which is what survives a lane being reordered.
+    for (size_t i = 0; i < clip.envelopes.size() && i < 32; ++i)
+        if (autoLaneInert(clip.uid, clip.envelopes[i].address)) out.inert |= 1u << (u32)i;
+    if (out.inert) out.inertWhy = "inert - this device has no realtime parameter path";
+}
+
+// ---------------------------------------------------------------------------
 // clip detail
 // ---------------------------------------------------------------------------
 
@@ -84,6 +152,39 @@ void App::drawDetailPanel(const Rect& r) {
 
 void App::drawClipDetail(const Rect& r) {
     const f32 s = win_.dpiScale();
+
+    // Headless verification hook (see app.h): NXTAKT_DEBUG_AUTOLANE=<track>
+    // selects that track's first clip, seeds one volume envelope on it and puts
+    // the lane on that envelope, once per run. Nothing inside gamescope can
+    // work a chooser or drag a breakpoint, so this is what lets a screenshot
+    // check that the lane draws real points against the roll's own time axis.
+    if (!autoDebugSeeded_) {
+        if (const char* want = env("DEBUG_AUTOLANE")) {
+            autoDebugSeeded_ = true;
+            int t = 0, laneNo = 1;
+            sscanf(want, "%d:%d", &t, &laneNo);       // "<track>[:<lane>]"
+            if (t > 0 && t < (int)ses_.tracks.size()) { selTrack_ = t; selSlot_ = 0; }
+            ClipModel& c = ses_.tracks[selTrack_].slots[selSlot_];
+            if (c.valid()) {
+                if (c.envelopes.empty()) {
+                    AutoLane l;
+                    l.address = addr::trackField(ses_.tracks[selTrack_].uid, "vol");
+                    const f64 len = c.lengthBeats > 0.0 ? c.lengthBeats : 4.0;
+                    l.points.push_back(AutoPoint{0.0,         0.30f, 0, {}});
+                    l.points.push_back(AutoPoint{len * 0.25,  0.95f, 0, {}});
+                    l.points.push_back(AutoPoint{len * 0.5,   0.55f, 0, {}});
+                    l.points.push_back(AutoPoint{len * 0.875, 0.85f, 0, {}});
+                    c.envelopes.push_back(std::move(l));
+                    pushClip(selTrack_, selSlot_);
+                    status_ = "NXTAKT_DEBUG_AUTOLANE: seeded a volume envelope";
+                } else {
+                    status_ = "NXTAKT_DEBUG_AUTOLANE: showing lane " + std::to_string(laneNo);
+                }
+                if (!roll_) roll_ = std::make_unique<PianoRoll>();
+                roll_->showLane(clampv(laneNo, 0, (int)c.envelopes.size()));
+            }
+        }
+    }
 
     ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
     if (!m.valid()) {
@@ -237,54 +338,56 @@ void App::drawClipDetail(const Rect& r) {
         rend_.textIn(fSmall_, row, buf, pal::textFaint, Align::Left, 0);
     }
 
-    // --- the material: a piano roll for a pattern, a waveform for a sample ---
+    // --- the material: the note grid for a pattern, the waveform for a sample,
+    //     and under either of them the automation lane -----------------------
+    //
+    // Both kinds go through the roll now, and the choice is worth stating: an
+    // audio clip's envelopes need a TIME axis, and the only correct time axis
+    // is the one its material is drawn against. Giving the audio clip its own
+    // lane widget under the old fixed-width waveform would have meant two
+    // beat<->pixel mappings that agree only while nothing is zoomed. So the
+    // roll draws the waveform where the note grid goes (PianoRoll::draw,
+    // `midiClip`), the lane keeps the axis it already shares with the ruler,
+    // and there is exactly one mapping in the program. The note-specific
+    // furniture (FOLD, the keyboard column, the loop-length drag) is suppressed
+    // rather than faked.
     Rect wave{ctrl.right() + 12 * s, head.bottom() + 6 * s,
               r.right() - ctrl.right() - 20 * s, r.bottom() - head.bottom() - 12 * s};
 
-    // Where the clip is, in its own beats, so both editors can draw the same
-    // playhead from the same number.
+    // Where the clip is, in its own beats, so the grid and the lane draw the
+    // same playhead from the same number.
     const bool active = engine_.activeSlot[selTrack_].load() == selSlot_;
     const f64  phase  = clampv(engine_.clipPhase[selTrack_].load(), 0.0, 1.0);
 
-    if (midi) {
-        if (!roll_) roll_ = std::make_unique<PianoRoll>();
-        // The roll edits m.notes (and its length) in place and says whether it
-        // touched anything; republishing is ours, and pushClip is what retires
-        // the array the engine is still reading from.
-        //
-        // The undo entry therefore needs the clip as it was *before* the call,
-        // which is why the copy is taken unconditionally: whether an edit
-        // happens is not knowable until draw() returns, and by then m already
-        // has it. A clip is a note vector, two strings and a shared pointer --
-        // cheap enough to copy once a frame, and it buys the one thing that
-        // matters here, which is that a click that adds a note can be undone.
-        // The roll owns ui_.active for the length of a drag, so a note dragged
-        // across the grid leaves one entry and not one per frame.
-        const ClipModel before = m;
-        if (roll_->draw(ui_, wave, m, active ? phase * m.lengthBeats : 0.0, active)) {
-            undoPointWith("note edit", m, before);
-            pushClip(selTrack_, selSlot_);
-        }
-        // Auditioning is the caller's job: the roll only names the pitches that
-        // want to be heard (from this draw, and from any keyboard edit earlier
-        // in the frame — handleShortcuts runs first). See previews_ for why
-        // these reach the right instrument.
-        u8 pv[PianoRoll::kPreviewMax];
-        const int np = roll_->drainPreview(pv, PianoRoll::kPreviewMax);
-        for (int i = 0; i < np; ++i) startPreview((int)pv[i], m.uid);
-        return;
-    }
+    if (!roll_) roll_ = std::make_unique<PianoRoll>();
 
-    rend_.roundRect(wave, 2 * s, pal::appBg);
-    rend_.pushClip(wave.inset(2 * s));
-    drawWaveform(wave.inset(3 * s), *m.sample, ccol.scale(0.85f));
+    AutoTargets targets;
+    buildAutoTargets(selTrack_, m, targets);
 
-    // Playhead, when this clip is the one sounding on its track.
-    if (active) {
-        const f32 px = wave.x + 3 * s + (wave.w - 6 * s) * (f32)phase;
-        rend_.rect({px, wave.y + 2 * s, 1.5f * s, wave.h - 4 * s}, pal::playGreen);
+    // The roll edits m.notes and m.envelopes in place and says whether it
+    // touched anything; republishing is ours, and pushClip is what retires the
+    // arrays the engine is still reading from.
+    //
+    // The undo entry therefore needs the clip as it was *before* the call, which
+    // is why the copy is taken unconditionally: whether an edit happens is not
+    // knowable until draw() returns, and by then m already has it. A clip is a
+    // note vector, an envelope vector, two strings and a shared pointer -- cheap
+    // enough to copy once a frame, and it buys the one thing that matters here,
+    // which is that a click that adds a note or a breakpoint can be undone. The
+    // roll owns ui_.active for the length of a drag, so a note or a breakpoint
+    // dragged across the editor leaves one entry and not one per frame.
+    const ClipModel before = m;
+    if (roll_->draw(ui_, wave, m, targets, active ? phase * m.lengthBeats : 0.0, active)) {
+        undoPointWith(roll_->lastEdit(), m, before);
+        pushClip(selTrack_, selSlot_);
     }
-    rend_.popClip();
+    // Auditioning is the caller's job: the roll only names the pitches that want
+    // to be heard (from this draw, and from any keyboard edit earlier in the
+    // frame — handleShortcuts runs first). See previews_ for why these reach the
+    // right instrument.
+    u8 pv[PianoRoll::kPreviewMax];
+    const int np = roll_->drainPreview(pv, PianoRoll::kPreviewMax);
+    for (int i = 0; i < np; ++i) startPreview((int)pv[i], m.uid);
 }
 
 

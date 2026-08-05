@@ -112,7 +112,28 @@ void App::drawControlBar(const Rect& r) {
     if (ui_.button(uiId(1, 6), recR, "", recIntent_ || anyRec, recPlate)) recIntent_ = !recIntent_;
     rend_.circle(recR.cx(), recR.cy(), 5 * s,
                  anyRec ? pal::recRed : (recIntent_ ? pal::textOnClip : pal::recRed.scale(0.55f)));
-    x += recR.w + 12 * s;
+    x += recR.w + 3 * s;
+
+    // Automation Arm — its own control, immediately right of the record circle
+    // (docs/AUTOMATION.md §5.1, decision #10). Not implied by record-arm:
+    // recording notes and recording knob moves are genuinely different intents,
+    // and one control for both would surprise in whichever direction it guessed.
+    // Drawn as the KBD chip is — accentHi on dark rather than a filled plate —
+    // because it is a MODE the transport row reports, not a transport action,
+    // and the row already reads "the red thing is record".
+    {
+        Rect autoR{x, cy, 34 * s, h};
+        const u64 id = uiId(1, 10);
+        const bool hot = ui_.setHot(id, autoR) && ui_.isHot(id);
+        if (hot) ui_.cursor = Cursor::Hand;
+        rend_.roundRect(autoR, 2 * s, autoArm_ ? pal::accent.alpha(0.18f)
+                                               : (hot ? pal::slotHover : pal::appBg));
+        rend_.textIn(fSmall_, autoR, "AUTO", autoArm_ ? pal::accentHi : pal::textFaint,
+                     Align::Center);
+        if (hot) ui_.tip = "Automation arm: record control moves into the playing clip";
+        if (hot && win_.input().pressed[0]) toggleAutoArm();
+        x = autoR.right() + 12 * s;
+    }
 
     // --- position readout ---
     {
@@ -369,7 +390,16 @@ void App::drawStatusBar(const Rect& r) {
     const f32 s = win_.dpiScale();
     rend_.rect(r, pal::panel);
     rend_.rect({r.x, r.y, r.w, 1 * s}, pal::divider);
-    rend_.textIn(fSmall_, r, status_.c_str(), pal::textFaint, Align::Left, 8 * s);
+    // Ui::tip is what the control under the cursor wants said about itself, and
+    // the status bar is the one place in the program with room to say it. It
+    // wins over `status_` only while it is set — the bar is drawn last in the
+    // frame, so every widget has already had its chance to ask — and the status
+    // message is still there the moment the pointer moves off. Nothing else
+    // rendered tips before this; the automation lane's key block needs them,
+    // because a plugin parameter's name does not fit in a 46 px gutter.
+    const bool tip = !ui_.tip.empty();
+    rend_.textIn(fSmall_, r, tip ? ui_.tip.c_str() : status_.c_str(),
+                 tip ? pal::textDim : pal::textFaint, Align::Left, 8 * s);
 
     // The MIDI tag carries the sequencer client id: nothing is auto-connected,
     // so the number is what the user needs to hand aconnect or qpwgraph.

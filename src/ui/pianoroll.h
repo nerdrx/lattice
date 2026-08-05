@@ -1,16 +1,75 @@
-// MIDI note editor — the piano roll shown in the CLIP tab for MIDI clips.
+// MIDI note editor — the piano roll shown in the CLIP tab, and the clip
+// automation lane that shares its time axis.
 //
-// Self-contained by design: it edits ClipModel::notes in place and reports
-// whether anything changed; the caller (App) owns pushing the result to the
-// engine and everything else about clip lifetime. No engine types in here —
-// not even for the note preview, which the roll only *asks* for (see
-// PreviewQueue) and never performs itself.
+// Self-contained by design: it edits ClipModel::notes and ClipModel::envelopes
+// in place and reports whether anything changed; the caller (App) owns pushing
+// the result to the engine and everything else about clip lifetime. No engine
+// types in here — not even for the note preview, which the roll only *asks*
+// for (see PreviewQueue) and never performs itself, and not for automation,
+// whose parameter names, ranges and units arrive as the plain AutoTargets view
+// below rather than as devices the roll would have to know about.
 #pragma once
 #include "widgets.h"
 #include "app.h"
+#include <string>
 #include <vector>
 
 namespace lat {
+
+// What a clip's envelopes are allowed to name, as the roll sees it: strings and
+// floats only. Built by App::drawClipDetail each frame from the selected
+// track's mixer fields and devices — no PluginInstance, no ParamInfo, no
+// DeviceModel — which is what keeps this header compilable against app.h alone
+// (docs/AUTOMATION.md §6.5).
+struct AutoTargets {
+    struct Entry {
+        std::string group;          // "Track" or the device's display name
+        std::string label;          // "Volume", "Drive", ...
+        std::string address;        // canonical, what an AutoLane stores
+        std::string unit;
+        f32  lo = 0.f, hi = 1.f, def = 0.f;
+        bool automated = false;     // this clip already has a lane for it
+    };
+    std::vector<Entry> entries;
+    // Lanes the engine gave up on: bit i is clip.envelopes[i], set from
+    // Ev::AutoLaneInert. An inert lane is drawn greyed with a one-line reason
+    // — the envelope is visible, the sound does not move, and something says
+    // why (docs/AUTOMATION.md §3.4).
+    u32 inert = 0;
+    // What to say about an inert lane; a default is used when this is empty.
+    std::string inertWhy;
+
+    const Entry* find(const std::string& address) const {
+        for (const Entry& e : entries)
+            if (e.address == address) return &e;
+        return nullptr;
+    }
+};
+
+// A set of indices into some vector, one member singled out as the primary —
+// the one the last gesture was actually about. Extracted from the note
+// selection so the automation lane's breakpoints can use it unchanged: the two
+// index spaces are different, but every rule about them is the same. Sorted
+// because a multi-delete has to run back to front and a bounds check only needs
+// the last element; unique because every group edit would otherwise apply twice
+// to the same member; the primary is always inside the set while there is one
+// to have it. GUI thread only.
+struct IndexSel {
+    std::vector<int> items;          // sorted ascending, unique
+    int primary = -1;                // a member of `items`, or -1
+
+    bool empty() const { return items.empty(); }
+    int  count() const { return (int)items.size(); }
+    bool has(int i) const;
+    void clear();
+    void one(int i);                 // the set becomes {i}, primary = i
+    void add(int i);                 // no-op when already in
+    void toggle(int i);
+    void erased(int at);             // after `at` was erased from the vector
+    void prune(int n);               // drops anything past the end
+    // Adopts a band's base set and re-anchors the primary inside it.
+    void adopt(const std::vector<int>& v);
+};
 
 class PianoRoll {
 public:
@@ -76,15 +135,41 @@ public:
     //     the band needs a modifier at all.) Every group edit — move, nudge,
     //     delete, velocity, duplicate — acts on the whole set; see the keyboard
     //     API below.
-    //   * velocity lane at the bottom: one stem per note, drag to set
+    //   * the bottom lane is a CHOOSER (docs/AUTOMATION.md §6.1, decision #9):
+    //     it shows either the velocity stems or ONE of the clip's envelopes,
+    //     never both. The selectors sit in the lane's key block, where the
+    //     static "VEL" label used to be: what the lane shows, what "+" would
+    //     add, and the shown lane's on/off toggle. Envelope editing uses the
+    //     grid's own verbs — click empty space adds a breakpoint (grid-
+    //     quantized in time, free in value), drag moves it, Alt frees the beat,
+    //     Ctrl freezes it, right-click or double-click deletes, Shift+drag from
+    //     empty space rubber-bands a set that then moves as one, Delete and the
+    //     arrows act on the whole set. The lane uses the roll's OWN time axis,
+    //     so zoom and scroll can never drift apart from the notes above.
+    //   * an AUDIO clip gets the same editor with the note grid replaced by its
+    //     waveform, drawn against that same time axis, so a sample's envelopes
+    //     are edited where its transients are.
     //   * wheel = vertical scroll, Shift+wheel = horizontal, Ctrl+wheel = zoom
     //     the time axis about the cursor (kZoomMin..kZoomMax logical px/beat).
     //     A clip is first shown fit to the width; from the first Ctrl+wheel on,
     //     the zoom is the user's and is kept until the clip changes.
     //   * loop length readout + drag at the top-right of the ruler
     //     (whole-beat steps, min 1)
-    // Notes must stay sorted by beat after every edit.
-    bool draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, bool playing);
+    // Notes must stay sorted by beat after every edit, and so must the points
+    // of every envelope.
+    bool draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& targets,
+              f64 playheadBeats, bool playing);
+
+    // What the last edit that returned true was about, for the caller's undo
+    // label. Valid only immediately after a call that reported a change.
+    const char* lastEdit() const { return lastEdit_; }
+
+    // Puts the lane on `idx` (0 = velocity, n = the clip's nth envelope) for
+    // the clip that is about to be drawn — including one this roll has not seen
+    // yet, whose identity reset would otherwise take the choice straight back.
+    // The headless hook is the only caller: nothing inside gamescope can work a
+    // selector, and a lane nobody can select is a lane no screenshot can check.
+    void showLane(int idx) { laneSel_ = idx; pendingLane_ = idx; }
 
     // --- keyboard API ------------------------------------------------------
     // Driven by App::handleShortcuts, which routes the arrows, Delete, Escape
@@ -99,7 +184,11 @@ public:
     // return the same "the clip changed, re-push it" as draw().
     //
     // These signatures are the caller's contract and did not change when the
-    // selection became a set: each one extends to the whole set transparently.
+    // selection became a set, nor when the automation lane arrived: each one
+    // extends to the whole set transparently, and each acts on the BREAKPOINTS
+    // instead of the notes while the lane is showing an envelope and something
+    // is selected in it. That is what makes Delete, Escape and the arrows work
+    // in the lane without the caller having to know the lane exists.
     bool hasSelection(const ClipModel& clip) const;   // true for a set of any size
     bool clearSelection();                          // clears the whole set
     // Left/right by `gridSteps` grid steps, up/down by `semitones`, applied to
@@ -125,31 +214,55 @@ private:
     // identity as an unsaved, un-uid'd clip has to offer.
     bool owns(const ClipModel& clip) const { return clip.uid == clipUid_; }
 
-    // --- selection set -----------------------------------------------------
-    // `sel_` is kept sorted ascending and free of duplicates: sorted because a
-    // delete has to run back to front and a bounds check only needs the last
-    // element, unique because every group edit would otherwise apply twice to
-    // the same note. A vector rather than a bitset because it is the *order* we
-    // keep needing, and because a selection is small in every session anyone
-    // has ever played back — but it is not bounded in principle, so it grows.
-    // GUI thread only; no allocation happens on any audio path.
-    //
-    // `primary_` is one member of `sel_` (or -1 when the set is empty): the
-    // note the last gesture was actually about. It is what the view follows,
-    // what the audition plays, and the anchor a group move is measured from.
-    // Everything else about the set is symmetric.
-    bool selHas(int i) const;
-    void selClear();
-    void selOne(int i);          // the set becomes {i}, primary_ = i
-    void selAdd(int i);          // no-op when already in
-    void selToggle(int i);
-    // Rewrites the set after `at` was erased from clip.notes.
-    void selErased(int at);
-    // Drops anything past the end of a clip that changed under us.
-    void selPrune(int noteCount);
+    // The envelope the lane is showing, or null when it is showing the
+    // velocity stems — or when laneSel_ names a lane a clip that changed under
+    // us no longer has, which is why every caller goes through here rather than
+    // indexing envelopes itself.
+    AutoLane* shownLane(ClipModel& clip) const {
+        return (laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
+                   ? &clip.envelopes[(size_t)laneSel_ - 1]
+                   : nullptr;
+    }
+    // The lane's key block: the chooser, the target "+" would add, the add
+    // button and the shown lane's on/off toggle. Split out of draw() because it
+    // is the one part that can ADD a lane, and therefore the one part that must
+    // run before anything takes a pointer into clip.envelopes.
+    void drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip, const AutoTargets& targets,
+                     f32 s, bool& changed);
 
-    std::vector<int> sel_;       // indices into clip.notes, sorted + unique
-    int  primary_ = -1;          // index into clip.notes, always in sel_ or -1
+    const AutoLane* shownLane(const ClipModel& clip) const {
+        return (laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
+                   ? &clip.envelopes[(size_t)laneSel_ - 1]
+                   : nullptr;
+    }
+
+    // --- selection sets ----------------------------------------------------
+    // Two of them, one machine: `sel_` indexes clip.notes, `psel_` indexes the
+    // points of whichever envelope the lane is showing. Both are IndexSel, so
+    // "sorted, unique, primary stays inside, an erase renumbers what follows"
+    // is written once and the lane inherits the note grid's behaviour for free
+    // — a group drag, a band, a multi-delete all work the same way in both.
+    // GUI thread only; no allocation happens on any audio path.
+    IndexSel sel_;               // notes
+    IndexSel psel_;              // breakpoints of the shown envelope
+
+    // --- the lane ----------------------------------------------------------
+    // 0 = the velocity stems, n = clip.envelopes[n-1]. Clamped on every draw:
+    // the caller can delete a lane (undo, a project load) between frames.
+    int  laneSel_ = 0;
+    // Which AutoTargets entry the "+" button would add a lane for.
+    int  targetSel_ = 0;
+    // A lane choice made from outside for a clip not yet drawn; -1 = none. See
+    // showLane(): it survives exactly one identity reset and is then forgotten.
+    int  pendingLane_ = -1;
+    // The shown lane's value range as of the last draw. The keyboard API has no
+    // AutoTargets to consult — it runs before the frame that would hand one over
+    // — so the range the lane was last drawn against is what an arrow nudge is
+    // measured and clamped against. 0..1 until a lane has been drawn, which is
+    // the range of every mixer target anyway.
+    f32  laneLo_ = 0.f, laneHi_ = 1.f;
+    // The label the caller should put on the undo entry for the last change.
+    const char* lastEdit_ = "note edit";
 
     f32  scrollY_ = 0.f;         // pixels, pitch axis (relative, see draw())
     f32  scrollX_ = 0.f;         // pixels, time axis
@@ -170,18 +283,29 @@ private:
     // into view, so nudging a note off the top does not lose it.
     bool followSel_ = false;
     PreviewQueue preview_{};
-    // Drag state. Band is the rubber band, and is the one drag with no note
-    // under it — hence the dragNote_ checks that exclude it.
-    enum class Drag { None, Move, Resize, Velocity, Band } drag_ = Drag::None;
+    // Drag state. Band and PointBand are the two drags with nothing under them
+    // — hence the dragNote_ checks that exclude them. Point/PointBand are the
+    // lane's, and are deliberately the same two shapes as the grid's.
+    enum class Drag { None, Move, Resize, Velocity, Band, Point, PointBand } drag_ = Drag::None;
     int  dragNote_ = -1;
     f32  dragY_ = 0.f;
     f64  dragBeat_ = 0.0;
     int  dragPitch_ = 0;
+    // Breakpoint being dragged, and the grab offsets that keep it under the
+    // cursor: where inside the point the press landed, in beats and in value.
+    int  dragPt_ = -1;
+    f64  dragPtBeat_ = 0.0;
+    f32  dragPtVal_ = 0.f;
     // Rubber-band anchor, held in CONTENT space rather than screen space
     // (a beat, and a pixel offset down the row stack) so that scrolling or
     // zooming mid-band leaves the corner on the material it was put on.
     f64  bandBeat_ = 0.0;
     f32  bandY_ = 0.f;
+    // The lane's band anchor. Its second coordinate is a VALUE and not a pixel
+    // offset, for the same reason bandY_ is a content offset: the lane's value
+    // axis does not move, but the corner must stay on the material it was put
+    // on when the time axis under it does.
+    f32  bandVal_ = 0.f;
     // The selection as it stood when the band started. The band adds to it
     // rather than replacing it — Shift means "and also" here as everywhere —
     // which also means a band that touches nothing takes nothing away.

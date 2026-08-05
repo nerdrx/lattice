@@ -465,20 +465,38 @@ void App::drawDeviceStrip(const Rect& r) {
             // the value the snapshot reads (serializeDevices asks the instance)
             // is still the old one when the entry is taken. A knob drag
             // coalesces on the widget's id, as everywhere else.
+            // Both also report the move to autoCapture (docs/AUTOMATION.md
+            // §5.1). Unconditionally, and only for a TRACK chain: a clip
+            // envelope may only automate its own track's devices (§4.2 step 2,
+            // decision #2), so a return's or the master's knob has no clip to
+            // record into and no address a lane could name. Everything else —
+            // the arm, the transport, which clip is playing, the thinning —
+            // is autoCapture's decision, kept in one place on purpose. The
+            // value is the plugin's own units (§2.3), and the knob's id is the
+            // gesture, so one drag is one pass and one undo entry.
+            const u64 wid = uiId(12, (int)i * 256 + p, 0);
+            const bool ownTrack = ownIsTrack(devOwner_);
             if (info.isBool) {
                 Rect tg{cell.cx() - 11 * s, cell.y + 8 * s, 22 * s, 14 * s};
                 bool on = d.inst->getParam(p) > 0.5f;
-                if (ui_.squareToggle(uiId(12, (int)i * 256 + p, 0), tg, "", &on, pal::accent)) {
+                if (ui_.squareToggle(wid, tg, "", &on, pal::accent)) {
                     undoPoint(info.name.c_str());
-                    d.inst->setParam(p, on ? info.max : info.min);
+                    const f32 nv = on ? info.max : info.min;
+                    d.inst->setParam(p, nv);
+                    if (ownTrack)
+                        autoCapture(addr::deviceParam(ses_.tracks[devOwner_].uid, d.uid, info.id),
+                                    nv, wid);
                 }
             } else {
                 Rect kr{cell.cx() - 16 * s, cell.y + 2 * s, 32 * s, 32 * s};
                 f32 v = d.inst->getParam(p);
-                if (ui_.knob(uiId(12, (int)i * 256 + p, 0), kr, &v, info.min, info.max,
+                if (ui_.knob(wid, kr, &v, info.min, info.max,
                              info.def, info.isInt ? "%.0f" : "%.2f")) {
                     undoPoint(info.name.c_str());
                     d.inst->setParam(p, v);
+                    if (ownTrack)
+                        autoCapture(addr::deviceParam(ses_.tracks[devOwner_].uid, d.uid, info.id),
+                                    v, wid);
                 }
             }
 

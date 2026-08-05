@@ -462,7 +462,11 @@ PianoRoll* App::visibleRoll() {
     if (selTrack_ < 0 || selTrack_ >= (int)ses_.tracks.size()) return nullptr;
     if (selSlot_ < 0 || selSlot_ >= kMaxScenes) return nullptr;
     const ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
-    return m.kind == ClipKind::Midi ? roll_.get() : nullptr;
+    // Audio clips reach the roll too, since it now hosts their envelope lane:
+    // the keyboard verbs (Delete, arrows, Escape) route to whichever selection
+    // the roll holds, and refusing here would have left an audio clip's
+    // breakpoints mouse-editable but not keyboard-editable.
+    return m.valid() ? roll_.get() : nullptr;
 }
 
 void App::startPreview(int pitch, u64 clipUid) {
