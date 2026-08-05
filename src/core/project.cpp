@@ -99,10 +99,13 @@ f32 clWidth(f32 v)      { return std::isfinite(v) ? clampv(v, 24.f, 1024.f) : 94
 int clWarp(int v)       { return clampv(v, (int)Warp::Off, (int)Warp::Beats); }
 i64 clFrame(i64 v)      { return v < 0 ? 0 : v; }
 
-// A slot counts as occupied if it holds audio or was given a name. There is no
-// explicit "used" flag in ClipModel, and a clip whose file went missing must
-// still survive a save/load cycle, so the name carries the occupancy.
-bool clipOccupied(const ClipModel& c) { return c.sample != nullptr || !c.name.empty(); }
+// A slot counts as occupied if it holds audio, remembers a source file, or was
+// given a name. There is no explicit "used" flag in ClipModel; the path is what
+// keeps a clip whose media went offline alive across a save/load cycle, and the
+// name covers clips that never had a file at all.
+bool clipOccupied(const ClipModel& c) {
+    return c.sample != nullptr || !c.path.empty() || !c.name.empty();
+}
 
 // Number of scene rows the file must describe: the model's own scene list,
 // widened to cover any clip that lives below it. Writing the wider count is
@@ -142,7 +145,12 @@ void kn(std::string& o, const char* indent, const char* key, const std::string& 
 
 void writeClip(std::string& o, const ClipModel& c, int idx) {
     o += "  clip " + std::to_string(idx) + "\n";
-    if (c.sample && !c.sample->path.empty()) kv(o, "    ", "file", c.sample->path);
+    // ClipModel::path is the authority: unlike the sample's own path it outlives
+    // a file that failed to load, so an offline set keeps its references instead
+    // of quietly dropping the `file` line on the next save. The sample is only
+    // consulted for in-memory clips built before `path` was populated.
+    if (!c.path.empty())                          kv(o, "    ", "file", c.path);
+    else if (c.sample && !c.sample->path.empty()) kv(o, "    ", "file", c.sample->path);
     kv(o, "    ", "name", c.name);
     kn(o, "    ", "color",  std::to_string(clColor(c.colorIdx)));
     kn(o, "    ", "gain",   fmtF32(clGain(c.gain)));
@@ -165,6 +173,11 @@ void writeTrack(std::string& o, const TrackModel& t, int idx) {
     kn(o, "  ", "flags", std::string(t.mute ? "1" : "0") + " " +
                          (t.solo ? "1" : "0") + " " + (t.arm ? "1" : "0"));
     kn(o, "  ", "width", fmtF32(clWidth(t.width)));
+    // WAVE 2: the device chain goes here, between the track scalars and the
+    // clips -- one "device <idx>" / "enddevice" block per entry of t.devices,
+    // holding the plugin URI, bypass flag and its saved state. Deliberately not
+    // serialized yet: a `device` key inside a track is still a parse error, so
+    // no half-written chain can be read back by this version.
     for (int i = 0; i < kMaxScenes; ++i)
         if (clipOccupied(t.slots[i])) writeClip(o, t.slots[i], i);
     o += "endtrack\n";
@@ -300,7 +313,7 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
     bool sawHeader = false;
     int  ti = -1, ci = -1, sci = -1;
     std::string clipFile;
-    bool clipSawRange = false, clipSawBpm = false, clipSawBeats = false;
+    bool clipSawRange = false, clipSawBpm = false, clipSawBeats = false, clipSawName = false;
     int  missing = 0;
 
     // Resolves the pending clip once its body has been read: the sample load is
@@ -308,22 +321,26 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
     auto finishClip = [&]() {
         if (ti < 0 || ci < 0) return;
         ClipModel& c = out.tracks[(size_t)ti].slots[ci];
+        // The reference is recorded whether or not the audio can be decoded --
+        // that is what lets the next save write the same `file` line back.
+        c.path = clipFile;
         if (!clipFile.empty()) {
             c.sample = loadSample(clipFile, engineRate);
             if (!c.sample) {
                 ++missing;
-                LOGW("project: missing sample '%s' (slot %d/%d kept empty)", clipFile.c_str(), ti, ci);
-                if (c.name.empty()) c.name = baseName(clipFile);
+                LOGW("project: missing sample '%s' (slot %d/%d kept, path preserved)", clipFile.c_str(), ti, ci);
+                if (!clipSawName) c.name = baseName(clipFile);
             } else {
                 // Only fill in what the file did not state, so a project that
                 // spells out every field re-saves byte-for-byte identically.
-                if (c.name.empty())  c.name = c.sample->name;
+                // An explicitly empty `name` counts as stated.
+                if (!clipSawName)    c.name = c.sample->name;
                 if (!clipSawBpm)     c.clipBpm = clBpm(c.sample->guessedBpm);
                 if (!clipSawBeats)   c.lengthBeats = clBeats(c.sample->guessedBeats);
                 if (!clipSawRange) { c.loopStart = 0; c.loopEnd = c.sample->frames; }
             }
         }
-        if (c.name.empty() && c.sample == nullptr) {
+        if (!clipOccupied(c)) {
             // Nothing identifies this slot; drop it rather than leave a ghost.
             c = ClipModel{};
         }
@@ -426,7 +443,7 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 ci = v;
                 t.slots[ci] = ClipModel{};
                 clipFile.clear();
-                clipSawRange = clipSawBpm = clipSawBeats = false;
+                clipSawRange = clipSawBpm = clipSawBeats = clipSawName = false;
                 st = St::Clip;
             } else if (key == "endtrack") {
                 ti = -1;
@@ -442,7 +459,7 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             if (key == "file") {
                 clipFile = unesc(rest);
             } else if (key == "name") {
-                c.name = unesc(rest);
+                c.name = unesc(rest); clipSawName = true;
             } else if (key == "color") {
                 int v; if (!sc.integer(v)) return fail("clip color: expected an integer");
                 c.colorIdx = clColor(v);

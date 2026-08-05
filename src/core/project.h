@@ -22,6 +22,9 @@ bool saveProject(const Session& s, const std::string& path, std::string* err);
 //
 // A clip whose audio file has gone missing is *kept* (with a null sample) and
 // logged; losing a whole set because one sample moved is never the right call.
+// Its ClipModel::path is filled in regardless of whether the audio decoded, so
+// the reference survives the next save and the set repairs itself once the file
+// comes back.
 // On a genuine parse error `s` is left untouched, *err is set, and false is
 // returned.
 bool loadProject(Session& s, const std::string& path, f64 engineRate, std::string* err);
