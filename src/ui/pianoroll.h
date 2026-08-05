@@ -8,6 +8,7 @@
 #pragma once
 #include "widgets.h"
 #include "app.h"
+#include <vector>
 
 namespace lat {
 
@@ -65,6 +66,16 @@ public:
     //     step, velocity = last-used); click note = select; drag note = move
     //     (pitch + beat); drag right edge = resize; right-click note = delete;
     //     double-click empty = add, double-click note = delete (Live habit)
+    //   * the selection is a SET. Shift+click a note toggles it in or out;
+    //     plain-clicking a note that is already part of a multi-selection keeps
+    //     the set (so the click can start a group drag) and otherwise reduces
+    //     the selection to that one note. Shift+drag from empty grid space
+    //     rubber-bands: an accent-outlined rect that adds every note it touches
+    //     to the selection as it is dragged. (Plain drag from empty space still
+    //     adds a note — the press-drag-add gesture is unchanged, which is why
+    //     the band needs a modifier at all.) Every group edit — move, nudge,
+    //     delete, velocity, duplicate — acts on the whole set; see the keyboard
+    //     API below.
     //   * velocity lane at the bottom: one stem per note, drag to set
     //   * wheel = vertical scroll, Shift+wheel = horizontal, Ctrl+wheel = zoom
     //     the time axis about the cursor (kZoomMin..kZoomMax logical px/beat).
@@ -82,20 +93,28 @@ public:
     // keys keep their session-wide meaning. See App::visibleRoll().
     //
     // Every call takes the clip rather than trusting the last one drawn: the
-    // selection is an index, the caller can put a different clip in front of
-    // the roll between frames, and a stale index is a wrong-note edit. They
-    // are no-ops for a clip this roll has not drawn (uid mismatch), and return
-    // the same "the clip changed, re-push it" as draw().
-    bool hasSelection(const ClipModel& clip) const;
-    bool clearSelection();                          // true when it cleared one
-    // Left/right by `gridSteps` grid steps, up/down by `semitones`; both
-    // clamped into the clip and into 0..127, and a pitch change auditions.
+    // selection is a set of indices, the caller can put a different clip in
+    // front of the roll between frames, and a stale index is a wrong-note edit.
+    // They are no-ops for a clip this roll has not drawn (uid mismatch), and
+    // return the same "the clip changed, re-push it" as draw().
+    //
+    // These signatures are the caller's contract and did not change when the
+    // selection became a set: each one extends to the whole set transparently.
+    bool hasSelection(const ClipModel& clip) const;   // true for a set of any size
+    bool clearSelection();                          // clears the whole set
+    // Left/right by `gridSteps` grid steps, up/down by `semitones`, applied to
+    // EVERY selected note. The delta is clamped once for the group rather than
+    // per note — the group stops when its extreme member reaches the start of
+    // the clip, its end, pitch 0 or pitch 127 — so relative spacing inside the
+    // selection is never squashed by a wall. A pitch change auditions the
+    // primary note only (see kPreviewMax: a thirty-note chord is not an
+    // audition, it is noise).
     bool nudgeSelected(ClipModel& clip, int gridSteps, int semitones);
-    bool deleteSelected(ClipModel& clip);
+    bool deleteSelected(ClipModel& clip);           // deletes the whole set
     // Live's duplicate-loop (Cmd+D on the loop brace): doubles lengthBeats up
     // to kMaxLoopBeats and appends a copy of every note one old-length later.
-    // The selection follows into the copy, so a duplicate can be edited at
-    // once without hunting for the new note.
+    // The selection follows into the copy — the whole set does, note for note —
+    // so a duplicate can be edited at once without hunting for the new notes.
     bool duplicateLoop(ClipModel& clip);
     // Pitches to audition this frame; see PreviewQueue. Empties the queue.
     int  drainPreview(u8* out, int max) { return preview_.drain(out, max); }
@@ -105,6 +124,32 @@ private:
     // compares equal to a roll that has drawn nothing, which is as much
     // identity as an unsaved, un-uid'd clip has to offer.
     bool owns(const ClipModel& clip) const { return clip.uid == clipUid_; }
+
+    // --- selection set -----------------------------------------------------
+    // `sel_` is kept sorted ascending and free of duplicates: sorted because a
+    // delete has to run back to front and a bounds check only needs the last
+    // element, unique because every group edit would otherwise apply twice to
+    // the same note. A vector rather than a bitset because it is the *order* we
+    // keep needing, and because a selection is small in every session anyone
+    // has ever played back — but it is not bounded in principle, so it grows.
+    // GUI thread only; no allocation happens on any audio path.
+    //
+    // `primary_` is one member of `sel_` (or -1 when the set is empty): the
+    // note the last gesture was actually about. It is what the view follows,
+    // what the audition plays, and the anchor a group move is measured from.
+    // Everything else about the set is symmetric.
+    bool selHas(int i) const;
+    void selClear();
+    void selOne(int i);          // the set becomes {i}, primary_ = i
+    void selAdd(int i);          // no-op when already in
+    void selToggle(int i);
+    // Rewrites the set after `at` was erased from clip.notes.
+    void selErased(int at);
+    // Drops anything past the end of a clip that changed under us.
+    void selPrune(int noteCount);
+
+    std::vector<int> sel_;       // indices into clip.notes, sorted + unique
+    int  primary_ = -1;          // index into clip.notes, always in sel_ or -1
 
     f32  scrollY_ = 0.f;         // pixels, pitch axis (relative, see draw())
     f32  scrollX_ = 0.f;         // pixels, time axis
@@ -116,7 +161,6 @@ private:
     // one particular clip, so they reset when this changes.
     u64  clipUid_ = 0;
     bool fold_ = false;
-    int  selected_ = -1;         // index into clip.notes, -1 none
     u8   lastVel_ = 100;
     // "The press before this one created a note." Clicking empty space adds,
     // so without this the second click of a double-click on empty space would
@@ -126,12 +170,22 @@ private:
     // into view, so nudging a note off the top does not lose it.
     bool followSel_ = false;
     PreviewQueue preview_{};
-    // Drag state
-    enum class Drag { None, Move, Resize, Velocity } drag_ = Drag::None;
+    // Drag state. Band is the rubber band, and is the one drag with no note
+    // under it — hence the dragNote_ checks that exclude it.
+    enum class Drag { None, Move, Resize, Velocity, Band } drag_ = Drag::None;
     int  dragNote_ = -1;
     f32  dragY_ = 0.f;
     f64  dragBeat_ = 0.0;
     int  dragPitch_ = 0;
+    // Rubber-band anchor, held in CONTENT space rather than screen space
+    // (a beat, and a pixel offset down the row stack) so that scrolling or
+    // zooming mid-band leaves the corner on the material it was put on.
+    f64  bandBeat_ = 0.0;
+    f32  bandY_ = 0.f;
+    // The selection as it stood when the band started. The band adds to it
+    // rather than replacing it — Shift means "and also" here as everywhere —
+    // which also means a band that touches nothing takes nothing away.
+    std::vector<int> bandBase_;
 };
 
 } // namespace lat

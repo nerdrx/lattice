@@ -165,76 +165,239 @@ int sortTracking(std::vector<NoteModel>& v, const NoteModel& key) {
     return -1;
 }
 
-// Keyboard nudge: `steps` grid steps along time, `semis` semitones of pitch.
-// Both clamped — into the clip at both ends, into 0..127 — and the time nudge
-// goes through the same snap as a mouse move, so nudging an off-grid note (one
-// that arrived by MIDI recording) pulls it onto the grid rather than carrying
-// the offset along forever.
+// ---------------------------------------------------------------------------
+// the selection, as a set
+// ---------------------------------------------------------------------------
+
+// A selection expressed as *notes* rather than indices — the only form of it
+// that survives a re-sort. `primary` is a slot in `notes`, or -1.
+struct SelKeys {
+    std::vector<NoteModel> notes;
+    int primary = -1;
+};
+
+// sortTracking for a whole set. Two notes that compare equal on all four
+// fields are interchangeable, but they are still two notes: each key claims a
+// slot of its own, so a selection holding both never collapses onto one index
+// (and then moves that one note twice as far on the next drag). The search
+// starts at the sorted position of the key, so this stays near-linear even
+// when the whole clip is selected and a group drag re-runs it every frame.
 //
-// `index` comes back as the note's index *after* the re-sort, or -1 when the
-// nudge changed nothing at all (a note already against a clamp).
+// `outSel` comes back sorted ascending; a key whose note no longer exists is
+// simply dropped, which is what makes this safe to run after a trim.
+void sortTrackingSet(std::vector<NoteModel>& v, const SelKeys& keys,
+                     std::vector<int>& outSel, int& outPrimary) {
+    std::sort(v.begin(), v.end(), noteLess);
+    outSel.clear();
+    outPrimary = -1;
+    const size_t n = v.size(), k = keys.notes.size();
+    if (k == 0 || n == 0) return;
+    std::vector<bool> taken(n, false);
+    for (size_t j = 0; j < k; ++j) {
+        const NoteModel& key = keys.notes[j];
+        size_t i = (size_t)(std::lower_bound(v.begin(), v.end(), key, noteLess) - v.begin());
+        for (; i < n; ++i) {
+            if (noteLess(key, v[i])) break;          // past every equal-ordering note
+            if (taken[i] || !sameNote(v[i], key)) continue;
+            taken[i] = true;
+            outSel.push_back((int)i);
+            if ((int)j == keys.primary) outPrimary = (int)i;
+            break;
+        }
+    }
+    std::sort(outSel.begin(), outSel.end());
+}
+
+// How far a selection can travel before one of its members hits a wall: the
+// start of the clip, its end, pitch 0 or pitch 127. Clamping the *group* this
+// way rather than each note on its own is the whole difference between a group
+// move that keeps its shape and one that piles up against the edge.
+struct GroupRoom {
+    f64  left = 0.0, right = 0.0;   // beats: most negative / most positive move
+    int  down = 0, up = 0;          // semitones
+    bool empty = true;
+};
+GroupRoom groupRoom(const std::vector<NoteModel>& notes, const std::vector<int>& sel,
+                    f64 lengthBeats) {
+    GroupRoom g;
+    f64 minBeat = 0.0, maxEnd = 0.0;
+    int minP = 0, maxP = 0;
+    for (int i : sel) {
+        if (i < 0 || i >= (int)notes.size()) continue;
+        const NoteModel& nt = notes[(size_t)i];
+        if (g.empty) {
+            minBeat = nt.beat; maxEnd = nt.beat + nt.len;
+            minP = maxP = (int)nt.pitch;
+            g.empty = false;
+        } else {
+            minBeat = std::min(minBeat, nt.beat);
+            maxEnd  = std::max(maxEnd, nt.beat + nt.len);
+            minP    = std::min(minP, (int)nt.pitch);
+            maxP    = std::max(maxP, (int)nt.pitch);
+        }
+    }
+    if (g.empty) return g;
+    g.left  = -minBeat;
+    // A group that already hangs past the end of the clip (an over-long note,
+    // or a loop dragged shorter under it) has *negative* room to the right, and
+    // taking that as the clamp pulls it back inside — which is exactly what the
+    // single-note clamp does. It can never pull further left than beat 0.
+    g.right = std::max(g.left, lengthBeats - maxEnd);
+    g.down  = -minP;
+    g.up    = 127 - maxP;
+    return g;
+}
+
+// A group move, already clamped. Both fields are deltas, not destinations.
+struct GroupDelta {
+    f64 beats = 0.0;
+    int semis = 0;
+};
+GroupDelta clampGroupDelta(const std::vector<NoteModel>& notes, const std::vector<int>& sel,
+                           f64 dBeats, int dSemis, f64 lengthBeats) {
+    GroupDelta d;
+    const GroupRoom g = groupRoom(notes, sel, lengthBeats);
+    if (g.empty) return d;
+    d.beats = clampv(dBeats, g.left, g.right);
+    d.semis = clampv(dSemis, g.down, g.up);
+    return d;
+}
+
+// Applies a clamped delta to every selected note and restores the sorted-by-
+// beat invariant, re-deriving `sel` and `primary` through it. Returns false
+// when the delta was zero (a group already against both walls), in which case
+// nothing was touched and the caller must not report a change.
+//
+// Note that only the group's *extremes* were clamped: the members are moved by
+// the same delta, so the shape of a chord or a riff is preserved exactly.
+bool applyGroupDelta(std::vector<NoteModel>& notes, std::vector<int>& sel, int& primary,
+                     const GroupDelta& d) {
+    if (d.beats == 0.0 && d.semis == 0) return false;
+    SelKeys keys;
+    keys.notes.reserve(sel.size());
+    for (int i : sel) {
+        if (i < 0 || i >= (int)notes.size()) continue;
+        NoteModel& nt = notes[(size_t)i];
+        nt.beat  = nt.beat + d.beats;
+        nt.pitch = (u8)clampv((int)nt.pitch + d.semis, 0, 127);
+        if (i == primary) keys.primary = (int)keys.notes.size();
+        keys.notes.push_back(nt);
+    }
+    if (keys.notes.empty()) return false;
+    sortTrackingSet(notes, keys, sel, primary);
+    return true;
+}
+
+// Keyboard nudge: `steps` grid steps along time, `semis` semitones of pitch,
+// applied to every selected note. Both clamped — into the clip at both ends,
+// into 0..127 — once for the group.
+//
+// The time nudge goes through the same snap as a mouse move, measured on the
+// PRIMARY note: nudging an off-grid note (one that arrived by MIDI recording)
+// pulls it onto the grid rather than carrying the offset along forever, and a
+// selection is pulled onto the grid by its anchor while keeping its internal
+// spacing. For a one-note selection this is exactly clampBeat, note for note.
+//
+// `changed` is false when the nudge changed nothing at all (a group already
+// against the clamp); otherwise `sel` and `primary` come back re-derived.
 struct NudgeResult {
-    int  index = -1;
+    bool changed = false;
     bool pitchChanged = false;
 };
-NudgeResult nudgeNote(std::vector<NoteModel>& notes, int idx, int steps, int semis,
-                      f64 lengthBeats) {
+NudgeResult nudgeGroup(std::vector<NoteModel>& notes, std::vector<int>& sel, int& primary,
+                       int steps, int semis, f64 lengthBeats) {
     NudgeResult res;
-    if (idx < 0 || idx >= (int)notes.size()) return res;
-    NoteModel nt = notes[(size_t)idx];
-    const NoteModel was = nt;
-    if (steps != 0) nt.beat = clampBeat(nt.beat + (f64)steps * kGridStep, nt.len, lengthBeats);
-    if (semis != 0) nt.pitch = (u8)clampv((int)nt.pitch + semis, 0, 127);
-    if (sameNote(nt, was)) return res;
-    notes[(size_t)idx] = nt;
-    res.index = sortTracking(notes, nt);
-    res.pitchChanged = nt.pitch != was.pitch;
+    if (sel.empty()) return res;
+    const int anchor = (primary >= 0 && primary < (int)notes.size()) ? primary : sel.front();
+    if (anchor < 0 || anchor >= (int)notes.size()) return res;
+    const f64 aBeat = notes[(size_t)anchor].beat;
+    const f64 want = steps != 0 ? quantNear(aBeat + (f64)steps * kGridStep) - aBeat : 0.0;
+    const GroupDelta d = clampGroupDelta(notes, sel, want, semis, lengthBeats);
+    if (!applyGroupDelta(notes, sel, primary, d)) return res;
+    res.changed = true;
+    res.pitchChanged = d.semis != 0;
     return res;
 }
 
 // Live's duplicate-loop: the loop doubles and everything in it is copied one
-// old-length later, so a bar of material becomes two bars of it. `selected`
-// (an index, or -1) follows into the *copy*, which is the note the user is
-// about to edit; the returned index is where that copy landed.
+// old-length later, so a bar of material becomes two bars of it. The selection
+// follows into the *copy* — the whole set does, note for note — because the
+// copy is what the user is about to edit.
 //
 // The cap is a length, not a factor: doubling a 40-beat loop gives 64 and the
 // copies that would start past the new end are simply not made (a note that
-// straddles the end is trimmed). Nothing happens at all once the loop is
-// already at the cap — a no-op that reports false, so the caller does not
-// re-push an unchanged clip.
+// straddles the end is trimmed). A selected note whose copy was not made keeps
+// the selection on the original, so the set never silently shrinks. Nothing
+// happens at all once the loop is already at the cap — a no-op that reports
+// false, so the caller does not re-push an unchanged clip.
 struct DupResult {
     bool changed = false;
-    int  index = -1;
+    std::vector<int> sel;
+    int  primary = -1;
 };
-DupResult duplicateLoopNotes(std::vector<NoteModel>& notes, f64& lengthBeats, int selected) {
+DupResult duplicateLoopNotes(std::vector<NoteModel>& notes, f64& lengthBeats,
+                             const std::vector<int>& selected, int primary) {
     DupResult res;
     const f64 oldLen = std::max(kGridStep, lengthBeats);
     if (oldLen >= kMaxLoopBeats) return res;
     const f64 newLen = std::min(kMaxLoopBeats, oldLen * 2.0);
 
-    // The note the selection should end on: the copy of the selected note, or
-    // the selected note itself when the cap left no room for its copy. Either
-    // way it is tracked through the sort, because a bare sort would leave the
-    // caller holding an index into the old order.
+    // The notes the selection should end on, tracked as notes rather than
+    // indices: a bare sort would leave the caller holding indices into the old
+    // order. Each starts as the original and is overwritten by its copy if one
+    // gets made.
     const size_t n = notes.size();
-    NoteModel key{};
-    bool haveKey = selected >= 0 && selected < (int)n;
-    if (haveKey) key = notes[(size_t)selected];
+    SelKeys keys;
+    std::vector<int> slotOf(n, -1);          // note index -> slot in keys
+    for (int i : selected) {
+        if (i < 0 || i >= (int)n) continue;
+        slotOf[(size_t)i] = (int)keys.notes.size();
+        if (i == primary) keys.primary = (int)keys.notes.size();
+        keys.notes.push_back(notes[(size_t)i]);
+    }
     for (size_t i = 0; i < n; ++i) {
         NoteModel c = notes[i];
         c.beat += oldLen;
         if (c.beat >= newLen - 1e-9) continue;
         c.len = std::min(c.len, newLen - c.beat);
-        if ((int)i == selected) { key = c; haveKey = true; }
+        if (slotOf[i] >= 0) keys.notes[(size_t)slotOf[i]] = c;
         notes.push_back(c);
     }
     lengthBeats = newLen;
     res.changed = true;
     // The vector is two sorted runs (originals, then copies, each in order and
-    // the second entirely later), which sortTracking restores in one pass.
-    if (haveKey) res.index = sortTracking(notes, key);
-    else         std::sort(notes.begin(), notes.end(), noteLess);
+    // the second entirely later), which the re-sort inside here restores.
+    sortTrackingSet(notes, keys, res.sel, res.primary);
     return res;
+}
+
+// Screen span of a note along the time axis, including the minimum width the
+// grid draws a very short note at. The hit tests and the drawing have to agree
+// about where a note is, so both come through here.
+inline void noteSpanX(const NoteModel& nt, const TimeAxis& ta, f32 minW, f32& x0, f32& x1) {
+    x0 = beatToX(ta, nt.beat);
+    x1 = std::max(beatToX(ta, nt.beat + nt.len), x0 + minW);
+}
+
+// Every note whose block touches `band`, in index order. Touching counts: a
+// band that grazes an edge takes the note, and a band with no height (dragged
+// straight along one row, which is the commonest way to sweep a line of notes)
+// still takes the row it is on. Notes on a pitch the row map does not contain
+// — folded away — cannot be banded, since they are not on screen to be swept.
+void notesInBand(const std::vector<NoteModel>& notes, const RowMap& rows,
+                 const TimeAxis& ta, const PitchAxis& pa, const Rect& band, f32 minW,
+                 std::vector<int>& out) {
+    out.clear();
+    for (size_t i = 0; i < notes.size(); ++i) {
+        const int row = rows.rowOf(notes[i].pitch);
+        if (row < 0) continue;
+        f32 x0 = 0.f, x1 = 0.f;
+        noteSpanX(notes[i], ta, minW, x0, x1);
+        if (x1 < band.x || x0 > band.right()) continue;
+        const f32 y0 = rowToY(pa, row), y1 = y0 + pa.rowH;
+        if (y1 < band.y || y0 > band.bottom()) continue;
+        out.push_back((int)i);
+    }
 }
 
 // Topmost note under a point, or -1. Later notes win so the hit order matches
@@ -246,8 +409,8 @@ int noteAt(const std::vector<NoteModel>& notes, const RowMap& rows,
     int found = -1;
     for (size_t i = 0; i < notes.size(); ++i) {
         if ((int)notes[i].pitch != pitch) continue;
-        const f32 x0 = beatToX(ta, notes[i].beat);
-        const f32 x1 = std::max(beatToX(ta, notes[i].beat + notes[i].len), x0 + minW);
+        f32 x0 = 0.f, x1 = 0.f;
+        noteSpanX(notes[i], ta, minW, x0, x1);
         if (mx >= x0 && mx < x1) found = (int)i;
     }
     return found;
@@ -268,6 +431,68 @@ f32 dpiOf(const Ui& ui) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// PianoRoll: the selection set
+//
+// Small, sorted and unique, with one member singled out as the primary — the
+// note the last gesture was about, which is what the view follows and what the
+// audition plays. Every path that can invalidate an index goes through one of
+// these, so there is exactly one place where the set can get out of step with
+// clip.notes.
+// ---------------------------------------------------------------------------
+
+bool PianoRoll::selHas(int i) const {
+    return i >= 0 && std::binary_search(sel_.begin(), sel_.end(), i);
+}
+
+void PianoRoll::selClear() {
+    sel_.clear();
+    primary_ = -1;
+}
+
+void PianoRoll::selOne(int i) {
+    sel_.clear();
+    if (i >= 0) sel_.push_back(i);
+    primary_ = i >= 0 ? i : -1;
+}
+
+void PianoRoll::selAdd(int i) {
+    if (i < 0) return;
+    const auto it = std::lower_bound(sel_.begin(), sel_.end(), i);
+    if (it != sel_.end() && *it == i) return;
+    sel_.insert(it, i);
+    if (primary_ < 0) primary_ = i;
+}
+
+void PianoRoll::selToggle(int i) {
+    if (i < 0) return;
+    const auto it = std::lower_bound(sel_.begin(), sel_.end(), i);
+    if (it != sel_.end() && *it == i) {
+        sel_.erase(it);
+        // The primary has to stay inside the set; which member inherits it does
+        // not matter, only that one does while there is one to have it.
+        if (primary_ == i) primary_ = sel_.empty() ? -1 : sel_.front();
+        return;
+    }
+    sel_.insert(it, i);
+    primary_ = i;                       // the note just added is under the hand
+}
+
+void PianoRoll::selErased(int at) {
+    for (size_t k = 0; k < sel_.size();) {
+        if (sel_[k] == at)      sel_.erase(sel_.begin() + (long)k);
+        else                  { if (sel_[k] > at) --sel_[k]; ++k; }
+    }
+    if (primary_ == at)     primary_ = sel_.empty() ? -1 : sel_.front();
+    else if (primary_ > at) --primary_;
+}
+
+void PianoRoll::selPrune(int noteCount) {
+    while (!sel_.empty() && sel_.back() >= noteCount) sel_.pop_back();
+    if (sel_.empty())         primary_ = -1;
+    else if (!selHas(primary_)) primary_ = sel_.front();
+}
 
 // ---------------------------------------------------------------------------
 // PianoRoll
@@ -301,7 +526,8 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     // way a clip is first shown: fit to the width, nothing selected.
     if (clip.uid != clipUid_) {
         clipUid_ = clip.uid;
-        selected_ = -1;
+        selClear();
+        bandBase_.clear();
         dragNote_ = -1;
         drag_ = Drag::None;
         scrollX_ = scrollY_ = 0.f;
@@ -314,7 +540,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     // A note count can still change under a live selection (undo, a MIDI take
     // finishing), so indices are re-checked on every frame regardless.
     const int noteCount = (int)clip.notes.size();
-    if (selected_ >= noteCount) selected_ = -1;
+    selPrune(noteCount);
     if (dragNote_ >= noteCount) { dragNote_ = -1; drag_ = Drag::None; }
 
     // --- axes --------------------------------------------------------------
@@ -373,11 +599,13 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     // A keyboard edit can push the selected note out of the view — an octave
     // nudge usually does — and a note the user cannot see is a note they have
     // lost. The view follows it, by the smallest move that puts it back on
-    // screen (clamping to a window it is already inside is a no-op).
+    // screen (clamping to a window it is already inside is a no-op). It follows
+    // the *primary* note: a group can be taller and longer than the view, and
+    // chasing all of it would mean choosing which part to lose anyway.
     if (followSel_) {
         followSel_ = false;
-        if (selected_ >= 0 && selected_ < noteCount) {
-            const NoteModel& sel = clip.notes[(size_t)selected_];
+        if (primary_ >= 0 && primary_ < noteCount) {
+            const NoteModel& sel = clip.notes[(size_t)primary_];
             const int row = rows.rowOf(sel.pitch);
             if (row >= 0) {
                 const f32 top = (f32)row * rowH;
@@ -407,7 +635,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
     auto eraseNote = [&](int i) {
         if (i < 0 || i >= (int)clip.notes.size()) return;
         clip.notes.erase(clip.notes.begin() + i);
-        if (selected_ == i) selected_ = -1; else if (selected_ > i) --selected_;
+        selErased(i);
         if (dragNote_ == i) { dragNote_ = -1; drag_ = Drag::None; }
         else if (dragNote_ > i) --dragNote_;
         changed = true;
@@ -419,14 +647,47 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
         return (u8)clampv((int)std::lround(t * 127.f), 1, 127);
     };
 
+    // The rubber band, when one is in flight: computed with the interaction and
+    // drawn later, inside the grid's clip.
+    Rect bandRect{};
+    bool showBand = false;
+
     if (drag_ != Drag::None) {
-        if (!in.down[0] || dragNote_ < 0 || dragNote_ >= (int)clip.notes.size()) {
+        // The band is the one drag with no note under it.
+        const bool needsNote = drag_ != Drag::Band;
+        if (!in.down[0] ||
+            (needsNote && (dragNote_ < 0 || dragNote_ >= (int)clip.notes.size()))) {
             drag_ = Drag::None;
             dragNote_ = -1;
+            bandBase_.clear();
             if (ui.active == gridId || ui.active == laneId) ui.active = 0;
+        } else if (drag_ == Drag::Band) {
+            // Live, not on release: the selection is whatever the band touches
+            // *now*, so dragging back over a note un-takes it and there is no
+            // moment where what is highlighted and what is selected disagree.
+            // The anchor is in content space, so a wheel mid-band leaves the
+            // corner on the material it was put on rather than on a pixel.
+            const f32 ax = beatToX(ta, bandBeat_);
+            const f32 ay = grid.y - viewY + bandY_;
+            bandRect = Rect{std::min(ax, in.mx), std::min(ay, in.my),
+                            std::fabs(in.mx - ax), std::fabs(in.my - ay)};
+            showBand = true;
+            std::vector<int> hits;
+            notesInBand(clip.notes, rows, ta, pa, bandRect, minNoteW, hits);
+            // Shift means "and also" here as everywhere, so the band adds to
+            // what was selected when it started — which also means a band that
+            // touches nothing takes nothing away.
+            sel_ = bandBase_;
+            for (int i : hits) selAdd(i);
+            if (!selHas(primary_)) primary_ = sel_.empty() ? -1 : sel_.front();
         } else if (drag_ == Drag::Move) {
-            NoteModel& nt = clip.notes[(size_t)dragNote_];
-            const f64 nb = clampBeat(xToBeat(ta, in.mx) - dragBeat_, nt.len, clip.lengthBeats);
+            // The note under the hand is always part of what moves. It is put
+            // there on the press, but Escape can empty the set from the
+            // keyboard between frames while the button is still down, and a
+            // drag that silently stopped moving anything would look like a
+            // freeze rather than a cancel.
+            if (!selHas(dragNote_)) selOne(dragNote_);
+            const NoteModel nt = clip.notes[(size_t)dragNote_];   // copy: we sort below
             // Pitch follows whole rows travelled since the press. Both ends go
             // through the current axis, so wheeling mid-drag can shift the
             // result by at most the one row the sub-row phase moved by, rather
@@ -439,27 +700,47 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
                 const int p = rows.pitchAt(row);
                 if (p >= 0) np = p;
             }
-            if (nb != nt.beat || np != (int)nt.pitch) {
+            // The gesture is measured on the note under the hand and applied to
+            // the whole selection as one delta, so a chord keeps its shape and
+            // the group stops when its extreme member reaches a wall. With one
+            // note selected this is the old clampBeat/pitch clamp exactly.
+            const GroupDelta d = clampGroupDelta(
+                clip.notes, sel_, quantNear(xToBeat(ta, in.mx) - dragBeat_) - nt.beat,
+                np - (int)nt.pitch, clip.lengthBeats);
+            if (d.beats != 0.0 || d.semis != 0) {
                 // Dragging across rows plays what is under the note, the way a
                 // note dragged in Live does: the pitch is the thing being
-                // chosen, and choosing it by eye alone is guesswork.
-                if (np != (int)nt.pitch) preview_.push(np);
-                nt.beat = nb;
-                nt.pitch = (u8)np;
-                const NoteModel key = nt;           // nt dangles once we sort
-                dragNote_ = sortTracking(clip.notes, key);
-                selected_ = dragNote_;
+                // chosen, and choosing it by eye alone is guesswork. Only the
+                // note under the hand is auditioned — thirty at once is noise,
+                // not a chord.
+                if (d.semis != 0) preview_.push((int)nt.pitch + d.semis);
+                if (applyGroupDelta(clip.notes, sel_, primary_, d)) changed = true;
+                dragNote_ = primary_;
                 if (dragNote_ < 0) drag_ = Drag::None;
-                changed = true;
             }
         } else if (drag_ == Drag::Resize) {
+            // Length stays a one-note edit: a group resize has to choose
+            // between absolute and proportional lengths, and neither is what
+            // the hand on one note's right edge asked for.
             NoteModel& nt = clip.notes[(size_t)dragNote_];
             const f64 nl = clampLen(xToBeat(ta, in.mx), nt.beat, clip.lengthBeats);
             if (nl != nt.len) { nt.len = nl; changed = true; }
         } else if (drag_ == Drag::Velocity) {
-            NoteModel& nt = clip.notes[(size_t)dragNote_];
+            // Absolute, and for the whole selection: every selected stem takes
+            // the value under the cursor. Relative (each stem keeping its
+            // offset from the one being dragged) is the other defensible
+            // answer, but absolute is what a group drag does in Live and it is
+            // the one a user can aim. Velocity does not reorder, so no re-sort.
+            if (!selHas(dragNote_)) selOne(dragNote_);
             const u8 nv = velAt(in.my);
-            if (nv != nt.vel) { nt.vel = nv; lastVel_ = nv; changed = true; }
+            bool any = false;
+            for (int i : sel_) {
+                if (i < 0 || i >= (int)clip.notes.size()) continue;
+                if (clip.notes[(size_t)i].vel == nv) continue;
+                clip.notes[(size_t)i].vel = nv;
+                any = true;
+            }
+            if (any) { lastVel_ = nv; changed = true; }
         }
     } else if (hotGrid && (in.pressed[0] || in.pressed[2])) {
         const int hit = noteAt(clip.notes, rows, ta, pa, in.mx, in.my, minNoteW);
@@ -472,19 +753,41 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             if (hit >= 0) eraseNote(hit);                 // right-click deletes
         } else if (hit >= 0 && in.dblClick && !prevAdded) {
             eraseNote(hit);                               // double-click deletes
+        } else if (hit >= 0 && in.shift()) {
+            // Shift+click is about membership and starts no drag: a group that
+            // moved because a note was being added to it would be unusable.
+            selToggle(hit);
+            if (selHas(hit)) preview_.push((int)clip.notes[(size_t)hit].pitch);
         } else if (hit >= 0) {
-            selected_ = hit;
+            // A plain click on a note that is already part of a multi-selection
+            // keeps the set, so the same press can start a group drag; on
+            // anything else it reduces the selection to that one note. Standard
+            // DAW behaviour, and the reason clicking inside a chord to move it
+            // does not scatter the chord first.
+            if (!selHas(hit)) selOne(hit);
+            else              primary_ = hit;
             ui.active = gridId;
             const NoteModel& nt = clip.notes[(size_t)hit];
             preview_.push((int)nt.pitch);          // clicking a note plays it
-            const f32 x0 = beatToX(ta, nt.beat);
-            const f32 x1 = std::max(beatToX(ta, nt.beat + nt.len), x0 + minNoteW);
+            f32 x0 = 0.f, x1 = 0.f;
+            noteSpanX(nt, ta, minNoteW, x0, x1);
             const f32 edge = std::min(4.f * s, (x1 - x0) * 0.35f);
             dragNote_ = hit;
             dragY_ = in.my;
             dragPitch_ = (int)nt.pitch;
             if (in.mx >= x1 - edge) { drag_ = Drag::Resize; dragBeat_ = 0.0; }
             else { drag_ = Drag::Move; dragBeat_ = xToBeat(ta, in.mx) - nt.beat; }
+        } else if (in.shift()) {
+            // Rubber band. Plain empty-drag still adds a note — press-drag-add
+            // is the gesture the roll is built around — so the band is what
+            // Shift buys on empty space. The anchor is kept in content space so
+            // scrolling or zooming mid-band does not drag the corner with it.
+            drag_ = Drag::Band;
+            dragNote_ = -1;
+            bandBeat_ = xToBeat(ta, in.mx);
+            bandY_ = in.my - grid.y + viewY;
+            bandBase_ = sel_;
+            ui.active = gridId;
         } else {
             const int pitch = rows.pitchAt(yToRow(pa, in.my));
             const f64 b = quantFloor(xToBeat(ta, in.mx));
@@ -496,7 +799,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
                 nn.vel = lastVel_;
                 clip.notes.push_back(nn);
                 const int idx = sortTracking(clip.notes, nn);
-                selected_ = idx;
+                selOne(idx);                     // a fresh note is the selection
                 dragNote_ = idx;
                 // Press-drag-add: the new note is grabbed by the same gesture,
                 // so drawing a note and placing it is one movement.
@@ -520,7 +823,12 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             if (d <= bestD) { bestD = d; best = (int)i; }
         }
         if (best >= 0) {
-            selected_ = best;
+            // A stem that belongs to the current selection drags the whole set
+            // (the same rule the grid uses); any other stem takes the selection
+            // over first, so the lane can never edit a note the user cannot see
+            // they picked.
+            if (!selHas(best)) selOne(best);
+            else               primary_ = best;
             dragNote_ = best;
             drag_ = Drag::Velocity;
             // The lane deliberately does not audition: a velocity drag would
@@ -529,11 +837,14 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             addedLastPress_ = false;
             ui.active = laneId;
             const u8 nv = velAt(in.my);
-            if (nv != clip.notes[(size_t)best].vel) {
-                clip.notes[(size_t)best].vel = nv;
-                lastVel_ = nv;
-                changed = true;
+            bool any = false;
+            for (int i : sel_) {
+                if (i < 0 || i >= (int)clip.notes.size()) continue;
+                if (clip.notes[(size_t)i].vel == nv) continue;
+                clip.notes[(size_t)i].vel = nv;
+                any = true;
             }
+            if (any) { lastVel_ = nv; changed = true; }
         }
     }
 
@@ -625,14 +936,20 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
         const NoteModel& nt = clip.notes[i];
         const int row = rows.rowOf(nt.pitch);
         if (row < firstRow || row > lastRow) continue;
-        const f32 x0 = beatToX(ta, nt.beat);
-        const f32 x1 = std::max(beatToX(ta, nt.beat + nt.len), x0 + minNoteW);
+        f32 x0 = 0.f, x1 = 0.f;
+        noteSpanX(nt, ta, minNoteW, x0, x1);
         if (x1 < grid.x || x0 > grid.right()) continue;
         const Rect nr{x0, rowToY(pa, row) + 1.f * s, std::max(minNoteW, x1 - x0 - 1.f * s), rowH - 2.f * s};
         // Velocity reads as brightness, so a part's dynamics are visible in the
         // note block itself and not only down in the lane.
         rr.roundRect(nr, 2.f * s, base.scale(0.55f + 0.45f * (f32)nt.vel / 127.f));
-        if ((int)i == selected_) rr.roundRectOutline(nr, 2.f * s, 1.f * s, pal::accent);
+        if (selHas((int)i)) rr.roundRectOutline(nr, 2.f * s, 1.f * s, pal::accent);
+    }
+    // The band goes over the notes it is taking, translucent enough to leave
+    // them readable underneath.
+    if (showBand) {
+        rr.rect(bandRect, pal::accent.alpha(0.12f));
+        rr.roundRectOutline(bandRect, 0.f, 1.f * s, pal::accent);
     }
     if (playing) {
         const f32 px = beatToX(ta, playheadBeats);
@@ -654,8 +971,12 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
             const f32 x = std::round(beatToX(ta, clip.notes[i].beat));
             if (x < lane.x - 2.f * s || x > lane.right()) continue;
             const f32 top = foot - (f32)clip.notes[i].vel / 127.f * travel;
-            const bool sel = ((int)i == selected_);
-            const Col c = sel ? pal::accent : base.scale(0.8f);
+            // Every selected stem is accented, since a lane drag moves all of
+            // them; the primary keeps the full accent so the note the gesture
+            // is anchored on is still findable inside a large selection.
+            const Col c = !selHas((int)i)     ? base.scale(0.8f)
+                          : (int)i == primary_ ? pal::accent
+                                               : pal::accent.alpha(0.75f);
             rr.rect({x, top, std::max(1.f, 1.f * s), foot - top}, c);
             rr.circle(x + 0.5f * s, top, 2.5f * s, c);
         }
@@ -695,31 +1016,44 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, f64 playheadBeats, 
 // and an index into the wrong clip's notes is an edit to the wrong note.
 // ---------------------------------------------------------------------------
 
+// A set of any size answers yes, and one index out of range condemns the lot:
+// the set is only ever rebuilt as a whole, so a stale member means the clip
+// changed under it and nothing in it can be trusted. (sel_ is sorted, so the
+// last element is the only one that has to be checked.)
 bool PianoRoll::hasSelection(const ClipModel& clip) const {
-    return owns(clip) && selected_ >= 0 && selected_ < (int)clip.notes.size();
+    return owns(clip) && !sel_.empty() && sel_.back() < (int)clip.notes.size();
 }
 
 bool PianoRoll::clearSelection() {
-    if (selected_ < 0) return false;
-    selected_ = -1;
+    if (sel_.empty()) return false;
+    selClear();
     return true;
 }
 
 bool PianoRoll::nudgeSelected(ClipModel& clip, int gridSteps, int semitones) {
     if (!hasSelection(clip)) return false;
-    const NudgeResult res = nudgeNote(clip.notes, selected_, gridSteps, semitones,
-                                      clip.lengthBeats);
-    if (res.index < 0) return false;               // already against a clamp
-    selected_ = res.index;
+    const NudgeResult res = nudgeGroup(clip.notes, sel_, primary_, gridSteps, semitones,
+                                       clip.lengthBeats);
+    if (!res.changed) return false;                // already against a clamp
     followSel_ = true;
-    if (res.pitchChanged) preview_.push((int)clip.notes[(size_t)res.index].pitch);
+    // One audition for the group: the primary note. A held arrow key on a
+    // thirty-note chord would otherwise be a wall of retriggers.
+    if (res.pitchChanged && primary_ >= 0 && primary_ < (int)clip.notes.size())
+        preview_.push((int)clip.notes[(size_t)primary_].pitch);
     return true;
 }
 
 bool PianoRoll::deleteSelected(ClipModel& clip) {
     if (!hasSelection(clip)) return false;
-    clip.notes.erase(clip.notes.begin() + selected_);
-    selected_ = -1;
+    // Back to front: an index into a vector survives only until something
+    // earlier than it is removed. sel_ is sorted, so walking it in reverse is
+    // all the bookkeeping a multi-delete needs.
+    for (size_t k = sel_.size(); k-- > 0;) {
+        const int i = sel_[k];
+        if (i >= 0 && i < (int)clip.notes.size())
+            clip.notes.erase(clip.notes.begin() + i);
+    }
+    selClear();
     // A drag cannot be in flight (this arrives from the keyboard), but the
     // index would be stale if one ever were.
     dragNote_ = -1;
@@ -729,9 +1063,11 @@ bool PianoRoll::deleteSelected(ClipModel& clip) {
 
 bool PianoRoll::duplicateLoop(ClipModel& clip) {
     if (!owns(clip)) return false;
-    const DupResult res = duplicateLoopNotes(clip.notes, clip.lengthBeats, selected_);
+    const DupResult res = duplicateLoopNotes(clip.notes, clip.lengthBeats, sel_, primary_);
     if (!res.changed) return false;                // already at the cap
-    selected_ = res.index;
+    sel_ = res.sel;
+    primary_ = res.primary;
+    if (!sel_.empty() && !selHas(primary_)) primary_ = sel_.front();
     followSel_ = true;
     return true;
 }
