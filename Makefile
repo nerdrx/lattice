@@ -201,15 +201,20 @@ build/ipc_test: tests/ipc_test.cpp src/ipc/shm.h
 	@mkdir -p build
 	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
 
-# The engine daemon: Engine + a backend + the control region, and no GUI.
-# engine.cpp's use of PluginInstance is header-only virtual dispatch, so this
-# links without src/plugin — the same property build/engine_test relies on.
+# The engine daemon: Engine + a backend + the control region + the plugin
+# layer, and no GUI. Phase 3 is where src/plugin joins the link: the daemon
+# owns every PluginInstance now, so it needs the backends (lilv for LV2, dl for
+# CLAP) that phases 1 and 2 could do without. Still no GUI, no window system and
+# no sndfile — latticed renders, it does not decode or draw.
 DAEMON_SRC := src/daemon/latticed.cpp src/audio/engine.cpp src/audio/backend.cpp \
-              src/core/common.cpp
-DAEMON_CF  := -std=c++20 -O2 $(WARN) $(shell pkg-config --cflags jack alsa)
-DAEMON_LD  := $(shell pkg-config --libs jack alsa) -lrt -lpthread -lm
+              src/core/common.cpp \
+              src/plugin/host.cpp src/plugin/lv2_host.cpp src/plugin/clap_host.cpp \
+              src/plugin/internal_devices.cpp
+DAEMON_CF  := -std=c++20 -O2 $(WARN) -Ivendor/clap/include \
+              $(shell pkg-config --cflags jack alsa lilv-0)
+DAEMON_LD  := $(shell pkg-config --libs jack alsa lilv-0) -ldl -lrt -lpthread -lm
 
-build/latticed: $(DAEMON_SRC) $(IPC_H) src/audio/engine.h src/audio/backend.h
+build/latticed: $(DAEMON_SRC) $(IPC_H) src/audio/engine.h src/audio/backend.h src/plugin/host.h
 	@mkdir -p build
 	$(CXX) $(DAEMON_CF) $(DAEMON_SRC) -o $@ $(DAEMON_LD)
 

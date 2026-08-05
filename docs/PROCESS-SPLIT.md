@@ -1,10 +1,11 @@
 # Splitting Lattice into an engine process and a GUI process
 
-Status: **phase 2 shipped — `latticed` plays clips out of a shared sample pool (§10).**
+Status: **phase 3 shipped — `latticed` hosts the plugins (§11).**
 Wave 1 landed the transport (`src/ipc/shm.h`, `tests/ipc_test.cpp`) and this
 document; wave 2 landed the daemon and a scalar control plane (§9); wave 3
-landed the sample pool, the clip table and protocol v2 (§10). Nothing in
-`src/audio` or `src/ui` has been touched yet — the GUI still runs an in-process
+landed the sample pool, the clip table and protocol v2 (§10); wave 4 moved the
+plugin layer into the daemon — devices, the param table, protocol v3, and the
+exact sample retirement §10 asked for (§11). `src/ui` still runs an in-process
 `Engine` and is still the shipping path.
 
 ## Contents
@@ -37,6 +38,7 @@ landed the sample pool, the clip table and protocol v2 (§10). Nothing in
 8. [What wave 1 actually delivered](#8-what-wave-1-actually-delivered)
 9. [Phase 1 shipped](#9-phase-1-shipped)
 10. [Phase 2 shipped — the sample pool](#10-phase-2-shipped--the-sample-pool)
+11. [Phase 3 shipped — the plugins move in](#11-phase-3-shipped--the-plugins-move-in)
 
 ---
 
@@ -1101,6 +1103,13 @@ failure than any of the ownership bugs this phase removed. The exact version
 needs `Engine` to publish a drain counter: two lines in `src/audio`, and the
 first thing phase 3 should take.
 
+> **Superseded by §11.5.** Phase 3 took it. `Engine::drains` exists,
+> `latticed` retires on the counter, and the deadline is now reachable only
+> against an engine that does not count — a state the daemon latches and
+> publishes as `ControlHeader::drainsExact` rather than leaving to inference.
+> The exact rule is `drains >= k + 2` where `k` is read *after* the displacing
+> `pushCommand` returned true; §11.5 has the argument for the 2.
+
 At clean shutdown the daemon flushes every outstanding retirement after the
 driver has stopped, since with no audio thread left they are all trivially true.
 A client that is still attached can then free its pool cleanly instead of
@@ -1215,13 +1224,364 @@ and the test sanitised. `make test` is green end to end (252 + 54 + 200).
 - **Mixer scalars in `SharedState`.** Still unpublished by `Engine::publish()`,
   so a reattaching GUI still cannot read back vol/pan/mute/solo/arm.
 - **Chains, devices, the param table, recording** — phase 3, unchanged.
+  **— chains, devices and the param table are done in §11; recording is not.**
 - **The AF_UNIX socket**, and with it `memfd` + `SCM_RIGHTS` and the plugin
   catalog.
 - **GUI-crash reattach** (§4.3). The region survives a GUI crash by
   construction and `SamplePool::attach()` can adopt it, but nothing negotiates
   the unlink obligation back.
 - **`Engine` counting its own command drains**, which would replace the
-  retirement deadline with a proof (§10.3).
+  retirement deadline with a proof (§10.3). **— done in §11.5.**
 - **The GUI itself.** `src/ui` still owns an in-process `Engine`;
   `EngineClient` still has no callers outside the test. That is the next step —
   §9's step 4, now unblocked.
+
+---
+
+## 11. Phase 3 shipped — the plugins move in
+
+`latticed` links `src/plugin` and owns every `PluginInstance` in the system. A
+client names a plugin by URI; the daemon scans, instantiates, prepares, builds
+an `RtChain` out of *its own* instances and hands it to its `Engine`. What comes
+back is a device id and a table row. **No pointer crosses the boundary in either
+direction, and none is left to remove:** `RtClip::data` went in §10 and
+`RtChain::fx` goes here, which was the whole of §2.4 and §2.5.
+
+Protocol version 3, pool version 2. `kShmVersion` stays at 2 — `ShmHeader`,
+`ShmSpscRing` and `SharedStateT` did not change — but the control region grew
+two sections and its layout hash moved, so a phase-2 binary and a phase-3 binary
+refuse each other at `attach()` with a specific message.
+
+`src/audio` and `src/ui` were not edited by this wave. `Engine::drains`,
+`SetReturnChain`/`SetMasterChain` and the delay compensation this phase builds
+on landed in parallel, against the frozen `engine.h`.
+
+### 11.1 What exists now
+
+- **`src/daemon/latticed.cpp`** — the device layer.
+  - `PluginRegistry`, scanned lazily on the first device command, on a thread of
+    its own (§11.6). `PluginInstance` instantiation, preparation and destruction
+    on the pump thread.
+  - A device table (`Device[kMaxDevices]`), one flat chain array covering
+    32 tracks + 4 returns + the master, and the queue that turns
+    `AddDevice`/`RemoveDevice`/`MoveDevice` into `Cmd::SetChain` /
+    `SetReturnChain` / `SetMasterChain`.
+  - `pumpParams()`: the param table applied to `setParam` at 1 ms cadence.
+  - `drainProof()` / `drainProven()`: exact retirement for both sample blocks
+    and chains (§11.5).
+- **`src/ipc/control.h`** — protocol v3. `CmdAddDevice`/`RemoveDevice`/
+  `MoveDevice`/`SetBypass`/`ScanPlugins` in a daemon-command space clear of
+  `lat::Cmd`; `EvDeviceAdded`/`Failed`/`Removed`/`Changed`/`EvScanComplete`;
+  seven new reject reasons; `WireDeviceInfo[320]` and `WireDeviceParams[320]` as
+  the seventh and eighth region sections; device, param, chain and drain
+  counters in `ControlHeader`.
+- **`src/ipc/pool.h`** — `PoolKindString` and `SamplePool::writeString()`, the
+  string-crossing mechanism (§11.2). `PoolReader::block()` so the daemon can
+  bound a read by the block's declared size.
+- **`src/ipc/client.h`** — `addDevice`/`removeDevice`/`moveDevice`/`setBypass`/
+  `scanPlugins`, `setDeviceParam`, `readDevice` into a `DeviceMirror`, and the
+  slot-generation bookkeeping that guards a stale param write.
+- **`Makefile`** — `build/latticed` links `src/plugin/*.cpp` plus `lilv-0` and
+  `-ldl`. Still no GUI, no window system, no sndfile.
+- **`tests/daemon_test.cpp`** — 300 checks, fifteen sections.
+
+### 11.2 Strings across the boundary: the pool, not a table
+
+The rings carry 32 bytes and §3.2 is right that stretching them to carry a
+plugin URI would be a mistake. §3.2's answer is the AF_UNIX socket, and there
+still is not one. So a string travels in **the region that already exists for
+variable-length payloads**: the client allocates a `PoolKindString` block,
+writes the bytes, and `CmdAddDevice{ref}` carries the offset.
+
+Three properties made this the choice over a fixed string table in the control
+region:
+
+1. **One validator, not two.** `poolValidate()` is already the single place in
+   the tree where an untrusted `u64` becomes a pointer, and it is already
+   reviewed as such. A string table would be a second such place, indexed by a
+   number exactly as untrusted, with its own slot-reuse protocol to get wrong.
+2. **No fixed budget.** A table needs a slot count and a maximum length chosen
+   in advance; the pool needs neither.
+3. **The lifecycle already exists.** A string blob is a pool block, so
+   free-after-confirm applies unchanged — and it applies in its tightest
+   possible form.
+
+**Retirement of a string is instant, and that is not a shortcut.** The rule
+`EvBlockRetired` encodes is "the engine can no longer reach this". A string is
+copied into a stack buffer on the pump thread and is *never handed to the
+engine*, so there is nothing to be quiescent of: the daemon echoes the offset
+back in the same tick it reads it. Concretely, the client's half is
+
+```
+writeString  -> Quiescent, refs = 1
+markLive     -> Live               (so a concurrent free cannot take it)
+push AddDevice
+markDisplaced -> Retiring
+release       -> refs = 0, still Retiring, still not freed
+EvBlockRetired -> Quiescent -> refs == 0 -> freed
+```
+
+which is the existing state machine with no new states and no new rules.
+
+**Exactly one retirement echo per blob, accepted or refused.** The daemon copies
+the string and retires it *before* it looks at whether the URI resolves, so an
+`AddDevice` that fails does not leave the client holding a block it can never
+free. That is the same discipline `EvClipAck` established for cells and for the
+same reason: a silent refusal wedges the sender.
+
+Bound: `kMaxPoolString` = 1024 bytes, and the terminator must be **inside the
+block's own declared size**. A "string" whose NUL is past its allocation is not
+a truncation, it is a read off the end of somebody else's data, and it is
+refused with `RejectBadString`.
+
+### 11.3 Device metadata: a table, written by the daemon
+
+The brief for this phase said the daemon should write a metadata blob *into a
+pool block*. It cannot, and the reason is a feature: **`PoolReader` maps the
+pool `PROT_READ`** (§10.1), so "the engine only reads the pool" is a page
+permission and not a comment. Making the pool writable by the daemon to ship
+metadata would trade a hard guarantee for a soft convenience.
+
+So metadata goes the other way round from everything else, in a table the daemon
+owns:
+
+| table | in | writer | reader |
+|---|---|---|---|
+| clip table | control region | client | daemon |
+| param table | control region | client | daemon |
+| **device table** | control region | **daemon** | **client** |
+| sample pool | session region | client | daemon (`PROT_READ`) |
+
+`WireDeviceInfo` is 4416 B: uri/name/vendor at fixed widths, format, kind,
+channel counts, `latencyFrames()`, chain position, and `WireParamInfo params[64]`
+— every `ParamInfo` field with the two `std::string`s truncated to 32 and 8
+bytes. `EvDeviceAdded` carries the id; the client reads the row once and mirrors
+it into its own `DeviceMirror`/`ParamMirror` (`src/ipc/client.h`), which are
+`PluginDesc`/`ParamInfo` under different names because the client no longer
+links `src/plugin` and that is the point.
+
+`state` is stored **last, with release**, exactly as `PoolBlock::magic` is: a
+reader that sees the slot live has seen every byte describing it.
+
+Two limits, both visible rather than silent: 320 devices (every addressable
+chain position is 296, so "full" means a leak) and 64 controls per device
+(`truncatedParams` reports the overflow and the daemon logs it). §3.7 sketched
+256 params, which would have made the table 5.5 MiB instead of 1.4 for no plugin
+anyone has.
+
+### 11.4 The param table, and why `setParam` on the pump thread is the contract
+
+`WireDeviceParams` is §3.7 relocated and otherwise unchanged: the client stores
+a plain float into `value[i]` and bumps `generation` with release; the daemon's
+pump samples the generation every millisecond and calls
+`PluginInstance::setParam` for whatever moved. No ring, therefore **no drops** —
+a dropped param write leaves the knob and the plugin permanently disagreeing,
+which is the worst bug class in this corner of the system.
+
+**Why the pump may call `setParam`.** `src/plugin/host.h` documents it as "GUI
+thread, concurrent with `process()`". That wording names a caller, but the
+guarantee it describes has three parts and none of them is the thread's name:
+
+1. **not the audio thread** — so it may not be inside `process()`, and it need
+   not be realtime-safe itself;
+2. **a plain aligned scalar store**, loaded by the plugin without
+   synchronisation, so a torn read is unrepresentable on every target we build
+   for and a stale read costs at most one block of latency;
+3. **exactly one writer**, so two callers cannot interleave on one parameter.
+
+The pump satisfies all three identically, and (3) more strongly than the
+in-process build did. In-process, `setParam` and `instantiate` were both "the
+GUI thread" by convention — two roles that happened to share a thread. In the
+daemon the pump *is* the thread that instantiates the plugin, that owns it, and
+that destroys it; there is no second candidate. Nothing about the contract was
+relaxed. The name of the thread changed, and the property it was standing in for
+became structural.
+
+What genuinely is new is that the values arrive from another process, so two
+things are checked before `setParam` is reached:
+
+- a non-finite float is dropped;
+- a write stamped with a **device generation** the slot no longer has is
+  dropped. Device ids are reused; without this, a knob drag in flight when a
+  device was removed would land on its replacement. The client stamps the
+  generation *it* believes in (from its own `EvDeviceAdded`/`EvDeviceRemoved`
+  bookkeeping), never the one currently in the table — stamping the table's
+  value would make the guard tautological.
+
+Cost when nothing moves: one acquire load per live device per millisecond.
+
+**Deviation from §3.7:** the param table is in the *control* region, not the
+session region. §3.7 puts it in the session region so it survives an engine
+restart. It cannot usefully: the table is indexed by device ids the daemon
+issues, and a respawned daemon re-instantiates from scratch and numbers from
+zero, so a surviving table would be indexed by numbers that no longer name
+anything. Device state is rebuilt by re-issuing `AddDevice`, which the client
+can do because the URI is a string and strings ride the pool that *did* survive.
+`daemon_test` §13 asserts exactly this round trip.
+
+### 11.5 Exact retirement: `drains >= k + 2`
+
+§10.3 shipped a retirement that waited `max(100 ms, 8 block periods)` plus four
+rendered blocks and said plainly that this was the weak half — a wedged backend
+does not drain, and the deadline fires anyway, announcing a block free while a
+voice could still be reading it. `Engine::drains`, bumped at the end of every
+`drainCommands()`, replaces it with a proof.
+
+**The rule.** Read `k = drains` *immediately after* `Engine::pushCommand`
+returned true. The command is provably consumed once `drains >= k + 2`.
+
+**Why 2 and not 1**, because this is the whole of the correctness argument and
+an off-by-one here would produce a retirement that is right almost always:
+
+- Let `P` be the moment the push's release store lands, and `R > P` the moment
+  we read `k`.
+- By definition drain #`k` completed before `R`.
+- Drain #`k+1` completes after `R` — but it may have **started** before `P`, in
+  which case it never saw the command. So `drains >= k+1` proves nothing.
+- Drain #`k+2` cannot start until #`k+1` finished, which is after `R` and
+  therefore after `P`. It must observe the push.
+
+Two is the smallest safe number. Reading `k` *before* the push does not help and
+needs 3 in the worst case, which is why `considerRetire()` is called from
+`commit()` and not from `translate()` — that ordering was already required for a
+different reason in §10.3 and now carries this one too.
+
+**What this buys.** At 256 frames / 48 kHz the wait is at most two block
+periods, ~10.7 ms, against phase 2's 100 ms floor. `daemon_test` §12 measures it
+end to end with no sleep in the loop: **8.2 ms, one rendered block, and the
+counter observed to move by exactly the two the proof requires.** More
+importantly it is a proof and not a guess — no clock is involved, and a wedged
+backend simply never satisfies it, which is the correct answer to "has the audio
+thread passed this point" when the audio thread has not moved.
+
+**The same proof retires chains and instances.** `RemoveDevice` does not destroy
+the `PluginInstance`; the instance and the displaced `RtChain` ride the proof
+together, because until the engine has drained past the new chain the audio
+thread may still be inside the old one, and the old one names that instance.
+This is `App::retiring_`, moved into the daemon and made exact. Two proofs are
+accepted and either suffices: `Ev::ChainRetired` naming the exact pointer (it is
+pushed from *inside* `drainCommands()`, so its arrival **is** the drain, and it
+beats the counter by up to one block), or the counter. The counter is what makes
+the return and master chains safe, since those are newer than any assumption
+about which events the engine emits.
+
+**The deadline is still compiled in**, for exactly one case: an `Engine` built
+without the counter, where `drains` stays 0 forever. The daemon latches
+`drainsExact_` the first time it sees the counter move and publishes the answer
+in `ControlHeader::drainsExact`, so which rule is in force is *observable from
+outside* rather than inferred — a client, or a test, cannot see the daemon's
+`Engine`, and a silent difference in retirement semantics would be worse than a
+slow one. Against this tree the timer is never consulted.
+
+### 11.6 The scan, and keeping the pump alive
+
+`PluginRegistry::scan()` walks every LV2 bundle on the system: **4.3 s here, 410
+plugins.** It is lazy — nothing is scanned until a device command asks for a
+plugin — and it runs on a thread of its own.
+
+The thread is not an optimisation. `pumpLoop()` runs on `main()`, and a pump
+that blocked for four seconds would stop the heartbeat; a client watching
+`SharedState::stale()` would conclude the engine had wedged and start thinking
+about respawning it. Losing the audio because we went looking for plugins would
+be a remarkable own goal. `daemon_test` §11 asserts the heartbeat advanced by
+thousands of ticks across the scan and that `alive()` never went false.
+
+The registry is still touched by **exactly one thread at a time**: the scanning
+thread owns its own `PluginRegistry` until it sets a release flag, and the pump
+joins before it reads. host.h's "GUI thread only" means "the one non-realtime
+thread that owns this object", and here that is the pump, briefly delegated.
+
+Device commands arriving mid-scan are **queued, in order**, in the daemon (bound
+256; overflow is answered with `RejectScanBusy`, never dropped). Ordering
+between device commands and scalar commands is not preserved across the scan
+window — a `LaunchClip` can overtake a queued `AddDevice` — which is a few
+milliseconds of dry audio and is documented rather than defended.
+
+§3.6 asks for the scan in a short-lived `lattice-scan` **child process**, so a
+plugin that segfaults during discovery takes down neither the GUI nor the
+engine. That is strictly better and it is still deferred: it needs a way to ship
+the catalog back, which is the socket.
+
+### 11.7 Deliberate deviations from §3.6 / §3.7
+
+1. **No chain table on the wire.** §3.6 sketches `Cmd::SetChain{track,
+   generation}` plus an ordered id list in a control-region table. There is
+   none, because there is nothing for it to carry: `AddDevice` carries a
+   position, `MoveDevice` carries a position, and the daemon is the only thing
+   that needs to know what a chain looks like. The client never names an
+   ordering, so there is no ordering to synchronise.
+2. **`RtChain::fx` did not become `u32 device[]`.** It did not need to. §3.6
+   proposed ids in `RtChain` because it assumed the chain still crossed the
+   boundary; it does not, so the engine keeps `PluginInstance*` and `src/audio`
+   was not touched at all.
+3. **Device metadata is a daemon-written table, not a pool blob** (§11.3), to
+   keep the pool `PROT_READ`.
+4. **The param table is in the control region, not the session region**
+   (§11.4), because device ids do not survive an engine restart.
+5. **`Ev::ChainRetired` did not disappear** — it disappeared *from the wire*.
+   §3.6 predicted the event would go away entirely; in fact it is still exactly
+   the right message from the audio thread to whoever owns the chain, and now
+   both are in one process. The daemon consumes it as one of two accepted
+   proofs.
+6. **`Cmd::SetChain` and its two siblings are refused permanently**, not
+   pending a phase. A client has no business naming an `RtChain` because it has
+   no `RtChain`s. `commandCarriesPointer()` still returns true for them and the
+   reject reason was reworded from "phase 3" to what it now means.
+7. **No `Ev::DeviceDestroyed` distinct from the request.** §3.6 has
+   `RemoveDevice` answered by `DeviceDestroyed` "once the engine has actually
+   torn it down". `EvDeviceRemoved` is sent when the id is free and the chain is
+   republished; the *destruction* happens later, on the proof, and no client has
+   anything to do with that interval — the id is already unusable and the
+   instance is already unreachable. Publishing an event for a moment nobody can
+   act on would be noise.
+8. **`Cmd::SendLevel` and `Cmd::ReturnVol` joined the scalars.** They are plain
+   numbers into the engine's mixer and always were; they only look new because
+   the engine grew return buses in the same wave.
+
+### 11.8 Test coverage
+
+`tests/daemon_test.cpp`, 300 checks, all against a real spawned
+`latticed --driver null`:
+
+| § | what |
+|---|---|
+| 1–5 | phase 1's: handshake, beat clock, metronome/master through rendered audio, refusals, a 3000-command burst |
+| 6–10 | phase 2's: the pool, a DC clip measured at the meter, retirement, MIDI clips, seven bad offsets |
+| **11** | **devices.** Lazy scan (410 plugins, 4.3 s) with the heartbeat advancing throughout; `AddDevice "lattice:saturator"` on track 0; the metadata row parsed into the client mirror — 3 params, `Drive` dB [0..36] flagged logarithmic, `Output` [-24..24], `Mix` [0..1] def 1; the URI blob freed by its echo; a 0.2 DC clip measured dry at 0.2000, driven to 0.4621 by a **param-table write**, back to 0.2000 under `SetBypass`, up again when it is cleared, and back to 0.2000 after `RemoveDevice` — with the displaced chain and its instance freed only after the proof; insert-at-position, `MoveDevice`, and the positional shifts the table reports; a garbage URI answered with `EvDeviceFailed{RejectUnknownUri}` and its blob retired anyway; `RemoveDevice` on an empty slot answered with `RejectBadDevice`; a saturator on **return 0** and on the **master**, both retiring through the same proof; `eventsDropped == 0`, because `Ev::ChainRetired` is consumed and not dropped |
+| **12** | **exact retirement.** `drainsExact == 1`; a block displaced and confirmed quiescent in **8.2 ms with no sleep in the loop**, within **one** rendered block, with the drain counter observed to advance by ≥ 2 — the `k+2` proof, measured |
+| **13** | `SIGKILL` **with a device loaded**: the pool survives, the block is still `Live`, samples intact, key still matches; the orphan control region reaped; respawn, pool re-announced, `republishClips()`, same offset, same 0.5 at the meter; **devices did not survive and the daemon says so** (`devicesLive == 0`, the table row free, the client's generation record dropped); re-`AddDevice` on the fresh engine works, metadata comes back, and a param write shapes 0.5 DC to 0.4621 |
+| 14 | `SIGTERM`: control region unlinked, pool still there, nothing else in `/dev/shm`; `closePool()` unlinks it |
+| 15 | `/dev/shm` clean |
+
+Green over five consecutive runs (14.8–23.3 s each, dominated by the scan) and
+twice under ASan + UBSan with both the daemon and the test sanitised — no leak,
+no runtime error. `/dev/shm` clean after every run.
+
+### 11.9 Still deferred
+
+- **Plugin editor windows** (§3.6). Lattice draws its own generic knob UI from
+  `ParamInfo`, which keeps working unchanged through the param table, so this is
+  phase 5 and blocks nothing.
+- **Out-of-process scanning** (§11.6): a crash in a third-party bundle during
+  discovery still takes the daemon with it.
+- **Engine → GUI param changes.** `WireDeviceParams::engineGeneration` exists
+  and is bumped when the daemon initialises a row, but nothing continuously
+  mirrors `getParam()` back: no in-tree plugin moves its own controls, and a
+  mirror that fought the client's writes every millisecond would be worse than
+  none. The field and the protocol are in place for the day a native UI needs
+  it.
+- **Presets.** `Cmd::LoadPreset{deviceId, ref}` (§3.7) is not implemented; the
+  string mechanism it would use is (§11.2).
+- **Recording.** `RecordSlot`/`RecordMidiSlot` still carry client-owned buffers
+  and are still refused.
+- **The AF_UNIX socket**, and with it `memfd` + `SCM_RIGHTS` and shipping the
+  plugin catalog to the client. The catalog is scanned in the daemon and is
+  currently only reachable one URI at a time — a GUI browser needs the socket
+  or a catalog table.
+- **Publishing from the engine instead of the mirror thread**, and mixer scalars
+  in `SharedState`. Both edit `src/audio`.
+- **GUI-crash reattach** (§4.3).
+- **The GUI itself.** `src/ui` still owns an in-process `Engine`;
+  `EngineClient` still has no callers outside the test. That remains the next
+  step, and it is now the only thing between this and "a GUI crash no longer
+  stops the audio".

@@ -33,10 +33,47 @@
 #include "control.h"
 
 #include <string>
+#include <vector>
 
 #include <sys/wait.h>
 
 namespace lat::ipc {
+
+// ---------------------------------------------------------------------------
+// The client's mirror of a loaded device
+// ---------------------------------------------------------------------------
+//
+// lat::ParamInfo and lat::PluginDesc live in src/plugin/host.h, which this file
+// deliberately does not include: the whole point of phase 3 is that the client
+// no longer links the plugin layer. So the client gets its own copies, filled
+// in from the daemon's device table, with the two std::strings back — a GUI
+// wants to draw a name, and it is not on any hot path.
+struct ParamMirror {
+    std::string name, unit;
+    f32 min = 0.f, max = 1.f, def = 0.f;
+    u32 id = 0;
+    u32 flags = 0;                 // ParamIs*
+    bool isBool() const { return (flags & ParamIsBool) != 0; }
+    bool isInt()  const { return (flags & ParamIsInt)  != 0; }
+    bool isLog()  const { return (flags & ParamIsLog)  != 0; }
+};
+
+struct DeviceMirror {
+    u32  id = 0;
+    u32  generation = 0;
+    bool live = false;
+    std::string uri, name, vendor;
+    u32  target = DevTargetTrack;
+    i32  targetIdx = 0;
+    i32  chainPos = -1;
+    i32  latencyFrames = 0;
+    u32  format = 0, kind = 0;
+    u32  audioIn = 0, audioOut = 0;
+    bool hasMidiIn = false;
+    bool bypassed = false;
+    u32  truncatedParams = 0;      // controls the plugin has beyond kMaxDevParams
+    std::vector<ParamMirror> params;
+};
 
 class EngineClient {
 public:
@@ -130,6 +167,11 @@ public:
         // by republishClips(), so the un-acknowledged value was never part of
         // anything's state.
         rollbackPendingCells();
+        // Device ids belong to the engine that issued them and die with it: a
+        // respawned daemon re-instantiates from scratch and numbers from zero.
+        // Keeping the old generations would let a param write land on a
+        // stranger, so the mirror is dropped with the region.
+        for (u32& g : deviceGen_) g = 0;
     }
 
     bool attached() const { return region_.valid() && map_.valid(); }
@@ -321,6 +363,171 @@ public:
         return sent;
     }
 
+    // -----------------------------------------------------------------------
+    // Devices (phase 3)
+    // -----------------------------------------------------------------------
+    //
+    // The client never sees a PluginInstance again — it names a plugin by URI,
+    // the daemon loads it, and what comes back is an id plus a table row.
+    // Instantiation is asynchronous now, which is honest: it always was slow,
+    // the in-process GUI just blocked on it (§3.6).
+
+    // Copies a NUL-terminated string into the pool and hands the daemon its
+    // offset. Ownership follows the free-after-confirm rule the sample blocks
+    // already use, with the tightest possible retirement: the daemon copies
+    // the bytes on its pump thread and echoes the offset back at once, because
+    // a string is never handed to the engine and so has nothing to be quiescent
+    // *of*. See §11.2.
+    //
+    // Returns the offset, or 0 — and on 0 nothing was pushed, so the caller
+    // retries next frame like any refused push.
+    u64 pushStringBlob(const char* s) {
+        if (!attached() || !pool_.valid() || !s) return 0;
+        const u64 ref = pool_.writeString(s);
+        if (!ref) { setErr("%s", pool_.error()); return 0; }
+        pool_.markLive(ref);        // un-freeable until the daemon says otherwise
+        return ref;
+    }
+
+    // Undo pushStringBlob when the command it was for never went out.
+    void dropStringBlob(u64 ref) {
+        if (!ref) return;
+        pool_.unmarkLive(ref);      // never published: nothing to retire
+        pool_.release(ref);
+    }
+
+    // Load `uri` onto a chain. `chainPos` < 0 appends.
+    //
+    // Answered by exactly one EvDeviceAdded (ref = the new device id) or
+    // EvDeviceFailed (b = the reason), and the URI blob comes back as an
+    // EvBlockRetired either way. Returns false only for "could not send" —
+    // no pool, no engine, ring full, pool full — which is a retry, not a
+    // failure to load.
+    bool addDevice(u32 target, i32 targetIdx, i32 chainPos, const char* uri) {
+        if (!attached() || !uri || !*uri) return false;
+        if (map_.cmds->size() >= CommandRing::capacity()) return false;   // measured; we are the only producer
+        const u64 ref = pushStringBlob(uri);
+        if (!ref) return false;
+        WireCommand w{};
+        w.type  = CmdAddDevice;
+        w.flags = target;
+        w.a     = targetIdx;
+        w.b     = chainPos;
+        w.ref   = ref;
+        if (!pushCommand(w)) { dropStringBlob(ref); return false; }
+        // The blob belongs to the daemon's read now. Drop our own reference so
+        // that the retirement echo is the only thing left to free it.
+        pool_.markDisplaced(ref);
+        pool_.release(ref);
+        return true;
+    }
+
+    bool removeDevice(u32 deviceId) {
+        return pushDeviceCommand(CmdRemoveDevice, deviceId, 0, 0);
+    }
+    bool moveDevice(u32 deviceId, i32 newPos) {
+        return pushDeviceCommand(CmdMoveDevice, deviceId, 0, newPos);
+    }
+    // Structural, therefore a command and not a param-table write: bypass has
+    // to land in a defined order relative to the chain edits around it (§3.7).
+    bool setBypass(u32 deviceId, bool on) {
+        return pushDeviceCommand(CmdSetBypass, deviceId, on ? 1 : 0, 0);
+    }
+    // Start the catalog scan now instead of on the first addDevice().
+    bool scanPlugins() {
+        WireCommand w{};
+        w.type = CmdScanPlugins;
+        return pushCommand(w);
+    }
+
+    u32 scanState()   const { return header().scanState.load(std::memory_order_acquire); }
+    u32 scanPluginCount() const { return header().scanPlugins.load(std::memory_order_relaxed); }
+
+    // -- the param table ----------------------------------------------------
+    //
+    // §3.7, relocated: a plain store plus a generation bump, no ring and
+    // therefore no drops. The daemon's pump notices the generation within a
+    // millisecond and calls PluginInstance::setParam for whatever moved.
+    //
+    // `deviceGeneration` is stamped from the client's *own* record of the slot,
+    // not from the table — that is what makes it a guard. A write aimed at a
+    // device the daemon has since replaced carries the generation the client
+    // still believes in, and the daemon drops it.
+    bool setDeviceParam(u32 deviceId, u32 index, f32 v) {
+        WireDeviceParams* p = attached() ? map_.param(deviceId) : nullptr;
+        if (!p || index >= kMaxDevParams || deviceGen_[deviceId] == 0) return false;
+        p->deviceGeneration.store(deviceGen_[deviceId], std::memory_order_relaxed);
+        p->value[index].store(v, std::memory_order_relaxed);
+        // Release, and last: the reader samples on the generation, so it must
+        // not be able to see a new generation without the value that went with
+        // it. This is the same edge SharedState::generation uses.
+        p->generation.fetch_add(1, std::memory_order_release);
+        return true;
+    }
+
+    // What the daemon last published for this parameter — the engine -> GUI
+    // direction of §3.7, used when a plugin moves its own controls.
+    f32 deviceParam(u32 deviceId, u32 index) const {
+        const WireDeviceParams* p = attached() ? map_.param(deviceId) : nullptr;
+        return (p && index < kMaxDevParams) ? p->value[index].load(std::memory_order_relaxed) : 0.f;
+    }
+    u32 deviceParamEngineGeneration(u32 deviceId) const {
+        const WireDeviceParams* p = attached() ? map_.param(deviceId) : nullptr;
+        return p ? p->engineGeneration.load(std::memory_order_acquire) : 0;
+    }
+
+    // -- metadata -----------------------------------------------------------
+
+    // Parses one device table row into the client's own mirror. Every string
+    // is copied with an enforced terminator: the row is written by another
+    // process, and a name that ran off the end of its array would be a read
+    // past the mapping, not a cosmetic bug.
+    bool readDevice(u32 deviceId, DeviceMirror& out) const {
+        const WireDeviceInfo* d = attached() ? map_.device(deviceId) : nullptr;
+        if (!d) return false;
+        out = DeviceMirror{};
+        out.id = deviceId;
+        // Acquire: `state` is stored last, so seeing Live means seeing the row.
+        if (d->state.load(std::memory_order_acquire) != DeviceSlotLive) return false;
+        out.live            = true;
+        out.generation      = d->generation.load(std::memory_order_relaxed);
+        out.bypassed        = d->bypass.load(std::memory_order_relaxed) != 0;
+        out.uri             = fixed(d->uri, sizeof d->uri);
+        out.name            = fixed(d->name, sizeof d->name);
+        out.vendor          = fixed(d->vendor, sizeof d->vendor);
+        out.target          = (u32)d->target;
+        out.targetIdx       = d->targetIdx;
+        out.chainPos        = d->chainPos;
+        out.latencyFrames   = d->latencyFrames;
+        out.format          = d->format;
+        out.kind            = d->kind;
+        out.audioIn         = d->audioIn;
+        out.audioOut        = d->audioOut;
+        out.hasMidiIn       = d->hasMidiIn != 0;
+        out.truncatedParams = d->truncatedParams;
+        const u32 n = d->paramCount < kMaxDevParams ? d->paramCount : kMaxDevParams;
+        out.params.reserve(n);
+        for (u32 i = 0; i < n; ++i) {
+            const WireParamInfo& s = d->params[i];
+            ParamMirror p;
+            p.name  = fixed(s.name, sizeof s.name);
+            p.unit  = fixed(s.unit, sizeof s.unit);
+            p.min   = s.min;
+            p.max   = s.max;
+            p.def   = s.def;
+            p.id    = s.id;
+            p.flags = s.flags;
+            out.params.push_back(std::move(p));
+        }
+        return true;
+    }
+
+    // The slot generation this client believes `deviceId` currently has, 0 if
+    // it does not think anything is there. Maintained by observe().
+    u32 deviceGeneration(u32 deviceId) const {
+        return deviceId < kMaxDevices ? deviceGen_[deviceId] : 0;
+    }
+
     // Applies an event's client-side bookkeeping. popEvent() does this for
     // you; it is public only so a client that drains the ring some other way
     // (a test, a bridge) can stay honest. Returns true if the event was one of
@@ -330,6 +537,23 @@ public:
             case EvClipAck:      return onClipAck(e);
             case EvBlockRetired: pool_.confirmRetired(e.ref); return true;
             case EvPoolAttached: return true;
+            // Track the slot generations the param-table guard is stamped with.
+            // Doing it here rather than making it the caller's duty is the same
+            // decision popEvent()'s header note explains: a client that forgot
+            // would find its knob writes silently ignored after the first
+            // remove-then-add, which looks like nothing at all.
+            case EvDeviceAdded:
+                if (e.ref < kMaxDevices && map_.device((u32)e.ref))
+                    deviceGen_[e.ref] =
+                        map_.device((u32)e.ref)->generation.load(std::memory_order_acquire);
+                return true;
+            case EvDeviceRemoved:
+                if (e.ref < kMaxDevices) deviceGen_[e.ref] = 0;
+                return true;
+            case EvDeviceFailed:
+            case EvDeviceChanged:
+            case EvScanComplete:
+                return true;
             default:             return false;
         }
     }
@@ -509,6 +733,24 @@ private:
         }
     }
 
+    bool pushDeviceCommand(u32 type, u32 deviceId, i32 a, i32 b) {
+        if (!attached() || deviceId >= kMaxDevices) return false;
+        WireCommand w{};
+        w.type = type;
+        w.a    = a;
+        w.b    = b;
+        w.ref  = deviceId;
+        return pushCommand(w);
+    }
+
+    // A fixed-width char array from shared memory turned into a std::string
+    // without trusting it to be terminated.
+    static std::string fixed(const char* p, size_t cap) {
+        size_t n = 0;
+        while (n < cap && p[n]) ++n;
+        return std::string(p, n);
+    }
+
     void setErr(const char* fmt, ...) {
         va_list ap;
         va_start(ap, fmt);
@@ -530,6 +772,11 @@ private:
     // whole point of the shadow is to outlive one.
     WireClip    shadow_[kCells]  = {};
     WireClip    pending_[kCells] = {};
+
+    // The slot generation this client last saw for each device id. 0 means
+    // "nothing there as far as I know", which is also what a stale param write
+    // is stamped with after a removal — and therefore what the daemon drops.
+    u32         deviceGen_[kMaxDevices] = {};
 };
 
 } // namespace lat::ipc

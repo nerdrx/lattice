@@ -204,6 +204,18 @@ static f32 peakTrack(ipc::EngineClient& c, int track, int ms) {
     return peak;
 }
 
+// The same, after letting the meter come down. peakTrack() is a peak *hold*
+// over its window, and Engine's meter decays 0.72 per block, so measuring a
+// downward change immediately reports the value from before it: the first
+// sample of the window is still the old peak. Anything asserting "the level
+// dropped" has to wait out the decay first — about three blocks — or it is
+// asserting on history.
+static f32 settledPeak(ipc::EngineClient& c, int track, int ms) {
+    sleepMs(60);
+    return peakTrack(c, track, ms);
+}
+
+
 // ---------------------------------------------------------------------------
 // clip helpers
 // ---------------------------------------------------------------------------
@@ -1075,11 +1087,438 @@ static void testBadOffsets(ipc::EngineClient& c) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. engine crash: SIGKILL, detect, reap, respawn — with the pool attached
+// 11. devices: the plugin layer lives in the daemon now
+// ---------------------------------------------------------------------------
+//
+// Phase 3. The client names a plugin by URI, the daemon loads it in its own
+// address space, and what comes back is a device id plus a table row. Nothing
+// in this file links src/plugin — that is the point — so everything asserted
+// here is asserted through the wire: the metadata table, the param table, and
+// the *rendered audio*.
+//
+// The signal is a DC clip at 0.2. Saturator's shaper is
+// y = tanh(g*x) * tanh(0.5)/tanh(g*0.5), so at drive 0 dB it passes 0.2 through
+// as tanh(0.2) = 0.197 (indistinguishable from unity, deliberately) and at
+// drive 36 dB it lifts it to tanh(0.5) = 0.462. That is a factor of 2.3 in the
+// meter from one parameter, which is what makes "the plugin is actually
+// processing" a measurement rather than a liveness check. 0.5 would have been
+// the obvious level to pick and is exactly the wrong one: it is the shaper's
+// own reference amplitude, so it reads 0.462 at *both* ends of the knob.
+
+static constexpr u32 kSatDrive = 0;   // the ordinals the table is indexed by
+static constexpr u32 kSatTrim  = 1;
+static constexpr u32 kSatMix   = 2;
+
+// A scan walks every LV2 bundle on the system: about four seconds here, and
+// several times that under ASan with a cold page cache. The wait is generous
+// on purpose — this test is about what the daemon converges to, never about
+// how fast it gets there.
+static constexpr int kScanTimeoutMs = 180000;
+
+// Pops until an event of `type` shows up. Everything popped on the way is
+// still observed (popEvent does the client-side bookkeeping), so draining past
+// an EvBlockRetired here does not lose the free it authorises.
+static bool waitEvent(ipc::EngineClient& c, u32 type, ipc::WireEvent& out, int timeoutMs) {
+    return waitUntil([&] {
+        ipc::WireEvent e;
+        while (c.popEvent(e)) if (e.type == type) { out = e; return true; }
+        return false;
+    }, timeoutMs);
+}
+
+// A device that never appears would otherwise hang the whole section on the
+// next assertion instead of failing on this one.
+static bool addDeviceAndWait(ipc::EngineClient& c, u32 target, i32 idx, i32 pos,
+                             const char* uri, u32& idOut, int timeoutMs) {
+    idOut = 0;
+    if (!c.addDevice(target, idx, pos, uri)) return false;
+    ipc::WireEvent e{};
+    if (!waitEvent(c, ipc::EvDeviceAdded, e, timeoutMs)) return false;
+    idOut = (u32)e.ref;
+    return true;
+}
+
+static void testDevices(ipc::EngineClient& c) {
+    banner("11. devices: AddDevice over the wire, metadata back, audio through it");
+
+    resetMixer(c);
+    drainEvents(c);
+    const ipc::ControlHeader& h = c.header();
+
+    // -- a DC clip to hear the device with ----------------------------------
+    const i64 kFrames = 12000;
+    const std::vector<f32> dc = makeDc(kFrames, 2, 0.2f);
+    const u64 ref = c.poolWrite(dc.data(), kFrames, 2, 48000.0, /*key*/0xD1CEull);
+    CHECK(ref != 0, "a 0.2 DC clip in the pool at offset %llu", (unsigned long long)ref);
+    ipc::WireClip wc = audioClip(ref, kFrames, 2);
+    CHECK(c.setClip(0, 1, wc) && waitClipIdle(c, 0, 1), "published into [0][1]");
+    c.pushCommand(Cmd::LaunchClip, 0, 1);
+    const bool playing = waitUntil([&] {
+        drainEvents(c);
+        return c.state().slotState[0].load() == (int)SlotState::Playing;
+    }, 2000);
+    CHECK(playing, "and playing");
+    const u64 blocksBefore = c.pool().liveBlocks();   // whatever earlier sections left
+    const f32 dry = peakTrack(c, 0, 300);
+    CHECK(std::fabs(dry - 0.2f) < 0.02f, "the dry track meter reads %.4f", (double)dry);
+
+    // -- the scan ------------------------------------------------------------
+    //
+    // Lazy: nothing has been scanned yet, because nothing has asked for a
+    // plugin. The first AddDevice starts it, on a thread of its own, and the
+    // heartbeat has to keep going while it runs — a pump that blocked for four
+    // seconds would look exactly like a wedged engine to a client watching
+    // SharedState::stale().
+    CHECK(c.scanState() == ipc::ScanIdle,
+          "no plugin scan has run yet (state %u) — it is lazy", c.scanState());
+    const u64 hb0 = c.heartbeat();
+    CHECK(c.scanPlugins(), "ask for the catalog");
+
+    ipc::WireEvent scanEv{};
+    const bool scanned = waitEvent(c, ipc::EvScanComplete, scanEv, kScanTimeoutMs);
+    CHECK(scanned, "EvScanComplete arrived: %d plugins in %.2f s", scanEv.a, scanEv.x);
+    CHECK(c.scanState() == ipc::ScanDone, "scanState is Done (%u)", c.scanState());
+    CHECK(scanEv.a >= 2, "the catalog has at least the two stock devices (%d)", scanEv.a);
+    CHECK(c.heartbeat() > hb0 + 100,
+          "the pump kept beating right through the scan (%llu -> %llu ticks)",
+          (unsigned long long)hb0, (unsigned long long)c.heartbeat());
+    CHECK(c.alive(), "so the engine never looked wedged");
+
+    // -- AddDevice -----------------------------------------------------------
+    const u64 added0 = h.devicesAdded.load();
+    u32 sat = 0;
+    const bool got = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1, "lattice:saturator",
+                                      sat, 5000);
+    CHECK(got, "AddDevice 'lattice:saturator' on track 0 -> device %u", sat);
+    if (!got) return;
+    CHECK(h.devicesAdded.load() == added0 + 1, "one device added (%llu)",
+          (unsigned long long)h.devicesAdded.load());
+    CHECK(h.devicesLive.load() == 1, "one device live (%llu)",
+          (unsigned long long)h.devicesLive.load());
+    CHECK(h.chainsPublished.load() >= 1, "and a chain was published to the engine (%llu)",
+          (unsigned long long)h.chainsPublished.load());
+
+    // -- the metadata table --------------------------------------------------
+    ipc::DeviceMirror d;
+    const bool read = c.readDevice(sat, d);
+    CHECK(read, "the device table row parses into the client's own mirror");
+    CHECK(read && d.uri == "lattice:saturator", "uri '%s'", read ? d.uri.c_str() : "");
+    CHECK(read && d.name == "Saturator", "name '%s'", read ? d.name.c_str() : "");
+    CHECK(read && d.target == ipc::DevTargetTrack && d.targetIdx == 0 && d.chainPos == 0,
+          "on %s %d at position %d", read ? ipc::devTargetName(d.target) : "?",
+          read ? d.targetIdx : -1, read ? d.chainPos : -1);
+    CHECK(read && d.params.size() == 3, "three parameters (%zu)",
+          read ? d.params.size() : 0);
+    CHECK(read && d.truncatedParams == 0, "none of them truncated away");
+    CHECK(read && d.latencyFrames == 0, "zero reported latency (%d)",
+          read ? d.latencyFrames : -1);
+    if (read && d.params.size() == 3) {
+        CHECK(d.params[kSatDrive].name == "Drive" && d.params[kSatDrive].unit == "dB" &&
+              std::fabs(d.params[kSatDrive].min - 0.f) < 1e-6f &&
+              std::fabs(d.params[kSatDrive].max - 36.f) < 1e-6f &&
+              std::fabs(d.params[kSatDrive].def - 0.f) < 1e-6f,
+              "param 0 '%s' %s [%.1f..%.1f] def %.1f",
+              d.params[0].name.c_str(), d.params[0].unit.c_str(),
+              (double)d.params[0].min, (double)d.params[0].max, (double)d.params[0].def);
+        CHECK(d.params[kSatDrive].isLog(),
+              "and it is flagged logarithmic, as the device asks (flags 0x%x)",
+              d.params[kSatDrive].flags);
+        CHECK(d.params[kSatTrim].name == "Output" &&
+              std::fabs(d.params[kSatTrim].min + 24.f) < 1e-6f &&
+              std::fabs(d.params[kSatTrim].max - 24.f) < 1e-6f,
+              "param 1 '%s' [%.1f..%.1f]", d.params[1].name.c_str(),
+              (double)d.params[1].min, (double)d.params[1].max);
+        CHECK(d.params[kSatMix].name == "Mix" &&
+              std::fabs(d.params[kSatMix].min) < 1e-6f &&
+              std::fabs(d.params[kSatMix].max - 1.f) < 1e-6f &&
+              std::fabs(d.params[kSatMix].def - 1.f) < 1e-6f,
+              "param 2 '%s' [%.1f..%.1f] def %.1f", d.params[2].name.c_str(),
+              (double)d.params[2].min, (double)d.params[2].max, (double)d.params[2].def);
+    }
+    CHECK(std::fabs(c.deviceParam(sat, kSatMix) - 1.0f) < 1e-6f,
+          "the param table starts at the plugin's own values (Mix %.3f)",
+          (double)c.deviceParam(sat, kSatMix));
+
+    // -- the URI blob came back ---------------------------------------------
+    //
+    // The string crossed in the pool. A string is never handed to the engine,
+    // so it is retired the instant the daemon has copied it — and because the
+    // client dropped its own reference at push time, the echo is the whole of
+    // the free. If this leaked, the pool would grow by one block per device for
+    // the life of the session.
+    const bool blobGone = waitUntil([&] {
+        drainEvents(c);
+        return c.pool().liveBlocks() == blocksBefore;
+    }, 2000);
+    CHECK(blobGone, "the URI blob was freed by its retirement echo (%llu live blocks)",
+          (unsigned long long)c.pool().liveBlocks());
+
+    // -- audio through it ----------------------------------------------------
+    const f32 unity = settledPeak(c, 0, 300);
+    CHECK(unity > 0.15f && unity < dry + 0.02f,
+          "with drive at 0 dB the meter is unchanged: %.4f (was %.4f)",
+          (double)unity, (double)dry);
+
+    // -- the param table drives it -------------------------------------------
+    //
+    // §3.7: a plain store plus a generation bump, no ring and therefore no
+    // drops. The daemon's pump notices within a millisecond and calls
+    // PluginInstance::setParam from its own thread.
+    const u64 writes0 = h.paramWrites.load();
+    CHECK(c.setDeviceParam(sat, kSatDrive, 36.f), "write Drive = 36 dB into the param table");
+    const bool applied = waitUntil([&] { return h.paramWrites.load() > writes0; }, 500);
+    CHECK(applied, "the pump applied it (%llu setParam calls)",
+          (unsigned long long)(h.paramWrites.load() - writes0));
+    const f32 driven = peakTrack(c, 0, 300);
+    CHECK(driven > unity * 1.5f,
+          "and the rendered audio changed direction with it: %.4f -> %.4f",
+          (double)unity, (double)driven);
+
+    // A write for a device that does not exist must not be silently applied to
+    // one that does.
+    CHECK(!c.setDeviceParam(sat + 1, 0, 1.f),
+          "a param write for an unknown device is refused by the client");
+
+    // -- bypass round-trips --------------------------------------------------
+    CHECK(c.setBypass(sat, true), "SetBypass on");
+    ipc::WireEvent chg{};
+    const bool bypassEv = waitEvent(c, ipc::EvDeviceChanged, chg, 2000);
+    CHECK(bypassEv && (chg.flags & ipc::DeviceChangedBypass) && chg.ref == sat,
+          "EvDeviceChanged says bypass (flags 0x%x, device %llu)",
+          chg.flags, (unsigned long long)chg.ref);
+    CHECK(c.readDevice(sat, d) && d.bypassed, "and the table row reads bypassed");
+    const f32 bypassed = settledPeak(c, 0, 300);
+    CHECK(std::fabs(bypassed - dry) < 0.02f,
+          "the audio is passing through untouched again: %.4f (dry was %.4f)",
+          (double)bypassed, (double)dry);
+
+    CHECK(c.setBypass(sat, false), "SetBypass off");
+    const bool backOn = waitUntil([&] {
+        drainEvents(c);
+        return c.readDevice(sat, d) && !d.bypassed;
+    }, 2000);
+    CHECK(backOn, "the table row reads active again");
+    const f32 driven2 = settledPeak(c, 0, 300);
+    CHECK(driven2 > bypassed * 1.5f, "and the saturation is back: %.4f", (double)driven2);
+
+    // -- a second device, and MoveDevice ------------------------------------
+    u32 sat2 = 0;
+    const bool got2 = addDeviceAndWait(c, ipc::DevTargetTrack, 0, 0, "lattice:saturator",
+                                       sat2, 5000);
+    CHECK(got2 && sat2 != sat, "a second saturator inserted at position 0 -> device %u", sat2);
+    if (got2) {
+        CHECK(c.readDevice(sat2, d) && d.chainPos == 0, "it is first in the chain (%d)",
+              d.chainPos);
+        const bool shifted = waitUntil([&] {
+            drainEvents(c);
+            return c.readDevice(sat, d) && d.chainPos == 1;
+        }, 2000);
+        CHECK(shifted, "and the first one moved to position 1 (%d)", d.chainPos);
+
+        CHECK(c.moveDevice(sat2, 1), "MoveDevice it to position 1");
+        const bool moved = waitUntil([&] {
+            drainEvents(c);
+            return c.readDevice(sat2, d) && d.chainPos == 1;
+        }, 2000);
+        CHECK(moved, "which the table reflects (%d)", d.chainPos);
+
+        CHECK(c.removeDevice(sat2), "and remove it again");
+        ipc::WireEvent rm{};
+        CHECK(waitEvent(c, ipc::EvDeviceRemoved, rm, 2000) && rm.ref == sat2,
+              "EvDeviceRemoved for %u", sat2);
+        CHECK(!c.readDevice(sat2, d), "its table row is free");
+    }
+
+    // -- a garbage URI is answered, not fatal --------------------------------
+    const u64 failed0 = h.devicesFailed.load();
+    const u64 live0   = c.pool().liveBlocks();
+    CHECK(c.addDevice(ipc::DevTargetTrack, 0, -1, "urn:no-such-plugin:nope"),
+          "AddDevice with a URI nothing answers to");
+    ipc::WireEvent fail{};
+    const bool answered = waitEvent(c, ipc::EvDeviceFailed, fail, 3000);
+    CHECK(answered, "EvDeviceFailed came back");
+    CHECK(answered && (u32)fail.b == ipc::RejectUnknownUri,
+          "with reason %u (%s)", answered ? (u32)fail.b : 0u,
+          ipc::rejectReasonName(answered ? (u32)fail.b : 0u));
+    CHECK(h.devicesFailed.load() == failed0 + 1, "counted as a failure (%llu)",
+          (unsigned long long)h.devicesFailed.load());
+    const bool blobFreed = waitUntil([&] {
+        drainEvents(c);
+        return c.pool().liveBlocks() == live0;
+    }, 2000);
+    CHECK(blobFreed, "and its URI blob was retired anyway — a refusal must not leak");
+    CHECK(c.alive(), "the daemon is still alive after a failed instantiation");
+
+    // A bad device id is refused the same way.
+    CHECK(c.removeDevice(ipc::kMaxDevices - 1), "RemoveDevice on an empty slot");
+    ipc::WireEvent fail2{};
+    const bool answered2 = waitEvent(c, ipc::EvDeviceFailed, fail2, 2000);
+    CHECK(answered2 && (u32)fail2.b == ipc::RejectBadDevice,
+          "answered with %s", ipc::rejectReasonName(answered2 ? (u32)fail2.b : 0u));
+
+    // -- RemoveDevice restores passthrough -----------------------------------
+    const u64 removed0 = h.devicesRemoved.load();
+    const u64 retired0 = h.chainsRetired.load();
+    CHECK(c.removeDevice(sat), "RemoveDevice %u", sat);
+    ipc::WireEvent rm{};
+    CHECK(waitEvent(c, ipc::EvDeviceRemoved, rm, 2000) && rm.ref == sat,
+          "EvDeviceRemoved for it");
+    CHECK(h.devicesRemoved.load() >= removed0 + 1, "counted (%llu removed)",
+          (unsigned long long)h.devicesRemoved.load());
+    CHECK(h.devicesLive.load() == 0, "no devices live (%llu)",
+          (unsigned long long)h.devicesLive.load());
+    // The instance is not destroyed at RemoveDevice — it rides the same proof
+    // the displaced chain does, because until the engine has drained past the
+    // new chain the audio thread may still be inside the old one. Under ASan a
+    // premature destruction here is a use-after-free on the audio thread, which
+    // is exactly the bug class this phase exists to remove.
+    const bool chainFreed = waitUntil([&] {
+        drainEvents(c);
+        return h.chainsRetired.load() > retired0;
+    }, 2000);
+    CHECK(chainFreed, "the displaced chain and its instance were freed after the proof (%llu)",
+          (unsigned long long)h.chainsRetired.load());
+    const f32 passthrough = settledPeak(c, 0, 300);
+    CHECK(std::fabs(passthrough - dry) < 0.02f,
+          "and the track is passing the clip through again: %.4f (dry %.4f)",
+          (double)passthrough, (double)dry);
+
+    // -- returns and the master ----------------------------------------------
+    //
+    // The engine grew return buses and a master chain in the same wave as this
+    // phase. If SetReturnChain is not functional in the Engine this daemon was
+    // linked against, there is nothing here to test and saying so is better
+    // than failing: the probe is whether the chain is accepted and retired at
+    // all, which is a property of the daemon either way.
+    u32 ret = 0;
+    const bool retAdded = addDeviceAndWait(c, ipc::DevTargetReturn, 0, -1,
+                                           "lattice:saturator", ret, 5000);
+    CHECK(retAdded, "AddDevice saturator on return 0 -> device %u", ret);
+    if (retAdded) {
+        CHECK(c.readDevice(ret, d) && d.target == ipc::DevTargetReturn && d.targetIdx == 0,
+              "the row says return %d", d.targetIdx);
+        CHECK(c.pushCommand(Cmd::ReturnVol, 0, 0, 1.0) &&
+              c.pushCommand(Cmd::SendLevel, 0, 0, 0.5),
+              "ReturnVol and SendLevel cross as ordinary scalars now");
+        const u64 retired1 = h.chainsRetired.load();
+        CHECK(c.removeDevice(ret), "remove it again");
+        const bool freed = waitUntil([&] {
+            drainEvents(c);
+            return h.chainsRetired.load() > retired1;
+        }, 3000);
+        CHECK(freed, "the return chain retired through the same proof");
+    }
+
+    u32 mas = 0;
+    const bool masAdded = addDeviceAndWait(c, ipc::DevTargetMaster, 0, -1,
+                                           "lattice:saturator", mas, 5000);
+    CHECK(masAdded, "AddDevice saturator on the master -> device %u", mas);
+    if (masAdded) {
+        CHECK(c.readDevice(mas, d) && d.target == ipc::DevTargetMaster,
+              "the row says master");
+        const f32 masterPeak = peakMaster(c, 300);
+        CHECK(masterPeak > 0.f, "the master is still rendering with a chain on it (%.4f)",
+              (double)masterPeak);
+        CHECK(c.removeDevice(mas), "remove it");
+        CHECK(waitEvent(c, ipc::EvDeviceRemoved, rm, 3000), "EvDeviceRemoved");
+    }
+
+    CHECK(c.alive(), "the daemon survived the whole section");
+    CHECK(h.eventsDropped.load() == 0,
+          "and no engine event had to be dropped — Ev::ChainRetired is consumed, "
+          "not dropped (%llu)", (unsigned long long)h.eventsDropped.load());
+
+    // Leave track 0 empty for the sections after this one.
+    CHECK(c.clearClip(0, 1) && waitClipIdle(c, 0, 1), "clear [0][1]");
+    waitRetired(c, ref);
+    c.poolRelease(ref);
+}
+
+// ---------------------------------------------------------------------------
+// 12. exact retirement: the drains counter replaces the deadline
+// ---------------------------------------------------------------------------
+//
+// §10.3 shipped a sample-block retirement that waited max(100 ms, 8 block
+// periods) and said plainly that this was the weak half: a wedged backend does
+// not drain, and the deadline fires anyway. Engine::drains makes the same
+// statement provable — a command is consumed once the counter has advanced two
+// past the value read after the push (two, not one, because the drain in
+// flight at push time may have missed it).
+//
+// The test is therefore not "does a block retire" — section 8 covers that — but
+// *how* it retires: with no sleep, in a couple of block periods, and with the
+// counter having moved by the amount the proof requires.
+
+static void testDrainsExactness(ipc::EngineClient& c) {
+    banner("12. sample retirement is a proof, not a deadline");
+
+    const ipc::ControlHeader& h = c.header();
+    CHECK(h.drainsExact.load() == 1,
+          "this Engine counts its command drains (%llu so far)",
+          (unsigned long long)h.engineDrains.load());
+    if (h.drainsExact.load() != 1) {
+        note("Engine::drains never moved, so the daemon is on the legacy deadline");
+        note("and the timing assertions below would be measuring the timer.");
+        return;
+    }
+
+    resetMixer(c);
+    drainEvents(c);
+
+    const i64 kFrames = 4800;
+    const std::vector<f32> a = makeDc(kFrames, 1, 0.3f);
+    const u64 refA = c.poolWrite(a.data(), kFrames, 1, 48000.0);
+    const u64 refB = c.poolWrite(a.data(), kFrames, 1, 48000.0);
+    CHECK(refA && refB && refA != refB, "two blocks in the pool (%llu, %llu)",
+          (unsigned long long)refA, (unsigned long long)refB);
+
+    CHECK(c.setClip(1, 0, audioClip(refA, kFrames, 1)) && waitClipIdle(c, 1, 0),
+          "publish block A into [1][0]");
+    CHECK(c.pool().stateOf(refA) == ipc::BlockLive, "A is live");
+
+    // Displace A with B and time the echo. No sleep anywhere in the loop: the
+    // whole claim is that the answer arrives on the engine's terms and not on a
+    // timer's, so a poll that slept would be measuring itself.
+    const u64 blocks0  = c.state().blocksRendered.load();
+    const u64 drains0  = h.engineDrains.load();
+    const u64 t0       = ipc::monotonicNs();
+    CHECK(c.setClip(1, 0, audioClip(refB, kFrames, 1)), "displace it with block B");
+
+    const bool retired = waitUntil([&] {
+        drainEvents(c);
+        return c.pool().stateOf(refA) != ipc::BlockRetiring &&
+               c.pool().stateOf(refA) != ipc::BlockLive;
+    }, 2000, /*pollMs*/0);
+    const u64 elapsedNs = ipc::monotonicNs() - t0;
+    const u64 blocks1   = c.state().blocksRendered.load();
+    const u64 drains1   = h.engineDrains.load();
+
+    CHECK(retired, "A retired (state %s)", ipc::poolStateName(c.pool().stateOf(refA)));
+    CHECK(elapsedNs < 60ull * 1000000ull,
+          "in %.1f ms — under phase 2's 100 ms floor, so no deadline was involved",
+          (double)elapsedNs / 1e6);
+    CHECK(drains1 >= drains0 + 2,
+          "and the drain counter moved by at least the two the proof needs (%llu -> %llu)",
+          (unsigned long long)drains0, (unsigned long long)drains1);
+    CHECK(blocks1 - blocks0 <= 8,
+          "within %llu rendered blocks (phase 2 waited four *plus* 100 ms)",
+          (unsigned long long)(blocks1 - blocks0));
+    CHECK(c.poolRelease(refA), "and the client could free it immediately");
+
+    // Clean up: B is still live in the cell.
+    CHECK(c.clearClip(1, 0) && waitClipIdle(c, 1, 0), "clear [1][0]");
+    CHECK(waitRetired(c, refB, 2000), "B retires on the same proof");
+    CHECK(c.poolRelease(refB), "and frees");
+    note("%llu blocks still live in the pool (earlier sections')",
+         (unsigned long long)c.pool().liveBlocks());
+}
+
+// ---------------------------------------------------------------------------
+// 13. engine crash: SIGKILL, detect, reap, respawn — with the pool attached
 // ---------------------------------------------------------------------------
 
 static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
-    banner("11. SIGKILL the daemon: alive() drops, the orphan is reaped, respawn works");
+    banner("13. SIGKILL the daemon: alive() drops, the orphan is reaped, respawn works");
     note("and the pool survives, because the pool is ours and not the engine's.");
 
     // Put a clip up first, so the kill happens with the pool mapped on both
@@ -1098,6 +1537,18 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
         return c.state().slotState[0].load() == (int)SlotState::Playing;
     }, 2000);
     CHECK(wasPlaying, "and playing before the kill");
+
+    // And a device loaded, because that is the interesting half now: the
+    // instance lives in the daemon's address space and dies with it. That is
+    // the design and not a regression — a plugin cannot outlive the process
+    // hosting it — so what has to survive is the *pool*, and what has to work
+    // afterwards is re-adding the device to a fresh engine.
+    u32 preKillDevice = 0;
+    const bool hadDevice = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1,
+                                            "lattice:saturator", preKillDevice, 10000);
+    CHECK(hadDevice, "a saturator on track 0 before the kill (device %u)", preKillDevice);
+    CHECK(c.header().devicesLive.load() == 1, "one device live (%llu)",
+          (unsigned long long)c.header().devicesLive.load());
 
     CHECK(c.alive(), "alive() before the kill");
     ::kill(daemon, SIGKILL);
@@ -1193,14 +1644,58 @@ static void testCrashAndRespawn(ipc::EngineClient& c, pid_t& daemon) {
     const f32 peak = peakTrack(c, 0, 400);
     CHECK(std::fabs(peak - 0.5f) < 0.05f,
           "and the same samples are sounding: meter %.4f", (double)peak);
+
+    // Devices, on the other hand, did not survive — they were instances in a
+    // process that no longer exists — and the replacement daemon says so
+    // honestly rather than inheriting a table full of ghosts.
+    CHECK(c.header().devicesLive.load() == 0,
+          "the new engine has no devices: they died with the process (%llu)",
+          (unsigned long long)c.header().devicesLive.load());
+    ipc::DeviceMirror gone;
+    CHECK(!c.readDevice(preKillDevice, gone),
+          "and device %u's table row is free in the fresh region", preKillDevice);
+    CHECK(c.deviceGeneration(preKillDevice) == 0,
+          "the client dropped its own record of it on detach, so a stale param "
+          "write cannot land on whatever takes that id next");
+
+    // Re-adding is the whole recovery story: the URI is a string, the string
+    // rides the pool that survived, and the new daemon scans and instantiates
+    // from scratch.
+    u32 fresh = 0;
+    const bool readded = addDeviceAndWait(c, ipc::DevTargetTrack, 0, -1,
+                                          "lattice:saturator", fresh, kScanTimeoutMs);
+    CHECK(readded, "re-AddDevice on the replacement engine -> device %u", fresh);
+    if (readded) {
+        ipc::DeviceMirror d;
+        CHECK(c.readDevice(fresh, d) && d.params.size() == 3,
+              "with its metadata back (%zu params)", d.params.size());
+        // This clip is DC at 0.5, which is Saturator's own reference
+        // amplitude: fully driven, tanh pins it to tanh(0.5) = 0.462, so the
+        // level goes *down*. Asserting the direction rather than the number is
+        // the point — what is being tested is that a param write in one process
+        // reached a plugin in another and changed the samples.
+        const u64 writes0 = c.header().paramWrites.load();
+        CHECK(c.setDeviceParam(fresh, kSatDrive, 36.f), "drive it to 36 dB");
+        const bool took = waitUntil([&] {
+            return c.header().paramWrites.load() > writes0;
+        }, 2000);
+        CHECK(took, "the pump applied it");
+        const f32 shaped = settledPeak(c, 0, 400);
+        CHECK(shaped < 0.49f && shaped > 0.40f,
+              "and the rendered audio changed: 0.5 DC shaped to %.4f (tanh(0.5) = 0.4621)",
+              (double)shaped);
+        CHECK(c.removeDevice(fresh), "remove it again so the shutdown section is clean");
+        ipc::WireEvent rm{};
+        CHECK(waitEvent(c, ipc::EvDeviceRemoved, rm, 3000), "EvDeviceRemoved");
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 12. clean shutdown, in two stages
+// 14. clean shutdown, in two stages
 // ---------------------------------------------------------------------------
 
 static void testCleanShutdown(ipc::EngineClient& c, pid_t& daemon) {
-    banner("12. SIGTERM: the daemon stops, publishes the flag and unlinks");
+    banner("14. SIGTERM: the daemon stops, publishes the flag and unlinks");
 
     drainEvents(c);
     ::kill(daemon, SIGTERM);
@@ -1283,11 +1778,13 @@ int main(int argc, char** argv) {
         testClearAndRetire(client);
         testMidiClip(client);
         testBadOffsets(client);
+        testDevices(client);
+        testDrainsExactness(client);
         testCrashAndRespawn(client, daemon);
         testCleanShutdown(client, daemon);
     }
 
-    banner("13. /dev/shm is clean");
+    banner("15. /dev/shm is clean");
     cleanup();
     const int leftover = countLatticeShm();
     CHECK(leftover == 0, "no lattice region left in /dev/shm (found %d)", leftover);

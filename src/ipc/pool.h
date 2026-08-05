@@ -92,7 +92,13 @@ inline constexpr u64 kPoolBlockMagic = 0x4C54435F424C4B31ull;  // "LTC_BLK1"
 // Bump on any change to PoolHeader/PoolBlock/WireNote layout or meaning. It is
 // folded into the pool region's layout hash, so a mismatched GUI and daemon
 // refuse to share a pool instead of misreading one.
-inline constexpr u32 kPoolVersion = 1;
+//
+//   v2 — PoolKindString (phase 3). No layout moved; the *meaning* of `kind`
+//        grew, and a v1 daemon handed a v2 string block would refuse it as
+//        "not sample data" rather than misreading it. Bumping is still the
+//        right call: the two builds no longer agree about what a pool can
+//        contain, and that is exactly what this number is for.
+inline constexpr u32 kPoolVersion = 2;
 
 // Every block — header and data — starts on a 64-byte line. Blocks are large
 // (a stereo bar of audio is hundreds of kilobytes) so the padding is noise,
@@ -121,7 +127,23 @@ enum : u32 {
     PoolKindNone    = 0,
     PoolKindSamples = 1,   // interleaved f32, `frames` * `channels` of them
     PoolKindNotes   = 2,   // WireNote[], `frames` of them
+
+    // A NUL-terminated byte string: a plugin URI, a preset name, a path.
+    // Phase 3's answer to "the rings cannot carry a string" (§3.2) without a
+    // socket to carry one over: the client allocates a blob, writes the bytes,
+    // and the 32-byte command carries the offset. `frames` is the byte length
+    // including the terminator. The daemon copies it out on the pump thread
+    // and echoes the offset straight back as EvBlockRetired — a string never
+    // reaches the audio thread, so its retirement needs no proof at all. See
+    // docs/PROCESS-SPLIT.md §11.2.
+    PoolKindString  = 3,
 };
+
+// The longest string the pool will carry. Not a buffer size — a policy: the
+// daemon copies a blob into a fixed stack buffer, so an unbounded blob would
+// be an unbounded copy driven by a peer. Every string the protocol has (a
+// plugin URI is the longest) fits several times over.
+inline constexpr u64 kMaxPoolString = 1024;
 
 // Block lifecycle. See "the free-after-confirm rule" below — these four states
 // *are* the rule, written down.
@@ -321,7 +343,8 @@ inline bool poolValidate(const u8* base, size_t payloadBytes, const PoolHeader* 
     if (st == BlockFree)                     return no("block has been freed");
     if (wantKind != PoolKindNone && b->kind != wantKind)
         return no(wantKind == PoolKindSamples ? "block does not hold sample data"
-                                              : "block does not hold notes");
+                : wantKind == PoolKindNotes   ? "block does not hold notes"
+                                              : "block does not hold a string");
     if (needBytes > b->bytes)                return no("block is smaller than the clip claims");
     return true;
 }
@@ -527,6 +550,21 @@ public:
         if (!ref) return 0;
         if (interleaved) std::memcpy(base_ + ref, interleaved, n * sizeof(f32));
         else             std::memset(base_ + ref, 0, n * sizeof(f32));
+        return ref;
+    }
+
+    // A string blob (PoolKindString). Returns the offset, or 0. The NUL is
+    // written and counted, so a daemon that trusts nothing still gets a
+    // terminated buffer if it copies `bytes` of it — but it must not trust
+    // that either, and does not (Daemon::readPoolString).
+    u64 writeString(const char* s) {
+        if (!s) return 0;
+        const size_t len = std::strlen(s);
+        if (len + 1 > kMaxPoolString) return 0;
+        const u64 ref = alloc(len + 1, PoolKindString, (i64)(len + 1), 0, 0.0, 0);
+        if (!ref) return 0;
+        std::memcpy(base_ + ref, s, len);
+        base_[ref + len] = '\0';
         return ref;
     }
 
@@ -887,6 +925,15 @@ public:
     // Only ever called after validate() said yes. Returns a pointer into a
     // mapping that outlives every clip that could reference it.
     const u8* at(u64 ref) const { return base_ + ref; }
+
+    // The block's own header. Also only after validate() — that is what proves
+    // the 128 bytes before `ref` are inside the mapping and are a header.
+    // Needed because the *declared size* of a block bounds how far the daemon
+    // may read into it, which matters for a string: the terminator has to be
+    // inside the allocation or the blob is not a string at all.
+    const PoolBlock* block(u64 ref) const {
+        return (const PoolBlock*)(base_ + ref - sizeof(PoolBlock));
+    }
 
     // The inverse: an address the engine handed back (Ev::NotesRetired carries
     // one) turned into the offset the GUI knows it by. Returns 0 for anything

@@ -48,12 +48,78 @@ namespace lat::ipc {
 //   v2 — the sample pool (phase 2): the clip table, the pool handshake in
 //        ControlHeader, EvClipAccepted/EvBlockRetired, and SetClip/ClearClip
 //        moving from "refused" to "accepted".
-inline constexpr u32 kProtocolVersion = 2;
+//   v3 — devices (phase 3): AddDevice/RemoveDevice/MoveDevice/SetBypass, string
+//        blobs through the pool, the device metadata table (daemon -> client)
+//        and the param table (client -> daemon). Cmd::SendLevel/ReturnVol join
+//        the scalars; Cmd::SetChain and its return/master siblings become
+//        daemon-internal and are refused on the wire *permanently* rather than
+//        pending a phase.
+inline constexpr u32 kProtocolVersion = 3;
 
 // Daemon-generated wire events start here, well clear of lat::Ev. The event
 // ring carries a superset of Ev: the boundary itself has things to report
 // (a refused command, "I am going away") that no engine ever needs to say.
 inline constexpr u32 kDaemonEventBase = 0x1000;
+
+// Daemon-*consumed* commands start here, well clear of lat::Cmd, and for the
+// mirror-image reason: the boundary has things done to it that no Engine ever
+// hears about. `AddDevice` is the archetype — it names a plugin by URI,
+// instantiates it in the daemon's address space, and only then turns into a
+// `Cmd::SetChain` the engine understands. lat::Cmd stays the engine's
+// vocabulary; this is the boundary's.
+inline constexpr u32 kDaemonCommandBase = 0x1000;
+
+enum : u32 {
+    // flags = DevTarget*, a = track/return index (ignored for master),
+    // b = chain position (-1 appends), ref = pool offset of a PoolKindString
+    // holding the plugin URI. Answered by exactly one EvDeviceAdded or
+    // EvDeviceFailed, and the URI blob is retired (EvBlockRetired) either way.
+    CmdAddDevice    = kDaemonCommandBase + 0,
+
+    // ref = device id. Answered by EvDeviceRemoved (or EvDeviceFailed).
+    CmdRemoveDevice = kDaemonCommandBase + 1,
+
+    // ref = device id, b = new position within its own chain. Answered by
+    // EvDeviceChanged.
+    CmdMoveDevice   = kDaemonCommandBase + 2,
+
+    // ref = device id, a = 0/1. A *command* and not a param-table write
+    // because §3.7 says so and it is right: bypass has to land in a defined
+    // order relative to the chain edits around it.
+    CmdSetBypass    = kDaemonCommandBase + 3,
+
+    // Force the plugin scan to start now rather than on the first AddDevice.
+    // Purely an optimisation for a GUI that knows it is about to need the
+    // catalog; the lazy path is identical.
+    CmdScanPlugins  = kDaemonCommandBase + 4,
+};
+
+// What a chain belongs to. The engine has three chain commands with three
+// different shapes (Cmd::SetChain / SetReturnChain / SetMasterChain); one enum
+// on the wire keeps the client from having to know which is which.
+enum : u32 {
+    DevTargetTrack  = 0,   // a = track index
+    DevTargetReturn = 1,   // a = return index
+    DevTargetMaster = 2,   // a ignored
+};
+
+// ControlHeader::scanState. The plugin scan is lazy and asynchronous, which is
+// §3.6 being honest: it always took a second, the in-process GUI just blocked
+// on it.
+enum : u32 {
+    ScanIdle    = 0,   // not started; the first device command starts it
+    ScanRunning = 1,
+    ScanDone    = 2,
+};
+
+inline const char* devTargetName(u32 t) {
+    switch (t) {
+        case DevTargetTrack:  return "track";
+        case DevTargetReturn: return "return";
+        case DevTargetMaster: return "master";
+        default:              return "?";
+    }
+}
 
 enum : u32 {
     EvCommandRejected = kDaemonEventBase + 0,  // a = Cmd, b = RejectReason
@@ -78,6 +144,43 @@ enum : u32 {
     // x = the mapped byte count. Purely informational — the client may publish
     // clips before it arrives, they are simply refused until the pool is in.
     EvPoolAttached    = kDaemonEventBase + 5,
+
+    // --- devices (phase 3) -------------------------------------------------
+    //
+    // A device command is answered exactly once, the same discipline EvClipAck
+    // established: a silent refusal would leave a GUI showing an
+    // "instantiating…" strip forever.
+
+    // The plugin is loaded, prepared and in a published chain.
+    // ref = device id, flags = DevTarget*, a = target index, b = chain
+    // position, x = param count. **The metadata is not in this event** — it is
+    // in the device table at `ControlMap::device(id)`, which the client reads
+    // once and mirrors. See §11.3 for why a table and not a blob.
+    EvDeviceAdded     = kDaemonEventBase + 6,
+
+    // ref = the URI blob offset the client sent (0 if the command never named
+    // one), b = a Reject* reason, a = DevTarget*. The daemon is still alive;
+    // that is the whole point of answering rather than dying.
+    EvDeviceFailed    = kDaemonEventBase + 7,
+
+    // ref = device id. The instance is destroyed, the chain is republished and
+    // the id is free for reuse — with a bumped WireDeviceInfo::generation, so
+    // a param write aimed at the old occupant cannot land on the new one.
+    EvDeviceRemoved   = kDaemonEventBase + 8,
+
+    // ref = device id. Something in the device's table row changed that the
+    // client did not write: a move (b = the new position), a bypass the daemon
+    // applied (flags & DeviceChangedBypass), a re-published chain.
+    EvDeviceChanged   = kDaemonEventBase + 9,
+
+    // The plugin scan finished. a = plugin count, x = seconds it took.
+    EvScanComplete    = kDaemonEventBase + 10,
+};
+
+// EvDeviceChanged::flags.
+enum : u32 {
+    DeviceChangedMoved  = 1u << 0,
+    DeviceChangedBypass = 1u << 1,
 };
 
 // EvClipAck::flags.
@@ -100,18 +203,34 @@ enum : u32 {
     RejectNoPool         = 5,  // a clip references the pool and none is mapped
     RejectBadPoolRef     = 6,  // offset failed poolValidate() — see the log line
     RejectBadClip        = 7,  // the clip's own scalars are inconsistent
+
+    // --- devices (phase 3) --------------------------------------------------
+    RejectUnknownUri     = 8,  // the scan does not know that URI
+    RejectInstantiate    = 9,  // the plugin refused to load or to activate
+    RejectDeviceTableFull= 10, // kMaxDevices devices already exist
+    RejectChainFull      = 11, // kMaxChainFx devices already on that chain
+    RejectBadDevice      = 12, // no such device id, or its generation is stale
+    RejectBadString      = 13, // the URI blob is not a terminated string
+    RejectScanBusy       = 14, // the scan is running and the queue is full
 };
 
 inline const char* rejectReasonName(u32 r) {
     switch (r) {
-        case RejectPointerPayload: return "carries a pointer (phase 3)";
-        case RejectUnknownCommand: return "unknown command type";
-        case RejectBadIndex:       return "track/slot index out of range";
-        case RejectNotFinite:      return "non-finite scalar";
-        case RejectNoPool:         return "no sample pool is attached";
-        case RejectBadPoolRef:     return "sample pool offset failed validation";
-        case RejectBadClip:        return "clip fields are inconsistent";
-        default:                   return "none";
+        case RejectPointerPayload:  return "carries a pointer the daemon owns";
+        case RejectUnknownCommand:  return "unknown command type";
+        case RejectBadIndex:        return "track/slot index out of range";
+        case RejectNotFinite:       return "non-finite scalar";
+        case RejectNoPool:          return "no sample pool is attached";
+        case RejectBadPoolRef:      return "sample pool offset failed validation";
+        case RejectBadClip:         return "clip fields are inconsistent";
+        case RejectUnknownUri:      return "no plugin with that URI was found";
+        case RejectInstantiate:     return "the plugin failed to load or activate";
+        case RejectDeviceTableFull: return "the device table is full";
+        case RejectChainFull:       return "the chain is full";
+        case RejectBadDevice:       return "no such device";
+        case RejectBadString:       return "the string blob is not terminated";
+        case RejectScanBusy:        return "the plugin scan is busy and the queue is full";
+        default:                    return "none";
     }
 }
 
@@ -224,6 +343,132 @@ inline WireClip defaultWireClip() {
 using WireSetClip = WireClip;
 
 // ---------------------------------------------------------------------------
+// Devices: two tables, opposite directions
+// ---------------------------------------------------------------------------
+//
+// Phase 3's problem is §2.5's: `RtChain::fx` is an array of PluginInstance*,
+// and both the pointer and the object it names have to stop crossing. They do,
+// by the plugin moving into the daemon (§3.6). What is left crossing is
+// *description* and *value*, and those pull in opposite directions, so they get
+// one table each:
+//
+//   device table   WireDeviceInfo[kMaxDevices]    DAEMON writes, client reads.
+//                  What a loaded plugin is: uri, name, latency, and one
+//                  WireParamInfo per control. Static per instance, so it is
+//                  written once at AddDevice and read once at EvDeviceAdded.
+//
+//   param table    WireDeviceParams[kMaxDevices]  CLIENT writes, daemon reads.
+//                  What its controls are currently set to. Written at knob
+//                  rate, scanned by the daemon's pump every millisecond.
+//
+// Both are preallocated in the control region for the reason everything here
+// is: no side may wait for an allocation, and a republish after an engine
+// restart must not need one either.
+//
+// §3.7 puts the param table in the *session* region instead, so that it
+// survives an engine restart the way the sample pool does. It is here because
+// the device *ids* it is indexed by are the daemon's, and they do not survive:
+// a respawned daemon re-instantiates from scratch and hands out fresh ids, so
+// a surviving table would be indexed by numbers that no longer mean anything.
+// The client keeps its own mirror and re-pushes after a respawn, exactly as it
+// re-pushes the clip table — see §11.4.
+
+// A device id is an index into both tables. There are enough for every chain
+// position the engine can address (32 tracks + 4 returns + master, 8 devices
+// each = 296) with room to spare, so "the table is full" means a leak, not a
+// large session.
+inline constexpr u32 kMaxDevices   = 320;
+
+// Controls per device that cross the boundary. §3.7 sketches 256; 64 covers
+// every plugin in practice and keeps the table at 1.4 MiB instead of 5.5.
+// A device with more reports the first 64 and says so in `truncatedParams`,
+// which is a visible, testable degradation rather than a silent one.
+inline constexpr u32 kMaxDevParams = 64;
+
+static_assert(kMaxDevices >= (u32)(kMaxTracks * kMaxChainFx + kMaxReturns * kMaxChainFx + kMaxChainFx),
+              "the device table must be able to hold every addressable chain position");
+
+// WireParamInfo::flags — lat::ParamInfo's three booleans, as bits.
+enum : u32 {
+    ParamIsBool = 1u << 0,
+    ParamIsInt  = 1u << 1,
+    ParamIsLog  = 1u << 2,
+};
+
+// lat::ParamInfo with the two std::strings truncated to fixed widths. A name
+// longer than 31 bytes is cut, never wrapped and never heap-allocated: this
+// struct lives in shared memory and the whole point of the exercise is that
+// nothing in it can point anywhere.
+struct WireParamInfo {
+    f32  min, max, def;
+    u32  id;              // backend-defined; LV2 uses the port index
+    u32  flags;           // ParamIs*
+    u32  reserved;
+    char name[32];        // NUL-terminated, truncated
+    char unit[8];         // "dB", "Hz", ""
+};
+static_assert(std::is_trivially_copyable_v<WireParamInfo>);
+static_assert(sizeof(WireParamInfo) == 64, "WireParamInfo is part of the region layout");
+
+// WireDeviceInfo::state.
+enum : u32 {
+    DeviceSlotFree = 0,
+    DeviceSlotLive = 1,
+};
+
+// Written by the daemon, read by the client. `state` and `generation` are the
+// only atomics, and `state` is written *last* with release for the same reason
+// PoolBlock::magic is: a reader that sees the slot live has seen every field
+// that describes it.
+struct WireDeviceInfo {
+    std::atomic<u32> state;        // DeviceSlot*
+    std::atomic<u32> generation;   // +1 per allocation of this slot; never reused
+    std::atomic<u32> bypass;       // what the daemon actually applied
+    u32 paramCount;                // <= kMaxDevParams
+    u32 truncatedParams;           // controls beyond kMaxDevParams, 0 normally
+    i32 target;                    // DevTarget*
+    i32 targetIdx;                 // track or return index
+    i32 chainPos;                  // position within that chain
+    i32 latencyFrames;             // PluginInstance::latencyFrames()
+    u32 format;                    // lat::PluginFormat
+    u32 kind;                      // lat::PluginKind
+    u32 audioIn, audioOut;
+    u32 hasMidiIn;
+    u32 reserved[2];
+    char uri[128];
+    char name[64];
+    char vendor[64];
+    WireParamInfo params[kMaxDevParams];
+};
+static_assert(std::is_trivially_copyable_v<WireDeviceInfo>);
+static_assert(sizeof(WireDeviceInfo) == 320 + sizeof(WireParamInfo) * kMaxDevParams,
+              "WireDeviceInfo is part of the region layout");
+
+// Written by the client, read by the daemon's pump thread.
+//
+// This is §3.7 relocated and otherwise unchanged: the GUI stores a plain float
+// and bumps a generation; the reader notices the generation and re-reads. No
+// ring, therefore no drops — a dropped param write would leave the knob and the
+// plugin permanently disagreeing, which is the worst bug class in this corner
+// of the system.
+//
+// `deviceGeneration` is the one addition a process boundary forces. Device ids
+// are reused, so a write that was in flight when a device was removed could
+// otherwise land on its replacement. The client stamps the slot generation it
+// believes it is talking to and the daemon ignores anything stale.
+struct WireDeviceParams {
+    std::atomic<u32> generation;        // client: +1 per write batch (release)
+    std::atomic<u32> engineGeneration;  // daemon: +1 when the plugin moved a param
+    std::atomic<u32> deviceGeneration;  // client: the WireDeviceInfo generation it wrote for
+    std::atomic<u32> reserved;
+    std::atomic<f32> value[kMaxDevParams];
+};
+static_assert(sizeof(WireDeviceParams) == 16 + 4 * kMaxDevParams,
+              "WireDeviceParams is part of the region layout");
+static_assert(std::atomic<f32>::is_always_lock_free,
+              "a param table of non-lock-free atomics would put a futex in the pump");
+
+// ---------------------------------------------------------------------------
 // Command policy
 // ---------------------------------------------------------------------------
 //
@@ -235,16 +480,22 @@ using WireSetClip = WireClip;
 //            table, whose pointers have become pool offsets — so they cross,
 //            but only after the daemon has validated every offset against its
 //            own mapping of the pool. This is phase 2's entire delta.
-//   refused  SetChain and the two Record commands. Still GUI-heap addresses,
-//            still refused at the boundary with a reason rather than
-//            half-translated: a SetChain whose `p` was silently zeroed is a
-//            track that loses its plugins, and you find that on stage.
+//   device   The five CmdAddDevice-family codes above. They are not lat::Cmd
+//            at all: the daemon consumes them, loads or unloads a plugin, and
+//            *generates* the Cmd::SetChain the engine sees. Phase 3's delta.
+//   refused  The three chain commands and the two Record commands. Their
+//            `Command::p` is an address in whoever built them, and for the
+//            chain family that is now permanently the daemon: a client has no
+//            business naming an RtChain, because it has no RtChains. This is
+//            no longer "not yet" — it is the design.
 //
-//   SetChain        Command::p is an RtChain* full of PluginInstance*
-//                                                              -> phase 3 ids
-//   RecordSlot      Command::p is a GUI-owned capture buffer    -> phase 3
-//   RecordMidiSlot  Command::p is a GUI-owned RtNote buffer     -> phase 3
+//   SetChain/SetReturnChain/SetMasterChain
+//                   Command::p is an RtChain* full of PluginInstance*, built
+//                   by the daemon from its own device table. Use AddDevice.
+//   RecordSlot      Command::p is a GUI-owned capture buffer    -> phase 4
+//   RecordMidiSlot  Command::p is a GUI-owned RtNote buffer     -> phase 4
 inline constexpr bool commandIsScalar(u32 type) {
+    if (type >= kDaemonCommandBase) return false;
     switch ((Cmd)type) {
         case Cmd::SetPlaying: case Cmd::SetTempo: case Cmd::SetQuantum:
         case Cmd::SetMetronome: case Cmd::LaunchClip: case Cmd::StopTrack:
@@ -252,8 +503,13 @@ inline constexpr bool commandIsScalar(u32 type) {
         case Cmd::TrackPan: case Cmd::TrackMute: case Cmd::TrackSolo:
         case Cmd::TrackArm: case Cmd::MasterVol: case Cmd::ClipGain:
         case Cmd::ClipWarp: case Cmd::ClipLoop:
+        // Phase 3: the bus topology's own scalars. SendLevel and ReturnVol are
+        // pure numbers into the engine's mixer and always were; they only look
+        // new because the engine grew return buses in the same wave.
+        case Cmd::SendLevel: case Cmd::ReturnVol:
             return true;
-        case Cmd::SetClip: case Cmd::ClearClip: case Cmd::SetChain:
+        case Cmd::SetClip: case Cmd::ClearClip:
+        case Cmd::SetChain: case Cmd::SetReturnChain: case Cmd::SetMasterChain:
         case Cmd::RecordSlot: case Cmd::RecordMidiSlot:
             return false;
     }
@@ -263,27 +519,41 @@ inline constexpr bool commandIsScalar(u32 type) {
 // Carries a clip cell rather than a scalar: the daemon reads the table, not
 // the command.
 inline constexpr bool commandIsPooled(u32 type) {
-    return (Cmd)type == Cmd::SetClip || (Cmd)type == Cmd::ClearClip;
+    return type < kDaemonCommandBase &&
+           ((Cmd)type == Cmd::SetClip || (Cmd)type == Cmd::ClearClip);
 }
 
-// Cannot cross at all, in this phase or any until §3.6 lands.
+// Consumed by the daemon, never forwarded verbatim.
+inline constexpr bool commandIsDevice(u32 type) {
+    return type >= kDaemonCommandBase && type <= CmdScanPlugins;
+}
+
+// Names memory the sender does not own on the receiving side. Permanently
+// refused, not deferred.
 inline constexpr bool commandCarriesPointer(u32 type) {
-    return !commandIsScalar(type) && !commandIsPooled(type);
+    return !commandIsScalar(type) && !commandIsPooled(type) && !commandIsDevice(type);
 }
 
 // True for a type this build knows at all. An unknown type is a peer from the
 // future; the version check should already have caught it, so this is the
 // belt to that pair of braces.
 inline constexpr bool commandIsKnown(u32 type) {
-    return type <= (u32)Cmd::RecordMidiSlot;
+    return type <= (u32)Cmd::RecordMidiSlot || commandIsDevice(type);
 }
 
 // Events that cannot cross as they stand: each hands a pointer back to whoever
-// allocated it. Ev::NotesRetired is the one that changed in phase 2 — it is no
-// longer dropped but *translated*, because its pointer now lands inside the
-// sample pool and the daemon can turn it back into the offset the GUI knows it
-// by (EvBlockRetired). It stays false here because it still may not be
-// forwarded verbatim; see Daemon::pumpEvents.
+// allocated it. Two of the four are now *consumed* rather than dropped, and
+// both stay false here because "may not be forwarded verbatim" is what this
+// predicate means:
+//
+//   Ev::NotesRetired  (phase 2) its pointer lands inside the sample pool, so
+//                     the daemon turns it back into the offset the client
+//                     knows it by and republishes it as EvBlockRetired.
+//   Ev::ChainRetired  (phase 3) its pointer is a chain the *daemon* built, so
+//                     the daemon keeps it: the retirement dance §2.5 describes
+//                     still happens, it just happens between two threads of
+//                     one process now. §3.6 said this event would disappear
+//                     from the protocol; it disappeared from the wire.
 //
 // The other three remain unreachable, because the commands that would allocate
 // their payloads are still refused. If their counter ever moves, something
@@ -329,6 +599,29 @@ struct ControlHeader {
     std::atomic<u64> clipsApplied;      // clip cells forwarded to the engine
     std::atomic<u64> blocksRetired;     // EvBlockRetired events published
 
+    // --- devices (phase 3) --------------------------------------------------
+    std::atomic<u64> devicesAdded;      // instances created
+    std::atomic<u64> devicesRemoved;    // instances destroyed
+    std::atomic<u64> devicesFailed;     // AddDevice answered with EvDeviceFailed
+    std::atomic<u64> devicesLive;       // instances alive right now
+    std::atomic<u64> paramWrites;       // setParam() calls made from the pump
+    std::atomic<u64> chainsPublished;   // Cmd::Set*Chain handed to the engine
+    std::atomic<u64> chainsRetired;     // RtChains freed after their proof landed
+    std::atomic<u32> scanState;         // ScanState below
+    std::atomic<u32> scanPlugins;       // catalog size once the scan is done
+
+    // --- the retirement proof (§11.5) ---------------------------------------
+    //
+    // Engine::drains counts completed drainCommands() passes and is the exact
+    // primitive phase 2's retirement deadline was standing in for. It is
+    // republished here for one reason beyond diagnostics: a client (or a test)
+    // cannot see the daemon's Engine, so without this it could not tell an
+    // engine that counts its drains from one that does not — and the daemon's
+    // behaviour differs between the two.
+    std::atomic<u64> engineDrains;
+    std::atomic<u32> drainsExact;       // 1 = the engine counts; retirement is a proof
+    std::atomic<u32> reserved1;
+
     char driverName[32];             // "null", "JACK", "ALSA"
 
     // --- the sample-pool handshake (docs/PROCESS-SPLIT.md §3.5) ------------
@@ -370,6 +663,18 @@ struct ControlHeader {
         eventsDropped.store(0, std::memory_order_relaxed);
         clipsApplied.store(0, std::memory_order_relaxed);
         blocksRetired.store(0, std::memory_order_relaxed);
+        devicesAdded.store(0, std::memory_order_relaxed);
+        devicesRemoved.store(0, std::memory_order_relaxed);
+        devicesFailed.store(0, std::memory_order_relaxed);
+        devicesLive.store(0, std::memory_order_relaxed);
+        paramWrites.store(0, std::memory_order_relaxed);
+        chainsPublished.store(0, std::memory_order_relaxed);
+        chainsRetired.store(0, std::memory_order_relaxed);
+        scanState.store(ScanIdle, std::memory_order_relaxed);
+        scanPlugins.store(0, std::memory_order_relaxed);
+        engineDrains.store(0, std::memory_order_relaxed);
+        drainsExact.store(0, std::memory_order_relaxed);
+        reserved1.store(0, std::memory_order_relaxed);
         std::memset(driverName, 0, sizeof driverName);
         std::snprintf(driverName, sizeof driverName, "%s", driver ? driver : "?");
         std::memset(poolName, 0, sizeof poolName);
@@ -400,26 +705,37 @@ using MidiRing    = ShmSpscRing<WireMidi, 1024>;
 // wait for an allocation and a republish must not need one either.
 inline constexpr size_t kClipTableBytes = sizeof(WireClip) * kMaxTracks * kMaxScenes;
 
+// 320 x 4.3 KiB of metadata and 320 x 272 B of values: 1.4 MiB, which on tmpfs
+// costs one page per table until something is written into it. Preallocated for
+// the same reason the clip table is — a device may not wait for an allocation,
+// and neither may a republish.
+inline constexpr size_t kDeviceTableBytes = sizeof(WireDeviceInfo)   * kMaxDevices;
+inline constexpr size_t kParamTableBytes  = sizeof(WireDeviceParams) * kMaxDevices;
+
 namespace control {
 
-inline constexpr size_t kHeader = 0;
-inline constexpr size_t kState  = alignUp(kHeader + sizeof(ControlHeader),  kCacheLine);
-inline constexpr size_t kCmds   = alignUp(kState  + sizeof(SharedState),    kCacheLine);
-inline constexpr size_t kEvts   = alignUp(kCmds   + CommandRing::bytes(),   kCacheLine);
-inline constexpr size_t kMidi   = alignUp(kEvts   + EventRing::bytes(),     kCacheLine);
-inline constexpr size_t kClips  = alignUp(kMidi   + MidiRing::bytes(),      kCacheLine);
-inline constexpr size_t kBytes  = kClips + kClipTableBytes;
+inline constexpr size_t kHeader  = 0;
+inline constexpr size_t kState   = alignUp(kHeader  + sizeof(ControlHeader),  kCacheLine);
+inline constexpr size_t kCmds    = alignUp(kState   + sizeof(SharedState),    kCacheLine);
+inline constexpr size_t kEvts    = alignUp(kCmds    + CommandRing::bytes(),   kCacheLine);
+inline constexpr size_t kMidi    = alignUp(kEvts    + EventRing::bytes(),     kCacheLine);
+inline constexpr size_t kClips   = alignUp(kMidi    + MidiRing::bytes(),      kCacheLine);
+inline constexpr size_t kDevices = alignUp(kClips   + kClipTableBytes,        kCacheLine);
+inline constexpr size_t kParams  = alignUp(kDevices + kDeviceTableBytes,      kCacheLine);
+inline constexpr size_t kBytes   = kParams + kParamTableBytes;
 
 // Everything that could move an offset out from under a peer goes into the
 // hash: the total size, every section offset, both message sizes, the ring
 // capacities and the protocol version.
 inline constexpr u32 kHash =
-    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
-        fnv1a("lattice.control.v2"),
+    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
+        fnv1a("lattice.control.v3"),
         (u64)kBytes), (u64)kState), (u64)kCmds), (u64)kEvts), (u64)kMidi), (u64)kClips),
+        (u64)kDevices), (u64)kParams),
         (u64)(sizeof(WireCommand) * 65536 + sizeof(WireEvent) * 256 + sizeof(WireMidi))),
         (u64)(CommandRing::capacity() * 65536ull + EventRing::capacity()) ^
-        (u64)(kProtocolVersion * 65536u + (u32)sizeof(WireClip)));
+        (u64)(kProtocolVersion * 65536u + (u32)sizeof(WireClip)) ^
+        (u64)(sizeof(WireDeviceInfo) * 65536ull + sizeof(WireDeviceParams)));
 
 } // namespace control
 
@@ -439,14 +755,31 @@ inline void controlRegionName(const char* session, char* out, size_t cap) {
 // at<T>() is bounds- and alignment-checked, so a layout mistake surfaces here,
 // at startup, on both sides. Nothing below ever recomputes an offset.
 struct ControlMap {
-    ControlHeader* hdr   = nullptr;
-    SharedState*   state = nullptr;
-    CommandRing*   cmds  = nullptr;
-    EventRing*     evts  = nullptr;
-    MidiRing*      midi  = nullptr;
-    WireClip*      clips = nullptr;      // [kMaxTracks * kMaxScenes], row-major
+    ControlHeader*    hdr     = nullptr;
+    SharedState*      state   = nullptr;
+    CommandRing*      cmds    = nullptr;
+    EventRing*        evts    = nullptr;
+    MidiRing*         midi    = nullptr;
+    WireClip*         clips   = nullptr;   // [kMaxTracks * kMaxScenes], row-major
+    WireDeviceInfo*   devices = nullptr;   // [kMaxDevices], daemon -> client
+    WireDeviceParams* params  = nullptr;   // [kMaxDevices], client -> daemon
 
-    bool valid() const { return hdr && state && cmds && evts && midi && clips; }
+    bool valid() const {
+        return hdr && state && cmds && evts && midi && clips && devices && params;
+    }
+
+    WireDeviceInfo* device(u32 id) {
+        return (devices && id < kMaxDevices) ? devices + id : nullptr;
+    }
+    const WireDeviceInfo* device(u32 id) const {
+        return const_cast<ControlMap*>(this)->device(id);
+    }
+    WireDeviceParams* param(u32 id) {
+        return (params && id < kMaxDevices) ? params + id : nullptr;
+    }
+    const WireDeviceParams* param(u32 id) const {
+        return const_cast<ControlMap*>(this)->param(id);
+    }
 
     // The clip table is one flat array with an accessor rather than a 2-D
     // pointer, so the region layout has one offset in it and the index
@@ -473,6 +806,7 @@ struct ControlMap {
         // know: it checks one T, and this is an array.
         if (clips && !r.at<WireClip>(control::kClips + kClipTableBytes - sizeof(WireClip)))
             clips = nullptr;
+        mapTables(r);
         return valid();
     }
     // Attacher: adopt the memory, touching nothing.
@@ -485,9 +819,24 @@ struct ControlMap {
         clips = r.at<WireClip>(control::kClips);
         if (clips && !r.at<WireClip>(control::kClips + kClipTableBytes - sizeof(WireClip)))
             clips = nullptr;
+        mapTables(r);
         return valid();
     }
     void clear() { *this = ControlMap{}; }
+
+private:
+    // Same last-element check as the clip table, for the same reason: at<T>()
+    // proves one T fits, and these are arrays of hundreds.
+    void mapTables(ShmRegion& r) {
+        devices = r.at<WireDeviceInfo>(control::kDevices);
+        if (devices && !r.at<WireDeviceInfo>(control::kDevices + kDeviceTableBytes -
+                                             sizeof(WireDeviceInfo)))
+            devices = nullptr;
+        params = r.at<WireDeviceParams>(control::kParams);
+        if (params && !r.at<WireDeviceParams>(control::kParams + kParamTableBytes -
+                                              sizeof(WireDeviceParams)))
+            params = nullptr;
+    }
 };
 
 } // namespace lat::ipc

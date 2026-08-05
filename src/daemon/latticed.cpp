@@ -45,17 +45,36 @@
 // finer than any display refresh. The cost is one memcpy-ish pass per 4 ms on
 // a non-RT thread; the benefit is that src/audio is untouched and the GUI-side
 // protocol is already the final one.
+// PHASE 3: THE PLUGINS MOVE IN
+// ----------------------------
+// The daemon now links src/plugin and owns every PluginInstance in the system
+// (§3.6). Three consequences shape everything below:
+//
+//   * `RtChain::fx` stops crossing, because it has nowhere to cross to. The
+//     client says AddDevice{track, uri}; the daemon instantiates, builds an
+//     RtChain out of *its own* instances, and pushes Cmd::SetChain. The
+//     pointer-swap-and-retire dance §2.5 describes is kept verbatim — it was
+//     always the right pattern, it just stopped being a cross-process concern.
+//   * PluginRegistry::scan() runs here, on a short-lived thread, lazily, on the
+//     first device command. It is slow (lilv walks every bundle on the system)
+//     and device commands that arrive while it runs are queued rather than
+//     refused.
+//   * setParam() is called from the pump thread. See "the param table" below
+//     for why that is the same guarantee host.h documents and not a weaker one.
 #include "../audio/backend.h"
 #include "../audio/engine.h"
 #include "../core/common.h"
 #include "../ipc/control.h"
 #include "../ipc/pool.h"
+#include "../plugin/host.h"
 
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -304,12 +323,57 @@ private:
     // proof that the audio thread has drained past the command that displaced
     // it. See "the free-after-confirm rule, daemon side" below.
     struct Retire {
-        u64  ref       = 0;
-        u32  kind      = 0;
-        i32  track     = 0, slot = 0;
+        u64  ref        = 0;
+        u32  kind       = 0;
+        i32  track      = 0, slot = 0;
+        u64  dueDrains  = 0;      // exact: Engine::drains must reach this
+        u64  dueNs      = 0;      // legacy fallback, see drainsExact_
+        u64  dueBlocks  = 0;
+        bool confirmed  = false;  // the engine proved it (Ev::NotesRetired)
+    };
+
+    // -- devices ------------------------------------------------------------
+
+    // One loaded plugin. The instance lives here and nowhere else: this is
+    // §2.5's `DeviceModel::inst` after it moved across the process boundary,
+    // and the client's half of it is a number.
+    struct Device {
+        std::unique_ptr<PluginInstance> inst;
+        u32 id         = 0;
+        u32 generation = 0;                 // +1 per allocation of this slot
+        u32 target     = ipc::DevTargetTrack;
+        int targetIdx  = 0;
+        int paramCount = 0;                 // clamped to kMaxDevParams
+        u32 seenParamGen = 0;               // last WireDeviceParams::generation applied
+        f32 cached[ipc::kMaxDevParams] = {};
+    };
+
+    // One chain: the order the client asked for, and the RtChain the engine is
+    // currently holding for it.
+    struct Chain {
+        std::vector<u32>         order;      // device ids, in processing order
+        std::unique_ptr<RtChain> published;  // what the engine holds; owned here
+    };
+
+    // A chain publication waiting for room in Engine's command ring. Chains
+    // queue rather than drop for the same reason commands do (§5): a lost
+    // SetChain is a track that silently loses its plugins.
+    struct ChainPush {
+        Command                  cmd{};
+        std::unique_ptr<RtChain> old;    // displaced; freed once the proof lands
+        std::vector<std::unique_ptr<PluginInstance>> dying;
+    };
+
+    // The retirement pattern §2.5 describes, kept verbatim and moved inside one
+    // process. The audio thread never frees a chain or an instance; the pump
+    // does, and only once it can prove the engine has drained past the swap.
+    struct ChainRetire {
+        std::unique_ptr<RtChain> chain;
+        std::vector<std::unique_ptr<PluginInstance>> dying;
+        const RtChain* watch = nullptr;   // matched against Ev::ChainRetired
+        u64  dueDrains = 0;
         u64  dueNs     = 0;
-        u64  dueBlocks = 0;
-        bool confirmed = false;   // the engine proved it (Ev::NotesRetired)
+        bool confirmed = false;
     };
 
     // -- startup ------------------------------------------------------------
@@ -352,15 +416,64 @@ private:
 
     void pumpLoop() {
         while (!gQuit) {
+            observeDrains();
             pumpPool();
             pumpCommands();
+            pumpDeviceQueue();
+            pumpChainPushes();
+            pumpParams();
             pumpMidi();
             pumpEvents();
             pumpRetirements();
+            pumpChainRetirements();
             map_.hdr->heartbeat.fetch_add(1, std::memory_order_relaxed);
             timespec ts{0, 1000000};        // 1 ms
             ::nanosleep(&ts, nullptr);
         }
+    }
+
+    // -- the drain counter --------------------------------------------------
+    //
+    // Engine::drains is bumped at the END of every drainCommands(), which is
+    // exactly the observation phase 2 wanted and could not have
+    // (docs/PROCESS-SPLIT.md §10.3: "the exact version needs Engine to publish
+    // a drain counter"). Republished into ControlHeader so that a client — or a
+    // test — can tell an engine that counts from one that does not, because the
+    // daemon's retirement behaviour differs between the two and a silent
+    // difference is worse than a slow one.
+    void observeDrains() {
+        const u64 d = engine_->drains.load(std::memory_order_acquire);
+        map_.hdr->engineDrains.store(d, std::memory_order_relaxed);
+        if (!drainsExact_ && d > 0) {
+            drainsExact_ = true;
+            map_.hdr->drainsExact.store(1, std::memory_order_release);
+            LOGI("Engine counts its command drains: retirement is exact, "
+                 "not deadline-based");
+        }
+    }
+
+    // THE PROOF, AND ITS OFF-BY-ONE
+    //
+    // Call this immediately after a successful Engine::pushCommand and keep the
+    // number; the command is provably consumed once `drains` has reached it.
+    //
+    // Why +2 and not +1. Let P be the moment the push's release store lands and
+    // R > P the moment we read `drains` here, giving d0. By definition drain
+    // #d0 completed before R. Drain #(d0+1) completes after R — but it may have
+    // *started* before P, in which case it never saw our command. Drain #(d0+2)
+    // cannot start until #(d0+1) has finished, which is after R and therefore
+    // after P, so it must observe the push. Two is the smallest safe number,
+    // and it is a proof rather than a guess: no clock is involved, and a wedged
+    // backend simply never satisfies it — which is the correct behaviour, since
+    // a wedged backend has not drained anything.
+    //
+    // Cost: at most two block periods (~10.7 ms at 256 frames / 48 kHz), versus
+    // phase 2's max(100 ms, 8 blocks).
+    u64 drainProof() const {
+        return engine_->drains.load(std::memory_order_acquire) + 2;
+    }
+    bool drainProven(u64 due) const {
+        return engine_->drains.load(std::memory_order_acquire) >= due;
     }
 
     // -- the sample pool ----------------------------------------------------
@@ -436,6 +549,14 @@ private:
         }
         ipc::WireCommand w;
         while (map_.cmds->pop(w)) {
+            // Device commands are not translated and never reach the engine —
+            // the daemon *executes* them, and what the engine hears about is
+            // the Cmd::SetChain that comes out the other end. They are queued
+            // rather than applied here because the first one triggers a plugin
+            // scan that takes about a second, and the pump must keep beating
+            // through it (§11.6).
+            if (ipc::commandIsDevice(w.type)) { enqueueDevice(w); continue; }
+
             Staged st{};
             u32 reason = ipc::RejectNone;
             if (!translate(w, st, reason)) {
@@ -701,6 +822,612 @@ private:
         }
     }
 
+    // =======================================================================
+    // Devices (docs/PROCESS-SPLIT.md §3.6, §3.7, §11)
+    // =======================================================================
+
+    // -- the scan -----------------------------------------------------------
+    //
+    // PluginRegistry::scan() walks every LV2 bundle on the system with lilv. It
+    // takes the better part of a second on a normal install, it allocates
+    // freely, and it is documented GUI-thread-only. So it runs once, lazily, on
+    // the first device command, on a thread of its own — and the pump keeps
+    // ticking, which is the property that matters: a pump that blocked for a
+    // second would stop the heartbeat, and a client watching the heartbeat
+    // would conclude the engine had wedged and start thinking about respawning
+    // it. Losing the audio because we went looking for plugins would be a
+    // remarkable own goal.
+    //
+    // The registry is still touched by exactly one thread at a time: the
+    // scanning thread owns `scanned_` alone until it sets `scanDone_`, and the
+    // pump joins before it reads. host.h's contract is honoured, not bent —
+    // "GUI thread" in that file means "the one non-realtime thread that owns
+    // this object", and here that is the pump, briefly delegated.
+    //
+    // §3.6 asks for a short-lived `lattice-scan` *child process*, so that a
+    // plugin which segfaults during discovery takes down neither the GUI nor
+    // the engine. That is strictly better and it is still deferred: it needs a
+    // way to ship the catalog back, which is the socket.
+    void startScan() {
+        if (scanState_ != ipc::ScanIdle) return;
+        scanState_ = ipc::ScanRunning;
+        map_.hdr->scanState.store(ipc::ScanRunning, std::memory_order_release);
+        scanStartNs_ = ipc::monotonicNs();
+        scanDone_.store(false, std::memory_order_relaxed);
+        scanned_ = std::make_unique<PluginRegistry>();
+        LOGI("plugin scan started (first device command)");
+        scanThread_ = std::thread([this] {
+            scanned_->scan();
+            scanDone_.store(true, std::memory_order_release);
+        });
+    }
+
+    // True once the catalog is usable.
+    bool registryReady() {
+        if (scanState_ == ipc::ScanDone) return true;
+        if (scanState_ != ipc::ScanRunning) return false;
+        if (!scanDone_.load(std::memory_order_acquire)) return false;
+        if (scanThread_.joinable()) scanThread_.join();
+        registry_ = std::move(*scanned_);
+        scanned_.reset();
+        scanState_ = ipc::ScanDone;
+        const u32 n = (u32)registry_.plugins().size();
+        const f64 secs = (f64)(ipc::monotonicNs() - scanStartNs_) / 1e9;
+        map_.hdr->scanPlugins.store(n, std::memory_order_relaxed);
+        map_.hdr->scanState.store(ipc::ScanDone, std::memory_order_release);
+        LOGI("plugin scan complete: %u plugins in %.2f s", n, secs);
+        ipc::WireEvent e{};
+        e.type = ipc::EvScanComplete;
+        e.a    = (i32)n;
+        e.x    = secs;
+        map_.evts->push(e);
+        return true;
+    }
+
+    // -- the device command queue -------------------------------------------
+    //
+    // Bounded, because it is fed by a peer. Overflow is answered rather than
+    // dropped, exactly like every other refusal here.
+    static constexpr size_t kDeviceQueueMax = 256;
+
+    void enqueueDevice(const ipc::WireCommand& w) {
+        if (w.type == ipc::CmdScanPlugins) { startScan(); return; }
+        if (deviceQueue_.size() >= kDeviceQueueMax) {
+            failDevice(w, ipc::RejectScanBusy);
+            return;
+        }
+        deviceQueue_.push_back(w);
+        startScan();                       // idempotent; the first one starts it
+    }
+
+    void pumpDeviceQueue() {
+        if (deviceQueue_.empty()) { registryReady(); return; }
+        if (!registryReady()) return;      // still scanning: everything waits, in order
+        while (!deviceQueue_.empty()) {
+            const ipc::WireCommand w = deviceQueue_.front();
+            deviceQueue_.pop_front();
+            switch (w.type) {
+                case ipc::CmdAddDevice:    doAddDevice(w);    break;
+                case ipc::CmdRemoveDevice: doRemoveDevice(w); break;
+                case ipc::CmdMoveDevice:   doMoveDevice(w);   break;
+                case ipc::CmdSetBypass:    doSetBypass(w);    break;
+                default:                   break;             // CmdScanPlugins: done
+            }
+        }
+    }
+
+    // -- strings through the pool -------------------------------------------
+    //
+    // §3.2 says a ring cannot carry a plugin URI and that stretching it to do
+    // so would be a mistake, and it is right — so the string travels in the one
+    // shared region that already exists for variable-length payloads, and the
+    // 32-byte command carries its offset. The blob goes through exactly the
+    // same validation every sample offset does (pool.h, poolValidate), with one
+    // extra rule that is specific to text: **the terminator must be inside the
+    // block**. A "string" whose NUL is past its own allocation is not a string
+    // that got truncated, it is a read off the end of somebody else's data.
+    bool readPoolString(u64 ref, char* out, size_t cap) {
+        if (cap) out[0] = '\0';
+        if (!ref) return false;
+        if (!pool_.valid()) return false;
+        const char* why = "";
+        if (!pool_.validate(ref, ipc::PoolKindString, 1, &why)) {
+            logBadRef("string", ref, 0, 0, why);
+            return false;
+        }
+        u64 n = pool_.block(ref)->bytes;
+        if (n > ipc::kMaxPoolString) n = ipc::kMaxPoolString;
+        const char* s = (const char*)pool_.at(ref);
+        u64 len = 0;
+        while (len < n && s[len]) ++len;
+        if (len >= n) return false;                 // no terminator inside the block
+        if (len + 1 > cap) return false;
+        std::memcpy(out, s, (size_t)len + 1);
+        return true;
+    }
+
+    // A string blob is retired the instant it has been copied. It never reaches
+    // the engine and no voice can ever be inside it, so there is nothing to be
+    // quiescent *of* — the whole drain-proof apparatus below simply does not
+    // apply. Queuing it as already-confirmed keeps one code path for
+    // publishing retirements (and its ring-full retry) instead of two.
+    void retireString(u64 ref) {
+        Retire r{};
+        r.ref       = ref;
+        r.kind      = ipc::PoolKindString;
+        r.track     = -1;
+        r.slot      = -1;
+        r.confirmed = true;
+        retiring_.push_back(r);
+    }
+
+    // -- the device table ---------------------------------------------------
+
+    static constexpr u32 kNoDevice = ipc::kMaxDevices;
+
+    Device* deviceById(u32 id) {
+        return (id < ipc::kMaxDevices) ? devices_[id].get() : nullptr;
+    }
+
+    u32 allocDeviceSlot() {
+        for (u32 i = 0; i < ipc::kMaxDevices; ++i)
+            if (!devices_[i]) return i;
+        return kNoDevice;
+    }
+
+    // Chains are indexed in one flat array: tracks, then returns, then master.
+    // One array rather than three members because every operation below is
+    // "whatever chain this device is on", and a three-way branch per operation
+    // is three chances to get it wrong.
+    static constexpr int kChainCount = kMaxTracks + kMaxReturns + 1;
+    static constexpr int kMasterChainIdx = kMaxTracks + kMaxReturns;
+
+    static int chainIndex(u32 target, int idx) {
+        switch (target) {
+            case ipc::DevTargetTrack:  return (idx >= 0 && idx < kMaxTracks) ? idx : -1;
+            case ipc::DevTargetReturn: return (idx >= 0 && idx < kMaxReturns) ? kMaxTracks + idx : -1;
+            case ipc::DevTargetMaster: return kMasterChainIdx;
+            default:                   return -1;
+        }
+    }
+
+    // -- AddDevice ----------------------------------------------------------
+
+    void doAddDevice(const ipc::WireCommand& w) {
+        // The URI blob first, and it is retired whatever happens next: a client
+        // whose AddDevice was refused must not be left holding a pool block it
+        // can never free. Exactly one retirement echo per blob, accepted or
+        // refused — the same discipline EvClipAck established for cells.
+        char uri[ipc::kMaxPoolString];
+        const bool haveUri = readPoolString(w.ref, uri, sizeof uri);
+        if (w.ref) retireString(w.ref);
+        if (!haveUri) { failDevice(w, w.ref ? ipc::RejectBadString : ipc::RejectNoPool); return; }
+
+        const u32 target = w.flags;
+        const int idx    = (target == ipc::DevTargetMaster) ? 0 : w.a;
+        const int ci     = chainIndex(target, idx);
+        if (ci < 0) { failDevice(w, ipc::RejectBadIndex); return; }
+
+        const PluginDesc* desc = registry_.find(std::string(uri));
+        if (!desc) {
+            logDevice("AddDevice: no plugin with URI '%s'", uri);
+            failDevice(w, ipc::RejectUnknownUri);
+            return;
+        }
+
+        Chain& ch = chains_[ci];
+        if ((int)ch.order.size() >= kMaxChainFx) { failDevice(w, ipc::RejectChainFull); return; }
+
+        const u32 id = allocDeviceSlot();
+        if (id == kNoDevice) { failDevice(w, ipc::RejectDeviceTableFull); return; }
+
+        // Slow, allocating, and able to fail or crash: precisely why it is here
+        // on the pump thread and not anywhere near the audio callback.
+        std::unique_ptr<PluginInstance> inst = registry_.instantiate(*desc, sr_, block_);
+        if (!inst) {
+            logDevice("AddDevice: '%s' failed to instantiate", uri);
+            failDevice(w, ipc::RejectInstantiate);
+            return;
+        }
+        if (!inst->prepare(sr_, block_)) {
+            logDevice("AddDevice: '%s' refused %.0f Hz / %d frames", uri, sr_, block_);
+            failDevice(w, ipc::RejectInstantiate);
+            return;
+        }
+
+        auto dev = std::make_unique<Device>();
+        dev->id         = id;
+        dev->generation = ++deviceGen_[id];       // never reused: the param guard
+        dev->target     = target;
+        dev->targetIdx  = idx;
+        dev->paramCount = inst->paramCount();
+        if (dev->paramCount > (int)ipc::kMaxDevParams) dev->paramCount = (int)ipc::kMaxDevParams;
+        for (int i = 0; i < dev->paramCount; ++i) dev->cached[i] = inst->getParam(i);
+        dev->inst = std::move(inst);
+
+        int pos = (w.b < 0 || w.b > (int)ch.order.size()) ? (int)ch.order.size() : w.b;
+        ch.order.insert(ch.order.begin() + pos, id);
+
+        publishDeviceInfo(*dev, *desc, pos);
+        resetParamRow(*dev);
+        devices_[id] = std::move(dev);
+        liveIds_.push_back(id);
+
+        publishChain(target, idx);
+        renumberChain(target, idx, /*silentFor*/(int)id);
+
+        map_.hdr->devicesAdded.fetch_add(1, std::memory_order_relaxed);
+        map_.hdr->devicesLive.store((u64)liveIds_.size(), std::memory_order_relaxed);
+
+        ipc::WireEvent e{};
+        e.type  = ipc::EvDeviceAdded;
+        e.flags = target;
+        e.a     = idx;
+        e.b     = pos;
+        e.x     = (f64)devices_[id]->paramCount;
+        e.ref   = id;
+        map_.evts->push(e);
+        LOGI("device %u: '%s' on %s %d at position %d (%d params, %d frames latency)",
+             id, uri, ipc::devTargetName(target), idx, pos,
+             devices_[id]->paramCount, devices_[id]->inst->latencyFrames());
+    }
+
+    void failDevice(const ipc::WireCommand& w, u32 reason) {
+        map_.hdr->devicesFailed.fetch_add(1, std::memory_order_relaxed);
+        map_.hdr->commandsRejected.fetch_add(1, std::memory_order_relaxed);
+        ipc::WireEvent e{};
+        e.type = ipc::EvDeviceFailed;
+        e.a    = (i32)w.flags;
+        e.b    = (i32)reason;
+        e.x    = (f64)w.type;
+        e.ref  = w.ref;
+        map_.evts->push(e);
+    }
+
+    // -- RemoveDevice / MoveDevice / SetBypass ------------------------------
+
+    void doRemoveDevice(const ipc::WireCommand& w) {
+        const u32 id = (u32)w.ref;
+        Device* d = deviceById(id);
+        if (!d) { failDevice(w, ipc::RejectBadDevice); return; }
+
+        const u32 target = d->target;
+        const int idx    = d->targetIdx;
+        const int ci     = chainIndex(target, idx);
+        Chain& ch = chains_[ci];
+        for (size_t i = 0; i < ch.order.size(); ++i)
+            if (ch.order[i] == id) { ch.order.erase(ch.order.begin() + (long)i); break; }
+
+        // Out of the live set *first*. The pump calls setParam on live devices,
+        // and an instance on its way out must stop receiving them before the
+        // unique_ptr moves — otherwise the last thing this function does is
+        // race with the thing it is running on.
+        for (size_t i = 0; i < liveIds_.size(); ++i)
+            if (liveIds_[i] == id) { liveIds_.erase(liveIds_.begin() + (long)i); break; }
+        std::unique_ptr<PluginInstance> dying = std::move(d->inst);
+        map_.device(id)->state.store(ipc::DeviceSlotFree, std::memory_order_release);
+        devices_[id].reset();
+
+        // The instance is not destroyed here. It rides the same proof the
+        // displaced chain does, because until the engine has drained past the
+        // new chain the audio thread may still be inside the old one, and the
+        // old one names this instance. This is App::retiring_, moved.
+        publishChain(target, idx);
+        chainPush_.back().dying.push_back(std::move(dying));
+        renumberChain(target, idx, -1);
+
+        map_.hdr->devicesRemoved.fetch_add(1, std::memory_order_relaxed);
+        map_.hdr->devicesLive.store((u64)liveIds_.size(), std::memory_order_relaxed);
+
+        ipc::WireEvent e{};
+        e.type = ipc::EvDeviceRemoved;
+        e.a    = (i32)target;
+        e.b    = idx;
+        e.ref  = id;
+        map_.evts->push(e);
+        LOGI("device %u removed from %s %d", id, ipc::devTargetName(target), idx);
+    }
+
+    void doMoveDevice(const ipc::WireCommand& w) {
+        const u32 id = (u32)w.ref;
+        Device* d = deviceById(id);
+        if (!d) { failDevice(w, ipc::RejectBadDevice); return; }
+        Chain& ch = chains_[chainIndex(d->target, d->targetIdx)];
+        size_t from = ch.order.size();
+        for (size_t i = 0; i < ch.order.size(); ++i) if (ch.order[i] == id) { from = i; break; }
+        if (from == ch.order.size()) { failDevice(w, ipc::RejectBadDevice); return; }
+        int to = w.b;
+        if (to < 0) to = 0;
+        if (to >= (int)ch.order.size()) to = (int)ch.order.size() - 1;
+        if ((size_t)to == from) { emitChanged(id, ipc::DeviceChangedMoved, to, 0); return; }
+        ch.order.erase(ch.order.begin() + (long)from);
+        ch.order.insert(ch.order.begin() + to, id);
+        publishChain(d->target, d->targetIdx);
+        renumberChain(d->target, d->targetIdx, -1);
+    }
+
+    // Bypass is a plain bool store into the instance, read by process() without
+    // synchronisation — the same contract as setParam and safe for the same
+    // reasons (see "the param table" below). It is a command rather than a
+    // table write because §3.7 says ordering matters for structural changes,
+    // and it does: bypass-then-remove and remove-then-bypass are different.
+    void doSetBypass(const ipc::WireCommand& w) {
+        const u32 id = (u32)w.ref;
+        Device* d = deviceById(id);
+        if (!d || !d->inst) { failDevice(w, ipc::RejectBadDevice); return; }
+        const bool on = w.a != 0;
+        d->inst->setBypassed(on);
+        if (ipc::WireDeviceInfo* row = map_.device(id))
+            row->bypass.store(on ? 1u : 0u, std::memory_order_relaxed);
+        emitChanged(id, ipc::DeviceChangedBypass, -1, on ? 1 : 0);
+    }
+
+    void emitChanged(u32 id, u32 flags, int pos, int a) {
+        ipc::WireEvent e{};
+        e.type  = ipc::EvDeviceChanged;
+        e.flags = flags;
+        e.a     = a;
+        e.b     = pos;
+        e.ref   = id;
+        map_.evts->push(e);
+    }
+
+    // A chain edit moves everything after it. The table rows are updated in
+    // place and each moved device gets one EvDeviceChanged, because a client
+    // mirror that silently disagreed about processing order would draw the
+    // chain in the wrong order and nothing would ever correct it.
+    void renumberChain(u32 target, int idx, int silentFor) {
+        Chain& ch = chains_[chainIndex(target, idx)];
+        for (size_t i = 0; i < ch.order.size(); ++i) {
+            const u32 id = ch.order[i];
+            ipc::WireDeviceInfo* row = map_.device(id);
+            if (!row) continue;
+            if (row->chainPos == (i32)i) continue;
+            row->chainPos = (i32)i;
+            if ((int)id != silentFor) emitChanged(id, ipc::DeviceChangedMoved, (int)i, 0);
+        }
+    }
+
+    // -- chain publication --------------------------------------------------
+    //
+    // Builds the RtChain the engine will hold and queues the swap. The daemon
+    // owns both the chain struct and every instance in it, so this is §2.5's
+    // protocol with the process boundary taken out of the middle — and that is
+    // the entire content of "the chain protocol becomes id-based, and gets
+    // simpler" (§3.6): there are no ids on the wire at all, because Add/Remove/
+    // Move carry position and the daemon is the only thing that needs to know
+    // what a chain looks like.
+    void publishChain(u32 target, int idx) {
+        Chain& ch = chains_[chainIndex(target, idx)];
+
+        std::unique_ptr<RtChain> next;
+        if (!ch.order.empty()) {
+            next = std::make_unique<RtChain>();
+            for (u32 id : ch.order) {
+                Device* d = deviceById(id);
+                if (d && d->inst && next->count < kMaxChainFx)
+                    next->fx[next->count++] = d->inst.get();
+            }
+        }
+
+        ChainPush p;
+        p.cmd.type = target == ipc::DevTargetTrack  ? Cmd::SetChain
+                   : target == ipc::DevTargetReturn ? Cmd::SetReturnChain
+                                                    : Cmd::SetMasterChain;
+        p.cmd.a = (target == ipc::DevTargetMaster) ? 0 : idx;
+        p.cmd.p = (void*)next.get();
+        p.old   = std::move(ch.published);
+        ch.published = std::move(next);          // the daemon keeps ownership
+        chainPush_.push_back(std::move(p));
+    }
+
+    void pumpChainPushes() {
+        while (!chainPush_.empty()) {
+            ChainPush& p = chainPush_.front();
+            if (!engine_->pushCommand(p.cmd)) return;    // ring full: next tick
+            map_.hdr->chainsPublished.fetch_add(1, std::memory_order_relaxed);
+
+            ChainRetire r;
+            r.watch     = p.old.get();
+            r.dueDrains = drainProof();                 // read AFTER the push
+            r.dueNs     = ipc::monotonicNs() + kRetireGraceNs;
+            r.chain     = std::move(p.old);
+            r.dying     = std::move(p.dying);
+            chainPush_.pop_front();
+            if (r.chain || !r.dying.empty()) chainRetire_.push_back(std::move(r));
+        }
+    }
+
+    // Frees a displaced chain and the instances it was the last reference to.
+    // Two proofs are accepted and either is enough:
+    //
+    //   * Ev::ChainRetired naming this exact pointer. It is pushed from inside
+    //     drainCommands(), so its arrival *is* the drain — the same exactness
+    //     Ev::NotesRetired gives the sample path.
+    //   * Engine::drains reaching dueDrains (see drainProof). This one covers
+    //     the chains the engine has no event for, and it is what makes the
+    //     return and master chains safe on the day they land.
+    void pumpChainRetirements() {
+        if (chainRetire_.empty()) return;
+        const u64 now = ipc::monotonicNs();
+        size_t keep = 0;
+        for (size_t i = 0; i < chainRetire_.size(); ++i) {
+            ChainRetire& r = chainRetire_[i];
+            const bool due = r.confirmed ||
+                             (drainsExact_ ? drainProven(r.dueDrains) : now >= r.dueNs);
+            if (!due) {
+                if (keep != i) chainRetire_[keep] = std::move(r);
+                ++keep;
+                continue;
+            }
+            map_.hdr->chainsRetired.fetch_add(1, std::memory_order_relaxed);
+            // r goes out of scope at the end of the loop body -> the RtChain and
+            // every instance in `dying` are destructed here, on the pump thread,
+            // provably outside anything the audio thread can reach.
+            r.chain.reset();
+            r.dying.clear();
+        }
+        chainRetire_.resize(keep);
+    }
+
+    void confirmChainRetire(const void* p) {
+        for (ChainRetire& r : chainRetire_)
+            if ((const void*)r.watch == p) { r.confirmed = true; return; }
+    }
+
+    // -- the param table ----------------------------------------------------
+    //
+    // WHY setParam ON THE PUMP THREAD IS THE CONTRACT, NOT A RELAXATION OF IT
+    //
+    // src/plugin/host.h documents setParam as "GUI thread, concurrent with
+    // process()", and every backend implements it as a plain float store that
+    // the plugin reads once per run(). That wording names the caller, but the
+    // *guarantee* it describes has three parts and none of them is about which
+    // thread it is:
+    //
+    //   1. it is not the audio thread — so it may not be inside process(), and
+    //      it does not have to be realtime-safe itself;
+    //   2. it writes a 4-byte-aligned scalar the reader loads without
+    //      synchronisation, so a torn read is unrepresentable on every target
+    //      we build for and a stale read costs at most one block;
+    //   3. exactly one thread does it, so two writers cannot interleave on one
+    //      parameter.
+    //
+    // The pump satisfies all three, identically. It is not the audio thread; it
+    // is the same non-realtime thread that instantiated the plugin and that
+    // will destroy it, so (3) is stronger here than it was in-process, where
+    // setParam and instantiate were merely both "the GUI thread" by convention.
+    // In-process, the GUI thread was simply the thread that happened to own the
+    // plugin; here the pump is. Nothing about the guarantee changed — the name
+    // of the thread did.
+    //
+    // What *is* new is that the values arrive from another process. That is
+    // handled before setParam is reached: a non-finite float is dropped, and a
+    // write stamped with a device generation the slot no longer has is dropped,
+    // so a knob drag that was in flight when a device was removed cannot land
+    // on its replacement.
+    //
+    // Cost when nothing is moving: one acquire load per live device per
+    // millisecond. Cost when a knob is dragging: one compare and one store per
+    // changed parameter.
+    void pumpParams() {
+        if (liveIds_.empty()) return;
+        u64 writes = 0;
+        for (u32 id : liveIds_) {
+            Device* d = devices_[id].get();
+            ipc::WireDeviceParams* p = map_.param(id);
+            if (!d || !d->inst || !p) continue;
+            const u32 g = p->generation.load(std::memory_order_acquire);
+            if (g == d->seenParamGen) continue;
+            d->seenParamGen = g;
+            if (p->deviceGeneration.load(std::memory_order_relaxed) != d->generation) continue;
+            for (int i = 0; i < d->paramCount; ++i) {
+                const f32 v = p->value[i].load(std::memory_order_relaxed);
+                if (!std::isfinite(v) || v == d->cached[i]) continue;
+                d->cached[i] = v;
+                d->inst->setParam(i, v);
+                ++writes;
+            }
+        }
+        if (writes) map_.hdr->paramWrites.fetch_add(writes, std::memory_order_relaxed);
+    }
+
+    // The device's metadata row: everything static about the instance, written
+    // once. `state` goes last with release, so a client that sees the slot live
+    // has seen every byte that describes it — the same publication rule
+    // PoolBlock::magic uses, for the same reason.
+    void publishDeviceInfo(const Device& dev, const PluginDesc& desc, int pos) {
+        ipc::WireDeviceInfo* w = map_.device(dev.id);
+        if (!w) return;
+        w->state.store(ipc::DeviceSlotFree, std::memory_order_relaxed);
+        w->generation.store(dev.generation, std::memory_order_relaxed);
+        w->bypass.store(dev.inst->bypassed() ? 1u : 0u, std::memory_order_relaxed);
+        w->paramCount      = (u32)dev.paramCount;
+        const int total    = dev.inst->paramCount();
+        w->truncatedParams = total > dev.paramCount ? (u32)(total - dev.paramCount) : 0u;
+        w->target          = (i32)dev.target;
+        w->targetIdx       = dev.targetIdx;
+        w->chainPos        = pos;
+        w->latencyFrames   = dev.inst->latencyFrames();
+        w->format          = (u32)desc.format;
+        w->kind            = (u32)desc.kind;
+        w->audioIn         = (u32)desc.audioIn;
+        w->audioOut        = (u32)desc.audioOut;
+        w->hasMidiIn       = desc.hasMidiIn ? 1u : 0u;
+        w->reserved[0] = w->reserved[1] = 0;
+        copyFixed(w->uri,    sizeof w->uri,    desc.uri.c_str());
+        copyFixed(w->name,   sizeof w->name,   desc.name.c_str());
+        copyFixed(w->vendor, sizeof w->vendor, desc.vendor.c_str());
+        for (int i = 0; i < dev.paramCount; ++i) {
+            const ParamInfo& s = dev.inst->paramInfo(i);
+            ipc::WireParamInfo& t = w->params[i];
+            t.min   = s.min;
+            t.max   = s.max;
+            t.def   = s.def;
+            t.id    = s.id;
+            t.flags = (s.isBool ? ipc::ParamIsBool : 0u) |
+                      (s.isInt  ? ipc::ParamIsInt  : 0u) |
+                      (s.isLogarithmic ? ipc::ParamIsLog : 0u);
+            t.reserved = 0;
+            copyFixed(t.name, sizeof t.name, s.name.c_str());
+            copyFixed(t.unit, sizeof t.unit, s.unit.c_str());
+        }
+        for (u32 i = (u32)dev.paramCount; i < ipc::kMaxDevParams; ++i)
+            w->params[i] = ipc::WireParamInfo{};
+        if (w->truncatedParams)
+            LOGW("device %u ('%s') has %d controls; the table carries %u",
+                 dev.id, desc.name.c_str(), total, (u32)ipc::kMaxDevParams);
+        w->state.store(ipc::DeviceSlotLive, std::memory_order_release);
+    }
+
+    // The param row starts holding the plugin's own values, so a GUI that
+    // attaches to a device it did not create draws the right knob positions
+    // without asking. `generation` is reset because the row may have belonged
+    // to a previous occupant; `deviceGeneration` is stamped so that a client
+    // write which crosses this reset is judged against the right device.
+    void resetParamRow(const Device& dev) {
+        ipc::WireDeviceParams* p = map_.param(dev.id);
+        if (!p) return;
+        for (u32 i = 0; i < ipc::kMaxDevParams; ++i)
+            p->value[i].store(i < (u32)dev.paramCount ? dev.cached[i] : 0.f,
+                              std::memory_order_relaxed);
+        p->deviceGeneration.store(dev.generation, std::memory_order_relaxed);
+        p->generation.store(0, std::memory_order_relaxed);
+        p->engineGeneration.fetch_add(1, std::memory_order_release);
+    }
+
+    static void copyFixed(char* dst, size_t cap, const char* src) {
+        std::memset(dst, 0, cap);
+        if (!src) return;
+        std::snprintf(dst, cap, "%s", src);
+    }
+
+    void logDevice(const char* fmt, ...) {
+        if (!opt_.verbose && deviceLogged_ >= kRejectLogLimit) return;
+        ++deviceLogged_;
+        char msg[512];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(msg, sizeof msg, fmt, ap);
+        va_end(ap);
+        LOGW("%s%s", msg,
+             (!opt_.verbose && deviceLogged_ == kRejectLogLimit) ? " [further device failures silent]" : "");
+    }
+
+    // Everything the daemon owns that the engine might still be inside. Called
+    // once the driver has stopped, when every proof is trivially satisfied.
+    void destroyAllDevices() {
+        for (Chain& ch : chains_) { ch.order.clear(); ch.published.reset(); }
+        chainPush_.clear();
+        chainRetire_.clear();
+        liveIds_.clear();
+        for (auto& d : devices_) d.reset();
+        for (u32 i = 0; i < ipc::kMaxDevices; ++i)
+            if (ipc::WireDeviceInfo* row = map_.device(i))
+                row->state.store(ipc::DeviceSlotFree, std::memory_order_relaxed);
+        map_.hdr->devicesLive.store(0, std::memory_order_relaxed);
+    }
+
     // -- retirement ---------------------------------------------------------
     //
     // THE FREE-AFTER-CONFIRM RULE, DAEMON SIDE
@@ -725,29 +1452,37 @@ private:
     // out, unlike the chain-retirement case this pattern comes from. One
     // completed drain is the whole proof.
     //
-    // How we know a drain happened, given that src/audio is frozen and cannot
-    // be asked:
+    // How we know a drain happened. Phase 2 had two answers and said plainly
+    // that one of them was weak; phase 3 replaces the weak one.
     //
-    //   * exactly, when the engine tells us. Replacing or clearing a MIDI clip
-    //     makes Engine push Ev::NotesRetired from inside drainCommands, so the
-    //     event's arrival *is* the drain. pumpEvents() below turns that
-    //     pointer back into an offset and releases the matching entry at once.
-    //   * conservatively otherwise, by deadline. There is no equivalent event
-    //     for sample data, so a sample block waits kRetireGraceNs — two orders
-    //     of magnitude longer than the block period, plus (under the null
-    //     driver, where we can count them) kRetireBlocks actual rendered
-    //     blocks.
+    //   * EXACTLY, from the counter. Engine::drains is bumped at the end of
+    //     every drainCommands(), so `drains >= (value read after the push) + 2`
+    //     is a proof that the audio thread has consumed the displacing command.
+    //     See drainProof() above for why the constant is 2 and not 1 — that
+    //     off-by-one is the whole of the correctness argument, and getting it
+    //     wrong would produce a retirement that is right almost always.
+    //   * Exactly, when the engine volunteers it. Replacing or clearing a MIDI
+    //     clip makes Engine push Ev::NotesRetired from inside drainCommands,
+    //     so the event's arrival *is* the drain and beats the counter by up to
+    //     one block. Kept, because it is free and it is tighter.
     //
-    // Both are documented rather than hidden because the deadline is the weak
-    // one: a wedged backend does not drain, and the deadline fires anyway. What
-    // bounds that is the pool's design, not the timer — the region stays mapped
-    // for the daemon's whole life and never shrinks, so the worst case is a
-    // voice reading bytes that have been reallocated to another clip. Audible,
-    // findable, and not a wild pointer. The exact version of this needs
-    // Engine to count its own drains, which is a two-line change in src/audio
-    // and the first thing phase 3 should take.
-    static constexpr u64 kRetireGraceNs = 100ull * 1000000ull;   // 100 ms
-    static constexpr u64 kRetireBlocks  = 4;
+    // WHAT WAS REMOVED. Phase 2 waited max(100 ms, 8 block periods) plus four
+    // rendered blocks for anything the engine did not volunteer an event for,
+    // and §10.3 called that "the weak half": a wedged backend does not drain,
+    // and the deadline fired anyway — announcing a block free while a voice
+    // could still be reading it. The counter cannot do that. A wedged backend
+    // simply never satisfies the proof, so nothing is ever announced, which is
+    // the correct answer to "has the audio thread passed this point" when the
+    // audio thread has not moved.
+    //
+    // THE DEADLINE IS STILL COMPILED IN, for exactly one case: an Engine built
+    // without the counter, where `drains` stays 0 forever. The daemon latches
+    // `drainsExact_` the first time it sees the counter move and publishes the
+    // answer in ControlHeader::drainsExact, so which rule is in force is
+    // observable from outside rather than inferred. When the counter is live —
+    // which it is in this tree — the timer is never consulted.
+    static constexpr u64 kRetireGraceNs = 100ull * 1000000ull;   // 100 ms (legacy)
+    static constexpr u64 kRetireBlocks  = 4;                     //        (legacy)
 
     // Records what the engine now holds for a cell and queues whatever that
     // displaced. Runs only from commit().
@@ -788,6 +1523,12 @@ private:
         r.kind      = kind;
         r.track     = track;
         r.slot      = slot;
+        // Read after the push that displaced the block — installClip() runs
+        // from commit(), which runs only once Engine::pushCommand has returned
+        // true. That ordering is what makes the +2 argument hold, and it is
+        // why the retirement was already queued from commit() and not from
+        // translate().
+        r.dueDrains = drainProof();
         const u64 blockNs = (u64)((f64)block_ / sr_ * 1e9);
         r.dueNs     = ipc::monotonicNs() +
                       (kRetireGraceNs > 8 * blockNs ? kRetireGraceNs : 8 * blockNs);
@@ -816,7 +1557,9 @@ private:
         for (size_t i = 0; i < retiring_.size(); ++i) {
             const Retire& r = retiring_[i];
             const bool due = r.confirmed ||
-                             (now >= r.dueNs && (!nullDriver_ || blocks >= r.dueBlocks));
+                             (drainsExact_
+                                  ? drainProven(r.dueDrains)
+                                  : (now >= r.dueNs && (!nullDriver_ || blocks >= r.dueBlocks)));
             if (due && publishRetired(r)) continue;          // done with it
             retiring_[keep++] = r;                           // not yet, or ring full
         }
@@ -835,12 +1578,21 @@ private:
         return true;
     }
 
-    // Engine events out. Ev::NotesRetired is translated rather than forwarded:
-    // its pointer is an address in *this* process, but it is an address inside
-    // the pool, so the daemon knows the offset the client calls it by. The
-    // other three pointer-carrying events remain unreachable, because the
-    // commands that would allocate their payloads are still refused. If their
-    // counter ever moves, something reached the engine that should not have.
+    // Engine events out. Two of the pointer-carrying four are consumed here
+    // rather than dropped, and both for the same reason: the pointer is an
+    // address in *this* process, and the daemon knows what it names.
+    //
+    //   Ev::NotesRetired  an offset in the pool, echoed back as EvBlockRetired.
+    //   Ev::ChainRetired  a chain the daemon built. §3.6 predicted this event
+    //                     would "disappear rather than being ported"; what
+    //                     disappeared is its trip across the boundary. The
+    //                     swap-and-retire dance is still exactly right and is
+    //                     still run — between the pump and the audio thread of
+    //                     one process, which is where it always belonged.
+    //
+    // The remaining two stay unreachable, because the commands that would
+    // allocate their payloads are still refused. If their counter ever moves,
+    // something reached the engine that should not have.
     void pumpEvents() {
         Event ev;
         while (engine_->popEvent(ev)) {
@@ -848,9 +1600,13 @@ private:
                 confirmRetire(ev.p);
                 continue;
             }
+            if (ev.type == Ev::ChainRetired) {
+                confirmChainRetire(ev.p);
+                continue;
+            }
             if (!ipc::eventIsScalar((u32)ev.type)) {
                 map_.hdr->eventsDropped.fetch_add(1, std::memory_order_relaxed);
-                LOGW("engine event %u carries a pointer and cannot cross (phase 2)",
+                LOGW("engine event %u carries a pointer and cannot cross",
                      (u32)ev.type);
                 ipc::WireEvent d{};
                 d.type = ipc::EvEventDropped;
@@ -942,6 +1698,18 @@ private:
         if (backend_)    backend_->stop();
         if (nullDriver_) nullDriver_->stop();
 
+        // With no audio thread left, every proof is trivially satisfied: the
+        // engine cannot be inside a chain nobody is calling. Chains and
+        // instances go first, because a plugin's destructor is the one place a
+        // third-party library is most likely to misbehave and we would rather
+        // it happen with the region still intact and the log still open.
+        // A scan in flight is joined rather than abandoned: it holds a lilv
+        // world and half the plugin libraries on the system open, and detaching
+        // from that at exit is how a "clean shutdown" turns into a crash in
+        // somebody else's atexit handler.
+        if (scanThread_.joinable()) scanThread_.join();
+        destroyAllDevices();
+
         // Rendering has stopped, so every outstanding retirement is trivially
         // true: there is no audio thread left to be inside a clip. Publishing
         // them now lets a client that is still attached free its pool cleanly
@@ -980,6 +1748,17 @@ private:
              (unsigned long long)map_.hdr->clipsApplied.load(),
              (unsigned long long)map_.hdr->blocksRetired.load(),
              pool_.valid() ? pool_.name() : "(none)");
+        LOGI("devices: %llu added, %llu removed, %llu failed; %llu param writes; "
+             "chains %llu published / %llu retired",
+             (unsigned long long)map_.hdr->devicesAdded.load(),
+             (unsigned long long)map_.hdr->devicesRemoved.load(),
+             (unsigned long long)map_.hdr->devicesFailed.load(),
+             (unsigned long long)map_.hdr->paramWrites.load(),
+             (unsigned long long)map_.hdr->chainsPublished.load(),
+             (unsigned long long)map_.hdr->chainsRetired.load());
+        LOGI("engine drains: %llu (%s)",
+             (unsigned long long)map_.hdr->engineDrains.load(),
+             drainsExact_ ? "exact retirement" : "no counter — legacy deadline");
     }
 
     static constexpr int kRejectLogLimit = 8;
@@ -1012,6 +1791,29 @@ private:
     // actually forwarded.
     ipc::WireClip                  shadow_[kMaxTracks][kMaxScenes]{};
     std::vector<Retire>            retiring_;
+
+    // -- phase 3 ------------------------------------------------------------
+    PluginRegistry                  registry_;          // the catalog, once scanned
+    std::unique_ptr<PluginRegistry> scanned_;           // the scanning thread's own
+    std::thread                     scanThread_;
+    std::atomic<bool>               scanDone_{false};
+    u32                             scanState_   = ipc::ScanIdle;
+    u64                             scanStartNs_ = 0;
+
+    std::deque<ipc::WireCommand>    deviceQueue_;       // waiting for the catalog
+    std::unique_ptr<Device>         devices_[ipc::kMaxDevices];
+    std::vector<u32>                liveIds_;           // what pumpParams walks
+    u32                             deviceGen_[ipc::kMaxDevices] = {};
+    Chain                           chains_[kChainCount];
+    std::deque<ChainPush>           chainPush_;
+    std::vector<ChainRetire>        chainRetire_;
+    int                             deviceLogged_ = 0;
+
+    // Latched the first time Engine::drains moves. False means "this engine
+    // does not count its drains", which is a real build (phase 2's) and not a
+    // hypothetical, so the legacy deadline stays reachable rather than being
+    // deleted and rediscovered.
+    bool                            drainsExact_ = false;
 };
 
 } // namespace
