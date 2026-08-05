@@ -55,11 +55,15 @@ jobs:
       #                        this, the first wine invocation pops a GUI
       #                        installer dialog and the job hangs until timeout
       #   WINEPREFIX           a scratch prefix, so nothing depends on whatever
-      #                        ~/.wine the image may or may not carry
+      #                        ~/.wine the image may or may not carry.
+      #                        github.workspace, not runner.temp: the `runner`
+      #                        context is not available in job-level env, and
+      #                        referencing it there invalidates the whole
+      #                        workflow file (zero jobs, instant failure).
       WINEDEBUG: -all
       WINEARCH: win64
       WINEDLLOVERRIDES: mscoree,mshtml=
-      WINEPREFIX: ${{ runner.temp }}/wineprefix
+      WINEPREFIX: ${{ github.workspace }}/.wineprefix
 
     steps:
       - uses: actions/checkout@v4
