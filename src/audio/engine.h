@@ -172,7 +172,13 @@ public:
 
     bool pushCommand(const Command& c) { return cmds_.push(c); }   // GUI thread
     bool popEvent(Event& e)            { return evts_.pop(e); }    // GUI thread
-    bool pushMidi(const MidiMsg& m)    { return midi_.push(m); }   // MIDI reader thread
+    // Two MIDI producers, two SPSC rings. Each Ring tolerates exactly one
+    // producer; the ALSA reader thread and the GUI (computer keyboard, note
+    // preview) are two, and sharing one ring races their head pointers and
+    // drops messages — a lost note-off is a stuck note. pushMidi() is the
+    // hardware reader's; pushMidiFromGui() is the GUI's; process() drains both.
+    bool pushMidi(const MidiMsg& m)        { return midi_.push(m); }    // MIDI reader thread
+    bool pushMidiFromGui(const MidiMsg& m) { return midiGui_.push(m); } // GUI thread
 
     // --- polled by the GUI ---------------------------------------------
     std::atomic<f64>  beat{0.0};            // absolute beats since transport start
@@ -185,6 +191,15 @@ public:
     std::atomic<f64>  clipPhase[kMaxTracks]{};    // 0..1 through the running clip
     std::atomic<f32>  meterL[kMaxTracks]{}, meterR[kMaxTracks]{};
     std::atomic<f32>  masterMeterL{0.f}, masterMeterR{0.f};
+    // Health telemetry the GUI/daemon polls. blocksRendered advances once per
+    // process() call (a liveness heartbeat that does not depend on transport);
+    // xruns counts dropouts the backend reports. Both relaxed — monotonic
+    // counters read for display, never for control.
+    std::atomic<u64>  blocksRendered{0};
+    std::atomic<u32>  xruns{0};
+    // Backend-reported dropout: the audio callback ran late or the device
+    // signalled an under/overrun. The backend calls this from its own thread.
+    void reportXrun() { xruns.fetch_add(1, std::memory_order_relaxed); }
     // Recording state per track: 0 idle, 1 queued, 2 recording; slot index.
     std::atomic<int>  recState[kMaxTracks]{};
     std::atomic<int>  recSlotIdx[kMaxTracks]{};
@@ -308,7 +323,8 @@ private:
 
     Ring<Command, 1024> cmds_;
     Ring<Event, 1024>   evts_;
-    Ring<MidiMsg, 1024> midi_;
+    Ring<MidiMsg, 1024> midi_;      // hardware reader thread -> audio
+    Ring<MidiMsg, 1024> midiGui_;   // GUI thread -> audio
 };
 
 } // namespace lat

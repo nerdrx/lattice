@@ -219,7 +219,7 @@ void App::shutdown() {
     // hear it: previews and held keyboard notes both outlive the state that
     // started them, and a plugin does not know the app is closing.
     stopPreviews();
-    kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidi(m); });
+    kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
 
     // Order matters. The MIDI reader goes first: it pushes into the engine's
     // ring from its own thread, so it has to be joined before anything else
@@ -2111,7 +2111,7 @@ void App::updateKbdPiano() {
     // keys and follow the layout like any other named shortcut.
     const KbdPiano::Result res = kbd_.update(in.scanDown, in.keyDown[KeyPageUp],
         in.keyDown[KeyPageDown], live,
-        [this](const MidiMsg& m) { engine_.pushMidi(m); });
+        [this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
 
     if (res.baseChanged) {
         char buf[96];
@@ -2144,7 +2144,7 @@ void App::toggleKbdMidi() {
         // Anything still held has to be let go here: the key release that would
         // normally end the note is about to be ignored, and a hung note would
         // sit in the instrument with nothing left to stop it.
-        kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidi(m); });
+        kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
         status_ = "Computer MIDI Keyboard off";
     }
 }
@@ -2179,18 +2179,18 @@ void App::startPreview(int pitch, u64 clipUid) {
     // audible as repeated notes and never leaves two offs chasing one on.
     for (Preview& p : previews_) {
         if (p.pitch != (u8)pitch) continue;
-        engine_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
-        engine_.pushMidi(MidiMsg{0x90, p.pitch, (u8)kPreviewVel, 0, 0});
+        engine_.pushMidiFromGui(MidiMsg{0x80, p.pitch, 0, 0, 0});
+        engine_.pushMidiFromGui(MidiMsg{0x90, p.pitch, (u8)kPreviewVel, 0, 0});
         p.offAt = off;
         return;
     }
     // Full: the oldest audition gives way. A dropped preview would be a note
     // that never sounds; a hung one would be a note that never stops.
     if ((int)previews_.size() >= kMaxPreviews) {
-        engine_.pushMidi(MidiMsg{0x80, previews_.front().pitch, 0, 0, 0});
+        engine_.pushMidiFromGui(MidiMsg{0x80, previews_.front().pitch, 0, 0, 0});
         previews_.erase(previews_.begin());
     }
-    engine_.pushMidi(MidiMsg{0x90, (u8)pitch, (u8)kPreviewVel, 0, 0});
+    engine_.pushMidiFromGui(MidiMsg{0x90, (u8)pitch, (u8)kPreviewVel, 0, 0});
     previews_.push_back(Preview{(u8)pitch, off});
 }
 
@@ -2208,7 +2208,7 @@ void App::updatePreviews() {
     const f64 now = nowSeconds();
     for (size_t i = 0; i < previews_.size();) {
         if (previews_[i].offAt <= now) {
-            engine_.pushMidi(MidiMsg{0x80, previews_[i].pitch, 0, 0, 0});
+            engine_.pushMidiFromGui(MidiMsg{0x80, previews_[i].pitch, 0, 0, 0});
             previews_.erase(previews_.begin() + (long)i);
         } else {
             ++i;
@@ -2217,7 +2217,7 @@ void App::updatePreviews() {
 }
 
 void App::stopPreviews() {
-    for (const Preview& p : previews_) engine_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
+    for (const Preview& p : previews_) engine_.pushMidiFromGui(MidiMsg{0x80, p.pitch, 0, 0, 0});
     previews_.clear();
     previewClip_ = 0;
 }
