@@ -54,7 +54,18 @@ static void usage() {
         "  Arrows         nudge the selected note (grid step / semitone)\n"
         "  Shift+Up/Down  nudge by an octave      Del      delete the note\n"
         "  Esc            deselect the note (again: stop all clips)\n"
-        "  Ctrl+U         double the loop and duplicate its notes\n");
+        "  Ctrl+U         double the loop and duplicate its notes\n"
+        "  ALL/FOLD/KEY   what the pitch axis shows: everything, only the\n"
+        "                 pitches this clip plays, or only the ones in the key\n"
+        "  VEL/CHANCE/RANGE  what the bottom lane edits. CHANCE is how often a\n"
+        "                 note sounds (rolled afresh every time round the loop);\n"
+        "                 RANGE is the far end of the velocity span each\n"
+        "                 sounding is drawn from, off at the bottom of the lane\n"
+        "  KEY row        the SET's root and scale, and SNAP: with it on, every\n"
+        "                 note written or dragged lands on a note of the scale\n"
+        "  QUANTIZE/NOTES quantize (grid + strength), legato, duplicate and\n"
+        "                 transpose. All of them act on the selection, or on the\n"
+        "                 whole clip when there is no selection.\n");
 }
 
 int main(int argc, char** argv) {

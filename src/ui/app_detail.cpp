@@ -271,7 +271,7 @@ void App::drawArrangeClipDetail(const Rect& r) {
     const f64 phase = inside ? (it->offset + (beat - it->start)) : 0.0;
 
     const ClipModel before = m;
-    if (arrRoll_->draw(ui_, wave, m, targets, phase, inside)) {
+    if (arrRoll_->draw(ui_, wave, m, targets, ses_.scale, phase, inside)) {
         undoPointWith(arrRoll_->lastEdit(), m, before);
         placed = true;
     }
@@ -320,7 +320,96 @@ void App::drawClipDetail(const Rect& r) {
                     status_ = "NXTAKT_DEBUG_AUTOLANE: showing lane " + std::to_string(laneNo);
                 }
                 if (!roll_) roll_ = std::make_unique<PianoRoll>();
-                roll_->showLane(clampv(laneNo, 0, (int)c.envelopes.size()));
+                // laneNo counts ENVELOPES from 1, which is what it meant before
+                // the chooser grew the per-note lanes in front of them; the
+                // offset is asked for rather than assumed so this hook does not
+                // have to know how many of those there are.
+                const int base = PianoRoll::envLaneBase(c);
+                roll_->showLane(clampv(base + laneNo - 1, 0,
+                                       base + (int)c.envelopes.size() - 1));
+            }
+        }
+    }
+
+    // Headless verification hooks for the piano-roll wave, in the same shape as
+    // the one above: nothing inside gamescope can work a selector, cycle a fold
+    // or drag a stem, so a screenshot can only check a scale, a fold-to-key and
+    // a note with a chance on it if something sets them up once per run.
+    //
+    //   NXTAKT_DEBUG_SCALE=<root>:<mode>[:<fold>][:<snap>]
+    //       puts the session in that key -- root 0..11, mode indexing kScales --
+    //       and optionally sets the roll's fold (0 ALL, 1 FOLD, 2 KEY) and the
+    //       snap flag. Selects the first MIDI clip it can find, so the shot is
+    //       of a pattern rather than of a waveform.
+    //   NXTAKT_DEBUG_CHANCE=<pct>[:<velRange>]
+    //       stamps that chance (and optionally that velocity range) onto every
+    //       other note of the selected clip, so one screenshot shows both the
+    //       plain notes and the uncertain ones side by side.
+    //
+    // Both are one-shot and inert without the variable, which is what keeps them
+    // out of the way of an actual session.
+    static bool scaleDebugSeeded = false;
+    if (!scaleDebugSeeded) {
+        const char* wantScale  = env("DEBUG_SCALE");
+        const char* wantChance = env("DEBUG_CHANCE");
+        if (wantScale || wantChance || env("DEBUG_NOTETOOL")) {
+            scaleDebugSeeded = true;
+            // The first MIDI clip in the set. A scale over a waveform is a
+            // screenshot of nothing.
+            for (size_t t = 0; t < ses_.tracks.size(); ++t)
+                for (int sl = 0; sl < kMaxScenes; ++sl)
+                    if (ses_.tracks[t].slots[sl].kind == ClipKind::Midi &&
+                        ses_.tracks[t].slots[sl].valid()) {
+                        selTrack_ = (int)t; selSlot_ = sl;
+                        t = ses_.tracks.size();     // break both loops
+                        break;
+                    }
+            if (!roll_) roll_ = std::make_unique<PianoRoll>();
+            if (wantScale) {
+                int root = 0, mode = 0, fold = 0, snap = 0;
+                sscanf(wantScale, "%d:%d:%d:%d", &root, &mode, &fold, &snap);
+                ses_.scale.root = clScaleRoot(root);
+                ses_.scale.mode = clScaleMode(mode);
+                ses_.scale.snap = snap != 0;
+                roll_->setFoldMode((FoldMode)clampv(fold, 0, kFoldModeCount - 1));
+                status_ = "NXTAKT_DEBUG_SCALE: " + ses_.scale.label();
+            }
+            if (const char* tool = env("DEBUG_NOTETOOL")) {
+                // NXTAKT_DEBUG_NOTETOOL=<legato|quantize|dup|up|down>[:<amount>]
+                // runs one note tool over the whole clip, since nothing inside
+                // gamescope can press a button. `amount` is the quantize
+                // strength in percent for `quantize` and the semitone count for
+                // `up`/`down`.
+                char verb[32] = {};
+                int amount = 100;
+                std::sscanf(tool, "%31[^:]:%d", verb, &amount);
+                ClipModel& c = ses_.tracks[selTrack_].slots[selSlot_];
+                bool did = false;
+                if (!std::strcmp(verb, "legato"))        did = roll_->legatoSelected(c);
+                else if (!std::strcmp(verb, "quantize")) {
+                    roll_->setQuantGrid(0.5);
+                    roll_->setQuantStrength((f32)clampv(amount, 0, 100) * 0.01f);
+                    did = roll_->quantizeSelected(c);
+                } else if (!std::strcmp(verb, "dup"))    did = roll_->duplicateSelected(c);
+                else if (!std::strcmp(verb, "up"))       did = roll_->transposeSelected(c, amount);
+                else if (!std::strcmp(verb, "down"))     did = roll_->transposeSelected(c, -amount);
+                if (did) pushClip(selTrack_, selSlot_);
+                status_ = std::string("NXTAKT_DEBUG_NOTETOOL: ") + verb +
+                          (did ? " applied" : " changed nothing");
+            }
+            if (wantChance) {
+                int pct = 50, range = 0;
+                sscanf(wantChance, "%d:%d", &pct, &range);
+                ClipModel& c = ses_.tracks[selTrack_].slots[selSlot_];
+                for (size_t i = 1; i < c.notes.size(); i += 2) {
+                    c.notes[i].chance = (u8)clampv(pct, 0, 100);
+                    c.notes[i].velTo  = (u8)clampv(range, 0, 127);
+                }
+                // The lane is put on CHANCE so the stems are visible too; the
+                // grid alone would show the fade but not the number.
+                roll_->showLane((int)NoteLane::Chance);
+                pushClip(selTrack_, selSlot_);
+                status_ = "NXTAKT_DEBUG_CHANCE: " + std::to_string(pct) + "% on every other note";
             }
         }
     }
@@ -346,6 +435,18 @@ void App::drawClipDetail(const Rect& r) {
     Rect ctrl{r.x + 8 * s, head.bottom() + 6 * s, panelW, r.bottom() - head.bottom() - 12 * s};
     f32 y = ctrl.y;
     const f32 rowH = 20 * s, lblW = 62 * s;
+
+    // A SECOND column, for a pattern only. The panel is a fixed height and the
+    // first column was already using all of it; the key and the note tools are
+    // three more rows and would simply have fallen off the bottom of it.
+    // Widthways there is room to spare -- the roll takes everything to the right
+    // of this and is still the widest thing on screen -- so the EDITOR's
+    // controls go beside the CLIP's rather than under them, which also happens
+    // to be the right grouping: one column is about how this clip launches and
+    // sounds, the other is about how notes get written into it. An audio clip
+    // has neither and gets the width back.
+    Rect ctrl2{ctrl.right() + 10 * s, ctrl.y, panelW, ctrl.h};
+    f32 y2 = ctrl2.y;
 
     auto label = [&](const char* t, const Rect& row) {
         rend_.textIn(fSmall_, {row.x, row.y, lblW, row.h}, t, pal::textFaint, Align::Left, 0);
@@ -463,6 +564,149 @@ void App::drawClipDetail(const Rect& r) {
         }
         y += rowH + 4 * s;
     }
+    if (midi) {   // The set's KEY: root, scale, and whether edits are held to it.
+        // On the clip panel rather than on the control bar, which is where Live
+        // puts it, for a reason that is about this program and not about taste:
+        // the control bar here is already at the width it can carry and the only
+        // thing that consumes a key is the editor twelve pixels to the right of
+        // these three widgets. Putting them together means the highlight changes
+        // under the eye that is choosing it.
+        //
+        // It is still the SESSION's key and not the clip's -- every clip in the
+        // set sees the same change -- which is why the row is labelled KEY and
+        // not, say, CLIP KEY, and why it goes through undoPoint like any other
+        // session edit.
+        Rect row{ctrl2.x, y2, ctrl2.w, rowH};
+        label("KEY", row);
+        static const char* rootNames[12] = {};
+        static bool rootInit = false;
+        if (!rootInit) { for (int i = 0; i < 12; ++i) rootNames[i] = kPitchNames[i]; rootInit = true; }
+        static const char* scaleNames[kScaleCount] = {};
+        static bool scaleInit = false;
+        if (!scaleInit) { for (int i = 0; i < kScaleCount; ++i) scaleNames[i] = kScales[i].name; scaleInit = true; }
+
+        int root = clScaleRoot(ses_.scale.root);
+        Rect rr_{row.x + lblW, row.y, 34 * s, row.h};
+        if (ui_.selector(uiId(24, 0), rr_, &root, rootNames, 12)) {
+            undoPoint("key");
+            ses_.scale.root = clScaleRoot(root);
+        }
+        int mode = clScaleMode(ses_.scale.mode);
+        Rect sr{rr_.right() + 6 * s, row.y, 90 * s, row.h};
+        if (ui_.selector(uiId(24, 1), sr, &mode, scaleNames, kScaleCount)) {
+            undoPoint("scale");
+            ses_.scale.mode = clScaleMode(mode);
+        }
+        Rect nr{sr.right() + 6 * s, row.y, 44 * s, row.h};
+        if (ui_.button(uiId(24, 2), nr, "SNAP", ses_.scale.snap, pal::accent)) {
+            undoPoint("scale snap");
+            ses_.scale.snap = !ses_.scale.snap;
+        }
+        if (ui_.hovered(nr))
+            ui_.tip = ses_.scale.active()
+                          ? (ses_.scale.snap ? "edits are pulled onto the nearest note of "
+                                               + ses_.scale.label()
+                                             : "click to pull every edit onto the nearest note of "
+                                               + ses_.scale.label())
+                          : std::string("pick a scale first - there is nothing to snap to in "
+                                        "Chromatic");
+        y2 += rowH + 4 * s;
+    }
+    if (midi && roll_) {
+        // The note tools (PianoRoll's quantize / legato / duplicate / transpose).
+        // Buttons rather than shortcuts: the roll's key map is already full, and
+        // these are deliberate one-shot gestures rather than things a hand does
+        // while it is holding a note.
+        //
+        // Every one of them acts on the roll's selection when there is one and
+        // on the whole clip when there is not, which is why the row is labelled
+        // for what it does and not for what it does it to.
+        {
+            Rect row{ctrl2.x, y2, ctrl2.w, rowH};
+            label("QUANTIZE", row);
+            // The grid, as a selector over the divisions a sequencer actually
+            // uses. Triplets are in the list because a swung part cannot be
+            // quantized by a straight grid at any strength.
+            static const char* gridNames[] = {"1/4", "1/8T", "1/8", "1/16T", "1/16", "1/32"};
+            static const f64   gridBeats[] = {1.0, 1.0 / 3.0, 0.5, 1.0 / 6.0, 0.25, 0.125};
+            constexpr int kGridCount = 6;
+            int gi = 4;
+            for (int i = 0; i < kGridCount; ++i)
+                if (std::fabs(gridBeats[i] - roll_->quantGrid()) < 1e-9) { gi = i; break; }
+            Rect gr{row.x + lblW, row.y, 52 * s, row.h};
+            if (ui_.selector(uiId(25, 0), gr, &gi, gridNames, kGridCount))
+                roll_->setQuantGrid(gridBeats[clampv(gi, 0, kGridCount - 1)]);
+
+            // Strength. Live's "Amount": 100% snaps hard, anything less keeps
+            // the part of a performance's timing that makes it one.
+            f64 amt = (f64)roll_->quantStrength() * 100.0;
+            Rect ar{gr.right() + 6 * s, row.y, 48 * s, row.h};
+            if (ui_.dragNumber(uiId(25, 1), ar, &amt, 0.0, 100.0, 0.4, "%.0f%%"))
+                roll_->setQuantStrength((f32)(amt * 0.01));
+
+            Rect qb{ar.right() + 6 * s, row.y, 44 * s, row.h};
+            if (ui_.button(uiId(25, 2), qb, "APPLY")) {
+                const ClipModel was = m;
+                if (roll_->quantizeSelected(m)) {
+                    undoPointWith("quantize", m, was);
+                    pushClip(selTrack_, selSlot_);
+                }
+            }
+            if (ui_.hovered(qb))
+                ui_.tip = roll_->hasSelection(m) ? "quantize the selected notes"
+                                                 : "quantize every note in the clip";
+            y2 += rowH + 4 * s;
+        }
+        {
+            Rect row{ctrl2.x, y2, ctrl2.w, rowH};
+            label("NOTES", row);
+            Rect lg{row.x + lblW, row.y, 52 * s, row.h};
+            Rect dp{lg.right() + 6 * s, row.y, 44 * s, row.h};
+            Rect dn{dp.right() + 6 * s, row.y, 22 * s, row.h};
+            Rect up{dn.right() + 3 * s, row.y, 22 * s, row.h};
+
+            if (ui_.button(uiId(25, 3), lg, "LEGATO")) {
+                const ClipModel was = m;
+                if (roll_->legatoSelected(m)) {
+                    undoPointWith("legato", m, was);
+                    pushClip(selTrack_, selSlot_);
+                }
+            }
+            if (ui_.hovered(lg))
+                ui_.tip = "stretch each note to where the next one begins";
+            if (ui_.button(uiId(25, 4), dp, "DUP")) {
+                const ClipModel was = m;
+                if (roll_->duplicateSelected(m)) {
+                    undoPointWith("duplicate notes", m, was);
+                    pushClip(selTrack_, selSlot_);
+                }
+            }
+            if (ui_.hovered(dp))
+                ui_.tip = "copy the notes one selection-width later (Ctrl+U doubles "
+                          "the whole loop instead)";
+            // Transpose by a semitone each way. An octave is Shift+Up/Down on the
+            // keyboard already, so the buttons cover what the keyboard does not.
+            if (ui_.button(uiId(25, 5), dn, "-")) {
+                const ClipModel was = m;
+                if (roll_->transposeSelected(m, -1)) {
+                    undoPointWith("transpose", m, was);
+                    pushClip(selTrack_, selSlot_);
+                }
+            }
+            if (ui_.button(uiId(25, 6), up, "+")) {
+                const ClipModel was = m;
+                if (roll_->transposeSelected(m, 1)) {
+                    undoPointWith("transpose", m, was);
+                    pushClip(selTrack_, selSlot_);
+                }
+            }
+            if (ui_.hovered(dn) || ui_.hovered(up))
+                ui_.tip = ses_.scale.snap && ses_.scale.active()
+                              ? "transpose by one step of " + ses_.scale.label()
+                              : std::string("transpose by a semitone");
+            y2 += rowH + 4 * s;
+        }
+    }
     {   // Read-out of what the engine will actually do
         Rect row{ctrl.x, y, ctrl.w, rowH};
         char buf[96];
@@ -490,8 +734,11 @@ void App::drawClipDetail(const Rect& r) {
     // and there is exactly one mapping in the program. The note-specific
     // furniture (FOLD, the keyboard column, the loop-length drag) is suppressed
     // rather than faked.
-    Rect wave{ctrl.right() + 12 * s, head.bottom() + 6 * s,
-              r.right() - ctrl.right() - 20 * s, r.bottom() - head.bottom() - 12 * s};
+    // The editor column only exists for a pattern, so an audio clip's waveform
+    // starts where it always did.
+    const f32 leftEdge = midi ? ctrl2.right() : ctrl.right();
+    Rect wave{leftEdge + 12 * s, head.bottom() + 6 * s,
+              r.right() - leftEdge - 20 * s, r.bottom() - head.bottom() - 12 * s};
 
     // Where the clip is, in its own beats, so the grid and the lane draw the
     // same playhead from the same number.
@@ -516,7 +763,8 @@ void App::drawClipDetail(const Rect& r) {
     // roll owns ui_.active for the length of a drag, so a note or a breakpoint
     // dragged across the editor leaves one entry and not one per frame.
     const ClipModel before = m;
-    if (roll_->draw(ui_, wave, m, targets, active ? phase * m.lengthBeats : 0.0, active)) {
+    if (roll_->draw(ui_, wave, m, targets, ses_.scale,
+                    active ? phase * m.lengthBeats : 0.0, active)) {
         undoPointWith(roll_->lastEdit(), m, before);
         pushClip(selTrack_, selSlot_);
     }

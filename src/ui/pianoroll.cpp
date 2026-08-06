@@ -69,30 +69,52 @@ struct RowMap {
 // `keepPitch` is the pitch a move drag started on: it stays on screen for the
 // whole gesture even after the note leaves it, otherwise the row under the
 // cursor would renumber mid-drag and the note would jump.
-RowMap buildRows(const std::vector<NoteModel>& notes, bool fold, int keepPitch) {
+//
+// FoldMode::Key is deliberately NOT "Used, restricted to the scale". It ignores
+// the clip's contents entirely and admits every in-scale pitch across the whole
+// range, because the case it exists for is the empty clip: fold to the key and
+// every row you can click is a right note. Padding to kMinFoldRows is therefore
+// only meaningful for Used — a scale has at least five degrees per octave and
+// so always fills the axis.
+//
+// Both folds fall back to the full chromatic range when they have nothing to
+// stand on (a clip with no notes, a session with no scale). A blank editor is
+// never the right answer to "show me less".
+RowMap buildRows(const std::vector<NoteModel>& notes, FoldMode fold, const ScaleKey& key,
+                 int keepPitch) {
     RowMap m;
     for (int p = 0; p < 128; ++p) m.rowOfP[p] = -1;
 
     bool used[128]{};
     int n = 0;
-    if (fold) {
+    if (fold == FoldMode::Used) {
         for (const NoteModel& nt : notes)
             if (nt.pitch < 128 && !used[nt.pitch]) { used[nt.pitch] = true; ++n; }
-        if (keepPitch >= 0 && keepPitch < 128 && !used[keepPitch]) { used[keepPitch] = true; ++n; }
+    } else if (fold == FoldMode::Key && key.active()) {
+        for (int p = 0; p < 128; ++p)
+            if (key.contains(p)) { used[p] = true; ++n; }
     }
-    // An empty clip has nothing to fold to, so it falls back to the full range.
-    if (!fold || n == 0) {
+    // The row the hand is on survives whatever the fold says, in both modes: a
+    // drag that carried a note onto a pitch the fold hides would otherwise
+    // renumber the axis out from under the gesture.
+    if (n > 0 && keepPitch >= 0 && keepPitch < 128 && !used[keepPitch]) {
+        used[keepPitch] = true;
+        ++n;
+    }
+    if (n == 0) {
         m.count = 128;
         for (int i = 0; i < 128; ++i) { m.pitchOf[i] = 127 - i; m.rowOfP[127 - i] = i; }
         return m;
     }
-    int lo = 0;   while (!used[lo]) ++lo;
-    int hi = 127; while (!used[hi]) --hi;
-    // Pad downwards first (a melody sits above its padding, like a keyboard).
-    while (n < kMinFoldRows && (lo > 0 || hi < 127)) {
-        if (lo > 0) { used[--lo] = true; }
-        else        { used[++hi] = true; }
-        ++n;
+    if (fold == FoldMode::Used) {
+        int lo = 0;   while (!used[lo]) ++lo;
+        int hi = 127; while (!used[hi]) --hi;
+        // Pad downwards first (a melody sits above its padding, like a keyboard).
+        while (n < kMinFoldRows && (lo > 0 || hi < 127)) {
+            if (lo > 0) { used[--lo] = true; }
+            else        { used[++hi] = true; }
+            ++n;
+        }
     }
     for (int p = 127; p >= 0; --p)
         if (used[p]) { m.pitchOf[m.count] = p; m.rowOfP[p] = m.count; ++m.count; }
@@ -128,8 +150,65 @@ inline f64 clampLen(f64 rawRight, f64 beat, f64 lengthBeats) {
 inline bool noteLess(const NoteModel& a, const NoteModel& b) {
     return a.beat != b.beat ? a.beat < b.beat : a.pitch < b.pitch;
 }
+// Two notes are interchangeable when EVERY field matches, the generative pair
+// included. That is not fussiness: this is what re-finds a note after a sort,
+// and a selection holding "the note at beat 1 pitch 60" would otherwise be able
+// to land on its twin with a different chance and then edit the wrong one.
 inline bool sameNote(const NoteModel& a, const NoteModel& b) {
-    return a.beat == b.beat && a.pitch == b.pitch && a.len == b.len && a.vel == b.vel;
+    return a.beat == b.beat && a.pitch == b.pitch && a.len == b.len && a.vel == b.vel &&
+           a.chance == b.chance && a.velTo == b.velTo;
+}
+
+// ---------------------------------------------------------------------------
+// the per-note lanes
+//
+// One gesture edits three different fields, so the field is data rather than a
+// branch in the drag: the lane asks for a normalized height and writes it back
+// through the same pair of functions the drawing reads it with, which is why a
+// stem can never be drawn at a height a drag would not reproduce.
+//
+// Every one of the three is an ABSOLUTE 0..1 of its own full range, so the
+// bottom of the lane means the same thing in all three: velocity 1 (never 0 —
+// that is a note-off on the wire), chance 0, and "no velocity range at all".
+// ---------------------------------------------------------------------------
+
+inline f32 noteLaneValue(const NoteModel& n, NoteLane which) {
+    switch (which) {
+    case NoteLane::Chance:   return (f32)n.chance / 100.f;
+    case NoteLane::VelRange: return (f32)n.velTo / 127.f;
+    default:                 return (f32)n.vel / 127.f;
+    }
+}
+
+// Returns true when the note actually moved, so a drag over stems that are
+// already at the cursor's height reports no change and leaves the undo history
+// alone.
+inline bool setNoteLaneValue(NoteModel& n, NoteLane which, f32 t) {
+    t = clampv(t, 0.f, 1.f);
+    switch (which) {
+    case NoteLane::Chance: {
+        const u8 v = (u8)clampv((int)std::lround(t * 100.f), 0, 100);
+        if (n.chance == v) return false;
+        n.chance = v;
+        return true;
+    }
+    case NoteLane::VelRange: {
+        // 0 is the sentinel for "no range", and it is also the bottom of the
+        // drag — which is exactly the affordance wanted: pulling a range stem
+        // all the way down turns the range off rather than pinning the note to
+        // velocity 1.
+        const u8 v = (u8)clampv((int)std::lround(t * 127.f), 0, 127);
+        if (n.velTo == v) return false;
+        n.velTo = v;
+        return true;
+    }
+    default: {
+        const u8 v = (u8)clampv((int)std::lround(t * 127.f), 1, 127);
+        if (n.vel == v) return false;
+        n.vel = v;
+        return true;
+    }
+    }
 }
 
 // Restores the sorted-by-beat invariant and reports where `key` ended up. An
@@ -246,21 +325,40 @@ GroupDelta clampGroupDelta(const std::vector<NoteModel>& notes, const std::vecto
 //
 // Note that only the group's *extremes* were clamped: the members are moved by
 // the same delta, so the shape of a chord or a riff is preserved exactly.
-bool applyGroupDelta(std::vector<NoteModel>& notes, IndexSel& sel, const GroupDelta& d) {
+// `key` is the session's scale. When it is snapping, the delta is applied first
+// and each moved pitch is then pulled onto the nearest degree, biased by the
+// direction of travel. Applying the delta first and snapping after — rather
+// than computing a per-note "next degree" delta — is what keeps a chord a chord:
+// every member takes the same chromatic step and only then rounds, so a shape
+// survives a transposition through a scale with uneven steps instead of
+// collapsing onto whichever degrees happen to be nearest.
+bool applyGroupDelta(std::vector<NoteModel>& notes, IndexSel& sel, const GroupDelta& d,
+                     const ScaleKey& key) {
     if (d.beats == 0.0 && d.semis == 0) return false;
+    const bool snap = key.snap && key.active();
+    const int dir = d.semis > 0 ? 1 : (d.semis < 0 ? -1 : 0);
     SelKeys keys;
     keys.notes.reserve(sel.items.size());
+    bool moved = false;
     for (int i : sel.items) {
         if (i < 0 || i >= (int)notes.size()) continue;
         NoteModel& nt = notes[(size_t)i];
+        const NoteModel was = nt;
         nt.beat  = nt.beat + d.beats;
-        nt.pitch = (u8)clampv((int)nt.pitch + d.semis, 0, 127);
+        int p = clampv((int)nt.pitch + d.semis, 0, 127);
+        if (snap) p = key.snapPitch(p, dir);
+        nt.pitch = (u8)p;
+        if (!sameNote(nt, was)) moved = true;
         if (i == sel.primary) keys.primary = (int)keys.notes.size();
         keys.notes.push_back(nt);
     }
     if (keys.notes.empty()) return false;
     sortTrackingSet(notes, keys, sel);
-    return true;
+    // A snap can swallow the whole delta -- nudging a note up a semitone inside
+    // a scale that does not admit the pitch above it and does not admit the one
+    // above that either, at the top of the range. Reporting "changed" then would
+    // leave an undo entry that undoes nothing.
+    return moved;
 }
 
 // Keyboard nudge: `steps` grid steps along time, `semis` semitones of pitch,
@@ -280,7 +378,7 @@ struct NudgeResult {
     bool pitchChanged = false;
 };
 NudgeResult nudgeGroup(std::vector<NoteModel>& notes, IndexSel& sel,
-                       int steps, int semis, f64 lengthBeats) {
+                       int steps, int semis, f64 lengthBeats, const ScaleKey& key) {
     NudgeResult res;
     if (sel.empty()) return res;
     const int anchor = (sel.primary >= 0 && sel.primary < (int)notes.size()) ? sel.primary
@@ -289,7 +387,7 @@ NudgeResult nudgeGroup(std::vector<NoteModel>& notes, IndexSel& sel,
     const f64 aBeat = notes[(size_t)anchor].beat;
     const f64 want = steps != 0 ? quantNear(aBeat + (f64)steps * kGridStep) - aBeat : 0.0;
     const GroupDelta d = clampGroupDelta(notes, sel.items, want, semis, lengthBeats);
-    if (!applyGroupDelta(notes, sel, d)) return res;
+    if (!applyGroupDelta(notes, sel, d, key)) return res;
     res.changed = true;
     res.pitchChanged = d.semis != 0;
     return res;
@@ -438,12 +536,16 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
     const Rect r1{r0.x, r0.bottom() + 1.f * s, r0.w, rowH};
     const Rect r2{r0.x, r1.bottom() + 1.f * s, r0.w, rowH};
 
-    // What the lane shows: velocity, then one entry per envelope the clip has.
-    // The names are the target's short label where the address resolves and the
-    // address itself where it does not — a lane naming a missing device must
-    // still be findable.
+    // What the lane shows: the per-note fields first (three on a pattern, one
+    // inert placeholder on a sample, which is what envLaneBase counts), then
+    // one entry per envelope the clip has. The names are the target's short
+    // label where the address resolves and the address itself where it does not
+    // — a lane naming a missing device must still be findable.
     std::vector<std::string> names;
-    names.push_back(clip.kind == ClipKind::Midi ? "VEL" : "--");
+    if (clip.kind == ClipKind::Midi)
+        for (int i = 0; i < kNoteLaneCount; ++i) names.push_back(kNoteLaneNames[i]);
+    else
+        names.push_back("--");
     for (const AutoLane& l : clip.envelopes) {
         const AutoTargets::Entry* e = targets.find(l.address);
         names.push_back(e ? e->label : l.address);
@@ -460,8 +562,24 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
         // lanes drops them rather than carrying a stale set across.
         lane_.detach();
     }
-    if (ui.hovered(r0) && laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
-        ui.tip = clip.envelopes[(size_t)laneSel_ - 1].address;
+    const int envBase = envLaneBase(clip);
+    if (ui.hovered(r0)) {
+        if (const AutoLane* l = shownLane(clip)) ui.tip = l->address;
+        else if (clip.kind == ClipKind::Midi)
+            switch (shownNoteLane()) {
+            case NoteLane::Chance:
+                ui.tip = "per-note chance - how often each note sounds, rolled every "
+                         "time round the loop";
+                break;
+            case NoteLane::VelRange:
+                ui.tip = "per-note velocity range - the far end of the span each "
+                         "sounding is drawn from; at the bottom there is no range";
+                break;
+            default:
+                ui.tip = "note velocity";
+                break;
+            }
+    }
 
     // What "+" would automate, with the button that does it beside the name so
     // the pair reads as one control. A dot marks a target this clip already has
@@ -493,13 +611,13 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
         for (size_t i = 0; i < clip.envelopes.size(); ++i)
             if (clip.envelopes[i].address == addr) { found = (int)i; break; }
         if (found >= 0) {
-            laneSel_ = found + 1;            // already there: show it
+            laneSel_ = envBase + found;       // already there: show it
             lane_.detach();
         } else if ((int)clip.envelopes.size() < kMaxClipLanes) {
             AutoLane l;
             l.address = addr;
             clip.envelopes.push_back(std::move(l));
-            laneSel_ = (int)clip.envelopes.size();
+            laneSel_ = envBase + (int)clip.envelopes.size() - 1;
             lane_.detach();
             changed = true;
             lastEdit_ = kEditAuto;
@@ -507,8 +625,8 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
     }
     // Live's "deactivate envelope": the lane keeps its points and stops driving
     // anything. Only meaningful with a lane on show.
-    if (laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size()) {
-        AutoLane& l = clip.envelopes[(size_t)laneSel_ - 1];
+    if (AutoLane* env = shownLane(clip)) {
+        AutoLane& l = *env;
         bool on = l.enabled;
         if (ui.squareToggle(uiId(23, 3), onR, "", &on, pal::accent)) {
             l.enabled = on;
@@ -528,12 +646,16 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
 // ---------------------------------------------------------------------------
 
 bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& targets,
-                     f64 playheadBeats, bool playing) {
+                     const ScaleKey& key, f64 playheadBeats, bool playing) {
     if (!ui.r || !ui.in) return false;
     Renderer& rr = *ui.r;
     Input& in = *ui.in;
     const f32 s = dpiOf(ui);
     bool changed = false;
+    // Remembered for the keyboard API, which runs before the NEXT draw and has
+    // to snap into the same scale this one is drawing.
+    key_ = key;
+    const bool snapping = key.snap && key.active();
     // An audio clip has no notes and no pitch axis, but it has envelopes and a
     // time axis — so it gets the same editor with its waveform where the note
     // grid would be. Everything below that is about notes is gated on this.
@@ -571,11 +693,12 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         followSel_ = false;
         preview_.clear();            // an audition for a clip nobody is looking at
         targetSel_ = 0;
-        // An audio clip has no velocity stems, so the lane opens on its first
+        // An audio clip has no per-note stems, so the lane opens on its first
         // envelope rather than on an entry that would draw nothing. A choice
         // made from outside for this clip (showLane) outranks both.
         laneSel_ = pendingLane_ >= 0 ? pendingLane_
-                                     : ((!midiClip && !clip.envelopes.empty()) ? 1 : 0);
+                                     : ((!midiClip && !clip.envelopes.empty())
+                                            ? envLaneBase(clip) : 0);
         pendingLane_ = -1;
     }
 
@@ -592,7 +715,10 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
 
     // Same for the lane: a lane and its points can go away under a live
     // selection (undo, a project load), and laneSel_ is an index like any other.
-    if (laneSel_ > (int)clip.envelopes.size()) { laneSel_ = 0; lane_.detach(); }
+    if (laneSel_ >= envLaneBase(clip) + (int)clip.envelopes.size()) {
+        laneSel_ = 0;
+        lane_.detach();
+    }
 
     // The lane's key block, drawn (and clicked) FIRST, before anything takes a
     // pointer into clip.envelopes: it can add a lane, and a push_back moves the
@@ -612,15 +738,18 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     // losing a filter sweep because a plugin is missing is the worst bug this
     // feature could have.
     const AutoTargets::Entry* const tgt = env ? targets.find(env->address) : nullptr;
-    const bool laneInert = env && laneSel_ <= 32 &&
-                           ((targets.inert & (1u << (u32)(laneSel_ - 1))) != 0u);
+    // `targets.inert` is indexed by ENVELOPE, not by chooser slot, so the note
+    // lanes in front of them have to be subtracted off before the bit is read.
+    const int envIdx = env ? laneSel_ - envLaneBase(clip) : -1;
+    const bool laneInert = env && envIdx >= 0 && envIdx < 32 &&
+                           ((targets.inert & (1u << (u32)envIdx)) != 0u);
     // "Switched off" and "therefore drawn greyed" are AutoLaneView's own
     // conclusions now: it is handed `enabled`, `inert` and `resolved` and works
     // out the rest, which is the same three facts this used to fold by hand.
 
     // --- axes --------------------------------------------------------------
     const int keepPitch = (drag_ == Drag::Move && dragNote_ >= 0) ? dragPitch_ : -1;
-    const RowMap rows = buildRows(clip.notes, fold_, keepPitch);
+    const RowMap rows = buildRows(clip.notes, fold_, key, keepPitch);
 
     const f64 lenBeats = std::max(1.0, clip.lengthBeats);
     // First sight of a clip: fit the loop to the width, so a pattern opens as
@@ -669,7 +798,11 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     // the content: 0 then means "centred on C3..C5" (or on the folded rows) with
     // no first-frame flag, which the frozen header has no room for. The clamp is
     // written back so scrolling never has a dead zone at either end.
-    const int centreRow = fold_ ? rows.count / 2 : rows.rowOf(kCentrePitch);
+    // A fold has no C4 to centre on in general (Key folds always contain one of
+    // its neighbours but not necessarily it), so a folded axis centres on its
+    // own middle row instead.
+    const int centreRow = (fold_ != FoldMode::All && rows.count < 128)
+                              ? rows.count / 2 : rows.rowOf(kCentrePitch);
     const f32 anchorY = (f32)std::max(0, centreRow) * rowH + rowH * 0.5f - grid.h * 0.5f;
     f32 viewY = clampv(anchorY + scrollY_, 0.f, std::max(0.f, contentH - grid.h));
 
@@ -721,11 +854,35 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         changed = true;
         lastEdit_ = kEditNote;
     };
-    // Velocity lane drags are absolute: the stem follows the cursor height, so a
+    // Note-lane drags are absolute: the stem follows the cursor height, so a
     // plain click on the lane also sets the value, like clicking a fader track.
-    auto velAt = [&](f32 y) {
-        const f32 t = clampv((lane.bottom() - 2.f * s - y) / std::max(1.f, lane.h - 6.f * s), 0.f, 1.f);
-        return (u8)clampv((int)std::lround(t * 127.f), 1, 127);
+    // The height is normalized here and turned into whichever field the lane is
+    // showing by setNoteLaneValue, so all three lanes share one gesture and one
+    // geometry — and a stem can never be drawn where a drag would not put it.
+    auto laneT = [&](f32 y) {
+        return clampv((lane.bottom() - 2.f * s - y) / std::max(1.f, lane.h - 6.f * s), 0.f, 1.f);
+    };
+    const NoteLane noteLane = shownNoteLane();
+    // Applies the lane's value to the whole selection and reports whether
+    // anything moved. Shared by the press and by the drag, so the two cannot
+    // disagree about what a click does.
+    auto applyLaneValue = [&](f32 t) {
+        bool any = false;
+        for (int i : sel_.items) {
+            if (i < 0 || i >= (int)clip.notes.size()) continue;
+            if (setNoteLaneValue(clip.notes[(size_t)i], noteLane, t)) any = true;
+        }
+        if (any) {
+            // Only velocity seeds the "next note added" default; a chance or a
+            // range is a per-note decision and inheriting one silently would put
+            // dice on notes nobody asked to gamble with.
+            if (noteLane == NoteLane::Velocity && sel_.primary >= 0 &&
+                sel_.primary < (int)clip.notes.size())
+                lastVel_ = clip.notes[(size_t)sel_.primary].vel;
+            changed = true;
+            lastEdit_ = kEditNote;
+        }
+        return any;
     };
 
     // The rubber band, when one is in flight: computed with the interaction and
@@ -737,7 +894,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     if (drag_ != Drag::None) {
         // Band is the one drag with nothing under it.
         const bool needsNote = drag_ == Drag::Move || drag_ == Drag::Resize ||
-                               drag_ == Drag::Velocity;
+                               drag_ == Drag::NoteVal;
         if (!in.down[0] ||
             (needsNote && (dragNote_ < 0 || dragNote_ >= (int)clip.notes.size()))) {
             drag_ = Drag::None;
@@ -782,6 +939,12 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
                 const int p = rows.pitchAt(row);
                 if (p >= 0) np = p;
             }
+            // Snapping is applied to the DESTINATION rather than to the delta,
+            // so a drag across an out-of-scale row lands on the nearest degree
+            // instead of refusing to move. Under FoldMode::Key it is already a
+            // no-op — every row on screen is in the scale — which is why the two
+            // are independent controls rather than one.
+            if (snapping) np = key.snapPitch(np, 0);
             // The gesture is measured on the note under the hand and applied to
             // the whole selection as one delta, so a chord keeps its shape and
             // the group stops when its extreme member reaches a wall. With one
@@ -796,7 +959,11 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
                 // note under the hand is auditioned — thirty at once is noise,
                 // not a chord.
                 if (d.semis != 0) preview_.push((int)nt.pitch + d.semis);
-                if (applyGroupDelta(clip.notes, sel_, d)) { changed = true; lastEdit_ = kEditNote; }
+                // The key is passed as-is: applyGroupDelta re-snaps every moved
+                // note, which for the note under the hand is a second, idempotent
+                // application of the snap above and for the rest of a group is
+                // the only one they get.
+                if (applyGroupDelta(clip.notes, sel_, d, key)) { changed = true; lastEdit_ = kEditNote; }
                 dragNote_ = sel_.primary;
                 if (dragNote_ < 0) drag_ = Drag::None;
             }
@@ -807,22 +974,15 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
             NoteModel& nt = clip.notes[(size_t)dragNote_];
             const f64 nl = clampLen(xToBeat(ta, in.mx), nt.beat, clip.lengthBeats);
             if (nl != nt.len) { nt.len = nl; changed = true; lastEdit_ = kEditNote; }
-        } else if (drag_ == Drag::Velocity) {
+        } else if (drag_ == Drag::NoteVal) {
             // Absolute, and for the whole selection: every selected stem takes
             // the value under the cursor. Relative (each stem keeping its
             // offset from the one being dragged) is the other defensible
             // answer, but absolute is what a group drag does in Live and it is
-            // the one a user can aim. Velocity does not reorder, so no re-sort.
+            // the one a user can aim. None of the three fields reorders the
+            // vector, so no re-sort.
             if (!sel_.has(dragNote_)) sel_.one(dragNote_);
-            const u8 nv = velAt(in.my);
-            bool any = false;
-            for (int i : sel_.items) {
-                if (i < 0 || i >= (int)clip.notes.size()) continue;
-                if (clip.notes[(size_t)i].vel == nv) continue;
-                clip.notes[(size_t)i].vel = nv;
-                any = true;
-            }
-            if (any) { lastVel_ = nv; changed = true; lastEdit_ = kEditNote; }
+            applyLaneValue(laneT(in.my));
         }
     } else if (hotGrid && midiClip && (in.pressed[0] || in.pressed[2])) {
         const int hit = noteAt(clip.notes, rows, ta, pa, in.mx, in.my, minNoteW);
@@ -871,7 +1031,11 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
             bandBase_ = sel_.items;
             ui.active = gridId;
         } else {
-            const int pitch = rows.pitchAt(yToRow(pa, in.my));
+            int pitch = rows.pitchAt(yToRow(pa, in.my));
+            // A note WRITTEN into the grid is snapped too, not just one dragged
+            // there: the whole promise of a key with snapping on is that every
+            // note you make is in it.
+            if (pitch >= 0 && snapping) pitch = key.snapPitch(pitch, 0);
             const f64 b = quantFloor(xToBeat(ta, in.mx));
             if (pitch >= 0 && b >= 0.0 && b < clip.lengthBeats) {
                 NoteModel nn;
@@ -913,21 +1077,13 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
             if (!sel_.has(best)) sel_.one(best);
             else                 sel_.primary = best;
             dragNote_ = best;
-            drag_ = Drag::Velocity;
-            // The lane deliberately does not audition: a velocity drag would
+            drag_ = Drag::NoteVal;
+            // The lane deliberately does not audition: a value drag would
             // retrigger the note on every pixel, and the value being edited is
             // not the pitch anyway.
             addedLastPress_ = false;
             ui.active = laneId;
-            const u8 nv = velAt(in.my);
-            bool any = false;
-            for (int i : sel_.items) {
-                if (i < 0 || i >= (int)clip.notes.size()) continue;
-                if (clip.notes[(size_t)i].vel == nv) continue;
-                clip.notes[(size_t)i].vel = nv;
-                any = true;
-            }
-            if (any) { lastVel_ = nv; changed = true; lastEdit_ = kEditNote; }
+            applyLaneValue(laneT(in.my));
         }
     }
 
@@ -952,7 +1108,22 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     }
     const Rect foldBox{ruler.x + 3.f * s, ruler.y + 2.f * s, keyW - 6.f * s, ruler.h - 4.f * s};
     if (midiClip) {
-        if (ui.button(uiId(21, 0), foldBox, "FOLD", fold_, pal::accent)) fold_ = !fold_;
+        // Three states, so a selector rather than the toggle this used to be:
+        // click cycles ALL -> FOLD -> KEY, right-click cycles back, which is the
+        // idiom every other multi-state control in the program uses. KEY is
+        // offered even with no scale set -- it falls back to ALL and the tooltip
+        // says why, which is more discoverable than a control that is not there.
+        int fm = (int)fold_;
+        if (ui.selector(uiId(21, 0), foldBox, &fm, kFoldModeNames, kFoldModeCount))
+            fold_ = (FoldMode)clampv(fm, 0, kFoldModeCount - 1);
+        if (ui.hovered(foldBox))
+            ui.tip = fold_ == FoldMode::Key
+                         ? (key.active() ? "showing only the rows in " + key.label()
+                                         : std::string("fold to key - the set has no scale set, "
+                                                       "so every row is shown"))
+                         : (fold_ == FoldMode::Used ? std::string("showing only the pitches this "
+                                                                  "clip uses")
+                                                    : std::string("showing every pitch"));
         // Whole beats only: a loop length between beats is a tempo problem.
         if (ui.dragNumber(uiId(22, 0), lenBox, &clip.lengthBeats, 1.0, 512.0, 0.06, "%.0f beats",
                           Align::Right, nullptr, 1.0)) {
@@ -972,16 +1143,34 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     // --- keyboard column ---------------------------------------------------
     rr.pushClip(keys);
     rr.rect(keys, pal::panel);
+    // With a scale on, the keyboard column says which key we are in the way a
+    // keyboard does: the notes of the scale keep their plate, everything else is
+    // pushed back into the background, and the ROOT is lit. That is the same
+    // information the grid rows carry, drawn twice on purpose -- the column is
+    // where the eye goes to find a pitch and the grid is where the hand goes to
+    // place one.
+    const bool showKey = key.active();
     for (int i = firstRow; i <= lastRow && midiClip; ++i) {
         const int p = rows.pitchAt(i);
         if (p < 0) continue;
         const Rect kr{keys.x, rowToY(pa, i), keys.w, rowH};
-        rr.rect(kr, isBlackKey(p) ? pal::panel : pal::panelAlt);
+        const bool inKey = !showKey || key.contains(p);
+        Col kc = isBlackKey(p) ? pal::panel : pal::panelAlt;
+        if (!inKey)               kc = pal::appBg;
+        else if (showKey && key.isRoot(p)) kc = kc.mix(pal::accent, 0.42f);
+        else if (showKey)         kc = kc.mix(pal::accentHi, 0.10f);
+        rr.rect(kr, kc);
         rr.rect({kr.x, kr.bottom() - 1.f * s, kr.w, 1.f * s}, pal::divider.alpha(0.55f));
-        if (p % 12 == 0 && ui.fSmall) {
+        // The octave label is C every twelve semitones; with a scale on, the
+        // ROOT is labelled too, because "which row is the tonic" is the one
+        // question a key is meant to answer at a glance.
+        if (ui.fSmall && (p % 12 == 0 || (showKey && key.isRoot(p)))) {
             char buf[16];
-            std::snprintf(buf, sizeof buf, "C%d", p / 12 - 1);
-            rr.textIn(*ui.fSmall, kr, buf, pal::textDim, Align::Left, 5.f * s);
+            if (p % 12 == 0) std::snprintf(buf, sizeof buf, "C%d", p / 12 - 1);
+            else             std::snprintf(buf, sizeof buf, "%s%d",
+                                           kPitchNames[p % 12], p / 12 - 1);
+            rr.textIn(*ui.fSmall, kr, buf,
+                      (showKey && key.isRoot(p)) ? pal::text : pal::textDim, Align::Left, 5.f * s);
         }
     }
     if (hotGrid && midiClip) {
@@ -1011,9 +1200,23 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         const int p = rows.pitchAt(i);
         if (p < 0) continue;
         const f32 y = rowToY(pa, i);
-        rr.rect({grid.x, y, grid.w, rowH}, isBlackKey(p) ? pal::appBg : pal::slotEmpty);
-        // One separator per octave keeps the eye anchored without banding.
-        if (p % 12 == 0) rr.rect({grid.x, y + rowH - 1.f * s, grid.w, 1.f * s}, pal::divider);
+        // The key, as row brightness. In-scale rows are lifted and the root is
+        // lifted further; out-of-scale rows are pushed down to the panel
+        // background so they read as "not here" without being invisible -- a
+        // note already sitting on one must still be findable and draggable, which
+        // is the difference between a highlight and a fold.
+        Col rc = isBlackKey(p) ? pal::appBg : pal::slotEmpty;
+        if (showKey) {
+            if (key.isRoot(p))        rc = rc.mix(pal::accent, 0.30f);
+            else if (key.contains(p)) rc = rc.mix(pal::accentHi, 0.075f);
+            else                      rc = rc.scale(0.62f);
+        }
+        rr.rect({grid.x, y, grid.w, rowH}, rc);
+        // One separator per octave keeps the eye anchored without banding; with
+        // a scale on it moves to the root, which is where an octave of THIS
+        // piece actually begins.
+        const bool divide = showKey ? key.isRoot(p) : (p % 12 == 0);
+        if (divide) rr.rect({grid.x, y + rowH - 1.f * s, grid.w, 1.f * s}, pal::divider);
     }
     drawTimeGrid(rr, ta, grid, s);          // the shared grid (timeaxis.h)
     {   // Past the loop length is not editable, so dim it like Live does.
@@ -1050,7 +1253,25 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         const Rect nr{x0, rowToY(pa, row) + 1.f * s, std::max(minNoteW, x1 - x0 - 1.f * s), rowH - 2.f * s};
         // Velocity reads as brightness, so a part's dynamics are visible in the
         // note block itself and not only down in the lane.
-        rr.roundRect(nr, 2.f * s, base.scale(0.55f + 0.45f * (f32)nt.vel / 127.f));
+        const Col nc = base.scale(0.55f + 0.45f * (f32)nt.vel / 127.f);
+        // A note that may not sound is drawn FADED, and the fraction of it that
+        // is drawn solid is its chance. Both at once, deliberately: the fade is
+        // what the eye picks up while scanning a pattern ("something in here is
+        // uncertain") and the solid fraction is what it reads once it looks
+        // ("about a third of the time"), and neither on its own does both jobs.
+        if (nt.chance < 100) {
+            rr.roundRect(nr, 2.f * s, nc.alpha(0.30f));
+            const f32 fw = nr.w * ((f32)nt.chance / 100.f);
+            if (fw > 0.5f) rr.roundRect({nr.x, nr.y, fw, nr.h}, 2.f * s, nc);
+        } else {
+            rr.roundRect(nr, 2.f * s, nc);
+        }
+        // A velocity range is a band, not a level, so it is drawn as one: a
+        // hairline across the block. It is deliberately quiet -- a range changes
+        // how a note feels, not whether it happens.
+        if (nt.velTo != 0 && nt.velTo != nt.vel && nr.h > 4.f * s)
+            rr.rect({nr.x + 1.f * s, nr.cy() - 0.5f * s, std::max(1.f, nr.w - 2.f * s), 1.f * s},
+                    pal::textOnClip.alpha(0.55f));
         if (sel_.has((int)i)) rr.roundRectOutline(nr, 2.f * s, 1.f * s, pal::accent);
     }
     // The band goes over the notes it is taking, translucent enough to leave
@@ -1093,15 +1314,27 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         const f32 travel = std::max(1.f, lane.h - 6.f * s);
         const f32 foot = lane.bottom() - 2.f * s;
         for (size_t i = 0; i < clip.notes.size(); ++i) {
-            const f32 x = std::round(beatToX(ta, clip.notes[i].beat));
+            const NoteModel& nt = clip.notes[i];
+            const f32 x = std::round(beatToX(ta, nt.beat));
             if (x < lane.x - 2.f * s || x > lane.right()) continue;
-            const f32 top = foot - (f32)clip.notes[i].vel / 127.f * travel;
+            const f32 top = foot - noteLaneValue(nt, noteLane) * travel;
             // Every selected stem is accented, since a lane drag moves all of
             // them; the primary keeps the full accent so the note the gesture
             // is anchored on is still findable inside a large selection.
             const Col c = !sel_.has((int)i)        ? base.scale(0.8f)
                           : (int)i == sel_.primary ? pal::accent
                                                    : pal::accent.alpha(0.75f);
+            // In the RANGE lane the note's own velocity is drawn behind the
+            // stem, because a range is meaningless without the value it ranges
+            // FROM: the pair of marks is the span the engine will draw from, and
+            // a range stem alone would be a number with no unit.
+            if (noteLane == NoteLane::VelRange) {
+                const f32 vy = foot - (f32)nt.vel / 127.f * travel;
+                rr.rect({x, std::min(vy, top), std::max(1.f, 1.f * s),
+                         std::fabs(top - vy)}, base.scale(0.34f));
+                rr.circle(x + 0.5f * s, vy, 1.8f * s, base.scale(0.55f));
+                if (nt.velTo == 0) continue;      // no range: nothing to draw
+            }
             rr.rect({x, top, std::max(1.f, 1.f * s), foot - top}, c);
             rr.circle(x + 0.5f * s, top, 2.5f * s, c);
         }
@@ -1123,7 +1356,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     if (drag_ == Drag::Resize)        ui.cursor = Cursor::ResizeH;
     else if (drag_ == Drag::Move)     ui.cursor = Cursor::Grab;
     else if (lane_.dragging())        ui.cursor = Cursor::Grab;
-    else if (drag_ == Drag::Velocity) ui.cursor = Cursor::ResizeV;
+    else if (drag_ == Drag::NoteVal)  ui.cursor = Cursor::ResizeV;
     else if (hotLane && env)          ui.cursor = lane_.pointHovered() ? Cursor::Grab
                                                                       : Cursor::Hand;
     else if (hotLane)                 ui.cursor = Cursor::ResizeV;
@@ -1185,8 +1418,13 @@ bool PianoRoll::nudgeSelected(ClipModel& clip, int gridSteps, int semitones) {
         return true;
     }
     if (!hasSelection(clip) || sel_.empty()) return false;
+    // key_ is what the last draw was handed. The alternative -- taking a key
+    // parameter here -- would put the burden on App::handleShortcuts to know
+    // which session the roll in front of it belongs to, and the roll already
+    // refuses to act on a clip it has not drawn (owns()), so it is exactly as
+    // fresh as every other piece of state these entry points read.
     const NudgeResult res = nudgeGroup(clip.notes, sel_, gridSteps, semitones,
-                                       clip.lengthBeats);
+                                       clip.lengthBeats, key_);
     if (!res.changed) return false;                // already against a clamp
     followSel_ = true;
     // One audition for the group: the primary note. A held arrow key on a
@@ -1217,6 +1455,151 @@ bool PianoRoll::deleteSelected(ClipModel& clip) {
     // index would be stale if one ever were.
     dragNote_ = -1;
     drag_ = Drag::None;
+    lastEdit_ = kEditNote;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// note tools
+//
+// The four of them share one question -- which notes am I about to change? --
+// and one answer, so it is written once here. A tool with a selection acts on
+// it; a tool without one acts on the whole clip, which is what makes any of
+// them useful straight after a MIDI take.
+//
+// `owns(clip)` gates only the SELECTION, not the tool: the roll's index set is
+// meaningless for a clip it has not drawn, but "every note in this clip" is a
+// perfectly good target for one it has never seen.
+// ---------------------------------------------------------------------------
+
+std::vector<int> PianoRoll::toolTargets(const ClipModel& clip) const {
+    std::vector<int> out;
+    const int n = (int)clip.notes.size();
+    if (owns(clip) && !sel_.empty() && sel_.items.back() < n) {
+        for (int i : sel_.items) if (i >= 0 && i < n) out.push_back(i);
+        if (!out.empty()) return out;
+    }
+    out.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) out.push_back(i);
+    return out;
+}
+
+bool PianoRoll::quantizeSelected(ClipModel& clip) {
+    const std::vector<int> tg = toolTargets(clip);
+    if (tg.empty()) return false;
+    const f64 g = quantGrid_ > 1e-6 ? quantGrid_ : 0.25;
+    const f32 t = clampv(quantStrength_, 0.f, 1.f);
+    if (t <= 0.f) return false;
+
+    // Tracked as notes, not indices: moving starts reorders the vector, and an
+    // index into the old order is an edit to the wrong note afterwards.
+    SelKeys keys;
+    const bool hadSel = owns(clip) && !sel_.empty();
+    bool moved = false;
+    for (int i : tg) {
+        NoteModel& nt = clip.notes[(size_t)i];
+        const f64 target = std::round(nt.beat / g) * g;
+        // Partway there, and clamped into the clip at both ends exactly as a
+        // drag is -- a quantize must not push a note past the loop end.
+        f64 b = nt.beat + (target - nt.beat) * (f64)t;
+        b = clampv(b, 0.0, std::max(0.0, clip.lengthBeats - nt.len));
+        if (b != nt.beat) { nt.beat = b; moved = true; }
+        if (hadSel) {
+            if (i == sel_.primary) keys.primary = (int)keys.notes.size();
+            keys.notes.push_back(nt);
+        }
+    }
+    if (!moved) return false;
+    if (hadSel) sortTrackingSet(clip.notes, keys, sel_);
+    else        std::sort(clip.notes.begin(), clip.notes.end(), noteLess);
+    followSel_ = true;
+    lastEdit_ = kEditNote;
+    return true;
+}
+
+bool PianoRoll::legatoSelected(ClipModel& clip) {
+    const std::vector<int> tg = toolTargets(clip);
+    if (tg.empty()) return false;
+    // The next start after each note, over the WHOLE clip and not only over the
+    // targets: a selected note followed by an unselected one must still stop
+    // where that one begins, or legato on half a phrase would bury the rest.
+    // The vector is sorted by beat, so one pass finds every answer.
+    bool changed = false;
+    for (int i : tg) {
+        NoteModel& nt = clip.notes[(size_t)i];
+        f64 next = clip.lengthBeats;
+        for (size_t k = 0; k < clip.notes.size(); ++k) {
+            const f64 b = clip.notes[k].beat;
+            if (b > nt.beat + 1e-9 && b < next) next = b;
+        }
+        const f64 len = std::max(kGridStep * 0.25, next - nt.beat);
+        if (std::fabs(len - nt.len) > 1e-9) { nt.len = len; changed = true; }
+    }
+    if (!changed) return false;
+    lastEdit_ = kEditNote;
+    return true;
+}
+
+bool PianoRoll::duplicateSelected(ClipModel& clip) {
+    const std::vector<int> tg = toolTargets(clip);
+    if (tg.empty()) return false;
+    // How far the copies go: the span the targets occupy, rounded UP to a whole
+    // grid step so a two-and-a-bit-beat phrase repeats on the grid rather than
+    // a sixteenth off it.
+    f64 lo = 1e300, hi = -1e300;
+    for (int i : tg) {
+        const NoteModel& nt = clip.notes[(size_t)i];
+        lo = std::min(lo, nt.beat);
+        hi = std::max(hi, nt.beat + nt.len);
+    }
+    f64 span = std::ceil((hi - lo) / kGridStep - 1e-9) * kGridStep;
+    if (!(span > 0.0)) span = kGridStep;
+
+    SelKeys keys;
+    std::vector<NoteModel> made;
+    made.reserve(tg.size());
+    for (int i : tg) {
+        NoteModel c = clip.notes[(size_t)i];
+        c.beat += span;
+        if (c.beat >= clip.lengthBeats - 1e-9) continue;   // past the end: dropped
+        c.len = std::min(c.len, clip.lengthBeats - c.beat);
+        if (i == sel_.primary) keys.primary = (int)keys.notes.size();
+        keys.notes.push_back(c);
+        made.push_back(c);
+    }
+    if (made.empty()) return false;                        // nothing fitted
+    for (const NoteModel& c : made) clip.notes.push_back(c);
+    // The copies become the selection: the copy is what is about to be edited.
+    sortTrackingSet(clip.notes, keys, sel_);
+    followSel_ = true;
+    lastEdit_ = kEditNote;
+    return true;
+}
+
+bool PianoRoll::transposeSelected(ClipModel& clip, int semitones) {
+    if (semitones == 0) return false;
+    const std::vector<int> tg = toolTargets(clip);
+    if (tg.empty()) return false;
+    // With a selection this is nudgeSelected's pitch half exactly. Without one
+    // the whole clip becomes the group for the length of the call, and the
+    // selection that comes back out of it is dropped again -- transposing a
+    // pattern must not silently leave every note in it selected.
+    const bool hadSel = owns(clip) && !sel_.empty() &&
+                        sel_.items.back() < (int)clip.notes.size();
+    IndexSel all;
+    IndexSel& use = hadSel ? sel_ : all;
+    if (!hadSel) {
+        all.items = tg;
+        all.primary = tg.front();
+    }
+    const GroupDelta d = clampGroupDelta(clip.notes, use.items, 0.0, semitones,
+                                         clip.lengthBeats);
+    if (!applyGroupDelta(clip.notes, use, d, key_)) return false;
+    if (hadSel) {
+        followSel_ = true;
+        if (sel_.primary >= 0 && sel_.primary < (int)clip.notes.size())
+            preview_.push((int)clip.notes[(size_t)sel_.primary].pitch);
+    }
     lastEdit_ = kEditNote;
     return true;
 }

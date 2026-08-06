@@ -1837,6 +1837,287 @@ static void testMidiClips() {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. per-note chance and velocity range (RtNote::chance / RtNote::velTo)
+// ---------------------------------------------------------------------------
+
+// The clip these cases share: four notes on the sixteenths of one beat, all at
+// velocity 100 and all certain. Each case then makes the ones it cares about
+// uncertain, so "what changed" is always exactly one field.
+static std::vector<RtNote> fourNoteClip() {
+    std::vector<RtNote> n(4);
+    for (int i = 0; i < 4; ++i) {
+        n[(size_t)i].beat  = 0.25 * i;
+        n[(size_t)i].len   = 0.125;
+        n[(size_t)i].pitch = (u8)(60 + i);
+        n[(size_t)i].vel   = 100;
+    }
+    return n;
+}
+
+// Runs `notes` for `laps` laps of a one-beat clip and returns everything the
+// instrument heard. One helper, so every case below differs only in the clip it
+// is handed and nothing in the harness can drift between them.
+static std::vector<NoteSink::Msg> playLaps(const std::vector<RtNote>& notes, int laps,
+                                           int block = kBlock) {
+    Host h; h.init(kSR, block);
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setChain(0, &chain);
+    h.setClip(0, 0, mkMidiClip(notes, 1.0, true));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(kBeat120 * laps);
+    h.push(Cmd::StopTrack, 0);
+    h.run(kBeat120);
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    return sink.evs;
+}
+
+static int countOns(const std::vector<NoteSink::Msg>& evs, int pitch) {
+    int n = 0;
+    for (const NoteSink::Msg& m : evs) if (isOn(m) && m.pitch == pitch) ++n;
+    return n;
+}
+
+// a. the two ends of the range are absolute, and the default costs nothing
+static void noteChanceEnds() {
+    {
+        std::vector<RtNote> n = fourNoteClip();
+        const std::vector<NoteSink::Msg> evs = playLaps(n, 16);
+        CHECK(countOns(evs, 60) == 16 && countOns(evs, 63) == 16,
+              "chance defaults to 100 and every note sounds every lap (%d / %d of 16)",
+              countOns(evs, 60), countOns(evs, 63));
+        CHECK(notesBalanced(evs), "and nothing is left hanging");
+    }
+    {
+        std::vector<RtNote> n = fourNoteClip();
+        n[1].chance = 0;
+        n[2].chance = 100;
+        const std::vector<NoteSink::Msg> evs = playLaps(n, 16);
+        CHECK(countOns(evs, 61) == 0, "chance 0 never sounds, over 16 laps (%d)",
+              countOns(evs, 61));
+        CHECK(countOns(evs, 62) == 16, "chance 100 beside it always does (%d of 16)",
+              countOns(evs, 62));
+        CHECK(notesBalanced(evs),
+              "and a note that did not sound owes no note-off");
+    }
+}
+
+// b. a note that loses its roll leaves the pattern exactly as it found it
+static void noteChanceSilentIsSilent() {
+    // Two notes on ONE pitch: a long certain one, and an uncertain one inside
+    // it. If the uncertain one's failed roll still ran the "release whatever is
+    // holding this pitch" step, the long note would be cut short by a note that
+    // never sounded -- an audible edit made by a dice roll that came up no.
+    std::vector<RtNote> n(2);
+    n[0].beat = 0.0;  n[0].len = 0.9;  n[0].pitch = 60; n[0].vel = 100;
+    n[1].beat = 0.25; n[1].len = 0.1;  n[1].pitch = 60; n[1].vel = 100;
+    n[1].chance = 0;
+
+    const std::vector<NoteSink::Msg> evs = playLaps(n, 8);
+    CHECK(countOns(evs, 60) == 8,
+          "eight laps produce eight note-ons: the impossible note adds none (%d)",
+          countOns(evs, 60));
+    CHECK(notesBalanced(evs), "and the pairing is still exact");
+    // The certain note must last its own 0.9 beats, not be clipped at 0.25.
+    bool full = true;
+    i64 lastOn = -1;
+    for (const NoteSink::Msg& m : evs) {
+        if (isOn(m)) { lastOn = m.frame; continue; }
+        if (lastOn < 0) continue;
+        const i64 len = m.frame - lastOn;
+        if (std::llabs((long long)(len - (i64)(0.9 * kBeat120))) > 4) full = false;
+        lastOn = -1;
+    }
+    CHECK(full, "and the certain note keeps its full 0.9 beats: a failed roll "
+                "releases nothing");
+}
+
+// c. the dice actually move, and they move PER LAP
+static void noteChanceRerollsEachLap() {
+    std::vector<RtNote> n = fourNoteClip();
+    for (int i = 0; i < 4; ++i) n[(size_t)i].chance = 50;
+    const std::vector<NoteSink::Msg> evs = playLaps(n, 64);
+
+    int total = 0;
+    for (int p = 60; p <= 63; ++p) total += countOns(evs, p);
+    // 128 expected out of 256 draws. The bound is wide on purpose: this is a
+    // check that the hash is not degenerate, not a statistical test, and a
+    // fixed-seed generator makes the number exact and reproducible anyway.
+    CHECK(total > 70 && total < 190,
+          "a 50%% pattern over 64 laps sounded %d of 256 notes (expected near 128)", total);
+    // Per lap, not per note: a hash that ignored the lap would give every lap
+    // the same four-note subset, so the count for one pitch would be 0 or 64.
+    bool varied = false;
+    for (int p = 60; p <= 63; ++p) {
+        const int c = countOns(evs, p);
+        if (c > 4 && c < 60) varied = true;
+    }
+    CHECK(varied, "and the subset changes from lap to lap rather than being fixed "
+                  "at the launch (%d %d %d %d of 64)",
+          countOns(evs, 60), countOns(evs, 61), countOns(evs, 62), countOns(evs, 63));
+    CHECK(notesBalanced(evs), "with nothing hanging across 64 laps of dice");
+}
+
+// d. the velocity range is a closed span, drawn inside it and nowhere else
+static void noteVelocityRange() {
+    {
+        std::vector<RtNote> n = fourNoteClip();
+        n[0].vel = 40;  n[0].velTo = 120;      // upwards
+        n[1].vel = 120; n[1].velTo = 40;       // the same span, written downwards
+        n[2].vel = 77;  n[2].velTo = 0;        // no range at all
+        const std::vector<NoteSink::Msg> evs = playLaps(n, 48);
+
+        int lo0 = 999, hi0 = -1, lo1 = 999, hi1 = -1;
+        bool fixed = true;
+        for (const NoteSink::Msg& m : evs) {
+            if (!isOn(m)) continue;
+            if (m.pitch == 60) { lo0 = std::min(lo0, (int)m.vel); hi0 = std::max(hi0, (int)m.vel); }
+            if (m.pitch == 61) { lo1 = std::min(lo1, (int)m.vel); hi1 = std::max(hi1, (int)m.vel); }
+            if (m.pitch == 62 && m.vel != 77) fixed = false;
+        }
+        CHECK(lo0 >= 40 && hi0 <= 120 && hi0 > lo0,
+              "an upward range stays inside it and uses it: %d..%d of 40..120", lo0, hi0);
+        CHECK(lo1 >= 40 && hi1 <= 120 && hi1 > lo1,
+              "a range written downwards means the same span: %d..%d of 40..120", lo1, hi1);
+        CHECK(fixed, "and velTo == 0 beside them is a fixed velocity, untouched");
+        CHECK(notesBalanced(evs), "with every sounding still paired");
+    }
+    {
+        // The floor: velocity 0 on a note-on is a note-off on the wire, so a
+        // range that reaches the bottom must still never emit one.
+        std::vector<RtNote> n(1);
+        n[0].beat = 0.0; n[0].len = 0.25; n[0].pitch = 60; n[0].vel = 1;
+        n[0].velTo = 2;
+        const std::vector<NoteSink::Msg> evs = playLaps(n, 32);
+        bool everZero = false;
+        int ons = 0;
+        for (const NoteSink::Msg& m : evs)
+            if ((m.status & 0xF0) == 0x90) { ++ons; if (m.vel == 0) everZero = true; }
+        CHECK(!everZero && ons == 32,
+              "a range at the bottom of the scale never emits velocity 0 (%d note-ons)", ons);
+        CHECK(notesBalanced(evs), "so nothing is silently turned into a hanging note");
+    }
+}
+
+// e. THE gate: the dice do not depend on how the audio was chopped up.
+//
+// This is the property the whole design of noteKey() exists for, and it is the
+// one that cannot be argued -- an offline render at 512 frames a block and a
+// live one at 64 have to produce the same performance, note for note and
+// velocity for velocity, or a probabilistic set is not renderable at all.
+static void noteDiceSurviveBlockSize() {
+    std::vector<RtNote> n = fourNoteClip();
+    for (int i = 0; i < 4; ++i) {
+        n[(size_t)i].chance = (u8)(35 + 15 * i);      // 35, 50, 65, 80
+        n[(size_t)i].vel    = 30;
+        n[(size_t)i].velTo  = 127;
+    }
+    // Deliberately awkward sizes as well as round ones: 100 and 333 do not
+    // divide a 24000-frame beat, so a lap boundary lands mid-block over and
+    // over and the beat cursor accumulates a different residue in each run.
+    const int blocks[] = {64, 100, 256, 333, 512, 1024};
+    // The comparison window is the laps that were ASKED for, and it has to be,
+    // because Host::run renders whole blocks: 40 beats is 960000 frames, which
+    // 333 and 1024 overshoot and 64, 100, 256 and 512 hit exactly. The overshoot
+    // is the harness's, not the engine's -- a real backend has the same property
+    // -- so the tail past the window and the unquantized stop that follows it are
+    // dropped rather than compared. Two frames of margin because a boundary note
+    // may round either side of the sample it is mathematically on.
+    const i64 window = (i64)40 * kBeat120 - 2;
+    const auto inWindow = [&](const std::vector<NoteSink::Msg>& in) {
+        std::vector<NoteSink::Msg> out;
+        for (const NoteSink::Msg& m : in) if (m.frame < window) out.push_back(m);
+        return out;
+    };
+    std::vector<NoteSink::Msg> ref;
+    bool ok = true, sizesOk = true;
+    for (size_t b = 0; b < sizeof blocks / sizeof blocks[0]; ++b) {
+        std::vector<NoteSink::Msg> evs = inWindow(playLaps(n, 40, blocks[b]));
+        if (b == 0) { ref = evs; continue; }
+        if (evs.size() != ref.size()) { sizesOk = false; ok = false; continue; }
+        for (size_t i = 0; i < evs.size(); ++i) {
+            // The FRAME is allowed to differ by a sample: a boundary that is
+            // mathematically between two frames rounds to one of them, and which
+            // one depends on where the block edge fell. WHICH notes sounded and
+            // at WHAT velocity may not differ at all -- those are the dice.
+            if (evs[i].status != ref[i].status || evs[i].pitch != ref[i].pitch ||
+                evs[i].vel != ref[i].vel ||
+                std::llabs((long long)(evs[i].frame - ref[i].frame)) > 1) { ok = false; break; }
+        }
+    }
+    CHECK(sizesOk, "40 laps of a 35/50/65/80%% pattern with velocity ranges produce "
+                   "the same number of messages at 64, 100, 256, 333, 512 and 1024 "
+                   "frames a block (%d at 64)", (int)ref.size());
+    CHECK(ok, "and the same messages: which notes the dice chose and how loud they "
+              "were does not depend on the buffer size");
+    // A gate that passed because nothing was ever skipped would be worthless.
+    CHECK((int)ref.size() < 40 * 4 * 2,
+          "and the dice really did skip notes (%d messages, %d if every note sounded)",
+          (int)ref.size(), 40 * 4 * 2);
+}
+
+// f. two runs of the same set are the same set, dice and all -- the per-note
+//    twin of followDeterminism, and the property an offline render rests on
+static void noteDiceRepeatable() {
+    std::vector<RtNote> n = fourNoteClip();
+    for (int i = 0; i < 4; ++i) { n[(size_t)i].chance = 50; n[(size_t)i].velTo = 127; }
+    const std::vector<NoteSink::Msg> a = playLaps(n, 32);
+    const std::vector<NoteSink::Msg> b = playLaps(n, 32);
+    bool same = a.size() == b.size();
+    if (same) for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].frame != b[i].frame || a[i].status != b[i].status ||
+            a[i].pitch != b[i].pitch || a[i].vel != b[i].vel) { same = false; break; }
+    CHECK(same, "two identical runs of a per-note-probability clip are message-identical "
+                "(%d vs %d messages)", (int)a.size(), (int)b.size());
+
+    // And a different clip is a different performance: a hash that ignored the
+    // note's own identity would give every note in every clip the same dice.
+    std::vector<RtNote> m = n;
+    m[2].pitch = 71;
+    const std::vector<NoteSink::Msg> c = playLaps(m, 32);
+    bool differs = c.size() != a.size();
+    if (!differs) for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].pitch != c[i].pitch || a[i].vel != c[i].vel) { differs = true; break; }
+    CHECK(differs, "and moving one note's pitch gives it its own dice");
+}
+
+// g. the field is inside padding RtNote already had, which is what let the wire
+//    stay put. Asserted here as well as in engine.h because this is the suite
+//    that would have to change if it ever stopped being true.
+static void noteFieldsCostNothing() {
+    CHECK(sizeof(RtNote) == 24,
+          "RtNote is still 24 B with chance and velTo in it (%d)", (int)sizeof(RtNote));
+    RtNote d;
+    CHECK(d.chance == 100 && d.velTo == 0,
+          "and a default-constructed note is certain and un-ranged (%d / %d)",
+          (int)d.chance, (int)d.velTo);
+    // Aggregate initialisation with the old four fields must still leave the new
+    // two at their defaults: every existing call site writes notes this way.
+    const RtNote agg{1.0, 0.5, 62, 90};
+    CHECK(agg.chance == 100 && agg.velTo == 0,
+          "an aggregate written with the four v3 fields is certain too (%d / %d)",
+          (int)agg.chance, (int)agg.velTo);
+}
+
+static void testNoteChance() {
+    banner("13b. per-note chance and velocity range");
+    note("Live's per-note Chance and Velocity Range, decided on the audio thread at");
+    note("the note-on. Both are a pure hash of (track, note index, pitch, the note's");
+    note("own beat, the loop lap) -- no generator state, no absolute beat, nothing");
+    note("that a different buffer size could round differently.");
+    noteChanceEnds();
+    noteChanceSilentIsSilent();
+    noteChanceRerollsEachLap();
+    noteVelocityRange();
+    noteDiceSurviveBlockSize();
+    noteDiceRepeatable();
+    noteFieldsCostNothing();
+}
+
+// ---------------------------------------------------------------------------
 // 14. MIDI recording
 // ---------------------------------------------------------------------------
 
@@ -7150,6 +7431,7 @@ int main() {
     testFollowActions();
     testMidiRouting();
     testMidiClips();
+    testNoteChance();
     testMidiRecording();
     testNoteRetirement();
     testOverdub();

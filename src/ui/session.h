@@ -24,10 +24,141 @@ enum class ClipKind { Audio, Midi };
 // One note in a MIDI clip, clip-relative beats. The GUI edits these freely;
 // pushClip snapshots them into a heap RtNote array for the engine, and the
 // old array comes back via Ev::NotesRetired before it is freed.
+//
+// `chance` and `velTo` mirror RtNote's fields of the same names and carry the
+// same defaults, because a NoteModel that is copied into an RtNote field for
+// field must not be able to mean something different from it. See engine.h for
+// what the two mean and where the dice are actually thrown.
 struct NoteModel {
     f64 beat = 0.0;
     f64 len  = 0.25;
     u8  pitch = 60, vel = 100;
+    u8  chance = 100;                  // 0..100 percent; 100 = always
+    u8  velTo  = 0;                    // 0 = fixed velocity, else the far end
+};
+
+// ---------------------------------------------------------------------------
+// Scales and key.
+//
+// A scale is a ROOT (0..11, C..B) and a MODE, and a mode is nothing but a
+// twelve-bit mask of the semitones it admits above its root. That is the whole
+// model: no per-scale interval list, no note-name table to keep in step with
+// it, and -- crucially -- one bit test to answer "is this pitch in key", which
+// is a question the piano roll asks 128 times per frame per row map.
+//
+// Mode 0 is CHROMATIC and means "no scale". It is not a special case in the
+// mask (it admits all twelve) but it is one in the UI and in the format: the
+// highlight is off, fold-to-scale falls back to the full range, snapping is
+// inert, and the project writer emits no line at all. That is what keeps a set
+// nobody has keyed byte-identical to what it was before scales existed.
+//
+// THE SCALE IS THE SESSION'S, not the clip's. Live 12 puts it on the control
+// bar for the whole set and lets a clip opt out; a per-clip key is the more
+// general model and the wrong default, because the overwhelmingly common case
+// is that a piece is in one key and every pattern in it should light up the
+// same rows. A per-clip override is a strictly additive change to this struct
+// if it is ever wanted, and costs nothing to leave out now.
+// ---------------------------------------------------------------------------
+
+struct ScaleDef {
+    const char* name;
+    u16 mask;                          // bit i set == semitone i is in the scale
+};
+
+// Bit 0 is the root. Written as binary literals so the shape of each scale is
+// readable in the source: the low bit is on the right, so these read backwards
+// from a keyboard, which is why every one of them also carries its degrees in
+// the comment.
+inline constexpr ScaleDef kScales[] = {
+    {"Chromatic",  0b111111111111},   // 0 1 2 3 4 5 6 7 8 9 10 11
+    {"Major",      0b101010110101},   // 0 2 4 5 7 9 11
+    {"Minor",      0b010110101101},   // 0 2 3 5 7 8 10
+    {"Dorian",     0b011010101101},   // 0 2 3 5 7 9 10
+    {"Phrygian",   0b010110101011},   // 0 1 3 5 7 8 10
+    {"Lydian",     0b101011010101},   // 0 2 4 6 7 9 11
+    {"Mixolydian", 0b011010110101},   // 0 2 4 5 7 9 10
+    {"Locrian",    0b010101101011},   // 0 1 3 5 6 8 10
+    {"Harm Minor", 0b100110101101},   // 0 2 3 5 7 8 11
+    {"Mel Minor",  0b101010101101},   // 0 2 3 5 7 9 11
+    {"Maj Penta",  0b001010010101},   // 0 2 4 7 9
+    {"Min Penta",  0b010010101001},   // 0 3 5 7 10
+    {"Blues",      0b010011001001},   // 0 3 5 6 7 10
+    {"Whole Tone", 0b010101010101},   // 0 2 4 6 8 10
+};
+inline constexpr int kScaleCount = (int)(sizeof kScales / sizeof kScales[0]);
+inline constexpr int kScaleChromatic = 0;
+
+// Sharps rather than flats, everywhere, deliberately: the alternative is to
+// pick a spelling per key, which needs a key SIGNATURE (is this F# major or Gb
+// major?) and this model has only a pitch class. One consistent spelling that
+// is right half the time beats an inconsistent one that is right all of it and
+// needs a second field to say so.
+inline constexpr const char* kPitchNames[12] = {
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+// A root is a pitch class, so out of range WRAPS: -1 is B and 13 is C#, and
+// both of those are what the arithmetic meant. A mode is a table index and is
+// not on a continuum -- clamping 99 to the last entry would silently put a set
+// into Whole Tone because it was saved by a build that knows more scales than
+// this one -- so anything this build cannot name folds to Chromatic, which is
+// the honest answer: "there is a scale here and it is not one I know, so do not
+// pretend". Both are applied on save and on load, so the round trip is stable.
+inline int clScaleRoot(int v) { return ((v % 12) + 12) % 12; }
+inline int clScaleMode(int v) {
+    return (v > kScaleChromatic && v < kScaleCount) ? v : kScaleChromatic;
+}
+
+// The set's key, and whether edits are held to it.
+struct ScaleKey {
+    int  root = 0;                     // 0..11, C..B
+    int  mode = kScaleChromatic;       // index into kScales
+    bool snap = false;                 // pull edited pitches into the scale
+
+    // "There is a scale worth drawing." Chromatic answers no, which is what
+    // makes every consumer below a one-line early-out rather than a branch on
+    // twelve set bits.
+    bool active() const { return mode > kScaleChromatic && mode < kScaleCount; }
+
+    // Semitones above the root, 0..11. Defined for every pitch, scale or not.
+    int degreeOf(int pitch) const { return ((pitch - root) % 12 + 12) % 12; }
+    bool contains(int pitch) const {
+        if (!active()) return true;
+        return (kScales[mode].mask >> degreeOf(pitch)) & 1u;
+    }
+    bool isRoot(int pitch) const { return degreeOf(pitch) == 0; }
+
+    // The nearest in-scale pitch. A pitch ALREADY in the scale comes back
+    // untouched whatever `dir` says, which is what makes "add the delta, then
+    // snap" the whole of transposing within a key: nudging E up a semitone in C
+    // major asks about F, F is in the scale, and the note lands on F rather
+    // than being pushed on to G by a rule that insists on moving.
+    //
+    // `dir` only chooses which way to look for a pitch that is NOT in the
+    // scale: +1 upwards only, -1 downwards only, 0 nearest with ties going up.
+    // Biasing it by the sign of the nudge is what stops an upward arrow from
+    // occasionally resolving downwards and appearing to do nothing.
+    //
+    // Out-of-range results are refused rather than wrapped: a snap that turned
+    // a note at pitch 127 into one at pitch 0 would be an octave-and-a-bit
+    // transposition dressed up as a correction. When nothing in range fits, the
+    // input comes back clamped -- which for a scale with at least one degree
+    // can only happen at the very ends of the MIDI range.
+    int snapPitch(int pitch, int dir = 0) const {
+        if (!active() || contains(pitch)) return clampv(pitch, 0, 127);
+        for (int d = 1; d <= 12; ++d) {
+            if (dir >= 0) { const int up = pitch + d; if (up <= 127 && contains(up)) return up; }
+            if (dir <= 0) { const int dn = pitch - d; if (dn >= 0  && contains(dn)) return dn; }
+        }
+        return clampv(pitch, 0, 127);
+    }
+
+    // The display name of the key, "C Minor" style, or "Chromatic".
+    std::string label() const {
+        const int m = clScaleMode(mode);
+        if (m == kScaleChromatic) return kScales[kScaleChromatic].name;
+        return std::string(kPitchNames[clScaleRoot(root)]) + " " + kScales[m].name;
+    }
 };
 
 // One breakpoint in an envelope, in clip-relative beats. `curve` is reserved
@@ -578,6 +709,11 @@ struct Session {
         return sigs.empty() ? sigPosAt(&one, 1, beat)
                             : sigPosAt(sigs.data(), (int)sigs.size(), beat);
     }
+
+    // The key the set is in. Session-wide, like the tempo and the signature and
+    // for the same reason: there is one piece. Default-constructed it is
+    // Chromatic, which is "no scale" and writes nothing to the file.
+    ScaleKey scale;
 
     int  quantumIdx = 4;               // index into kQuantumBeats -> "1 Bar"
     bool metronome = false;

@@ -115,8 +115,12 @@ void freeBlock(const void* header) {
 bool sameNotes(const std::vector<NoteModel>& a, const std::vector<NoteModel>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
+        // Every field, the generative pair included: two notes that differ only
+        // in their chance render differently, so merging them would be exactly
+        // the "one item playing another item's material" this refuses to do.
         if (a[i].beat != b[i].beat || a[i].len != b[i].len ||
-            a[i].pitch != b[i].pitch || a[i].vel != b[i].vel) return false;
+            a[i].pitch != b[i].pitch || a[i].vel != b[i].vel ||
+            a[i].chance != b[i].chance || a[i].velTo != b[i].velTo) return false;
     }
     return true;
 }
@@ -403,6 +407,8 @@ const RtArrangement* App::buildArrangement(int track) {
                     out.len   = n.len;
                     out.pitch = n.pitch;
                     out.vel   = n.vel;
+                    out.chance = n.chance;   // engine.h, RtNote::chance / velTo
+                    out.velTo  = n.velTo;
                     ++nw;
                 }
             }

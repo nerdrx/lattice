@@ -28,11 +28,49 @@ enum class SlotState : int { Empty = 0, Stopped, Queued, Playing, StopQueued };
 // mutated after publication; a replaced array travels back to the GUI via
 // Ev::NotesRetired before it may be freed — the same lifetime protocol as
 // RtChain, for the same reason: editing notes while the clip plays.
+//
+// `chance` and `velTo` are Live's per-note Chance and Velocity Range, and both
+// are evaluated ON THE AUDIO THREAD at the moment the note-on would go out --
+// the same place every other note decision is made, and the only place that
+// knows which lap of the loop this is.
+//
+//   chance  0..100 percent. 100 (the default) skips the draw entirely, so a
+//           pattern that does not use the feature costs exactly what it cost
+//           before it existed. 0 never sounds; a note that loses its roll is
+//           silent for that lap and does NOT release whatever is holding its
+//           pitch, because a note that did not happen cannot end one that did.
+//   velTo   0 (the default) means "fixed velocity, use `vel`". Anything else is
+//           the far end of a velocity SPAN: each sounding is drawn uniformly
+//           from the closed integer range between `vel` and `velTo`, in either
+//           order, so a range may be written downwards without meaning
+//           anything different.
+//
+// DETERMINISM is a hard requirement, not a nicety: this project's demo renders
+// are cmp-identical gates. Neither draw uses a generator with state, for the
+// reason spelled out at randUnit() in engine.cpp -- a stateful RNG's output
+// depends on how many times it has been called, which depends on the buffer
+// size. Both are a pure hash of the musical event: the track, the note's index
+// in its clip, its pitch, its clip-relative beat, and the LOOP LAP the voice is
+// on. Nothing in that list is a function of how the audio was chopped up.
+//
+// BOTH FIELDS LIVE IN PADDING RtNote ALREADY HAD. beat and len force 8-byte
+// alignment, so `pitch` and `vel` were followed by six dead bytes and the
+// struct was 24 B; it still is. That is not an accident of layout, it is the
+// reason this could be a one-wave change: src/ipc/pool.h asserts WireNote
+// mirrors this struct field for field and the note pool is a raw byte copy, so
+// two more bytes inside the existing footprint cross the process boundary with
+// no change to the wire, the pool, or the region's layout hash. The assert
+// below is what keeps that true.
 struct RtNote {
     f64 beat = 0.0;
     f64 len  = 0.25;
     u8  pitch = 60, vel = 100;
+    u8  chance = 100;                 // 0..100 percent, evaluated per sounding
+    u8  velTo  = 0;                   // 0 = fixed velocity; else the far end
 };
+static_assert(sizeof(RtNote) == 24,
+              "RtNote must stay 24 B: src/ipc/pool.h's WireNote mirrors it and the "
+              "note pool is copied as raw bytes");
 
 // ---------------------------------------------------------------------------
 // Time signatures.
@@ -645,6 +683,17 @@ private:
         // anything a slot sequencer produces; overflow steals the oldest.
         f64   beatPos = 0.0;
         int   nextNote = 0;
+        // Which time round the loop this is, from 0 at the launch. The one
+        // input to the per-note dice (RtNote::chance, RtNote::velTo) that makes
+        // a probabilistic pattern re-roll each lap instead of being frozen at
+        // whatever the first pass decided.
+        //
+        // A COUNT and not a time, deliberately: it is incremented by the wrap
+        // itself, so it is a function of how much musical time has passed and
+        // of nothing else. An absolute beat would be accumulated per block and
+        // would therefore differ by ulps between one buffer size and another,
+        // which is the exact property the dice may not have. See noteKey().
+        u32   lap = 0;
         struct PendingOff { f64 beat = 0.0; u8 pitch = 0; bool used = false; };
         PendingOff offs[32];
 

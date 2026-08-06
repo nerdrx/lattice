@@ -102,6 +102,12 @@ static void pushClip(Engine& e, const Session& s, int t, int slot, Owned& own) {
                 fresh[i].len   = n.len;
                 fresh[i].pitch = n.pitch;
                 fresh[i].vel   = n.vel;
+                // The generative pair (engine.h, RtNote::chance / velTo). An
+                // offline render is the ONE place these matter most: the whole
+                // reason the dice are a hash of the musical event rather than a
+                // generator is so that this file is reproducible.
+                fresh[i].chance = n.chance;
+                fresh[i].velTo  = n.velTo;
             }
             own.notes.push_back(fresh);
             rc.notes     = fresh;

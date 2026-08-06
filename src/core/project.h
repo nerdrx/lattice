@@ -78,7 +78,36 @@
 // cannot use, exactly as a `param` naming a control that no longer exists is
 // dropped.
 //
-// Saving always writes the current version; versions 1 through 8 all load,
+// Version 9 adds the set's KEY and the piano roll's per-note generative
+// fields, and does both by widening lines that were already there rather than
+// by adding blocks.
+//
+// Two top-level lines carry the key: `scale <root> <mode>`, where root is a
+// pitch class 0..11 and mode indexes the table in session.h, and `scalesnap
+// <0|1>`, whether edits are held to it. Mode 0 is Chromatic, which is what "no
+// scale" is spelled as, and the whole pair is sparse: a Chromatic set writes no
+// `scale` line and therefore no root either, which is why the root is folded to
+// 0 on the way out when there is no scale -- the value a missing line loads as
+// has to be exactly the value that suppresses it, and a remembered-but-unused
+// root would break that on the second save.
+//
+// `note` grows two OPTIONAL trailing fields, `note <beat> <length> <pitch>
+// <velocity> [<chance> [<velrange>]]`. Chance is 0..100 percent and defaults to
+// 100; velrange is 0 (a fixed velocity) or the far end of a velocity span, and
+// defaults to 0. Neither is written at its default, and because they are
+// positional the chance is written whenever the range is -- so a note that uses
+// neither emits the identical four fields version 8 emitted, and a set with no
+// per-note dice in it differs from its v8 self by exactly the header line.
+//
+// The one behaviour this changes for an OLD file is that `note` used to ignore
+// whatever trailed its four fields and now reads two more numbers off it. That
+// costs nothing for any file this program has ever written -- it never wrote a
+// fifth field -- and it buys the same "absent and unreadable are different
+// things" strictness `pt` has had since v5: a fifth field that is not a number
+// is a broken line and says so, rather than silently loading as the value that
+// suppresses it.
+//
+// Saving always writes the current version; versions 1 through 9 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 //

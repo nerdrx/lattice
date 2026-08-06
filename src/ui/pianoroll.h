@@ -54,6 +54,36 @@ struct AutoTargets {
 // IndexSel now lives in autolane.h, with the lane that is its second user. It
 // is the same type, unchanged; only which header declares it moved.
 
+// What the pitch axis shows. FOLD used to be a bool and is a three-way choice
+// now, because "only the rows in the key" is a third answer to the same
+// question the other two answer and not a modifier on either of them.
+//
+//   All   every pitch 0..127, the way a roll opens
+//   Used  only the pitches the clip actually plays (the old `fold_ == true`)
+//   Key   only the pitches the session's scale admits, over the whole range.
+//         Unlike Used this does NOT depend on the clip's contents, which is the
+//         point: it is how you write a melody that is in key by construction,
+//         and an empty clip needs it most.
+//
+// Key falls back to All when the session is Chromatic, exactly as Used falls
+// back to All for a clip with no notes: a fold with nothing to fold on is a
+// blank editor, and a blank editor is never the answer.
+enum class FoldMode : int { All = 0, Used = 1, Key = 2 };
+inline constexpr int kFoldModeCount = 3;
+inline constexpr const char* kFoldModeNames[kFoldModeCount] = {"ALL", "FOLD", "KEY"};
+
+// What the bottom lane edits when it is not showing an envelope. These are the
+// per-note fields, and they come FIRST in the lane chooser for a MIDI clip --
+// so `laneSel_` is an envelope index offset by however many of these the clip
+// has (three for a pattern, none for a sample).
+//
+// Chance and VelRange are Live's per-note Chance and Velocity Range, edited
+// exactly the way velocity already was: a stem per note, dragged to an absolute
+// height, and every selected stem takes the value under the cursor.
+enum class NoteLane : int { Velocity = 0, Chance = 1, VelRange = 2 };
+inline constexpr int kNoteLaneCount = 3;
+inline constexpr const char* kNoteLaneNames[kNoteLaneCount] = {"VEL", "CHANCE", "RANGE"};
+
 class PianoRoll {
 public:
     // --- audition ----------------------------------------------------------
@@ -138,21 +168,42 @@ public:
     //     the zoom is the user's and is kept until the clip changes.
     //   * loop length readout + drag at the top-right of the ruler
     //     (whole-beat steps, min 1)
+    //   * the SET'S KEY, passed in rather than owned: in-scale rows are lit and
+    //     the root is lit brighter, the FOLD control gains a "KEY" mode that
+    //     hides every out-of-scale row, and — when the key says so — every edit
+    //     that chooses a pitch is pulled onto the nearest scale degree. The roll
+    //     never writes to it; the panel that owns the session does.
     // Notes must stay sorted by beat after every edit, and so must the points
     // of every envelope.
     bool draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& targets,
-              f64 playheadBeats, bool playing);
+              const ScaleKey& key, f64 playheadBeats, bool playing);
 
     // What the last edit that returned true was about, for the caller's undo
     // label. Valid only immediately after a call that reported a change.
     const char* lastEdit() const { return lastEdit_; }
 
-    // Puts the lane on `idx` (0 = velocity, n = the clip's nth envelope) for
-    // the clip that is about to be drawn — including one this roll has not seen
-    // yet, whose identity reset would otherwise take the choice straight back.
-    // The headless hook is the only caller: nothing inside gamescope can work a
-    // selector, and a lane nobody can select is a lane no screenshot can check.
+    // Puts the lane on `idx` for the clip that is about to be drawn — including
+    // one this roll has not seen yet, whose identity reset would otherwise take
+    // the choice straight back. The headless hook is the only caller: nothing
+    // inside gamescope can work a selector, and a lane nobody can select is a
+    // lane no screenshot can check.
+    //
+    // The index space is the chooser's: for a MIDI clip 0..2 are the per-note
+    // lanes (NoteLane) and 3 + n is the clip's nth envelope; for an audio clip
+    // there is one placeholder entry and 1 + n is the nth envelope. Callers
+    // wanting an envelope should add envLaneBase(clip) rather than hard-coding
+    // either offset.
     void showLane(int idx) { laneSel_ = idx; pendingLane_ = idx; }
+    // Where a clip's envelopes start in that index space. Static because a
+    // caller has to be able to ask before the roll has ever drawn the clip.
+    static int envLaneBase(const ClipModel& clip) {
+        return clip.kind == ClipKind::Midi ? kNoteLaneCount : 1;
+    }
+    // Which fold the pitch axis is in, and a way to set it. The headless hook
+    // is again the only external caller: FOLD is a click nothing in gamescope
+    // can make, and a fold no screenshot can reach is a fold nothing checks.
+    FoldMode foldMode() const { return fold_; }
+    void setFoldMode(FoldMode m) { fold_ = m; }
 
     // --- keyboard API ------------------------------------------------------
     // Driven by App::handleShortcuts, which routes the arrows, Delete, Escape
@@ -191,20 +242,81 @@ public:
     // Pitches to audition this frame; see PreviewQueue. Empties the queue.
     int  drainPreview(u8* out, int max) { return preview_.drain(out, max); }
 
+    // --- note tools --------------------------------------------------------
+    // Live's Quantize, Legato, Duplicate and Transpose, driven from buttons on
+    // the clip panel rather than from the keyboard: they are deliberate,
+    // occasional gestures, and the roll's key map is already full.
+    //
+    // All four act on the SELECTION when there is one and on EVERY NOTE IN THE
+    // CLIP when there is not. That is Live's rule for quantize and it is the
+    // right one for all of them: a tool with nothing selected is being asked
+    // about the pattern, not about nothing. It is also what makes them useful
+    // straight after a MIDI take, when there is no selection yet and the whole
+    // point is to tidy the lot.
+    //
+    // Each returns the same "the clip changed, re-push it" as draw(), and each
+    // reports false when it would change nothing, so a click that is a no-op
+    // leaves no undo entry.
+
+    // Pulls each note's START toward the nearest multiple of quantGrid(),
+    // travelling quantStrength() of the way. Strength 1 is a hard quantize;
+    // anything less keeps the part of the performance's timing that makes it a
+    // performance. Lengths are untouched -- quantizing a length is a separate
+    // decision and Live keeps it separate too.
+    bool quantizeSelected(ClipModel& clip);
+    // Extends each note to where the NEXT note begins (the next start strictly
+    // later than its own, at any pitch), or to the end of the clip for the last
+    // one. Any pitch and not the same pitch, deliberately: a chord's members
+    // share a start, so "the next start after mine" extends all of them to the
+    // same place and keeps the chord a chord, while a per-pitch rule would let
+    // the members of one chord end at different times.
+    bool legatoSelected(ClipModel& clip);
+    // Copies the notes one selection-width later, snapped up to a grid step, so
+    // a bar of material becomes two. Copies that would fall past the end of the
+    // clip are dropped rather than extending it -- that is duplicateLoop's job,
+    // and doing both here would make one button mean two things. The copies
+    // become the selection, because the copy is what the user is about to edit.
+    bool duplicateSelected(ClipModel& clip);
+    // Moves every target note by `semitones`, clamped once for the group and
+    // pulled into the key when the key says to snap -- nudgeSelected's pitch
+    // half, exposed for a button and extended to the whole clip when nothing is
+    // selected.
+    bool transposeSelected(ClipModel& clip, int semitones);
+
+    // Quantize settings. Editor tool state, so it lives with the editor: the
+    // panel that draws the buttons reads and writes it through here rather than
+    // keeping a second copy that could disagree with what the button does.
+    f64  quantGrid() const { return quantGrid_; }
+    void setQuantGrid(f64 g) { quantGrid_ = (g > 1e-6 ? g : 0.25); }
+    f32  quantStrength() const { return quantStrength_; }
+    void setQuantStrength(f32 t) { quantStrength_ = clampv(t, 0.f, 1.f); }
+
 private:
+    // Which notes a note tool is about to change: the selection when there is a
+    // usable one, otherwise every note in the clip. See the block above the
+    // definition for why the fallback is the whole clip and not nothing.
+    std::vector<int> toolTargets(const ClipModel& clip) const;
+
     // True when `clip` is the clip this roll last drew. UID 0 (never assigned)
     // compares equal to a roll that has drawn nothing, which is as much
     // identity as an unsaved, un-uid'd clip has to offer.
     bool owns(const ClipModel& clip) const { return clip.uid == clipUid_; }
 
-    // The envelope the lane is showing, or null when it is showing the
-    // velocity stems — or when laneSel_ names a lane a clip that changed under
+    // The envelope the lane is showing, or null when it is showing one of the
+    // per-note lanes — or when laneSel_ names a lane a clip that changed under
     // us no longer has, which is why every caller goes through here rather than
     // indexing envelopes itself.
     AutoLane* shownLane(ClipModel& clip) const {
-        return (laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
-                   ? &clip.envelopes[(size_t)laneSel_ - 1]
+        const int base = envLaneBase(clip);
+        return (laneSel_ >= base && laneSel_ - base < (int)clip.envelopes.size())
+                   ? &clip.envelopes[(size_t)(laneSel_ - base)]
                    : nullptr;
+    }
+    // Which per-note field the lane is editing. Only meaningful for a MIDI clip
+    // whose laneSel_ is below envLaneBase(); shownLane() being null is what the
+    // callers actually branch on, and this says which of the three it is.
+    NoteLane shownNoteLane() const {
+        return (NoteLane)clampv(laneSel_, 0, kNoteLaneCount - 1);
     }
     // The lane's key block: the chooser, the target "+" would add, the add
     // button and the shown lane's on/off toggle. Split out of draw() because it
@@ -212,10 +324,16 @@ private:
     // run before anything takes a pointer into clip.envelopes.
     void drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip, const AutoTargets& targets,
                      f32 s, bool& changed);
+    // The key the last draw was handed. Kept because the keyboard API runs
+    // BEFORE the frame's draw and still has to snap into the same scale the
+    // roll is drawing — a nudge that ignored the key while the grid honoured it
+    // would be two different editors sharing one window.
+    ScaleKey key_;
 
     const AutoLane* shownLane(const ClipModel& clip) const {
-        return (laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
-                   ? &clip.envelopes[(size_t)laneSel_ - 1]
+        const int base = envLaneBase(clip);
+        return (laneSel_ >= base && laneSel_ - base < (int)clip.envelopes.size())
+                   ? &clip.envelopes[(size_t)(laneSel_ - base)]
                    : nullptr;
     }
 
@@ -232,8 +350,10 @@ private:
     // its own selection, its own drags and its own value range, and is handed
     // the roll's TimeAxis so the two can never disagree about a beat.
     AutoLaneView lane_;
-    // 0 = the velocity stems, n = clip.envelopes[n-1]. Clamped on every draw:
-    // the caller can delete a lane (undo, a project load) between frames.
+    // The chooser index: 0..kNoteLaneCount-1 are the per-note lanes on a MIDI
+    // clip (one inert placeholder on an audio clip), and everything from
+    // envLaneBase(clip) on is clip.envelopes. Clamped on every draw: the caller
+    // can delete a lane (undo, a project load) between frames.
     int  laneSel_ = 0;
     // Which AutoTargets entry the "+" button would add a lane for.
     int  targetSel_ = 0;
@@ -242,6 +362,11 @@ private:
     int  pendingLane_ = -1;
     // The label the caller should put on the undo entry for the last change.
     const char* lastEdit_ = "note edit";
+
+    // Quantize tool state. A grid in beats (0.25 == a 1/16 note, the roll's own
+    // drawing grid) and a strength in 0..1.
+    f64  quantGrid_ = 0.25;
+    f32  quantStrength_ = 1.f;
 
     f32  scrollY_ = 0.f;         // pixels, pitch axis (relative, see draw())
     f32  scrollX_ = 0.f;         // pixels, time axis
@@ -252,7 +377,7 @@ private:
     // freely (selecting another slot), and selection/scroll/zoom are all about
     // one particular clip, so they reset when this changes.
     u64  clipUid_ = 0;
-    bool fold_ = false;
+    FoldMode fold_ = FoldMode::All;
     u8   lastVel_ = 100;
     // "The press before this one created a note." Clicking empty space adds,
     // so without this the second click of a double-click on empty space would
@@ -265,7 +390,11 @@ private:
     // Drag state. Band is the one drag with nothing under it — hence the
     // dragNote_ checks that exclude it. The lane's two drags moved into
     // AutoLaneView, where they are deliberately still the same two shapes.
-    enum class Drag { None, Move, Resize, Velocity, Band } drag_ = Drag::None;
+    // `NoteVal` was `Velocity` until the lane learned to show chance and
+    // velocity range too. It is still one drag, because it is still one
+    // gesture: grab a stem, and every selected stem takes the height under the
+    // cursor. Which FIELD that height lands in is shownNoteLane()'s answer.
+    enum class Drag { None, Move, Resize, NoteVal, Band } drag_ = Drag::None;
     int  dragNote_ = -1;
     f32  dragY_ = 0.f;
     f64  dragBeat_ = 0.0;

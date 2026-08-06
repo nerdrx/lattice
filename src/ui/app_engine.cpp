@@ -530,6 +530,11 @@ void App::pushClip(int track, int slot) {
             fresh[i].len   = n.len;
             fresh[i].pitch = n.pitch;
             fresh[i].vel   = n.vel;
+            // The generative pair (engine.h, RtNote::chance / velTo). The dice
+            // are thrown on the audio thread, so all the GUI ever does with
+            // these is carry them across intact.
+            fresh[i].chance = n.chance;
+            fresh[i].velTo  = n.velTo;
         }
     }
 

@@ -159,6 +159,94 @@ static inline bool rollLaunch(const RtClip& c, int track, int slot, f64 beat) {
     return randUnit(1, track, slot, beat) < c.prob;
 }
 
+// ---------------------------------------------------------------------------
+// per-note chance and velocity range (RtNote::chance / RtNote::velTo)
+//
+// The same argument as randUnit, taken one level down, and one field longer --
+// but with one difference that is worth stating because it is the whole reason
+// this survives a change of buffer size.
+//
+// randUnit hashes the ABSOLUTE beat a launch was scheduled for. That number is
+// accumulated a block at a time (`beat_ = origin + (n - posOrigin) * bps`), so
+// it differs by a few ulps between one buffer size and another; quantizing to
+// 960 ticks per beat is what absorbs that, and it works because launches only
+// ever land on a quantum grid, decimals away from a tick boundary.
+//
+// A NOTE has no such guarantee: a note may sit at any beat a piano roll or a
+// MIDI take can produce, including one that lands within an ulp of a tick
+// boundary, where two buffer sizes could round to two different ticks and
+// therefore to two different dice. So none of the inputs here is an absolute
+// beat at all:
+//
+//   track     - fixed for the voice.
+//   noteIdx   - the note's index in its clip's array. Exact, integral.
+//   pitch     - exact.
+//   nt.beat   - read straight OUT OF THE ARRAY, never accumulated. It is the
+//               same f64 the GUI published, bit for bit, at every buffer size.
+//   lap       - Voice::lap, incremented once per loop wrap. A wrap happens
+//               once per `lengthBeats` of playback by construction: the wrap
+//               test is on the voice's own beat cursor against the loop length,
+//               so the FRAME it lands on can move by a sample between buffer
+//               sizes but the COUNT of wraps after N beats cannot.
+//
+// Every one of those is either an integer or a value copied verbatim from the
+// published array. Nothing is summed across blocks, so there is nothing for a
+// different block size to round differently, and the 960-tick quantization the
+// launch path needs is not needed here -- the beat is hashed at full precision.
+//
+// `lap` is what makes a probabilistic pattern re-roll each time round the loop,
+// which is the entire musical point of the feature; without it a 50% note would
+// be a note that is either always there or never there. It resets with the
+// voice, so relaunching a clip replays the same dice from the same place --
+// deliberately, because that is what makes an offline render of a set
+// reproducible and what lets the same bar be rendered twice and compared.
+//
+// `domain` separates the chance draw from the velocity draw, exactly as it
+// separates the launch roll from the Random follow pick: a note whose chance
+// came out low must not thereby also come out quiet.
+static inline u64 noteKey(int domain, int track, int noteIdx, u32 lap,
+                          u8 pitch, f64 clipBeat) {
+    // The beat's exact bits. std::memcpy through a u64 rather than a cast: it
+    // is the one spelling that is not a strict-aliasing violation, and it
+    // compiles to nothing.
+    u64 bits = 0;
+    std::memcpy(&bits, &clipBeat, sizeof bits);
+    // Two rounds over disjoint fields. One round with everything XORed into a
+    // single word would let a shift overlap turn two different notes into one
+    // key; splitting the fields across two finalisers costs a multiply and
+    // removes the question.
+    const u64 a = mix64(((u64)(u32)track << 40) ^ ((u64)(u32)noteIdx << 12) ^ (u64)pitch);
+    return mix64(a ^ bits ^ ((u64)(u32)domain << 56) ^ ((u64)lap << 24));
+}
+
+static inline f64 noteUnit(int domain, int track, int noteIdx, u32 lap,
+                           u8 pitch, f64 clipBeat) {
+    const u64 k = noteKey(domain, track, noteIdx, lap, pitch, clipBeat);
+    return (f64)(k >> 11) * (1.0 / 9007199254740992.0);   // 53 bits -> [0,1)
+}
+
+// Does this note sound on this lap? chance >= 100 skips the draw so a clip that
+// uses none of this executes the code it executed before the field existed.
+static inline bool rollNote(const RtNote& nt, int track, int noteIdx, u32 lap) {
+    if (nt.chance >= 100) return true;
+    if (nt.chance == 0)   return false;
+    return noteUnit(3, track, noteIdx, lap, nt.pitch, nt.beat) < (f64)nt.chance * 0.01;
+}
+
+// The velocity this sounding goes out at. Uniform over the closed integer range
+// between `vel` and `velTo`, in whichever order they were written, and always
+// at least 1 -- velocity 0 on a note-on is a note-off on the wire, which would
+// hang whatever was sounding on that pitch.
+static inline u8 noteVelocity(const RtNote& nt, int track, int noteIdx, u32 lap) {
+    if (nt.velTo == 0 || nt.velTo == nt.vel) return nt.vel ? nt.vel : (u8)1;
+    const int lo = nt.vel < nt.velTo ? nt.vel : nt.velTo;
+    const int hi = nt.vel < nt.velTo ? nt.velTo : nt.vel;
+    const f64 u = noteUnit(4, track, noteIdx, lap, nt.pitch, nt.beat);
+    int v = lo + (int)(u * (f64)(hi - lo + 1));
+    v = clampv(v, lo, hi);                    // guards the u == 1.0 corner case
+    return (u8)(v < 1 ? 1 : v);
+}
+
 // Beat at which `c`'s follow action comes due, given it launched at `at`.
 static inline f64 followDueBeat(const RtClip& c, f64 at) {
     if (c.followAction <= (int)Follow::None || c.followAction >= kFollowCount) return kNoFollow;
@@ -1692,6 +1780,7 @@ void Engine::startVoice(Track& t, const RtClip& c) {
     // clip needs nothing else — there is no audio state to prime.
     v.beatPos  = 0.0;
     v.nextNote = 0;
+    v.lap      = 0;
     for (auto& o : v.offs) o.used = false;
     // Grain hop of one 1/16 note keeps transients intact, which is what makes
     // Beats-mode warping sound like a beat repeat rather than a smear. One
@@ -2770,7 +2859,16 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
                     continue;
                 }
 
+                const int ni = v.nextNote;
                 const RtNote& nt = c.notes[v.nextNote++];
+                // Per-note chance (engine.h, RtNote::chance). The roll happens
+                // HERE -- before the same-pitch release below, before the
+                // note-on, before an off is parked -- because a note that did
+                // not happen must leave the pattern exactly as it found it: it
+                // does not cut short whatever is holding its pitch, and it owes
+                // no note-off. Free for chance == 100, which is every note in
+                // every set that does not use the feature.
+                if (!rollNote(nt, ti, ni, v.lap)) continue;
                 const int fr = frameAt(nt.beat);
                 // Same pitch still sounding from an overlapping note: off first,
                 // for the same reason.
@@ -2780,8 +2878,10 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
                         o.used = false;
                     }
                 // Velocity 0 on a note-on *is* a note-off on the wire, so a
-                // silent note in the clip would hang the previous one.
-                sendNote(t, 0x90, nt.pitch, nt.vel ? nt.vel : (u8)1, fr);
+                // silent note in the clip would hang the previous one --
+                // noteVelocity() upholds the floor of 1 for the ranged case as
+                // well as the fixed one.
+                sendNote(t, 0x90, nt.pitch, noteVelocity(nt, ti, ni, v.lap), fr);
 
                 // Park the off. beat+len may run past the loop end; the wrap
                 // below walks it down one lap at a time, which is what lets a
@@ -2839,6 +2939,11 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
             // from either hanging or firing twice.
             v.beatPos  = 0.0;
             v.nextNote = 0;
+            // A new lap, and therefore new dice for every note carrying a
+            // chance or a velocity range. Counted here rather than derived from
+            // the beat because this is the one place a wrap provably happens
+            // exactly once per loop length, whatever the buffer size.
+            ++v.lap;
             for (auto& o : v.offs)
                 if (o.used) { o.beat -= L; if (o.beat < 0.0) o.beat = 0.0; }
         }

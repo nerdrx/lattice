@@ -148,7 +148,40 @@ namespace {
 // string survives the round trip either way; the rack drops what it cannot read
 // when it restores, exactly as a `param` naming a control the plugin no longer
 // has is dropped.
-constexpr int kFormatVersion = 8;
+//
+// Version 9 adds the set's KEY and the per-note generative fields, and adds no
+// block and no nesting to do it.
+//
+//     scale 9 2            A Minor  (root 9 = A, mode 2 = Minor)
+//     scalesnap 1          edits are pulled into that scale
+//     ...
+//       note 0 0.5 57 100          an ordinary note, four fields, as at v3
+//       note 0.5 0.5 60 92 60      ... that sounds six times in ten
+//       note 1 0.5 64 100 100 70   ... always, at a velocity between 70 and 100
+//
+// Both key lines are sparse and mode 0 (Chromatic) is the default, so a set
+// nobody has keyed writes neither. The root is folded to 0 when the mode is
+// Chromatic: the value a missing line loads as must be exactly the value that
+// suppresses it, and a root remembered under a scale that is switched off would
+// otherwise be written by the first save and dropped by the second.
+//
+// The two note fields are POSITIONAL, so the chance is written whenever the
+// range is even at its default -- there is no way to spell the second without
+// the first, and inventing one (a `noteX` line, a key=value tail) would be a
+// second grammar inside a format that has exactly one. The cost is one extra
+// token on the rare note that has a velocity range and no chance; the benefit
+// is that a note using neither emits the identical four fields v3 through v8
+// emitted, and therefore that a set with no per-note dice in it differs from its
+// v8 self by exactly the header line.
+//
+// This is the first version to make `note` STRICTER rather than only wider. It
+// used to ignore anything after its four fields; it now reads a fifth and sixth
+// and REFUSES a fifth that is not a number, which is `pt`'s rule since v5 and
+// exists for the same reason: "absent" and "present but unreadable" have to be
+// distinguishable, or a typo loads as the value that hides it. No file this
+// program has ever written has a fifth field, so nothing that used to load
+// stops loading.
+constexpr int kFormatVersion = 9;
 constexpr int kMinFormatVersion = 1;
 
 // What saveProject writes. Reading accepts this and every spelling in
@@ -287,6 +320,15 @@ f64 clNoteLen(f64 v)  { return std::isfinite(v) ? clampv(v, kMinNoteLen, 1e7) : 
 // note, hence the floor of 1.
 u8 clPitch(i64 v)     { return (u8)clampv(v, (i64)0, (i64)127); }
 u8 clVel(i64 v)       { return (u8)clampv(v, (i64)1, (i64)127); }
+// Per-note chance, in whole percent. 100 is "always" and is the value that
+// suppresses the field, so the non-representable arms have to fold to exactly
+// 100 rather than to something merely near it.
+u8 clChance(i64 v)    { return (u8)clampv(v, (i64)0, (i64)100); }
+// The far end of a velocity range. 0 is the sentinel for "there is no range",
+// which is why this is not clVel: a file saying 0 means the note has a fixed
+// velocity, and a file saying -3 means the same thing badly. Everything above 0
+// is a velocity and shares clVel's ceiling.
+u8 clVelTo(i64 v)     { return v <= 0 ? (u8)0 : (u8)clampv(v, (i64)1, (i64)127); }
 
 // Automation breakpoints. Same symmetry, same reasoning.
 //
@@ -642,11 +684,23 @@ void writeClipBody(std::string& o, const ClipModel& c, const char* indent) {
     // reader refuses `note` inside an audio clip, so an audio ClipModel that
     // somehow carries leftover notes must not be written into a file that
     // cannot be read back.
-    if (midi) for (const auto& n : c.notes)
-        kn(o, indent, "note", fmtF64(clNoteBeat(n.beat)) + " " +
-                              fmtF64(clNoteLen(n.len)) + " " +
-                              std::to_string((int)clPitch(n.pitch)) + " " +
-                              std::to_string((int)clVel(n.vel)));
+    //
+    // The two v9 fields are appended to the SAME line and only when they are not
+    // at their defaults, which is the sparse rule every field since v2 follows.
+    // They are positional, so a velocity range drags the chance along with it
+    // even at 100; see the version note at the top for why that is the right
+    // trade against inventing a second grammar for optional named fields.
+    if (midi) for (const auto& n : c.notes) {
+        std::string ln = fmtF64(clNoteBeat(n.beat)) + " " +
+                         fmtF64(clNoteLen(n.len)) + " " +
+                         std::to_string((int)clPitch(n.pitch)) + " " +
+                         std::to_string((int)clVel(n.vel));
+        const int chance = (int)clChance((i64)n.chance);
+        const int velTo  = (int)clVelTo((i64)n.velTo);
+        if (chance != 100 || velTo != 0) ln += " " + std::to_string(chance);
+        if (velTo != 0)                  ln += " " + std::to_string(velTo);
+        kn(o, indent, "note", ln);
+    }
     // The warp map, after the notes and before the envelopes: content, like
     // both of them, and the two content vectors are mutually exclusive anyway
     // (only a MIDI clip has notes, only an audio clip has markers).
@@ -1031,9 +1085,28 @@ BodyKey clipBodyKey(ClipModel& c, const std::string& key, const std::string& res
             err = "note: expected beat, length, pitch and velocity";
             return BodyKey::Bad;
         }
+        // v9's chance and velocity range: optional, positional, and read with
+        // `pt`'s discipline rather than with the "ignore the rest of the line"
+        // this key used to have. "Nothing follows" is now meaningful -- it is
+        // chance 100 and no range -- so a fifth field that is not a number
+        // cannot be waved through: it would be an unreadable value silently
+        // loading as the one that suppresses it. Anything after the sixth is
+        // still ignored, exactly as anything after `pt`'s curve is.
+        i64 chance = 100, velTo = 0;
+        if (!sc.exhausted()) {
+            if (!sc.integer(chance)) {
+                err = "note: chance must be an integer percentage";
+                return BodyKey::Bad;
+            }
+            if (!sc.exhausted() && !sc.integer(velTo)) {
+                err = "note: velocity range must be an integer";
+                return BodyKey::Bad;
+            }
+        }
         // Appended, never sorted: see writeClipBody. File order is the order the
         // session gets.
-        c.notes.push_back(NoteModel{clNoteBeat(beat), clNoteLen(len), clPitch(pitch), clVel(vel)});
+        c.notes.push_back(NoteModel{clNoteBeat(beat), clNoteLen(len), clPitch(pitch),
+                                    clVel(vel), clChance(chance), clVelTo(velTo)});
     } else if (key == "wm") {
         // A warp marker: a source frame pinned to a clip-relative beat. Both
         // fields required (there is no defaulting one of a pair of coordinates),
@@ -1225,6 +1298,29 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
         if (ls != clArrBeat(deflt.loopStart) || le != clArrBeat(deflt.loopEnd))
             kn(o, "", "loop", fmtF64(ls) + " " + fmtF64(le));
         if (s.loopOn) kn(o, "", "loopon", "1");
+    }
+    // The key (v9). Beside the signature, because the two say the same kind of
+    // thing about a piece and a reader looking for one will look for the other.
+    //
+    // Sparse in the way `loop` above is, with one wrinkle worth naming: the ROOT
+    // is folded to 0 when there is no scale. A session can hold root 9 with mode
+    // Chromatic -- the user picked A and then switched the scale off -- and
+    // writing `scale 9 0` would be writing a line whose values are the defaults,
+    // which the reader would load and the next save would keep, forever. Folding
+    // it here is what makes "the value a missing line loads as is exactly the
+    // value that suppresses the line" true for the pair rather than for each
+    // field separately.
+    //
+    // `scalesnap` is NOT gated on there being a scale. It is a preference about
+    // editing rather than part of the key, it costs one line only when it is on,
+    // and silently forgetting it every time the scale is switched off would be a
+    // setting that will not stay set.
+    {
+        const int mode = clScaleMode(s.scale.mode);
+        const int root = mode == kScaleChromatic ? 0 : clScaleRoot(s.scale.root);
+        if (mode != kScaleChromatic)
+            kn(o, "", "scale", std::to_string(root) + " " + std::to_string(mode));
+        if (s.scale.snap) kn(o, "", "scalesnap", "1");
     }
 
     const size_t nTracks = std::min(s.tracks.size(), (size_t)kMaxTracks);
@@ -1441,6 +1537,23 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
             } else if (key == "loopon") {
                 int v; if (!sc.integer(v)) return fail("loopon: expected 0 or 1");
                 out.loopOn = v != 0;
+            } else if (key == "scale") {
+                // The set's key (v9). Both numbers required, for the reason
+                // `loop`'s two are: a key is one statement with two halves, and
+                // a root with no mode is not a smaller version of it -- it is a
+                // line that means nothing. Both are values and are clamped, the
+                // root by wrapping into 0..11 (which is what a pitch class is)
+                // and the mode into the table's range, so a file naming a scale
+                // a later build added lands on Chromatic rather than indexing
+                // off the end of it.
+                int a = 0, b = 0;
+                if (!sc.integer(a) || !sc.integer(b))
+                    return fail("scale: expected a root and a mode");
+                out.scale.root = clScaleRoot(a);
+                out.scale.mode = clScaleMode(b);
+            } else if (key == "scalesnap") {
+                int v; if (!sc.integer(v)) return fail("scalesnap: expected 0 or 1");
+                out.scale.snap = v != 0;
             } else if (key == "track") {
                 int v; if (!sc.integer(v)) return fail("track: expected an index");
                 if (v < 0 || v >= kMaxTracks)
