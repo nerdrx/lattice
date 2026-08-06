@@ -194,6 +194,13 @@ void App::shutdown() {
     retiringNotes_.clear();
     for (PendingRec& p : pendingRecs_) { delete[] p.buf; delete[] p.notes; }
     pendingRecs_.clear();
+    // The signature map, freed the same way and for the same reason. Its owner
+    // is a static in app_arrange.cpp with a destructor, so nothing leaked
+    // before this line existed -- but "freed by a static destructor at exit"
+    // and "freed here, beside every other array the audio thread was
+    // borrowing" are different claims, and only the second one is checkable in
+    // the place a reader looks for it.
+    dropSignatures();
     // Instances still on tracks die with ses_ when App is destroyed, which is
     // after this point and therefore also after the audio thread is gone.
 

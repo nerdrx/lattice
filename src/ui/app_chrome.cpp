@@ -31,14 +31,91 @@ static f32 ctlPulse01() {
     return 0.5f + 0.5f * (f32)std::sin(nowSeconds() * 6.2831853 * 1.6);
 }
 
+// NXTAKT_DEBUG_SIG's second half, and the only assertion in this program that a
+// screenshot genuinely cannot make: THAT THE MAP REACHED THE ENGINE.
+//
+// A ruler drawn from ses_.sigs and an engine that never received a
+// Cmd::SetSignatures look identical in a picture -- correct bar lines over 4/4
+// playback -- which is precisely the failure this wave had to not have. The
+// engine republishes posSigNum/posSigDen every block from ITS OWN map (engine.cpp,
+// publish()), so reading them back is a round trip through the audio thread and
+// through sigMapValid, not a re-read of what we sent.
+//
+// Deferred by a few dozen frames because the command has to be drained by the
+// audio thread first; runs once. Reaching `local()` in a draw is the one thing
+// engine_handle.h sanctions it for -- "the record journal's pump and the
+// headless hooks" -- and this is the second of those.
+static void debugSignatureCheck(Engine* eng, Session& s) {
+    static int frames = -1;
+    static int wasNum = 0, wasDen = 0;
+    if (frames < 0) {
+        if (!env("DEBUG_SIG")) { frames = -2; return; }
+        frames = 0;
+    }
+    if (frames == -2 || frames >= 90) return;
+    ++frames;
+    // A REPUBLISH, and the retirement it forces. One publication proves the
+    // engine got a map; it does not prove that the array the next one displaces
+    // ever comes home, and a retirement protocol that never reaps looks exactly
+    // like one that works until the process runs out of memory. So bar 0 is
+    // changed and changed back -- two publications, two Ev::SigsRetired, and the
+    // set ends exactly as it started, so the screenshot is unaffected.
+    if (frames == 30) {
+        wasNum = s.sigAtBar(0).num;
+        wasDen = s.sigAtBar(0).den;
+        s.setSignature(0, wasNum == 5 ? 6 : 5, 8);
+        return;
+    }
+    if (frames == 60) { s.setSignature(0, wasNum, wasDen); return; }
+    if (frames < 90) return;
+    if (!eng) { LOGW("NXTAKT_DEBUG_SIG: no in-process engine to check against"); return; }
+    LOGI("NXTAKT_DEBUG_SIG: republished twice -> %d array(s) reaped, %d still in flight",
+         sigsReaped(), sigsInFlight());
+
+    const f64 beat = eng->beat.load(std::memory_order_relaxed);
+    const BarPos want = s.barPosAt(beat);
+    const int gotNum = eng->posSigNum.load(std::memory_order_relaxed);
+    const int gotDen = eng->posSigDen.load(std::memory_order_relaxed);
+    const int gotBar = eng->posBar.load(std::memory_order_relaxed);
+    const bool ok = gotNum == want.num && gotDen == want.den && gotBar == want.bar + 1;
+    LOGI("NXTAKT_DEBUG_SIG: engine at beat %.4f says %d.%d.%d in %d/%d; the set's map "
+         "says %d.%d.%d in %d/%d -- %s",
+         beat, gotBar, eng->posBeat.load(std::memory_order_relaxed),
+         eng->posSixteenth.load(std::memory_order_relaxed), gotNum, gotDen,
+         want.bar + 1, want.beat + 1, want.sixteenth + 1, want.num, want.den,
+         ok ? "PUBLISHED" : "NOT PUBLISHED - the engine is playing a map it was never given");
+}
+
 void App::drawControlBar(const Rect& r) {
     const f32 s = win_.dpiScale();
     // Remote control's per-frame tick. It rides the control bar because the
     // control bar is drawn unconditionally, first, on every frame — see the
     // report for why the drain does not live in App::frame().
     drainControlInput();
+    // The signature map, handed to the engine. HERE, because the control bar is
+    // the one thing drawn unconditionally and first on every frame: a load, an
+    // undo, a redo and every edit below are all covered by one call site, and
+    // there is no path that changes the map and forgets to publish it. A set
+    // whose map never reaches the engine plays in 4/4 however the ruler is
+    // drawn, which is the one failure this wave could have had that nothing
+    // would have shown. syncSignatures is a compare against what it last
+    // published, so on the frames where nothing moved it costs that compare.
+    //
+    // Guarded on local(), like pumpJournal: Cmd::SetSignatures is not on the IPC
+    // wire yet (engine.h says so at the enumerator), so in daemon mode there is
+    // nothing to publish to and the branch is the honest way to say it.
+    if (Engine* e = eng_.local()) syncSignatures(*e, ses_);
+    debugSignatureCheck(eng_.local(), ses_);
     rend_.rect(r, pal::panel);
     rend_.rect({r.x, r.bottom() - 1 * s, r.w, 1 * s}, pal::divider);
+
+    // The playhead as a musician reads it, out of the SAME sigPosAt() the
+    // metronome and the engine's own posBar/posBeat/posSixteenth come from
+    // (engine.h). Everything the bar prints about position -- the readout and
+    // the signature chip -- reads this one struct, so the two cannot say the
+    // playhead is in different bars.
+    const BarPos pos = sigMapOf(ses_).posAt(es_.beat);
+    const Input& in = win_.input();
 
     const f32 pad = 8 * s, h = 20 * s;
     const f32 cy = r.y + (r.h - h) * 0.5f;
@@ -68,12 +145,99 @@ void App::drawControlBar(const Rect& r) {
     }
     x += tempoR.w + 6 * s;
 
+    // --- time signature ---
+    //
+    // What it SHOWS is the signature in force at the playhead, not ses_.sigNum:
+    // in a re-barred set those are different numbers from the first change on,
+    // and the one a transport bar is for is the one you are hearing.
+    //
+    // What it EDITS is the entry that signature comes from -- sigAtBar(pos.bar),
+    // whose own bar is where it starts. Not "insert a change at the playhead's
+    // bar": dragging the number in bar 37 of a set in plain 4/4 means "this
+    // piece is in 3/4", not "and from bar 37 it is", and a control that quietly
+    // laid down a change every time it was touched would fill the ruler with
+    // markers nobody asked for. Putting a change at a specific bar is the
+    // ruler's job (right-click), and once one is there, locating into it points
+    // this chip at it.
+    //
+    // It draws EXACTLY what it drew when it was a read-only label -- same rect,
+    // same font, same colour, same string -- and adds a hover tint and a cursor
+    // that only exist while the pointer is on it. That is deliberate: "a set
+    // that has never been re-barred renders bit-identically" is this wave's
+    // gate, and it is a gate a redesigned chip could not pass.
     Rect sigR{x, cy, 44 * s, h};
     {
+        // Two invisible halves, split on the slash: numerator left, denominator
+        // right. Hand-rolled rather than two Ui::dragNumbers because those draw
+        // their own text and this one has to keep drawing "4 / 4" as one string.
+        const Rect numR{sigR.x, sigR.y, sigR.w * 0.5f, sigR.h};
+        const Rect denR{sigR.x + sigR.w * 0.5f, sigR.y, sigR.w * 0.5f, sigR.h};
+        const u64 idN = uiId(1, 20), idD = uiId(1, 21);
+        ui_.setHot(idN, numR);
+        ui_.setHot(idD, denR);
+        const bool hotN = ui_.isHot(idN), hotD = ui_.isHot(idD);
+        const bool live = hotN || hotD || ui_.active == idN || ui_.active == idD;
+
+        // The entry this chip is pointing at. sigAtBar answers "which entry
+        // covers this bar"; its own `bar` is the one setSignature has to be
+        // given, or the drag would fork a new entry off the one it is editing.
+        const SigChange cur = ses_.sigAtBar(pos.bar);
+        const int editBar = cur.bar;
+
+        const auto press = [&](u64 id) {
+            if (in.pressed[0] && ui_.isHot(id)) {
+                ui_.active = id;
+                ui_.dragAccum = 0.f;
+                // The exponent for the denominator, the numerator itself.
+                f64 st = (f64)cur.num;
+                if (id == idD) { int k = 0; while ((1 << k) < cur.den) ++k; st = (f64)k; }
+                ui_.dragStart = st;
+            }
+        };
+        press(idN);
+        press(idD);
+        if (in.released[0] && (ui_.active == idN || ui_.active == idD)) ui_.active = 0;
+
+        if ((ui_.active == idN || ui_.active == idD) && in.dy != 0.f) {
+            const bool den = ui_.active == idD;
+            ui_.dragAccum += -in.dy;                  // drag up = increase
+            // A denominator moves an octave at a time and needs a long throw to
+            // do it; a numerator moves one unit per few pixels, like every other
+            // integer in this bar.
+            const f64 nv = ui_.dragStart + (f64)ui_.dragAccum * (den ? 0.03 : 0.12);
+            int want = (int)std::floor(nv + 0.5);
+            int n = cur.num, d = cur.den;
+            if (den) { want = (int)clampv((i64)want, (i64)0, (i64)5); d = 1 << want; }
+            else     { n = want; }
+            // THE CLAMPS AND THE DEDUPE LIVE IN session.h. setSignature runs
+            // clSigNum / clSigDen / clSigBar and then normalizes, so nothing
+            // here has to know that a denominator is a power of two or that a
+            // second entry at one bar replaces the first.
+            if (clSigNum(n) != cur.num || clSigDen(d) != cur.den) {
+                undoPoint("time signature", ui_.active);
+                ses_.setSignature(editBar, n, d);
+                const SigChange now = ses_.sigAtBar(editBar);
+                char sb[80];
+                if (editBar == 0)
+                    snprintf(sb, sizeof sb, "Time signature %d/%d", now.num, now.den);
+                else
+                    snprintf(sb, sizeof sb, "Time signature %d/%d from bar %d",
+                             now.num, now.den, editBar + 1);
+                status_ = sb;
+            }
+        }
+
         char buf[16];
-        snprintf(buf, sizeof buf, "%d / %d", ses_.sigNum, ses_.sigDen);
-        rend_.roundRect(sigR, 2 * s, pal::panelAlt);
-        rend_.textIn(fBody_, sigR, buf, pal::textDim, Align::Center);
+        snprintf(buf, sizeof buf, "%d / %d", pos.num, pos.den);
+        rend_.roundRect(sigR, 2 * s, live ? pal::slotHover : pal::panelAlt);
+        rend_.textIn(fBody_, sigR, buf, live ? pal::text : pal::textDim, Align::Center);
+        if (live) {
+            ui_.cursor = Cursor::ResizeV;
+            ui_.tip = editBar == 0
+                          ? "Time signature: drag the numerator or the denominator"
+                          : "Time signature from bar " + std::to_string(editBar + 1) +
+                                ": drag to change it";
+        }
     }
     x += sigR.w + 6 * s;
 
@@ -187,12 +351,29 @@ void App::drawControlBar(const Rect& r) {
 
     // --- position readout ---
     {
-        const f64 beat = es_.beat;
-        const int bar_ = (int)std::floor(beat / ses_.sigNum) + 1;
-        const int bt   = (int)std::floor(std::fmod(beat, (f64)ses_.sigNum)) + 1;
-        const int sx   = (int)std::floor(std::fmod(beat, 1.0) * 4.0) + 1;
+        // bar.beat.sixteenth, ONE-BASED. The three numbers come out of the map
+        // (BarPos is 0-based and the readout adds one, exactly as engine.h
+        // specifies), not out of `beat / ses_.sigNum` -- that division is wrong
+        // from the first signature change on, and it is wrong quietly: it keeps
+        // counting, it just counts bars that are not on the ruler.
+        //
+        // In a set with one signature and a denominator of 4 this is
+        // character-for-character what the division produced: sigPosAt reduces to
+        // floor(beat/4), floor(beat mod 4) and floor(frac(beat)*4) there, which
+        // is the pre-change expression term for term.
+        //
+        // OWED, and the reason this reads the session's map rather than the
+        // engine's: Engine already publishes posBar/posBeat/posSixteenth and
+        // posSigNum/posSigDen as atomics, but EngineState -- which is what a
+        // draw is allowed to read (engine_state.h: "nothing else reads an engine
+        // atomic") -- does not carry them yet, and that header belongs to
+        // another agent this wave. The numbers are identical while the publish
+        // above is succeeding, because both sides walk the same map through the
+        // same sigPosAt; the engine's are the better source the moment they are
+        // reachable, since they cannot disagree with what is being played even
+        // if a publication was refused.
         char buf[48];
-        snprintf(buf, sizeof buf, "%d.%d.%d", bar_, bt, sx);
+        snprintf(buf, sizeof buf, "%d.%d.%d", pos.bar + 1, pos.beat + 1, pos.sixteenth + 1);
         Rect posR{x, cy, 92 * s, h};
         rend_.roundRect(posR, 2 * s, pal::appBg);
         rend_.textIn(fBig_, posR, buf, playing ? pal::playGreen : pal::text, Align::Center);
@@ -513,7 +694,10 @@ void App::buildArrangeContext(ArrangeContext& ctx, std::vector<AutoTargets>* tar
     ctx.loopOn    = &ses_.loopOn;
     ctx.playhead  = es_.beat;
     ctx.playing   = es_.playing;
-    ctx.sigNum    = ses_.sigNum;
+    // BORROWED, and rebuilt every frame: `sigs` is a vector the editor below can
+    // grow, and a SigMap kept across frames would be a pointer into a
+    // reallocated buffer the first time it did.
+    ctx.sig       = sigMapOf(ses_);
     ctx.selTrack  = arrSelTrack_;
     ctx.selItem   = arrSelItem_;
 }
@@ -547,6 +731,50 @@ void App::arrangeCommit(ArrangeContext& ctx, u32 changed) {
         status_ = "Back to Arrangement: " + ses_.tracks[(size_t)ctx.backToArrTrack].name;
     }
     if (changed & ArrangeView::Loop) publishTransportCell();
+
+    // THE SIGNATURE EDITOR, half two: the ruler asked for a change at a bar and
+    // this side decides whether that means add or remove, because this side is
+    // the one holding the map.
+    //
+    // Nothing moves in TIME. An arrangement item lives in beats, the loop brace
+    // lives in beats, and both are left exactly where they were -- the only thing
+    // that changes is the bar they are DISPLAYED at, which is the direction
+    // engine.h's whole design note insists the conversion runs in. So there is no
+    // sweep over ses_.tracks here and there must never be one; a "helpful" pass
+    // that renumbered items into their new bars would be the bug this wave is
+    // built to make impossible.
+    if (ctx.sigBar >= 0) {
+        const int bar = clSigBar(ctx.sigBar);
+        const SigChange in_force = ses_.sigAtBar(bar);
+        const bool here = in_force.bar == bar;
+        if (here && bar == 0) {
+            // Bar 0 is refused, and it is refused by session.h -- removeSignature
+            // returns false rather than letting a piece have no signature from
+            // its first bar. Said out loud here only so the user is told why
+            // nothing happened.
+            status_ = "The signature at bar 1 is the set's - it cannot be removed";
+        } else if (here) {
+            undoPoint("remove time signature");
+            ses_.removeSignature(bar);
+            status_ = "Removed the time signature at bar " + std::to_string(bar + 1);
+        } else if ((int)ses_.sigs.size() >= kMaxSigs) {
+            status_ = "Time signature changes: " + std::to_string(kMaxSigs) + " is the limit";
+        } else {
+            // Seeded with the signature already in force, so the bar line does
+            // not jump under the hand that placed the marker; the transport chip
+            // is what changes it, and the locate is what points the chip at it.
+            undoPoint("add time signature");
+            ses_.setSignature(bar, in_force.num, in_force.den);
+            // Sent here rather than through ctx.locateBeat, which was already
+            // read above: the chip edits the entry in force AT THE PLAYHEAD, so
+            // moving the playhead into the new entry is what makes the marker
+            // that was just placed the thing the next drag changes.
+            send(Cmd::Locate, 0, 0, ses_.beatOfBar((f64)bar));
+            status_ = "Time signature " + std::to_string(in_force.num) + "/" +
+                      std::to_string(in_force.den) + " at bar " + std::to_string(bar + 1) +
+                      " - drag the signature in the transport to change it";
+        }
+    }
 
     // The one-shot verbs the mouse asked for. The undo point goes FIRST, because
     // the verb is what moves the model and an entry that already contains the
@@ -663,10 +891,48 @@ bool App::arrangeKey(int verb, const char* what) {
 // publisher -- rather than a test double.
 // ---------------------------------------------------------------------------
 
+// NXTAKT_DEBUG_SIG=<bar>:<num>/<den>[,...] -- the signature map, without a
+// mouse. `0:3/4` re-bars the whole set; `0:4/4,8:7/8,12:3/4` puts two changes on
+// the timeline. It rides debugSeedArrangement rather than being its own hook
+// because that is the function this file already spends on "get the arrangement
+// into a state a screenshot can look at", and because the two are almost always
+// wanted together.
+//
+// It drives the REAL path: Session::setSignature, which clamps and normalizes,
+// and then the ordinary per-frame publish in drawControlBar. Nothing here writes
+// ses_.sigs directly, so a map this hook produces is exactly a map the editor
+// could have produced.
+static void applyDebugSignatures(Session& s, const char* spec) {
+    int applied = 0;
+    for (const char* p = spec; *p;) {
+        int bar = 0, num = 0, den = 0, used = 0;
+        if (std::sscanf(p, " %d : %d / %d%n", &bar, &num, &den, &used) == 3 && used > 0) {
+            s.setSignature(bar, num, den);
+            ++applied;
+            p += used;
+        } else {
+            LOGW("NXTAKT_DEBUG_SIG: cannot read \"%s\" (want <bar>:<num>/<den>)", p);
+            break;
+        }
+        while (*p == ',' || *p == ' ') ++p;
+    }
+    if (!applied) return;
+    // Re-derived from the map rather than echoed back, which is the point of
+    // printing it: it is what NORMALIZED, and it is what the engine will be
+    // handed. A screenshot cannot read a bar line's beat; this line can.
+    LOGI("NXTAKT_DEBUG_SIG: %d change(s) -> %zu entries", applied, s.sigs.size());
+    for (size_t i = 0; i < s.sigs.size(); ++i)
+        LOGI("  sig %zu  bar %d (bar %d as printed)  %d/%d  beat %.4f  beatOfBar %.4f",
+             i, s.sigs[i].bar, s.sigs[i].bar + 1, s.sigs[i].num, s.sigs[i].den,
+             s.sigs[i].beat, s.beatOfBar((f64)s.sigs[i].bar));
+}
+
 void App::debugSeedArrangement() {
     if (arrDebugSeeded_) return;
     const char* want = env("DEBUG_ARRANGE");
-    if (!want) return;
+    const char* sig  = env("DEBUG_SIG");
+    const char* sedit = env("DEBUG_SIGEDIT");
+    if (!want && !sig && !sedit) return;
     arrDebugSeeded_ = true;
 
     // The view switch comes FIRST and unconditionally: this hook is the only
@@ -675,6 +941,45 @@ void App::debugSeedArrangement() {
     view_ = MainView::Arrangement;
     showDetail_ = true;
     detailTab_ = DetailTab::Clip;
+
+    if (sig) {
+        applyDebugSignatures(ses_, sig);
+        // Locate into the LAST entry, so debugSignatureCheck's read-back proves
+        // the engine walked the whole map and not merely that it got entry 0.
+        // A map with one entry is already proven at beat 0.
+        if (ses_.sigs.size() > 1) {
+            const f64 b = ses_.beatOfBar((f64)ses_.sigs.back().bar);
+            send(Cmd::Locate, 0, 0, b);
+            LOGI("NXTAKT_DEBUG_SIG: located to beat %.4f, bar %d", b,
+                 ses_.sigs.back().bar + 1);
+        }
+    }
+    // NXTAKT_DEBUG_SIGEDIT=<bar> -- the RULER'S editor, without a right-click.
+    //
+    // It goes through ctx.sigBar and App::arrangeCommit, which is the whole of
+    // the path a right-click takes once ArrangeView has turned a pixel into a
+    // bar: the same add/remove decision, the same undo points, the same locate,
+    // the same clamps in session.h. Only the hit test is skipped, and a hit test
+    // is the one part of this a screenshot could have checked anyway.
+    //
+    // Three toggles, so both verbs run: add, remove, add. The set is left with
+    // the change in place, which is what the screenshot is for.
+    if (const char* se = env("DEBUG_SIGEDIT")) {
+        int bar = 0;
+        std::sscanf(se, "%d", &bar);
+        for (int pass = 0; pass < 3; ++pass) {
+            ArrangeContext ctx;
+            buildArrangeContext(ctx, nullptr);
+            ctx.sigBar = bar;
+            arrangeCommit(ctx, ArrangeView::None);
+            const SigChange at = ses_.sigAtBar(bar);
+            LOGI("NXTAKT_DEBUG_SIGEDIT: toggle %d at bar %d -> %s (%zu entries, %d/%d there)",
+                 pass + 1, bar + 1,
+                 at.bar == bar ? "a change is there" : "no change there",
+                 ses_.sigs.size(), at.num, at.den);
+        }
+    }
+    if (!want) return;
 
     int t = 0;
     std::sscanf(want, "%d", &t);

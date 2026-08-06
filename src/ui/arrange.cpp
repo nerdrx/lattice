@@ -296,6 +296,22 @@ u32 ArrangeView::draw(Ui& ui, const Rect& r, ArrangeContext& ctx) {
         moved_ = true;              // the brace is not an edit to any lane
         ui.active = rulerId;
     }
+    // THE SIGNATURE EDITOR, half one: right-click on the ruler adds a change at
+    // the bar under the cursor, or removes the one already there. The NEAREST
+    // bar line and not the bar the cursor is inside -- a signature change is a
+    // thing that sits on a bar line, and "the bar I clicked in" would make the
+    // right half of every bar unable to reach the line on its right.
+    //
+    // Right-click, because both of the left button's jobs on this ruler are
+    // already spoken for (a click locates, a drag is the loop brace) and because
+    // it is the button this program already spends on "the other verb" -- a
+    // right-click deletes an item in the lanes below.
+    if (in.pressed[2] && hotRuler && drag_ == Drag::None) {
+        const f64 cb = std::max(0.0, (f64)xToBeat(ta, in.mx));
+        i64 bar = (i64)std::floor(ctx.sig.barOfBeat(cb) + 0.5);
+        ctx.sigBar = bar < 0 ? 0 : bar;
+    }
+
     if (drag_ == Drag::Loop) {
         if (!in.down[0]) {
             if (!loopMoved_) ctx.locateBeat = loopAnchor_;
@@ -320,7 +336,29 @@ u32 ArrangeView::draw(Ui& ui, const Rect& r, ArrangeContext& ctx) {
     if (ui.fSmall)
         drawRulerLabels(rr, *ui.fSmall, ta, ruler.x, ruler.right(),
                         ruler.y + (ruler.h - ui.fSmall->height()) * 0.5f, s,
-                        pal::textDim, pal::textFaint, ctx.sigNum, 44.f * s);
+                        pal::textDim, pal::textFaint, ctx.sig, 44.f * s);
+    // The signature markers. Drawn ONLY for a map that has more than one entry,
+    // which is not a shortcut: a set in one signature has nothing to mark -- the
+    // control bar already says what it is -- and a tag on bar 1 of every existing
+    // set would be a change to a ruler this wave promised not to change.
+    //
+    // Over the bar number rather than beside it, because at the bar a signature
+    // starts, "7/8" is the more useful of the two things that want that space.
+    if (ui.fSmall && ctx.sig.count() > 1) {
+        for (int i = 0; i < ctx.sig.count(); ++i) {
+            const RtSig sg = ctx.sig.entry(i);
+            const f32 mx = beatToX(ta, ctx.sig.beatOfBar((f64)sg.bar));
+            if (mx < ruler.x - 40.f * s || mx > ruler.right()) continue;
+            char buf[24];
+            std::snprintf(buf, sizeof buf, "%d/%d", sg.num, sg.den);
+            const f32 tw = ui.fSmall->measure(buf);
+            const Rect tag{mx + 1.f * s, ruler.y + 3.f * s,
+                           tw + 7.f * s, ruler.h - 6.f * s};
+            rr.roundRect(tag, 2.f * s, pal::accent.alpha(0.85f));
+            rr.textIn(*ui.fSmall, tag, buf, pal::textOnClip, Align::Center, 0.f);
+            rr.rect({mx, ruler.y, 1.f * s, ruler.h}, pal::accentHi);
+        }
+    }
     // The brace. A disabled loop still remembers where it was (session.h), so
     // it is drawn faintly rather than not at all: a brace that vanished when it
     // was switched off would make the toggle look like it erased something.
@@ -348,7 +386,7 @@ u32 ArrangeView::draw(Ui& ui, const Rect& r, ArrangeContext& ctx) {
     // --- the lanes ---------------------------------------------------------
     rr.pushClip(lanes);
     rr.rect(lanes, pal::appBg);
-    drawTimeGrid(rr, ta, lanes, s, ctx.sigNum, kArrMinGridPx * s);
+    drawTimeGrid(rr, ta, lanes, s, ctx.sig, kArrMinGridPx * s);
     // Past the loop end is still editable, so it is NOT dimmed the way the roll
     // dims past a clip's length: an arrangement has no end until something is
     // put there.
@@ -360,7 +398,7 @@ u32 ArrangeView::draw(Ui& ui, const Rect& r, ArrangeContext& ctx) {
         if (band.bottom() < lanes.y || band.y > lanes.bottom()) continue;
 
         rr.rect(band, (i % 2) ? pal::appBg.scale(1.10f) : pal::appBg);
-        drawTimeGrid(rr, ta, band, s, ctx.sigNum, kArrMinGridPx * s);
+        drawTimeGrid(rr, ta, band, s, ctx.sig, kArrMinGridPx * s);
         rr.rect({band.x, band.bottom() + row.autoH, band.w, 1.f * s}, pal::divider);
 
         if (!L.items) continue;
@@ -496,7 +534,7 @@ u32 ArrangeView::draw(Ui& ui, const Rect& r, ArrangeContext& ctx) {
 
             rr.rect(lr, pal::panel.scale(0.72f));
             rr.pushClip(lr.intersect(lanes));
-            drawTimeGrid(rr, ta, lr, s, ctx.sigNum, kArrMinGridPx * s);
+            drawTimeGrid(rr, ta, lr, s, ctx.sig, kArrMinGridPx * s);
             AutoLaneView& v = views[j];
             v.setId(uiId(25, (int)i, (int)j));
             v.prune((int)al.points.size());

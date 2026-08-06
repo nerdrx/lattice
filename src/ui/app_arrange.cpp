@@ -24,6 +24,7 @@
 //
 #include "app.h"
 #include "app_internal.h"
+#include "arrange.h"      // syncSignatures / reapSignatures / dropSignatures
 #include "arrtake.h"
 #include <algorithm>
 #include <cmath>
@@ -800,7 +801,124 @@ bool App::reapArrangementEvent(const Event& e) {
         freeBlock(old);
         return true;
     }
+    if (e.type == Ev::SigsRetired) return reapSignatures(e.p);
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// THE SIGNATURE MAP (session.h, publishSignatures) -- the seventh instance of
+// the RtNote retirement protocol, and the shortest, because the map is ONE flat
+// array and there is therefore exactly one pointer to talk about.
+//
+// It rides reapArrangementEvent() -- the one line pumpEngineEvents() already
+// spends on this file -- so wiring it cost no edit to a file this wave does not
+// own. That is not a trick: Ev::SigsRetired is a retirement of GUI-owned memory
+// announced by the audio thread, which is precisely what that reaper is, and
+// putting it anywhere else would have meant a second place that knows the rule.
+//
+// The state is file-static rather than a member of App for the reason
+// arrange.h states over the declarations: this wave cannot edit app.h. Nothing
+// about it is thread-shared -- the GUI thread publishes, the GUI thread reaps.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct SigPub {
+    // What the engine is holding right now, and what it was built from. The
+    // model copy is what makes syncSignatures a no-op on the frames -- almost
+    // all of them -- where nothing about the signatures moved.
+    const RtSig*              published = nullptr;
+    std::vector<SigChange>    last;
+    bool                      haveLast = false;
+    // Displaced arrays the audio thread may still be reading. Freed when their
+    // Ev::SigsRetired arrives and NOT BEFORE.
+    std::vector<const RtSig*> retiring;
+    int reaped = 0;                       // for the headless hook only
+
+    // Static storage duration, so this runs after main() has returned and
+    // therefore long after EngineHandle::close() joined the audio thread --
+    // which is the only moment freeing an array the engine was borrowing is
+    // safe without its handshake, and the same argument App::shutdown() makes
+    // for the chains and the note arrays. It exists so a leak checker has
+    // nothing to report; every free it does is of memory this file allocated.
+    ~SigPub() {
+        delete[] published;
+        for (const RtSig* p : retiring) delete[] p;
+    }
+};
+
+SigPub g_sigs;
+
+} // namespace
+
+void syncSignatures(Engine& eng, const Session& s) {
+    // Normalize a copy and compare. The comparison is against the NORMALIZED
+    // form and not against `s.sigs`, because that is what was published: a set
+    // whose map has never been normalized (a fresh Session, a parser that only
+    // appends) would otherwise republish on every frame forever.
+    const std::vector<SigChange> want = normalizedSigMap(s.sigs, s.sigNum, s.sigDen);
+    if (g_sigs.haveLast && g_sigs.last.size() == want.size()) {
+        bool same = true;
+        for (size_t i = 0; i < want.size() && same; ++i)
+            same = g_sigs.last[i].bar == want[i].bar &&
+                   g_sigs.last[i].num == want[i].num &&
+                   g_sigs.last[i].den == want[i].den;
+        if (same) return;
+    }
+    // publishSignatures does its own normalize -- deliberately, so no caller can
+    // hand the engine a map that skipped it -- and returns the array it pushed,
+    // or null having pushed nothing. A null is a FULL RING or a failed
+    // allocation, not an error: `last` is left alone, so the next frame tries
+    // again with the same map, which is what flushPending does for clips.
+    const RtSig* fresh = publishSignatures(eng, s);
+    if (!fresh) return;
+    // The engine announces a REPLACED array, and only when it differs from the
+    // incoming one; an array that will never be announced must not be queued for
+    // a retirement that will never arrive. publishNotes verbatim.
+    if (g_sigs.published && g_sigs.published != fresh)
+        g_sigs.retiring.push_back(g_sigs.published);
+    g_sigs.published = fresh;
+    g_sigs.last = want;
+    g_sigs.haveLast = true;
+}
+
+bool reapSignatures(const void* p) {
+    const RtSig* old = (const RtSig*)p;
+    if (!old) return true;
+    // The array the engine currently holds can also come back: a map it REFUSED
+    // (sigMapValid said no) is handed straight back in the same sweep while
+    // `published` still points at it. Clearing the pointer first is what stops
+    // the destructor above from freeing it a second time.
+    if (g_sigs.published == old) {
+        g_sigs.published = nullptr;
+        g_sigs.haveLast = false;      // the engine kept its old map; republish
+        delete[] old;
+        ++g_sigs.reaped;
+        return true;
+    }
+    auto it = g_sigs.retiring.begin();
+    for (; it != g_sigs.retiring.end(); ++it) if (*it == old) break;
+    if (it == g_sigs.retiring.end()) {
+        LOGW("SigsRetired for an unknown map %p - leaking it rather than freeing "
+             "a pointer we do not own", (const void*)old);
+        return true;
+    }
+    g_sigs.retiring.erase(it);
+    delete[] old;
+    ++g_sigs.reaped;
+    return true;
+}
+
+int sigsInFlight() { return (int)g_sigs.retiring.size(); }
+int sigsReaped()   { return g_sigs.reaped; }
+
+void dropSignatures() {
+    delete[] g_sigs.published;
+    g_sigs.published = nullptr;
+    for (const RtSig* p : g_sigs.retiring) delete[] p;
+    g_sigs.retiring.clear();
+    g_sigs.last.clear();
+    g_sigs.haveLast = false;
 }
 
 // ---------------------------------------------------------------------------

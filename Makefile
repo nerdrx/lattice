@@ -235,14 +235,29 @@ build/internal_device_test: tests/internal_device_test.cpp src/plugin/host.cpp \
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(shell pkg-config --libs lilv-0) -ldl
 
+# The view's bar grid against the engine's own bar arithmetic. Worth its own
+# binary rather than folding into engine_test: the property under test is that
+# two INDEPENDENT pieces of code agree -- every bar line the arrangement ruler
+# draws is a downbeat the engine would play -- so it has to link the view's
+# time axis and the engine together and assert they cannot diverge. Bars stopped
+# being uniform when signature changes landed, which is exactly when a drawn
+# grid and a played one become able to disagree silently.
+build/timesig_view_test: tests/timesig_view_test.cpp src/audio/engine.cpp \
+                         src/audio/sample.cpp src/core/common.cpp \
+                         src/plugin/host.cpp src/plugin/lv2_host.cpp \
+                         src/plugin/clap_host.cpp src/plugin/internal_devices.cpp
+	@mkdir -p build
+	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS) -ldl
+
 # Full headless check: engine unit tests, then a real render that must not be
 # silent, then a plugin scan.
 test: build/engine_test build/ipc_test build/daemon_test build/internal_device_test \
-      build/render build/gen_demo build/plugin_scan
+      build/timesig_view_test build/render build/gen_demo build/plugin_scan
 	./build/engine_test
 	./build/ipc_test
 	./build/daemon_test
 	./build/internal_device_test
+	./build/timesig_view_test
 	./build/gen_demo /tmp/nxtakt-selftest >/dev/null
 	./build/render /tmp/nxtakt-selftest/demo.lattice /tmp/nxtakt-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3

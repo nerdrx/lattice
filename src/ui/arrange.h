@@ -72,7 +72,12 @@ struct ArrangeContext {
     bool* loopOn    = nullptr;
     f64   playhead  = 0.0;
     bool  playing   = false;
-    int   sigNum    = 4;
+    // The signature map, BORROWED from the session (timeaxis.h). It replaced a
+    // plain `int sigNum`, and the replacement is the whole point of this wave:
+    // one number can only describe a set whose bars are all the same width, so a
+    // ruler holding one had no way to be wrong and no way to be right either.
+    // Still a plain value the view may only read -- no Session crosses the seam.
+    SigMap sig;
     // The selected item, as a (track, item uid) pair -- uid and not index,
     // because an insert renumbers indices between frames and a stale index is a
     // wrong-clip edit. Owned by the caller so the detail panel can read it.
@@ -93,6 +98,14 @@ struct ArrangeContext {
     f64  locateBeat = -1.0;
     // >= 0: this track's override tint was clicked and wants Back to Arrangement.
     int  backToArrTrack = -1;
+    // >= 0: the ruler was right-clicked at this BAR and wants the signature
+    // change there added, or -- if one is already there -- removed. The view
+    // reports the bar and not the verb: add and remove are both edits to a map
+    // it does not have, the clamps and the dedupe live in session.h, and a view
+    // that decided which one it was would have had to keep its own copy of the
+    // map to decide with. Bar 0 is reported like any other; the caller refuses
+    // to remove it, because Session::removeSignature does.
+    i64  sigBar = -1;
     // A drag in flight from elsewhere in the app (the browser, the session
     // grid). The caller sets `dropActive`; the view answers with where it was
     // let go, and the caller decides what to put there -- the view knows
@@ -222,5 +235,70 @@ private:
     const char* lastEdit_ = "arrangement edit";
     const char* pendingEdit_ = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// PUBLISHING THE SIGNATURE MAP  (session.h, publishSignatures)
+//
+// A set that never publishes plays in 4/4 no matter what the ruler draws, which
+// is the one thing about this wave that must not go silently wrong -- so these
+// three are declared where both callers can see them rather than left to a call
+// site somebody has to remember.
+//
+// WHERE THE STATE LIVES, and why not on App. The published pointer, the arrays
+// still in flight and the last map published are App's business by every other
+// precedent in this program (publishedNotes_/retiringNotes_, warpMaps_). They
+// are file-static in app_arrange.cpp instead because this wave does not own
+// app.h -- exactly the reason warpMaps_ spent a wave in a translation unit
+// before it moved, and the same note applies: this belongs on App and should go
+// there the moment one agent owns both files.
+//
+// GUI THREAD ONLY, like everything else in src/ui.
+// ---------------------------------------------------------------------------
+
+// The session's map, as a view sees it. ONE place, so a ruler, a readout and a
+// grid cannot end up holding three differently-built views of the same vector --
+// and one place for the rule that an EMPTY `sigs` is not "4/4" but "one entry,
+// sigNum/sigDen, at bar 0", which is what a set that has never been re-barred
+// and every v1..v6 file mean (session.h says the same over Session::sigAtBar).
+inline SigMap sigMapOf(const Session& s) {
+    SigMap m;
+    m.v     = s.sigs.empty() ? nullptr : s.sigs.data();
+    m.n     = (int)s.sigs.size();
+    m.fbNum = s.sigNum;
+    m.fbDen = s.sigDen;
+    return m;
+}
+
+// Publish `s`'s map if it differs from the one last published, and do nothing at
+// all if it does not. Called once per frame from the control bar -- which is
+// drawn unconditionally and first -- so a load, an undo, a redo and every
+// signature edit are all covered by one call site and none of them can be
+// forgotten. A publication the ring refuses is simply retried next frame.
+void syncSignatures(Engine& eng, const Session& s);
+
+// Ev::SigsRetired. Returns true when `p` was an array we published and have now
+// freed, false when it is not one of ours -- in which case the caller must leak
+// it rather than free a pointer nobody here owns, which is the rule every other
+// retirement in this program follows.
+bool reapSignatures(const void* p);
+
+// Everything still held, freed. Safe ONLY once the audio thread is joined, i.e.
+// after EngineHandle::close(), beside App::shutdown()'s existing sweep over the
+// chains and the note arrays.
+//
+// NOT CALLED YET, and deliberately so rather than by omission: App::shutdown()
+// is in app.cpp, which this wave does not own. Nothing leaks meanwhile -- the
+// owning object has static storage duration and frees in its destructor, which
+// runs after main() returns and therefore after the audio thread is long gone,
+// and a leak checker sees nothing. This is the tidier place for it and the one
+// line App::shutdown() is owed.
+void dropSignatures();
+
+// How many displaced arrays are still waiting for their Ev::SigsRetired, and how
+// many have come home. For the headless hook only: a retirement protocol that
+// publishes and never reaps looks exactly like one that works, until the leak
+// checker or the machine runs out of memory hours later.
+int  sigsInFlight();
+int  sigsReaped();
 
 } // namespace lat
