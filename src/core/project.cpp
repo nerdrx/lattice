@@ -94,7 +94,26 @@ namespace {
 // word that was read so a re-save preserves it. Load-and-save flips the header
 // to the new spelling, and that is the only thing it flips. See
 // kHeaderWord/isHeaderWord below.
-constexpr int kFormatVersion = 6;
+// Version 7 adds time-signature CHANGES, and adds them to the line that was
+// already there. `sig` gains a three-token form:
+//
+//     sig 4 4          the session signature, at bar 0 -- v1's line, unchanged
+//     sig 16 3 4       from bar 16 on, 3/4
+//     sig 24 7 8       from bar 24 on, 7/8
+//
+// The two-token form is bar 0 and stays the canonical spelling for it, which is
+// the whole reason the bar was appended to the FRONT of the new form rather than
+// the back: a set in one signature -- which is every set that exists -- writes
+// the identical byte sequence it wrote at v6, so the v6 -> v7 diff for it is
+// exactly the header line. Later changes are sparse in the way everything above
+// is sparse: no changes, no extra lines.
+//
+// Denominators are powers of two in 1..32 and numerators are 1..32
+// (clSigNum/clSigDen in session.h, applied on save and on load like every other
+// clamp here). Changes are sorted and deduplicated on load, last-wins, by
+// Session::normalizeSigs -- the same normalizer every edit and the publisher
+// use, so a hand-written file and an edited one cannot land in different shapes.
+constexpr int kFormatVersion = 7;
 constexpr int kMinFormatVersion = 1;
 
 // What saveProject writes. Reading accepts this and every spelling in
@@ -187,7 +206,10 @@ f64 clTempo(f64 t)      { return clampv(t, 20.0, 999.0); }
 f64 clSceneTempo(f64 t) { return t <= 0.0 ? 0.0 : clampv(t, 20.0, 999.0); }
 f64 clBpm(f64 t)        { return clampv(t, 1.0, 9999.0); }
 f64 clBeats(f64 b)      { return clampv(b, 0.0, 1e7); }
-int clSig(int v)        { return clampv(v, 1, 64); }
+// The signature clamps live in session.h beside the map they constrain
+// (clSigNum / clSigDen / clSigBar), because the editor and the publisher need
+// exactly the same ones and a second copy here would be a second answer to
+// "what is a legal denominator".
 int clQuantum(int v)    { return clampv(v, 0, kQuantumCount - 1); }
 int clClipQuantum(int v){ return clampv(v, -1, kQuantumCount - 1); }
 int clColor(int v)      { return clampv(v, 0, 255); }
@@ -1128,7 +1150,20 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
 
     o += std::string(kHeaderWord) + " " + std::to_string(kFormatVersion) + "\n";
     kn(o, "", "tempo",     fmtF64(clTempo(s.tempo)));
-    kn(o, "", "sig",       std::to_string(clSig(s.sigNum)) + " " + std::to_string(clSig(s.sigDen)));
+    // The signature map, written from a NORMALIZED copy rather than from the
+    // model as it stands: saving must not depend on whether the caller
+    // remembered to normalize, and the sorted/deduped/clamped form is the only
+    // one that round-trips. Bar 0 keeps the two-token spelling every version
+    // since 1 has used -- that identity is what makes the v6 -> v7 diff for a
+    // set with no changes exactly the header line -- and each later change adds
+    // one three-token line.
+    {
+        const std::vector<SigChange> m = normalizedSigMap(s.sigs, s.sigNum, s.sigDen);
+        kn(o, "", "sig", std::to_string(m[0].num) + " " + std::to_string(m[0].den));
+        for (size_t i = 1; i < m.size(); ++i)
+            kn(o, "", "sig", std::to_string(m[i].bar) + " " +
+                             std::to_string(m[i].num) + " " + std::to_string(m[i].den));
+    }
     kn(o, "", "quantum",   std::to_string(clQuantum(s.quantumIdx)));
     kn(o, "", "metronome", s.metronome ? "1" : "0");
     // Always written, unlike the per-entity uids: the counter is what keeps
@@ -1316,9 +1351,32 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 f64 v; if (!sc.num(v)) return fail("tempo: expected a number");
                 out.tempo = clTempo(v);
             } else if (key == "sig") {
-                int n = 0, d = 0;
-                if (!sc.integer(n) || !sc.integer(d)) return fail("sig: expected two integers");
-                out.sigNum = clSig(n); out.sigDen = clSig(d);
+                // Two shapes on one key, told apart by COUNT: `sig <num> <den>`
+                // is bar 0 and `sig <bar> <num> <den>` is a change. That needs
+                // exhausted(), for the same reason `pt` needs it -- "absent" and
+                // "present but not a number" are different answers and strtoll
+                // cannot tell them apart. A trailing token that is not an
+                // integer, or a fourth one, is STRUCTURE and is refused; the
+                // three numbers themselves are values and are clamped.
+                i64 a = 0, b = 0, c = 0;
+                if (!sc.integer(a) || !sc.integer(b))
+                    return fail("sig: expected '<num> <den>' or '<bar> <num> <den>'");
+                bool three = false;
+                if (!sc.exhausted()) {
+                    if (!sc.integer(c))
+                        return fail("sig: expected '<num> <den>' or '<bar> <num> <den>'");
+                    three = true;
+                }
+                if (!sc.exhausted()) return fail("sig: too many values");
+                SigChange sg{};
+                sg.bar = three ? clSigBar(a) : 0;
+                sg.num = clSigNum((int)clampv(three ? b : a, (i64)INT32_MIN, (i64)INT32_MAX));
+                sg.den = clSigDen((int)clampv(three ? c : b, (i64)INT32_MIN, (i64)INT32_MAX));
+                // Appended, not resolved: normalizeSigs() below sorts, dedupes
+                // last-wins and rebases, so the order lines appear in a
+                // hand-edited file is the only thing that decides a tie and the
+                // parser stays a parser.
+                out.sigs.push_back(sg);
             } else if (key == "quantum") {
                 int v; if (!sc.integer(v)) return fail("quantum: expected an integer");
                 out.quantumIdx = clQuantum(v);
@@ -1718,6 +1776,14 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         for (int i = 0; i < kMaxScenes; ++i)
             if (clipOccupied(t.slots[i]) && (size_t)i + 1 > need) need = (size_t)i + 1;
     if (need > out.scenes.size()) out.scenes.resize(need);
+
+    // The signature map, sorted, deduplicated last-wins, guaranteed an entry at
+    // bar 0 and rebased. A v1..v6 file mentions no changes and comes out with
+    // the single entry its `sig` line (or its absence) says, which is what makes
+    // the whole of this feature invisible to every set that predates it. Also
+    // where sigNum/sigDen get their value: the parser only ever appends, so the
+    // mirror is set here, once, from the map.
+    out.normalizeSigs();
 
     out.path = path;
     s = std::move(out);

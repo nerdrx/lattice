@@ -6636,6 +6636,503 @@ static void testArrangementRecording() {
 }
 
 // ---------------------------------------------------------------------------
+// 37. time signatures
+//
+// The map converts beats to bars and never the other way round, so every test
+// here is one of two shapes: "this beat is in this bar" (the conversions, the
+// metronome, the quantum) or "this beat did not move" (the item, the brace).
+// ---------------------------------------------------------------------------
+
+static RtSig sigEntry(int bar, int num, int den) {
+    RtSig s; s.bar = bar; s.num = num; s.den = den; return s;
+}
+// The publisher's job, done the way session.h does it: one array, rebased.
+static RtSig* mkSigMap(const std::vector<RtSig>& in) {
+    RtSig* a = new RtSig[in.size()];
+    for (size_t i = 0; i < in.size(); ++i) a[i] = in[i];
+    sigMapRebase(a, (int)in.size());
+    return a;
+}
+static void pushSigs(Host& h, const RtSig* a, int n) {
+    Command c; c.type = Cmd::SetSignatures; c.a = n; c.p = (void*)a;
+    h.e.pushCommand(c);
+}
+// The arithmetic every build before signatures used, kept here so the general
+// path can be held against it rather than against a hand-copied table.
+static f64 legacyQuantum(f64 from, f64 q) { return std::ceil(from / q - 1e-9) * q; }
+
+// Metronome strikes, recovered from the rendered output. A burst is 30 ms of a
+// decaying sine at 1600 Hz (downbeat) or 800 Hz (everything else), so counting
+// sign changes over the first 10 ms separates them two to one -- 32 against 16 --
+// with no threshold anywhere near either number.
+struct MetTick { i64 frame; bool accent; };
+static std::vector<MetTick> metTicks(const std::vector<f32>& v) {
+    const i64 burst = (i64)(0.03 * kSR);
+    std::vector<MetTick> out;
+    for (size_t i = 0; i < v.size();) {
+        if (std::fabs(v[i]) <= 1e-6f) { ++i; continue; }
+        int cross = 0;
+        f32 last = 0.f;
+        for (size_t j = i; j < i + 480 && j < v.size(); ++j) {
+            if (v[j] == 0.f) continue;
+            if (last != 0.f && ((last < 0.f) != (v[j] < 0.f))) ++cross;
+            last = v[j];
+        }
+        // The first sample of a burst is sin(0) == 0, so the detected onset is
+        // one frame late; report the strike itself.
+        out.push_back({(i64)i - 1, cross > 24});
+        i += (size_t)burst;
+    }
+    return out;
+}
+
+// --- a. beat <-> bar, both directions, including exactly on a change ------
+static void sigConversions() {
+    // 4/4 from bar 0, 3/4 from bar 4, 7/8 from bar 8, back to 4/4 at bar 12.
+    // Bar starts: 0, 16, 16+12 = 28, 28+14 = 42.
+    RtSig* m = mkSigMap({sigEntry(0, 4, 4), sigEntry(4, 3, 4),
+                         sigEntry(8, 7, 8), sigEntry(12, 4, 4)});
+    const int n = 4;
+
+    CHECK(sigMapValid(m, n), "a rebased map validates");
+    CHECK(m[0].beat == 0.0 && m[1].beat == 16.0 && m[2].beat == 28.0 && m[3].beat == 42.0,
+          "sigMapRebase sums the bar lengths ahead of each change "
+          "(0, %.1f, %.1f, %.1f)", m[1].beat, m[2].beat, m[3].beat);
+
+    struct { f64 bar, beat; } fwd[] = {
+        {0, 0}, {2, 8}, {4, 16}, {6, 22}, {8, 28}, {10, 35}, {12, 42}, {16, 58},
+        {2.5, 10}, {9.5, 33.25},
+    };
+    for (auto& c : fwd)
+        CHECK(std::fabs(sigBeatOfBar(m, n, c.bar) - c.beat) < 1e-12,
+              "bar %.2f begins on beat %.4f (%.4f)", c.bar, c.beat,
+              sigBeatOfBar(m, n, c.bar));
+
+    // The inverse, on the same points, and then as a round trip over a sweep --
+    // one direction being right is not the same claim as the two agreeing.
+    for (auto& c : fwd)
+        CHECK(std::fabs(sigBarOfBeat(m, n, c.beat) - c.bar) < 1e-12,
+              "beat %.4f is bar %.2f (%.4f)", c.beat, c.bar, sigBarOfBeat(m, n, c.beat));
+    {
+        f64 worst = 0.0;
+        for (int i = 0; i <= 4000; ++i) {
+            const f64 b = (f64)i * 0.0175;                 // through every entry
+            const f64 rt = sigBeatOfBar(m, n, sigBarOfBeat(m, n, b));
+            worst = std::max(worst, std::fabs(rt - b));
+        }
+        CHECK(worst < 1e-9, "beat -> bar -> beat is the identity over 4001 beats "
+                            "(worst %.3g)", worst);
+    }
+
+    // EXACTLY on a change, and one ulp either side of it. The boundary belongs
+    // to the NEW signature: bar 4 is the first bar of 3/4, and beat 16 is bar 4.
+    {
+        const BarPos on   = sigPosAt(m, n, 16.0);
+        const BarPos just = sigPosAt(m, n, std::nextafter(16.0, 0.0));
+        CHECK(on.bar == 4 && on.beat == 0 && on.num == 3 && on.den == 4,
+              "beat 16 is bar 4 beat 0, and bar 4 is in 3/4 (bar %d beat %d, %d/%d)",
+              on.bar, on.beat, on.num, on.den);
+        CHECK(just.bar == 3 && just.beat == 3 && just.num == 4 && just.den == 4,
+              "one ulp earlier is still the last beat of bar 3 in 4/4 "
+              "(bar %d beat %d, %d/%d)", just.bar, just.beat, just.num, just.den);
+    }
+    {
+        const BarPos p = sigPosAt(m, n, 29.25);
+        CHECK(p.bar == 8 && p.beat == 2 && p.sixteenth == 1 && p.num == 7 && p.den == 8,
+              "beat 29.25 is bar 8, eighth 2, sixteenth 1 of 7/8 "
+              "(bar %d beat %d s%d)", p.bar, p.beat, p.sixteenth);
+        CHECK(p.unit == 0.5 && p.barStart == 28.0,
+              "a 7/8 unit is half a beat and the bar began at 28 (%.3f, %.3f)",
+              p.unit, p.barStart);
+    }
+    {
+        const BarPos p = sigPosAt(m, n, 41.9);
+        CHECK(p.bar == 11 && p.beat == 6,
+              "beat 41.9 is the last eighth of the last 7/8 bar (bar %d beat %d)",
+              p.bar, p.beat);
+        const BarPos q = sigPosAt(m, n, 42.0);
+        CHECK(q.bar == 12 && q.beat == 0 && q.num == 4,
+              "and beat 42 is the downbeat of bar 12, back in 4/4 (bar %d beat %d, %d/%d)",
+              q.bar, q.beat, q.num, q.den);
+    }
+
+    // Past the last change the last signature runs forever, and below bar 0 it
+    // extrapolates backwards -- which is not a curiosity: the metronome asks
+    // about the sample before beat zero and has to be told "the bar before this".
+    CHECK(sigPosAt(m, n, 58.0).bar == 16, "the last entry runs on past its own bar");
+    CHECK(sigPosAt(m, n, -0.001).bar == -1, "and bar -1 exists, so beat 0 is a crossing");
+
+    // An empty map is 4/4 everywhere, expression for expression.
+    CHECK(sigPosAt(nullptr, 0, 9.5).bar == 2 && sigPosAt(nullptr, 0, 9.5).beat == 1 &&
+          sigBeatOfBar(nullptr, 0, 7.0) == 28.0 && sigBarOfBeat(nullptr, 0, 28.0) == 7.0,
+          "no map is plain 4/4 in every direction");
+
+    // What the engine refuses. Each of these would put a bar line somewhere the
+    // publisher's own numbers do not.
+    {
+        RtSig bad[2] = {sigEntry(1, 4, 4), sigEntry(2, 4, 4)};
+        CHECK(!sigMapValid(bad, 2), "a map that does not start at bar 0 is refused");
+        RtSig unsorted[2] = {sigEntry(0, 4, 4), sigEntry(0, 3, 4)};
+        sigMapRebase(unsorted, 2);
+        CHECK(!sigMapValid(unsorted, 2), "two entries at one bar are refused");
+        RtSig lied[2] = {sigEntry(0, 4, 4), sigEntry(4, 3, 4)};
+        sigMapRebase(lied, 2);
+        lied[1].beat = 99.0;
+        CHECK(!sigMapValid(lied, 2),
+              "and a derived beat that does not follow from the bars before it is "
+              "refused rather than believed");
+        RtSig odd[1] = {sigEntry(0, 4, 3)};
+        CHECK(!sigMapValid(odd, 1), "a denominator that is not a power of two is refused");
+        RtSig wide[1] = {sigEntry(0, 33, 4)};
+        CHECK(!sigMapValid(wide, 1), "and a numerator past kSigNumMax is refused");
+        CHECK(!sigMapValid(nullptr, 0), "an empty map is not a map");
+    }
+    delete[] m;
+}
+
+// --- b. the metronome accents the bar, whatever a bar is -----------------
+static void sigMetronome() {
+    // 3/4: a strike every beat, accented every third. 120 BPM, so a beat is
+    // kBeat120 frames and a bar is three of them.
+    {
+        Host h; h.init();
+        RtSig* m = mkSigMap({sigEntry(0, 3, 4)});
+        pushSigs(h, m, 1);
+        h.push(Cmd::SetMetronome, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(9 * kBeat120);
+        const auto t = metTicks(h.outL);
+        bool ok = t.size() >= 9;
+        for (size_t i = 0; ok && i < 9; ++i)
+            ok = std::llabs(t[i].frame - (i64)i * kBeat120) <= 2 &&
+                 t[i].accent == (i % 3 == 0);
+        CHECK(ok, "3/4 strikes every beat and accents 1, 4, 7 (%zu strikes)", t.size());
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        delete[] m;
+    }
+    // 7/8: the unit is an EIGHTH, so a strike every half beat and a bar of 3.5
+    // beats. This is the case a "sigNum beats per bar" engine cannot express at
+    // all, in either the tick rate or the accent.
+    {
+        Host h; h.init();
+        RtSig* m = mkSigMap({sigEntry(0, 7, 8)});
+        pushSigs(h, m, 1);
+        h.push(Cmd::SetMetronome, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(8 * kBeat120);
+        const auto t = metTicks(h.outL);
+        bool ok = t.size() >= 14;
+        for (size_t i = 0; ok && i < 14; ++i)
+            ok = std::llabs(t[i].frame - (i64)(i * (size_t)kBeat120 / 2)) <= 2 &&
+                 t[i].accent == (i % 7 == 0);
+        CHECK(ok, "7/8 strikes every eighth and accents every seventh (%zu strikes)",
+              t.size());
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        delete[] m;
+    }
+    // Across a change: 4/4 for two bars, then 3/4. The accents are at beats
+    // 0, 4, 8, 11, 14 -- and the one at 11 is the whole point, because it is
+    // three beats after the last one and four after none of them.
+    {
+        Host h; h.init();
+        RtSig* m = mkSigMap({sigEntry(0, 4, 4), sigEntry(2, 3, 4)});
+        pushSigs(h, m, 2);
+        h.push(Cmd::SetMetronome, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(16 * kBeat120);
+        const auto t = metTicks(h.outL);
+        std::vector<i64> acc;
+        for (const auto& k : t) if (k.accent) acc.push_back(k.frame);
+        const i64 want[] = {0, 4 * kBeat120, 8 * kBeat120, 11 * kBeat120, 14 * kBeat120};
+        bool ok = acc.size() >= 5;
+        for (size_t i = 0; ok && i < 5; ++i) ok = std::llabs(acc[i] - want[i]) <= 2;
+        CHECK(ok, "the downbeats move to 0, 4, 8, 11, 14 when 4/4 becomes 3/4 at bar 2 "
+                  "(%zu accents, first misplaced at %lld)", acc.size(),
+              acc.empty() ? -1LL : (long long)acc[0]);
+        // And the strike count is right on both sides: 8 in the two 4/4 bars,
+        // one per beat after.
+        CHECK(t.size() >= 16 && t.size() <= 17,
+              "with a strike on every beat throughout (%zu)", t.size());
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        delete[] m;
+    }
+    // The regression that matters most: with NO map the clicks are exactly the
+    // ones the engine has always produced.
+    {
+        Host h; h.init();
+        h.push(Cmd::SetMetronome, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(8 * kBeat120);
+        const auto t = metTicks(h.outL);
+        bool ok = t.size() >= 8;
+        for (size_t i = 0; ok && i < 8; ++i)
+            ok = std::llabs(t[i].frame - (i64)i * kBeat120) <= 2 &&
+                 t[i].accent == (i % 4 == 0);
+        CHECK(ok, "and with no map at all it is 4/4, strike for strike (%zu)", t.size());
+    }
+}
+
+// --- c. the launch quantum walks the map ---------------------------------
+static void sigQuantum() {
+    // 4/4 to bar 4 (beat 16), then 7/8 -- bars of 3.5 beats, so every bar line
+    // past the change is at a beat a 4/4 multiplication cannot produce.
+    RtSig* m = mkSigMap({sigEntry(0, 4, 4), sigEntry(4, 7, 8)});
+    const int n = 2;
+
+    struct { f64 from, want; } one[] = {
+        {0.0, 0.0}, {0.1, 4.0}, {12.0, 12.0}, {12.1, 16.0},
+        {16.0, 16.0},                    // exactly on the change
+        {16.1, 19.5}, {19.5, 19.5}, {20.0, 23.0}, {23.0, 23.0}, {23.1, 26.5},
+    };
+    for (auto& c : one)
+        CHECK(std::fabs(sigNextBarLine(m, n, c.from, 1) - c.want) < 1e-9,
+              "\"1 Bar\" from beat %.2f fires at %.2f (%.4f)", c.from, c.want,
+              sigNextBarLine(m, n, c.from, 1));
+
+    // Multi-bar quanta align on the ABSOLUTE bar index, so "4 Bars" is bars
+    // 0, 4, 8, 12 of the piece and the walk crosses the change to find them.
+    struct { f64 from; int bars; f64 want; } many[] = {
+        {1.0,  4, 16.0},                 // bar 4, which is where the change is
+        {16.1, 4, 30.0},                 // bar 8  = 16 + 4 * 3.5
+        {30.1, 4, 44.0},                 // bar 12 = 16 + 8 * 3.5
+        {17.0, 2, 23.0},                 // bar 6  = 16 + 2 * 3.5
+        {0.5,  8, 30.0},                 // bar 8, two entries away, at beat 30
+        {17.0, 8, 30.0},
+    };
+    for (auto& c : many)
+        CHECK(std::fabs(sigNextBarLine(m, n, c.from, c.bars) - c.want) < 1e-9,
+              "\"%d Bars\" from beat %.2f fires at %.2f (%.4f)", c.bars, c.from, c.want,
+              sigNextBarLine(m, n, c.from, c.bars));
+
+    // A walk over THREE entries in one query: from bar 0 to a bar-8 boundary
+    // that two changes lie before.
+    {
+        RtSig* w = mkSigMap({sigEntry(0, 4, 4), sigEntry(4, 3, 4), sigEntry(8, 7, 8)});
+        CHECK(std::fabs(sigNextBarLine(w, 3, 1.0, 8) - 28.0) < 1e-9,
+              "an \"8 Bars\" launch at beat 1 walks two changes to land on beat 28 (%.4f)",
+              sigNextBarLine(w, 3, 1.0, 8));
+        delete[] w;
+    }
+
+    // A uniform 4/4 map must reproduce the pre-signature arithmetic exactly, or
+    // "nothing changed for existing sets" is only true while nobody publishes.
+    {
+        RtSig* u = mkSigMap({sigEntry(0, 4, 4)});
+        f64 worst = 0.0;
+        for (int bi = 1; bi <= kQuantumBarMax; ++bi)
+            for (int i = 0; i <= 2000; ++i) {
+                const f64 from = (f64)i * 0.0625;      // exact binary, no eps window
+                worst = std::max(worst, std::fabs(sigNextBarLine(u, 1, from, kQuantumBars[bi]) -
+                                                  legacyQuantum(from, kQuantumBeats[bi])));
+            }
+        CHECK(worst == 0.0, "a 4/4 map gives the legacy quantum bit for bit over every "
+                            "bar-shaped quantum (worst %.3g)", worst);
+        delete[] u;
+    }
+
+    // End to end: a clip launched at "1 Bar" inside a 7/8 stretch starts on the
+    // frame of the real bar line and not on a 4/4 one.
+    {
+        const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+        RtClip cl = arrClip(buf);
+        Host h; h.init();
+        RtSig* q = mkSigMap({sigEntry(0, 7, 8)});
+        pushSigs(h, q, 1);
+        h.push(Cmd::SetQuantum, 4);                 // "1 Bar"
+        h.setClip(0, 0, cl);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(kBeat120);                            // land inside bar 0
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(8 * kBeat120);
+        const i64 on = firstWhere(h.outL, 0, nonZero);
+        CHECK(on == (i64)(3.5 * (f64)kBeat120),
+              "a \"1 Bar\" launch in 7/8 fires on frame %lld, the real bar line (%lld)",
+              (long long)(i64)(3.5 * (f64)kBeat120), (long long)on);
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        delete[] q;
+    }
+    delete[] m;
+}
+
+// --- d. what must NOT move ------------------------------------------------
+static void sigLeavesTheTimelineAlone() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+
+    // An arrangement item is placed in BEATS. Re-barring the piece changes the
+    // bar it is displayed at and nothing else -- so the same item, played once
+    // in 4/4 and once with a 3/4 map published, starts on the identical frame.
+    i64 on[2] = {-1, -1};
+    for (int k = 0; k < 2; ++k) {
+        Host h; h.init();
+        RtSig* m = nullptr;
+        if (k) { m = mkSigMap({sigEntry(0, 3, 4), sigEntry(2, 7, 8)}); pushSigs(h, m, 2); }
+        RtArrangement* a = mkArr({arrItem(8.0, 4.0, 0.0)}, {arrClip(buf)});
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(14 * kBeat120);
+        on[k] = firstWhere(h.outL, 0, nonZero);
+        pushArr(h, 0, nullptr);
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        freeArr(a);
+        delete[] m;
+    }
+    CHECK(on[0] == 8 * kBeat120 && on[1] == on[0],
+          "an item at beat 8 starts on frame %lld with and without a signature map "
+          "(%lld, %lld)", (long long)(8 * kBeat120), (long long)on[0], (long long)on[1]);
+    {
+        // ... and the bar it DISPLAYS at is the thing that moved, which is the
+        // correct half of the same statement.
+        RtSig* m = mkSigMap({sigEntry(0, 3, 4), sigEntry(2, 7, 8)});
+        CHECK(std::fabs(sigBarOfBeat(nullptr, 0, 8.0) - 2.0) < 1e-12 &&
+              std::fabs(sigBarOfBeat(m, 2, 8.0) - (2.0 + 2.0 / 3.5)) < 1e-12,
+              "beat 8 shows as bar 2 in 4/4 and bar %.4f under the map",
+              sigBarOfBeat(m, 2, 8.0));
+        delete[] m;
+    }
+
+    // The loop brace is two beats and stays two beats. A brace at 0..6 wraps on
+    // frame 6 * kBeat120 whether the piece is barred in 4/4 or 3/4.
+    for (int k = 0; k < 2; ++k) {
+        Host h; h.init();
+        RtSig* m = nullptr;
+        if (k) { m = mkSigMap({sigEntry(0, 3, 4)}); pushSigs(h, m, 1); }
+        RtArrangement* br = mkBrace(0.0, 6.0, true);
+        pushBrace(h, br);
+        RtArrangement* a = mkArr({arrItem(4.0, 8.0, 0.0)}, {arrClip(buf)});
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(10 * kBeat120);
+        // The item starts at beat 4 and the brace cuts it off at beat 6.
+        const i64 s = firstWhere(h.outL, 0, nonZero);
+        const i64 e = firstWhere(h.outL, s + 1000, departsFromSteady);
+        CHECK(s == 4 * kBeat120 && e == 6 * kBeat120,
+              "%s the brace wraps at beat 6 = frame %lld (start %lld, wrap %lld)",
+              k ? "under a 3/4 map" : "with no map", (long long)(6 * kBeat120),
+              (long long)s, (long long)e);
+        pushArr(h, 0, nullptr);
+        pushBrace(h, nullptr);
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        freeArr(a); freeArr(br);
+        delete[] m;
+    }
+}
+
+// --- e. retirement, once, with the right pointer -------------------------
+static void sigRetirement() {
+    Host h; h.init();
+    RtSig* a = mkSigMap({sigEntry(0, 3, 4)});
+    RtSig* b = mkSigMap({sigEntry(0, 4, 4), sigEntry(8, 5, 4)});
+
+    pushSigs(h, a, 1);
+    h.runBlocks(2);
+    int seen = 0;
+    Event e;
+    while (h.e.popEvent(e)) if (e.type == Ev::SigsRetired) ++seen;
+    CHECK(seen == 0, "publishing the first map retires nothing (%d)", seen);
+
+    pushSigs(h, b, 2);
+    h.runBlocks(2);
+    seen = 0;
+    const void* got = nullptr;
+    while (h.e.popEvent(e)) if (e.type == Ev::SigsRetired) { ++seen; got = e.p; }
+    CHECK(seen == 1 && got == (const void*)a,
+          "replacing it retires the displaced array exactly once, and it is the old "
+          "pointer (%d events, %s)", seen, got == (const void*)a ? "correct" : "wrong");
+
+    // Republishing the SAME pointer retires nothing -- the RtNote rule verbatim.
+    pushSigs(h, b, 2);
+    h.runBlocks(2);
+    seen = 0;
+    while (h.e.popEvent(e)) if (e.type == Ev::SigsRetired) ++seen;
+    CHECK(seen == 0, "republishing the same pointer retires nothing (%d)", seen);
+
+    // A map the engine cannot walk is refused AND handed back, both of it: the
+    // publisher must never be left owning memory with no event behind it.
+    RtSig* bad = new RtSig[2];
+    bad[0] = sigEntry(2, 4, 4);                    // does not start at bar 0
+    bad[1] = sigEntry(4, 4, 4);
+    pushSigs(h, bad, 2);
+    h.runBlocks(2);
+    int freshBack = 0, oldBack = 0;
+    while (h.e.popEvent(e))
+        if (e.type == Ev::SigsRetired) {
+            if (e.p == (void*)bad) ++freshBack;
+            if (e.p == (void*)b)   ++oldBack;
+        }
+    CHECK(freshBack == 1 && oldBack == 1,
+          "a refused map comes straight back and takes the previous one with it "
+          "(fresh %d, old %d)", freshBack, oldBack);
+    delete[] bad;
+    delete[] b;
+    delete[] a;
+
+    // And after the refusal the engine is in 4/4, not in a half-applied map.
+    {
+        RtSig* c = mkSigMap({sigEntry(0, 7, 8)});
+        pushSigs(h, c, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(4 * kBeat120);
+        CHECK(h.e.posSigNum.load() == 7 && h.e.posSigDen.load() == 8,
+              "the readout follows the map that was accepted (%d/%d)",
+              h.e.posSigNum.load(), h.e.posSigDen.load());
+        pushSigs(h, nullptr, 0);
+        h.runBlocks(2);
+        while (h.e.popEvent(e)) {}
+        delete[] c;
+    }
+}
+
+// --- f. the published readout --------------------------------------------
+static void sigReadout() {
+    Host h; h.init();
+    RtSig* m = mkSigMap({sigEntry(0, 4, 4), sigEntry(2, 3, 4)});
+    pushSigs(h, m, 2);
+    h.push(Cmd::SetPlaying, 1);
+
+    // Beat 9.25 is: bars 0 and 1 in 4/4 (8 beats), then 1.25 beats into bar 2 in
+    // 3/4 -- bar 3, beat 2, sixteenth 2, all one-based.
+    h.push(Cmd::Locate, 0, 0, 9.25);
+    h.runBlocks(1);
+    CHECK(h.e.posBar.load() == 3 && h.e.posBeat.load() == 2 && h.e.posSixteenth.load() == 2,
+          "beat 9.25 reads 3.2.2 (%d.%d.%d)", h.e.posBar.load(), h.e.posBeat.load(),
+          h.e.posSixteenth.load());
+    CHECK(h.e.posSigNum.load() == 3 && h.e.posSigDen.load() == 4,
+          "and the signature AT THE PLAYHEAD is 3/4, not the set's 4/4 (%d/%d)",
+          h.e.posSigNum.load(), h.e.posSigDen.load());
+
+    h.push(Cmd::Locate, 0, 0, 0.0);
+    h.runBlocks(1);
+    CHECK(h.e.posBar.load() == 1 && h.e.posBeat.load() == 1 && h.e.posSixteenth.load() == 1 &&
+          h.e.posSigNum.load() == 4,
+          "and beat 0 reads 1.1.1 in 4/4 (%d.%d.%d %d/%d)", h.e.posBar.load(),
+          h.e.posBeat.load(), h.e.posSixteenth.load(), h.e.posSigNum.load(),
+          h.e.posSigDen.load());
+
+    pushSigs(h, nullptr, 0);
+    h.runBlocks(2);
+    Event e; while (h.e.popEvent(e)) {}
+    delete[] m;
+}
+
+static void testSignatures() {
+    banner("37. time signatures");
+    note("The map converts beats to bars, never the other way round: what is "
+         "placed in beats stays where it is, and only the bar it is called moves.");
+    sigConversions();
+    sigMetronome();
+    sigQuantum();
+    sigLeavesTheTimelineAlone();
+    sigRetirement();
+    sigReadout();
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -6679,6 +7176,7 @@ int main() {
     testArrangementScheduler();
     testArrangementAutomation();
     testArrangementRecording();
+    testSignatures();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

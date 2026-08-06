@@ -1481,12 +1481,187 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
 
+// ---------------------------------------------------------------------------
+// Time signatures: the shared beat <-> bar conversions declared in engine.h.
+//
+// Free functions rather than members for the same reason autoValueAt is one:
+// the UI's ruler, the engine's metronome and the launch quantum all have to
+// agree about where a bar line is, and the only way to guarantee that is for
+// there to be one implementation and no second copy to drift from it.
+//
+// Every one of them treats a null/empty map as plain 4/4, which is not a
+// degenerate case but the ordinary one -- a renderer, the daemon and every set
+// nobody has re-barred take exactly the arithmetic they took before this
+// existed, expression for expression.
+// ---------------------------------------------------------------------------
+
+// A power of two in 1..kSigDenMax. Written as a loop rather than a popcount
+// trick because it also has to reject 0 and anything over the ceiling, and one
+// readable predicate beats three clever ones.
+static bool sigDenOk(int d) {
+    for (int p = 1; p <= kSigDenMax; p *= 2) if (d == p) return true;
+    return false;
+}
+
+bool sigMapValid(const RtSig* sigs, int count) {
+    if (!sigs || count < 1 || count > kMaxSigs) return false;
+    if (sigs[0].bar != 0 || sigs[0].beat != 0.0) return false;
+    for (int i = 0; i < count; ++i) {
+        const RtSig& s = sigs[i];
+        if (s.num < 1 || s.num > kSigNumMax || !sigDenOk(s.den)) return false;
+        if (!std::isfinite(s.beat)) return false;
+        if (i == 0) continue;
+        const RtSig& p = sigs[i - 1];
+        if (s.bar <= p.bar || !(s.beat > p.beat)) return false;
+        // The derived field, re-derived. `beat` exists so the engine can bisect
+        // instead of summing, and a bisect over numbers that do not follow from
+        // the bar lengths beside them would put bar lines where there are none.
+        // Checking it here costs one pass at publication and makes the field
+        // impossible to lie with; the tolerance is float slop over a map with
+        // hundreds of entries, not a licence.
+        const f64 want = p.beat + (f64)(s.bar - p.bar) * sigBarBeats(p.num, p.den);
+        if (std::fabs(want - s.beat) > 1e-6) return false;
+    }
+    return true;
+}
+
+bool sigMapRebase(RtSig* sigs, int count) {
+    if (!sigs || count < 1) return false;
+    sigs[0].beat = 0.0;
+    for (int i = 1; i < count; ++i)
+        sigs[i].beat = sigs[i - 1].beat +
+                       (f64)(sigs[i].bar - sigs[i - 1].bar) *
+                           sigBarBeats(sigs[i - 1].num, sigs[i - 1].den);
+    return sigMapValid(sigs, count);
+}
+
+// Largest i with sigs[i].beat <= beat. Deliberately WITHOUT an epsilon: a beat
+// one ulp under a change belongs to the bar before it, and widening the test
+// would hand that beat to an entry whose own start is past it -- which reads
+// back as the last bar of the previous signature carrying a negative offset.
+int sigIndexAtBeat(const RtSig* sigs, int count, f64 beat) {
+    if (!sigs || count <= 0) return 0;
+    if (!std::isfinite(beat)) return 0;
+    int lo = 0, hi = count;                 // first index with beat_i > beat
+    while (lo < hi) {
+        const int m = (lo + hi) >> 1;
+        if (sigs[m].beat <= beat) lo = m + 1; else hi = m;
+    }
+    return lo > 0 ? lo - 1 : 0;
+}
+
+int sigIndexAtBar(const RtSig* sigs, int count, i64 bar) {
+    if (!sigs || count <= 0) return 0;
+    int lo = 0, hi = count;
+    while (lo < hi) {
+        const int m = (lo + hi) >> 1;
+        if ((i64)sigs[m].bar <= bar) lo = m + 1; else hi = m;
+    }
+    return lo > 0 ? lo - 1 : 0;
+}
+
+f64 sigBeatOfBar(const RtSig* sigs, int count, f64 bar) {
+    if (!std::isfinite(bar)) bar = 0.0;
+    if (!sigs || count <= 0) return bar * 4.0;
+    const int i = sigIndexAtBar(sigs, count, (i64)std::floor(bar));
+    return sigs[i].beat + (bar - (f64)sigs[i].bar) * sigBarBeats(sigs[i].num, sigs[i].den);
+}
+
+f64 sigBarOfBeat(const RtSig* sigs, int count, f64 beat) {
+    if (!std::isfinite(beat)) beat = 0.0;
+    if (!sigs || count <= 0) return beat * 0.25;
+    const int i = sigIndexAtBeat(sigs, count, beat);
+    return (f64)sigs[i].bar + (beat - sigs[i].beat) / sigBarBeats(sigs[i].num, sigs[i].den);
+}
+
+BarPos sigPosAt(const RtSig* sigs, int count, f64 beat) {
+    BarPos p;
+    if (!std::isfinite(beat)) beat = 0.0;
+    f64 start = 0.0;
+    i64 bar0 = 0;
+    int i = 0;
+    if (sigs && count > 0) {
+        i = sigIndexAtBeat(sigs, count, beat);
+        start = sigs[i].beat;
+        bar0  = (i64)sigs[i].bar;
+        p.num = sigs[i].num;
+        p.den = sigs[i].den;
+    }
+    const f64 len = sigBarBeats(p.num, p.den);
+    // Negative bars are real ABOVE entry 0 and impossible below any other: the
+    // metronome asks about `beat - onesample` at beat zero and has to be told
+    // "the bar before this one", or it never strikes the very first downbeat.
+    // Inside a later entry a negative offset cannot happen -- the bisect just
+    // ruled it out -- so clamping there is a guard and not a rounding policy.
+    f64 k = std::floor((beat - start) / len);
+    if (i > 0 && k < 0.0) k = 0.0;
+    p.bar      = (i32)(bar0 + (i64)k);
+    p.barStart = start + k * len;
+    p.unit     = (p.den > 0) ? 4.0 / (f64)p.den : 1.0;
+
+    f64 u = std::floor((beat - p.barStart) / p.unit);
+    if (u < 0.0) u = 0.0;
+    if (u > (f64)(p.num - 1)) u = (f64)(p.num - 1);
+    p.beat = (i32)u;
+
+    f64 s16 = std::floor((beat - (p.barStart + u * p.unit)) / 0.25);
+    if (s16 < 0.0) s16 = 0.0;
+    p.sixteenth = (i32)s16;
+    return p;
+}
+
+f64 sigNextBarLine(const RtSig* sigs, int count, f64 beat, int bars) {
+    if (bars < 1) bars = 1;
+    if (!std::isfinite(beat)) beat = 0.0;
+    if (!sigs || count <= 0) {
+        const f64 q = 4.0 * (f64)bars;
+        return std::ceil(beat / q - kEps) * q;
+    }
+    int i = sigIndexAtBeat(sigs, count, beat);
+    for (;;) {
+        const RtSig& s = sigs[i];
+        const f64 len = sigBarBeats(s.num, s.den);
+        // kEps for the same reason nextQuantum has always subtracted it: a
+        // launch asked for ON a bar line must fire on that line and not one bar
+        // later, and beat_ arrives here plus or minus a few ulps.
+        f64 k = std::ceil((beat - s.beat) / len - kEps);
+        if (i > 0 && k < 0.0) k = 0.0;
+        i64 b = (i64)s.bar + (i64)k;
+        // Alignment is on the ABSOLUTE bar index, so "4 Bars" lands on bars
+        // 0, 4, 8 ... of the piece rather than four bars after whatever the last
+        // signature change was. The negative arm is for the pre-roll bars
+        // sigPosAt admits above; C++ leaves b % bars negative there.
+        i64 r = b % (i64)bars;
+        if (r < 0) r += (i64)bars;
+        if (r) b += (i64)bars - r;
+        // Landing past the next change means it is that entry's bar length that
+        // decides where the line is, not this one's. THIS is the walk: one step
+        // per change crossed, bounded by the map, never a multiplication.
+        if (i + 1 < count && b >= (i64)sigs[i + 1].bar) { ++i; continue; }
+        return s.beat + (f64)(b - (i64)s.bar) * len;
+    }
+}
+
 f64 Engine::nextQuantum(f64 fromBeat, int qIdx) const {
     const int idx = (qIdx < 0) ? quantum_ : qIdx;
     if (idx <= 0 || idx >= kQuantumCount) return fromBeat;
     const f64 q = kQuantumBeats[idx];
     if (q <= 0.0) return fromBeat;
-    return std::ceil(fromBeat / q - kEps) * q;
+    // No map: 4/4 everywhere, and this is the expression every build before
+    // signatures used, kept verbatim rather than reduced to from the general
+    // case. It is what makes "the demo renders are cmp-identical" a fact about
+    // the code rather than a hope about floating point.
+    if (!sigs_ || sigCount_ <= 0) return std::ceil(fromBeat / q - kEps) * q;
+    // "8 Bars" .. "1 Bar": walk the map. A bar is not four beats any more, so
+    // there is nothing left to multiply.
+    if (idx <= kQuantumBarMax) return sigNextBarLine(sigs_, sigCount_, fromBeat, kQuantumBars[idx]);
+    // A fraction of a beat, anchored to the bar it falls in. In 4/4 that is a
+    // no-op -- every bar line is a whole multiple of 2, 1, 1/2, 1/4 and 1/8 --
+    // and in 7/8 it is the difference between a 1/4 grid that restarts at each
+    // bar line and one that drifts across them, because 3.5 is not a multiple
+    // of 1 and never becomes one.
+    const BarPos p = sigPosAt(sigs_, sigCount_, fromBeat);
+    return p.barStart + std::ceil((fromBeat - p.barStart) / q - kEps) * q;
 }
 
 void Engine::startVoice(Track& t, const RtClip& c) {
@@ -2068,6 +2243,33 @@ void Engine::drainCommands() {
             // timeline silently undo the performance.
             locateTo(c.x);
             break;
+
+        // The signature map: a = count, p = the array. ONE pointer, so this is
+        // the RtNote retirement rule with nothing added -- no parking, because
+        // nothing holds a pointer into the map across a block the way a voice
+        // holds an RtClip inside an arrangement lane. The map is read, a bar
+        // line comes out, and the read is over.
+        //
+        // A map that does not validate is refused AND retired in the same sweep,
+        // so the publisher gets its memory back either way. Refusing means
+        // sigs_ goes null, which is 4/4 everywhere: an audible, explicable
+        // answer, as against walking beats that do not follow from their bars.
+        case Cmd::SetSignatures: {
+            const RtSig* fresh = (const RtSig*)c.p;
+            const RtSig* old   = sigs_;
+            if (fresh && sigMapValid(fresh, c.a)) {
+                sigs_ = fresh;
+                sigCount_ = c.a;
+            } else {
+                sigs_ = nullptr;
+                sigCount_ = 0;
+                if (fresh && fresh != old)
+                    emitCritical(this, evts_, {Ev::SigsRetired, 0, 0, 0.0, (void*)fresh});
+            }
+            if (old && old != sigs_)
+                emitCritical(this, evts_, {Ev::SigsRetired, 0, 0, 0.0, (void*)old});
+            break;
+        }
 
         // a = track, or -1 for every track. UNQUANTIZED: it is a corrective
         // gesture, and a correction that waits a bar is the wrong feel. The
@@ -2793,14 +2995,35 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
     }
 
     // Metronome, rendered last so it sits on top of the mix.
+    //
+    // It strikes once per SIGNATURE UNIT -- a quarter in 4/4, an eighth in 7/8 --
+    // and accents the unit that opens the bar. In 4/4 with no map that is
+    // provably the old test: sigPosAt gives bar = floor(b/4) and beat =
+    // floor(b) - 4*bar, so the pair changes exactly when floor(b) does and the
+    // accent falls exactly when floor(b) % 4 == 0. Same clicks, same frames,
+    // same samples.
+    //
+    // The pair is compared as one monotone integer because a bar number alone
+    // cannot separate two units of the same bar and a unit number alone repeats
+    // every bar. kSigNumMax + 1 as the radix, since a numerator is at most
+    // kSigNumMax and a unit index is therefore at most one less.
     if (metronome_) {
+        auto tickId = [](const BarPos& p) {
+            return (i64)p.bar * (i64)(kSigNumMax + 1) + (i64)p.beat;
+        };
+        // Seeded from the sample BEFORE the range, which is what makes the very
+        // first downbeat of a run strike: at beat 0 the previous sample is in
+        // bar -1, and sigPosAt says so rather than clamping it to bar 0.
+        i64 prev = tickId(sigPosAt(sigs_, sigCount_, beat_ + (f64)from * bps - bps));
         for (int i = from; i < to; ++i) {
             const f64 b = beat_ + (f64)i * bps;
-            const i64 fl = (i64)std::floor(b);
-            if (fl != (i64)std::floor(b - bps)) {
+            const BarPos p = sigPosAt(sigs_, sigCount_, b);
+            const i64 id = tickId(p);
+            if (id != prev) {
+                prev = id;
                 metCountdown_ = (int)(0.03 * sr_);
                 metPhase_ = 0.0;
-                metFreq_ = (fl % sigNum_ == 0) ? 1600.f : 800.f;
+                metFreq_ = (p.beat == 0) ? 1600.f : 800.f;
             }
             if (metCountdown_ > 0) {
                 const f32 decay = (f32)metCountdown_ / (f32)(0.03 * sr_);
@@ -3752,6 +3975,19 @@ void Engine::publish() {
     beat.store(beat_, std::memory_order_relaxed);
     playing.store(playing_, std::memory_order_relaxed);
     tempo.store(tempo_, std::memory_order_relaxed);
+
+    // bars.beats.sixteenths, one-based, off the same conversion the metronome
+    // and the launch quantum use. Once per block, not once per sample: a
+    // readout the eye reads sixty times a second does not need the bisect four
+    // thousand times more often than that.
+    {
+        const BarPos p = sigPosAt(sigs_, sigCount_, beat_);
+        posBar.store(p.bar + 1, std::memory_order_relaxed);
+        posBeat.store(p.beat + 1, std::memory_order_relaxed);
+        posSixteenth.store(p.sixteenth + 1, std::memory_order_relaxed);
+        posSigNum.store(p.num, std::memory_order_relaxed);
+        posSigDen.store(p.den, std::memory_order_relaxed);
+    }
 
     constexpr f32 kDecay = 0.72f;
     for (int ti = 0; ti < kMaxTracks; ++ti) {

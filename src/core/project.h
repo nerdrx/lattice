@@ -57,7 +57,17 @@
 // here, and the sort the engine's cursor depends on belongs to App::adoptSession,
 // beside the editing code that upholds the invariant.
 //
-// Saving always writes the current version; versions 1 through 6 all load,
+// Version 7 adds time-signature CHANGES, on the `sig` line that was already
+// there. `sig <num> <den>` still means the session signature at bar 0 and is
+// still written exactly as it was; `sig <bar> <num> <den>` adds a change, one
+// sparse line each, sorted and deduplicated last-wins on load. A set in one
+// signature -- which is every set that existed before this version -- therefore
+// writes the identical bytes version 6 wrote apart from the header line.
+// Numerators are 1..32 and denominators are powers of two in 1..32; a
+// denominator between two powers rounds down, so the clamp is stable across a
+// re-save.
+//
+// Saving always writes the current version; versions 1 through 7 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 //

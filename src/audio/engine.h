@@ -35,6 +35,97 @@ struct RtNote {
 };
 
 // ---------------------------------------------------------------------------
+// Time signatures.
+//
+// `beat_` -- the engine's timeline -- is and stays ABSOLUTE MUSICAL BEATS, a
+// beat being a quarter note. The map below converts beats to BARS and never the
+// other way round. That direction is the whole design: an arrangement item at
+// beat 8 is still at beat 8 after a signature change and only the bar it is
+// *displayed* at moves, the loop brace is two beats and stays two beats, and
+// nothing that was recorded against the clock has to be rewritten because
+// somebody re-barred the piece.
+//
+// A bar of num/den is `num * 4/den` beats -- 4 for 4/4, 3 for 3/4, 3.5 for 7/8.
+// Numerators are 1..kSigNumMax and denominators are POWERS OF TWO in
+// 1..kSigDenMax: the GUI clamps, the parser clamps, and the engine validates the
+// whole map once at publication and refuses one it cannot walk.
+// ---------------------------------------------------------------------------
+
+inline constexpr int kSigNumMax = 32;
+inline constexpr int kSigDenMax = 32;
+inline constexpr int kMaxSigs   = 256;   // signature changes per set
+
+// One signature change, and -- as a sorted array of them -- the realtime form of
+// the whole map. Entry 0 is ALWAYS at bar 0 and is the session signature; entry
+// i covers bars [sigs[i].bar, sigs[i+1].bar) and the last entry runs forever.
+//
+// `beat` is DERIVED: the absolute beat that `bar` begins on. It is computed once
+// by the publisher (sigMapRebase) instead of being re-summed by the engine on
+// every query, which is what makes beat -> bar a bisect rather than a walk from
+// bar zero. It is not merely trusted, either -- sigMapValid re-derives it and
+// refuses a map whose beats do not follow from its own bar lengths, so a
+// publisher cannot lie the engine into putting bar lines where there are none.
+struct RtSig {
+    i32 bar = 0;
+    i32 num = 4, den = 4;
+    i32 pad = 0;
+    f64 beat = 0.0;
+};
+
+// Beats (quarter notes) in one bar of num/den. The one place the 4/den ratio is
+// written; everything else asks this.
+inline constexpr f64 sigBarBeats(int num, int den) {
+    return den > 0 ? (f64)num * 4.0 / (f64)den : 4.0;
+}
+
+// A map the engine may walk: 1..kMaxSigs entries, entry 0 at bar 0 beat 0, bars
+// and beats both strictly increasing, every num/den in range and a power of two,
+// and every `beat` consistent with the bar lengths ahead of it. Run once per
+// publication, never per query.
+bool sigMapValid(const RtSig* sigs, int count);
+
+// Fill in every entry's derived `beat` from bar 0 forwards and report whether
+// the result is walkable. The publisher's half of the contract above; the input
+// must already be sorted, deduplicated and clamped (Session::normalizeSigs).
+bool sigMapRebase(RtSig* sigs, int count);
+
+// The entry covering `beat` / covering `bar`. Both return 0 for an empty map,
+// which every caller reads as plain 4/4 -- the behaviour of every build before
+// signatures existed.
+int sigIndexAtBeat(const RtSig* sigs, int count, f64 beat);
+int sigIndexAtBar (const RtSig* sigs, int count, i64 bar);
+
+// Where bar `bar` begins, in beats, and its inverse. Both take and return
+// FRACTIONAL bars so a ruler can ask where 4.5 bars is; both extrapolate below
+// bar 0 and past the last change with the signature in force there.
+f64 sigBeatOfBar(const RtSig* sigs, int count, f64 bar);
+f64 sigBarOfBeat(const RtSig* sigs, int count, f64 beat);
+
+// The playhead as a musician reads it. `bar`/`beat`/`sixteenth` are 0-BASED here
+// and the readout adds one; `beat` counts signature units (1/den notes), so 7/8
+// runs 0..6 and each of those units is half a quarter-note beat long.
+struct BarPos {
+    i32 bar = 0;
+    i32 beat = 0;
+    i32 sixteenth = 0;
+    i32 num = 4, den = 4;
+    f64 barStart = 0.0;    // absolute beat the bar begins on
+    f64 unit = 1.0;        // beats per signature unit, == 4/den
+};
+
+// THE conversion, shared by the metronome, the position readout, the launch
+// quantum and the UI's ruler, for the same reason autoValueAt is one function:
+// a grid that is drawn and a grid that is played must not be able to disagree.
+BarPos sigPosAt(const RtSig* sigs, int count, f64 beat);
+
+// The next bar line at or after `beat`, aligned to a multiple of `bars` bars
+// counted FROM BAR 0 -- so "4 Bars" stays a phrase boundary rather than becoming
+// "four bars from wherever the last signature change was". Walks the map; the
+// one thing it may not do is multiply, because bars are no longer all the same
+// length.
+f64 sigNextBarLine(const RtSig* sigs, int count, f64 beat, int bars);
+
+// ---------------------------------------------------------------------------
 // Automation. Full design and rationale: docs/AUTOMATION.md.
 //
 // The rule the whole feature hangs on: the engine NEVER writes an automated
@@ -384,6 +475,25 @@ enum class Cmd : u32 {
     // correction that waits a bar is the wrong feel. The track's cursor
     // re-seeks to beat_ and resumes whatever item covers it, mid-item.
     BackToArrangement,
+
+    // a = count, p = const RtSig* (null, or count 0, clears back to plain 4/4).
+    // ONE allocation and ONE pointer -- the RtNote retirement rule verbatim, and
+    // the reason the map is a flat array rather than a struct pointing at one:
+    // there is exactly one array here, so there is exactly one pointer to talk
+    // about and no rule needed about which retirement implies which. The
+    // displaced array comes back in Ev::SigsRetired and may not be freed before.
+    //
+    // A map that does not pass sigMapValid is REFUSED and handed straight back
+    // in the same sweep: the engine keeps no map at all and every bar line goes
+    // back to 4/4, which is a place the user can hear, rather than walking a
+    // map whose beats do not follow from its own bars.
+    //
+    // NOT YET ON THE WIRE. ipc/control.h classifies commands by value and its
+    // bound is the last enumerator it knew, so this one lands in "unknown" and
+    // the daemon answers RejectUnknownCommand -- fail-closed, exactly as
+    // Cmd::SetArrangement did for a wave before it was wired up. The daemon
+    // therefore plays every set in 4/4 until that file grows the two cases.
+    SetSignatures,
 };
 
 struct Command {
@@ -408,16 +518,30 @@ enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportSto
                       // protocol, a = the cell the pointer was published to
                       // (a = -1 being SetArrangement's transport cell).
                       ArrangementRetired, // a = track, p = the RtArrangement*
-                      TrackAutosRetired   // a = track, p = the RtAutoSetN*
+                      TrackAutosRetired,  // a = track, p = the RtAutoSetN*
+                      SigsRetired         // p = the RtSig[] now safe to free
                     };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
 // Global launch quantum choices, in beats. Index 0 is "None".
+//
+// The first four entries are BAR counts wearing 4/4 clothes: 32 beats is eight
+// bars only while a bar is four beats. They keep their 4/4 values because that
+// is still what they mean in 4/4 and because that is what the no-map path
+// multiplies by -- kQuantumBars beside them is what nextQuantum reads once a map
+// exists, and it walks the map instead of multiplying. The fractional entries
+// from index kQuantumBarMax + 1 on are genuine beat fractions and stay so; they
+// are anchored to the containing BAR, which is a no-op in 4/4 (every bar line is
+// a multiple of every one of them) and is what makes a 1/4 grid restart at the
+// bar line in 7/8, where 3.5 is not a multiple of 1.
 inline constexpr f64 kQuantumBeats[] = {0.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125};
 inline constexpr const char* kQuantumNames[] = {
     "None", "8 Bars", "4 Bars", "2 Bars", "1 Bar", "1/2", "1/4", "1/8", "1/16", "1/32"
 };
 inline constexpr int kQuantumCount = 10;
+// How many bars each of the bar-shaped quanta means, indexed by the same index.
+inline constexpr int kQuantumBars[]  = {0, 8, 4, 2, 1};
+inline constexpr int kQuantumBarMax  = 4;   // last index that means whole bars
 
 class Engine {
 public:
@@ -456,6 +580,15 @@ public:
     // Backend-reported dropout: the audio callback ran late or the device
     // signalled an under/overrun. The backend calls this from its own thread.
     void reportXrun() { xruns.fetch_add(1, std::memory_order_relaxed); }
+    // The playhead as a musician reads it: bars.beats.sixteenths, ONE-BASED,
+    // recomputed from the signature map every block. Published here rather than
+    // derived by each reader because the map lives here -- a readout that
+    // divided `beat` by a single sigNum would be wrong from the first signature
+    // change on, and would be wrong differently in the app and in the daemon.
+    // posSigNum/posSigDen are the signature in force AT THE PLAYHEAD, which is
+    // what a transport bar should show and is not in general the set's.
+    std::atomic<i32>  posBar{1}, posBeat{1}, posSixteenth{1};
+    std::atomic<i32>  posSigNum{4}, posSigDen{4};
     // Recording state per track: 0 idle, 1 queued, 2 recording; slot index.
     std::atomic<int>  recState[kMaxTracks]{};
     std::atomic<int>  recSlotIdx[kMaxTracks]{};
@@ -592,7 +725,15 @@ private:
 
     f64 sr_ = 48000.0;
     f64 tempo_ = 120.0;
-    int sigNum_ = 4;
+    // The signature map, borrowed from the GUI under the Cmd::SetSignatures
+    // contract. Null is not a degenerate map and is the ORDINARY case for a
+    // renderer, a daemon and every set nobody has re-barred: it means 4/4
+    // everywhere, and every caller takes the arithmetic it took before this
+    // existed. Deliberately NOT cleared by prepare(): the pointer is the GUI's,
+    // dropping it would leak an array with no retirement event behind it, and a
+    // sample-rate change does not re-bar the piece.
+    const RtSig* sigs_ = nullptr;
+    int sigCount_ = 0;
     int quantum_ = 4;               // index into kQuantumBeats -> 1 Bar
     bool playing_ = false;
     bool metronome_ = false;

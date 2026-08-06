@@ -403,6 +403,70 @@ struct SceneModel {
     f64 tempo = 0.0;                   // 0 => no tempo change on launch
 };
 
+// ---------------------------------------------------------------------------
+// Time signatures, GUI side.
+//
+// The model type IS the realtime type. One struct, so publishing the map is a
+// copy and not a translation, and so the beat <-> bar conversions in engine.h --
+// the ones the metronome and the launch quantum use -- can be pointed straight
+// at the session's own vector. `RtSig::beat` is derived and is maintained by
+// normalizeSigs(); nothing else may write it.
+// ---------------------------------------------------------------------------
+using SigChange = RtSig;
+
+inline int clSigNum(int n) { return clampv(n, 1, kSigNumMax); }
+// A denominator is a POWER OF TWO. Out-of-range clamps and anything between two
+// powers rounds DOWN to the one below it, because that is the direction that
+// cannot lengthen a bar past what the file asked for: a hand-typed `sig 4 3`
+// becomes 4/2, never 4/4. Applied identically on save and on load, so a file
+// that says 3 says 2 forever after and the round trip is byte-stable.
+inline int clSigDen(int d) {
+    if (d < 1) return 1;
+    if (d >= kSigDenMax) return kSigDenMax;
+    int p = 1;
+    while (p * 2 <= d) p *= 2;
+    return p;
+}
+// A ceiling on the bar a change may sit at. kMaxSigs changes at this bound is
+// still under the 1e7-beat ceiling every other beat field is clamped to.
+inline constexpr int kMaxSigBar = 1000000;
+inline int clSigBar(i64 b) { return (int)clampv(b, (i64)0, (i64)kMaxSigBar); }
+
+// Sort, deduplicate, clamp, guarantee an entry at bar 0, and fill in the derived
+// beats. THE normalizer: the parser calls it, every edit calls it, and the
+// publisher calls it, so there is one definition of what a well-formed map is
+// and it is the one sigMapValid checks for.
+//
+// Duplicates resolve LAST-WINS, which is what "a change at a bar that already
+// has one replaces it" means when the two arrive in one list -- the stable sort
+// is what makes "last" mean the later of the two in the file.
+inline std::vector<SigChange> normalizedSigMap(const std::vector<SigChange>& in,
+                                               int fallbackNum, int fallbackDen) {
+    std::vector<SigChange> m;
+    m.reserve(in.size() + 1);
+    for (const SigChange& s : in) {
+        SigChange c{};
+        c.bar = clSigBar(s.bar);
+        c.num = clSigNum(s.num);
+        c.den = clSigDen(s.den);
+        m.push_back(c);
+    }
+    std::stable_sort(m.begin(), m.end(),
+                     [](const SigChange& a, const SigChange& b) { return a.bar < b.bar; });
+    // Keep the last of every run of equal bars.
+    std::vector<SigChange> out;
+    out.reserve(m.size() + 1);
+    for (size_t i = 0; i < m.size(); ++i) {
+        if (i + 1 < m.size() && m[i + 1].bar == m[i].bar) continue;
+        out.push_back(m[i]);
+    }
+    if (out.empty() || out.front().bar != 0)
+        out.insert(out.begin(), SigChange{0, clSigNum(fallbackNum), clSigDen(fallbackDen), 0, 0.0});
+    if (out.size() > (size_t)kMaxSigs) out.resize((size_t)kMaxSigs);
+    sigMapRebase(out.data(), (int)out.size());
+    return out;
+}
+
 struct Session {
     std::vector<TrackModel> tracks;
     std::vector<SceneModel> scenes;
@@ -414,7 +478,85 @@ struct Session {
     u64 nextUid = 1;
     u64 newUid() { return nextUid++; }
     f64  tempo = 120.0;
+    // The session signature -- bar 0's, and a MIRROR of sigs.front() once the
+    // map is normalized. Kept as plain fields because that is what every reader
+    // of a set in one signature actually wants and because a method cannot
+    // share a name with the field it replaced; write it through
+    // setSignature(0, ...), never directly, or the next normalize will overwrite
+    // it from the map.
     int  sigNum = 4, sigDen = 4;
+    // The signature map: one entry per change, sorted by bar, the first at bar
+    // 0. Empty means "never touched" and reads as plain sigNum/sigDen
+    // everywhere; normalizeSigs() turns it into the canonical one-entry form.
+    std::vector<SigChange> sigs;
+
+    // Normalize in place and re-mirror sigNum/sigDen from bar 0. Idempotent.
+    void normalizeSigs() {
+        sigs = normalizedSigMap(sigs, sigNum, sigDen);
+        sigNum = sigs.front().num;
+        sigDen = sigs.front().den;
+    }
+    // Set (or replace) the signature in force from `bar` on. bar 0 is the
+    // session signature. THE mutator -- it normalizes, so the derived beats and
+    // the sigNum/sigDen mirror can never be stale after it.
+    void setSignature(int bar, int num, int den) {
+        SigChange c{};
+        c.bar = clSigBar(bar); c.num = clSigNum(num); c.den = clSigDen(den);
+        sigs.push_back(c);                 // last-wins dedupe does the replacing
+        normalizeSigs();
+    }
+    // Remove the change at `bar`, if there is one. Bar 0 is REFUSED: a piece is
+    // always in some signature from its first bar, and "no session signature" is
+    // not a state the map can express or the engine could play.
+    bool removeSignature(int bar) {
+        if (bar <= 0) return false;
+        const size_t before = sigs.size();
+        for (size_t i = 0; i < sigs.size(); ++i)
+            if (sigs[i].bar == bar) { sigs.erase(sigs.begin() + (long)i); break; }
+        if (sigs.size() == before) return false;
+        normalizeSigs();
+        return true;
+    }
+    // The conversions, over this session's map. Thin forwarders to the ONE
+    // implementation in engine.cpp -- the UI's ruler and the engine's metronome
+    // are reading the same function, which is the only way a drawn bar line and
+    // a played one cannot disagree. Safe on an un-normalized (even empty) map:
+    // the helpers read an empty one as plain 4/4.
+    //
+    // An EMPTY map is not "4/4": it is "one entry, sigNum/sigDen, at bar 0",
+    // which is what a set that has never been re-barred means and what the
+    // parser produces for a v1..v6 file. Synthesizing it here rather than
+    // demanding a normalize first is what keeps `Session s; s.sigNum = 7;` --
+    // exactly what a caller writes in a test or a fresh set -- from silently
+    // measuring in 4/4.
+    SigChange sigAtBar(int bar) const {
+        const SigChange one = lone();
+        const SigChange* d = sigs.empty() ? &one : sigs.data();
+        const int n = sigs.empty() ? 1 : (int)sigs.size();
+        return d[sigIndexAtBar(d, n, bar)];
+    }
+    SigChange sigAtBeat(f64 beat) const {
+        const SigChange one = lone();
+        const SigChange* d = sigs.empty() ? &one : sigs.data();
+        const int n = sigs.empty() ? 1 : (int)sigs.size();
+        return d[sigIndexAtBeat(d, n, beat)];
+    }
+    f64 beatOfBar(f64 bar) const {
+        const SigChange one = lone();
+        return sigs.empty() ? sigBeatOfBar(&one, 1, bar)
+                            : sigBeatOfBar(sigs.data(), (int)sigs.size(), bar);
+    }
+    f64 barOfBeat(f64 beat) const {
+        const SigChange one = lone();
+        return sigs.empty() ? sigBarOfBeat(&one, 1, beat)
+                            : sigBarOfBeat(sigs.data(), (int)sigs.size(), beat);
+    }
+    BarPos barPosAt(f64 beat) const {
+        const SigChange one = lone();
+        return sigs.empty() ? sigPosAt(&one, 1, beat)
+                            : sigPosAt(sigs.data(), (int)sigs.size(), beat);
+    }
+
     int  quantumIdx = 4;               // index into kQuantumBeats -> "1 Bar"
     bool metronome = false;
     // The arrangement loop brace. Session-wide, like the tempo and the quantum,
@@ -428,7 +570,43 @@ struct Session {
     bool loopOn    = false;
     std::string name = "Untitled";
     std::string path;                  // last saved location, empty if never
+
+private:
+    // The one-entry map an empty `sigs` stands for.
+    SigChange lone() const {
+        SigChange c{};
+        c.num = clSigNum(sigNum);
+        c.den = clSigDen(sigDen);
+        return c;
+    }
 };
+
+// Snapshot the session's signature map into ONE heap array and hand it to the
+// engine. The displaced array comes home in Ev::SigsRetired and may be
+// delete[]'d then and NOT BEFORE -- the RtNote protocol verbatim, and the reason
+// this returns the pointer it published rather than swallowing it: the caller
+// keeps it alive until the event arrives.
+//
+// Returns null when the command ring is full or the allocation failed, having
+// published nothing; the engine keeps whatever map it had. A caller that gets
+// null must try again, exactly as it must for a clip it failed to push.
+//
+// Every set should publish once after load and once after each signature edit.
+// A set that never publishes plays in 4/4, which is what every build before this
+// one did, and is why nothing breaks while a caller has not been taught yet.
+inline const RtSig* publishSignatures(Engine& eng, const Session& s) {
+    const std::vector<SigChange> m = normalizedSigMap(s.sigs, s.sigNum, s.sigDen);
+    if (m.empty()) return nullptr;
+    RtSig* a = new (std::nothrow) RtSig[m.size()];
+    if (!a) return nullptr;
+    for (size_t i = 0; i < m.size(); ++i) a[i] = m[i];
+    Command c{};
+    c.type = Cmd::SetSignatures;
+    c.a = (i32)m.size();
+    c.p = a;
+    if (!eng.pushCommand(c)) { delete[] a; return nullptr; }
+    return a;
+}
 
 enum class MainView { Session, Arrangement };
 
