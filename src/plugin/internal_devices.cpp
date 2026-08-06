@@ -15,6 +15,7 @@
 // aligned float cannot tear on any target we build for, and a stale read costs
 // at most one block of latency.
 #include "host.h"
+#include "internal_dsp.h"
 
 #include <cmath>
 #include <cstring>
@@ -22,6 +23,8 @@
 namespace lat {
 namespace detail {
 namespace {
+
+using dsp::flushDenormal;
 
 // Device URIs. These are not decoration: a saved set stores the URI verbatim
 // and asks the registry for it again on load, so a URI is a permanent public
@@ -47,8 +50,16 @@ namespace {
 // user's file, and it is safe precisely because the alias never expires: the
 // upgraded file is readable by nothing older, but the un-upgraded one stays
 // readable by everything newer.
-constexpr const char* kSaturatorUri = "nxtakt:saturator";
-constexpr const char* kPulseUri     = "nxtakt:pulse";
+constexpr const char* kSaturatorUri  = "nxtakt:saturator";
+constexpr const char* kPulseUri      = "nxtakt:pulse";
+// Added after the rename, so these have no legacy spelling and never will: no
+// project file has ever named them `lattice:*`. The scheme-swap alias in
+// host.cpp would happily map `lattice:eq3` onto them, which is harmless -- that
+// URI was never written by anything.
+constexpr const char* kEq3Uri        = "nxtakt:eq3";
+constexpr const char* kCompressorUri = "nxtakt:compressor";
+constexpr const char* kDelayUri      = "nxtakt:delay";
+constexpr const char* kReverbUri     = "nxtakt:reverb";
 
 // Pre-rename spellings. Append-only; an entry may never be removed.
 constexpr const char* kSaturatorUriLegacy = "lattice:saturator";
@@ -57,10 +68,8 @@ constexpr const char* kPulseUriLegacy     = "lattice:pulse";
 // Denormals cost hundreds of cycles per operation on x86 when they leak into a
 // feedback path (the one-pole filter state, a decaying envelope). We do not
 // control the FPU mode of whatever thread the host handed us, so every state
-// variable that can decay towards zero is flushed explicitly.
-inline f32 flushDenormal(f32 v) {
-    return (std::fabs(v) < 1e-25f) ? 0.f : v;
-}
+// variable that can decay towards zero is flushed explicitly. The helper lives
+// in internal_dsp.h now, next to the filters that need it most.
 
 // --- shared base -----------------------------------------------------------
 // Parameter storage, descriptor and bypass are identical for every internal
@@ -102,14 +111,18 @@ public:
     // property of the devices and not an accident of what the base class
     // happens to return today.
     //
-    // It is true by construction for both: the Saturator is a memoryless
-    // waveshaper (out[i] depends only on in[i]), and Pulse is a generator whose
-    // first sample of a voice lands on the frame the note-on asked for. Neither
-    // has a lookahead buffer, an FFT window or an oversampling filter, which
-    // are the three things that produce latency. Any future internal device
-    // that does acquire one must override this again with its real figure --
-    // the engine's delay compensation trusts it, so reporting 0 while actually
-    // delaying would smear transients across every parallel path.
+    // It is true by construction for all six. The Saturator is a memoryless
+    // waveshaper (out[i] depends only on in[i]); Pulse is a generator whose
+    // first sample of a voice lands on the frame the note-on asked for; EQ Three
+    // and the Compressor are recursive but causal, so their first output sample
+    // responds to their first input sample; the Delay and the Reverb are
+    // parallel wet paths whose dry component is untouched, and their delay is
+    // the effect rather than a processing cost. None has a lookahead buffer, an
+    // FFT window or an oversampling filter, which are the three things that
+    // produce latency. Any future internal device that does acquire one must
+    // override this again with its real figure -- the engine's delay
+    // compensation trusts it, so reporting 0 while actually delaying would
+    // smear transients across every parallel path.
     int latencyFrames() const override      { return 0; }
 
     void setBypassed(bool b) override       { bypassed_ = b; }
@@ -135,7 +148,59 @@ protected:
         return n_++;
     }
 
+    // A switch. Stored as a float like everything else -- the contract has one
+    // parameter type -- with isBool set so the UI draws a toggle instead of a
+    // knob with two positions.
+    int addBoolParam(const char* name, bool def) {
+        const int i = addParam(name, "", 0.f, 1.f, def ? 1.f : 0.f);
+        info_[(size_t)i].isBool = true;
+        return i;
+    }
+
+    // A stepped choice (the delay's musical division). isInt asks the UI to
+    // quantise the knob; the DSP rounds anyway, because an automation lane can
+    // still hand us 3.5.
+    int addIntParam(const char* name, int mn, int mx, int def) {
+        const int i = addParam(name, "", (f32)mn, (f32)mx, (f32)def);
+        info_[(size_t)i].isInt = true;
+        return i;
+    }
+
     f32 p(int i) const { return pv_[(size_t)i]; }
+
+    // REALTIME. An OUTPUT value the device publishes for the UI to display --
+    // today only the compressor's gain reduction.
+    //
+    // THE WART, stated plainly: ParamInfo has no read-only flag (host.h), so a
+    // meter has to be an ordinary parameter that the device writes over. Three
+    // consequences, all of them tolerable and none of them invisible:
+    //   * the UI draws it as a knob the user can turn. Turning it does nothing
+    //     for longer than one block, because process() overwrites it.
+    //   * it is automatable. Drawing an envelope on it is equally pointless,
+    //     and setParamRT's return value cannot say so.
+    //   * it is persisted with the rest of the parameters, so a saved set
+    //     carries whatever the meter happened to read at save time. Harmless:
+    //     the next block overwrites it.
+    // The fix is one bool on ParamInfo (`isOutput`) plus the UI honouring it,
+    // which is a host.h change and therefore not this file's to make.
+    void setReadout(int i, f32 v) {
+        if (i < 0 || i >= n_) return;
+        pv_[(size_t)i] = clampv(v, info_[(size_t)i].min, info_[(size_t)i].max);
+    }
+
+    // These devices model a stereo pair. A chain that hands us more channels
+    // than that gets the extras copied rather than dropped -- silence would be
+    // a worse answer than "unprocessed", and the engine only ever calls with 2.
+    static void copyExtra(const f32* const* in, f32* const* out, int first,
+                          int channels, int nframes) {
+        for (int c = first; c < channels; ++c) {
+            if (!out[c]) continue;
+            const f32* src = in ? in[c] : nullptr;
+            if (src == out[c]) continue;
+            if (src) std::memcpy(out[c], src, (size_t)nframes * sizeof(f32));
+            else     std::memset(out[c], 0, (size_t)nframes * sizeof(f32));
+        }
+    }
 
     // REALTIME. Bypass and "we have nothing to say" both land here.
     static void passthrough(const f32* const* in, f32* const* out, int channels, int nframes) {
@@ -488,6 +553,715 @@ private:
     f32   acc_[kMaxBlock]{};
 };
 
+// --- EQ Three --------------------------------------------------------------
+// Low shelf, peaking mid, high shelf. RBJ cookbook sections, transposed direct
+// form II, per-channel state.
+//
+// Three decisions worth stating:
+//
+//   * Coefficients are recomputed when a parameter MOVES, not per sample and
+//     not per block: a cos, a sin and a sqrt per section is far too much to pay
+//     48000 times a second for a knob nobody is touching. The cached values are
+//     compared verbatim, so a static EQ costs three multiply chains and nothing
+//     else.
+//   * The resulting coefficient step is glided per sample over ~10 ms. Without
+//     it, sweeping the mid frequency steps the whole section once per block and
+//     you hear the block rate. Interpolating direct-form coefficients is only
+//     safe for sections that stay well inside the stability triangle, which
+//     these do: |a2| < 1 for every RBJ shelf/peak below Nyquist, and the
+//     frequency is clamped to 0.495*sr before the trigonometry so a project
+//     opened at 32 kHz cannot ask for a section at 18 kHz.
+//   * TDF-II rather than DF-I because its state stays on the order of the
+//     signal rather than of the filter's internal gain, which is what keeps a
+//     +15 dB shelf from parking large numbers in memory between blocks.
+//
+// Defaults are flat: 0 dB on all three bands is bit-for-bit unity through the
+// biquads (b0 = 1, everything else 0), so adding the device to a chain and
+// playing changes nothing at all until a knob moves. That is the correct
+// behaviour for the one device that ends up on every channel.
+class Eq3 final : public InternalInstance {
+public:
+    explicit Eq3(const PluginDesc& d) : InternalInstance(d) {
+        pLoF_  = addParam("Low Freq",  "Hz", 30.f,   500.f,   100.f,  true);
+        pLoG_  = addParam("Low Gain",  "dB", -15.f,  15.f,    0.f);
+        pMidF_ = addParam("Mid Freq",  "Hz", 200.f,  8000.f,  1000.f, true);
+        pMidG_ = addParam("Mid Gain",  "dB", -15.f,  15.f,    0.f);
+        pMidQ_ = addParam("Mid Q",     "",   0.3f,   6.f,     0.9f,   true);
+        pHiF_  = addParam("High Freq", "Hz", 2000.f, 18000.f, 8000.f, true);
+        pHiG_  = addParam("High Gain", "dB", -15.f,  15.f,    0.f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+        glide_ = dsp::poleCoef(sr_, 0.01f);
+        for (int c = 0; c < kCh; ++c) { loS_[c].reset(); midS_[c].reset(); hiS_[c].reset(); }
+        recompute(true);                                // snap: no glide at load
+        first_ = true;
+        return true;
+    }
+
+    // REALTIME.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in) { passthrough(in, out, channels, nframes); return; }
+
+        recompute(false);
+        // The parameters a project restores are written after instantiate(), so
+        // the first block is the one that establishes them rather than one that
+        // glides towards them.
+        if (first_) { lo_ = loT_; mid_ = midT_; hi_ = hiT_; first_ = false; }
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        for (int i = 0; i < nframes; ++i) {
+            dsp::biquadGlide(lo_,  loT_,  glide_);
+            dsp::biquadGlide(mid_, midT_, glide_);
+            dsp::biquadGlide(hi_,  hiT_,  glide_);
+
+            for (int c = 0; c < nc; ++c) {
+                if (!dst[c]) continue;
+                f32 x = src[c] ? src[c][i] : 0.f;
+                x = dsp::biquadTick(lo_,  loS_[c],  x);
+                x = dsp::biquadTick(mid_, midS_[c], x);
+                x = dsp::biquadTick(hi_,  hiS_[c],  x);
+                dst[c][i] = x;
+            }
+        }
+
+        // Once per block: stop the glide from grinding on denormal residues,
+        // and reset any section whose state has gone non-finite. The second is
+        // belt and braces -- an RBJ section below Nyquist cannot blow up -- but
+        // a NaN in a recursive filter is permanent, and the cost of the check
+        // is three comparisons per block.
+        dsp::biquadSettle(lo_,  loT_);
+        dsp::biquadSettle(mid_, midT_);
+        dsp::biquadSettle(hi_,  hiT_);
+        for (int c = 0; c < kCh; ++c) { loS_[c].check(); midS_[c].check(); hiS_[c].check(); }
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh = 2;
+
+    void recompute(bool snap) {
+        const f32 lf = p(pLoF_),  lg = p(pLoG_);
+        const f32 mf = p(pMidF_), mg = p(pMidG_), mq = p(pMidQ_);
+        const f32 hf = p(pHiF_),  hg = p(pHiG_);
+        if (!snap && lf == cLf_ && lg == cLg_ && mf == cMf_ && mg == cMg_ &&
+            mq == cMq_ && hf == cHf_ && hg == cHg_)
+            return;
+        cLf_ = lf; cLg_ = lg; cMf_ = mf; cMg_ = mg; cMq_ = mq; cHf_ = hf; cHg_ = hg;
+
+        loT_  = dsp::rbj::lowShelf (sr_, lf, lg);
+        midT_ = dsp::rbj::peaking  (sr_, mf, mg, mq);
+        hiT_  = dsp::rbj::highShelf(sr_, hf, hg);
+        if (snap) { lo_ = loT_; mid_ = midT_; hi_ = hiT_; }
+    }
+
+    int pLoF_ = 0, pLoG_ = 0, pMidF_ = 0, pMidG_ = 0, pMidQ_ = 0, pHiF_ = 0, pHiG_ = 0;
+
+    dsp::BiquadCoeffs lo_, mid_, hi_;                  // gliding
+    dsp::BiquadCoeffs loT_, midT_, hiT_;               // target
+    dsp::BiquadState  loS_[kCh], midS_[kCh], hiS_[kCh];
+    f32  glide_ = 1.f;
+    bool first_ = true;
+
+    // Last parameter values the coefficients were built from. NaN-initialised
+    // through the sentinel below would be neater; -1 is enough, because no
+    // parameter here can legally be negative except the gains, and those start
+    // at 0 with a matching flat coefficient set from prepare().
+    f32 cLf_ = -1.f, cLg_ = -1.f, cMf_ = -1.f, cMg_ = -1.f, cMq_ = -1.f,
+        cHf_ = -1.f, cHg_ = -1.f;
+};
+
+// --- Compressor ------------------------------------------------------------
+// Feed-forward, peak-detecting, stereo-linked, with the whole detector living
+// in dB.
+//
+// Detection is PEAK, not RMS: this is the compressor you reach for on a drum
+// bus or a vocal, where the thing you are trying to catch is a transient, and
+// an RMS window with a musically useful time constant simply does not see it.
+// An RMS mode would be a second detector and a mode switch, and the honest
+// version of that device is a separate one (a bus/glue compressor) rather than
+// a switch on this one.
+//
+// Stereo-linked: the detector sees max(|L|, |R|) and ONE gain is applied to
+// both channels. Independent per-channel gains on a stereo bus pull the image
+// towards whichever side is quieter every time a snare lands -- that is not a
+// subtlety, it is the difference between a mix compressor and a broken one.
+//
+// Log-domain smoothing: the attack/release one-pole runs on the gain reduction
+// in dB, not on the linear envelope. Two things follow. The attack time means
+// the same thing whatever the ratio (a 10 ms attack reaches 63% of ITS OWN
+// target GR in 10 ms, whether that target is 3 dB or 30), and the release is a
+// constant number of dB per second rather than an exponential in linear gain,
+// which is what "release" means to everyone who has ever used one.
+//
+// Defaults: -18 dB threshold, 3:1, 10 ms / 120 ms, 6 dB knee, no makeup. A
+// signal below -18 dBFS peak passes through at exactly unity, so dropping the
+// device on a channel and playing is inaudible until the material asks for it.
+class Compressor final : public InternalInstance {
+public:
+    explicit Compressor(const PluginDesc& d) : InternalInstance(d) {
+        pThresh_ = addParam("Threshold", "dB", -60.f, 0.f,    -18.f);
+        pRatio_  = addParam("Ratio",     "",   1.f,   20.f,   3.f,   true);
+        pAttack_ = addParam("Attack",    "ms", 0.1f,  100.f,  10.f,  true);
+        pRelease_= addParam("Release",   "ms", 10.f,  1000.f, 120.f, true);
+        pKnee_   = addParam("Knee",      "dB", 0.f,   24.f,   6.f);
+        pMakeup_ = addParam("Makeup",    "dB", 0.f,   24.f,   0.f);
+        // Output-only. See InternalInstance::setReadout for the wart.
+        pGr_     = addParam("Gain Reduction", "dB", 0.f, 60.f, 0.f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+        env_ = 0.f;
+        makeup_.setTime(sr_, 0.02f);
+        makeup_.snap(dbToGain(clampv(p(pMakeup_), 0.f, 24.f)));
+        setReadout(pGr_, 0.f);
+        first_ = true;
+        return true;
+    }
+
+    // REALTIME.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in) { passthrough(in, out, channels, nframes); return; }
+
+        const f32 thr   = clampv(p(pThresh_), -60.f, 0.f);
+        const f32 ratio = clampv(p(pRatio_), 1.f, 20.f);
+        const f32 knee  = clampv(p(pKnee_), 0.f, 24.f);
+        const f32 slope = 1.f - 1.f / ratio;             // dB of GR per dB over
+        const f32 att   = dsp::poleCoef(sr_, clampv(p(pAttack_), 0.1f, 100.f) * 1e-3f);
+        const f32 rel   = dsp::poleCoef(sr_, clampv(p(pRelease_), 10.f, 1000.f) * 1e-3f);
+        makeup_.set(dbToGain(clampv(p(pMakeup_), 0.f, 24.f)));
+        if (first_) { makeup_.settle(); first_ = false; }
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        f32 peakGr = 0.f;
+        for (int i = 0; i < nframes; ++i) {
+            const f32 l = src[0] ? src[0][i] : 0.f;
+            const f32 r = (nc > 1 && src[1]) ? src[1][i] : l;
+
+            // Detector. The floor is -140 dB, which is below any signal that
+            // could matter and keeps the log finite for digital silence.
+            const f32 det  = std::fmax(std::fabs(l), std::fabs(r));
+            const f32 lvl  = 20.f * std::log10(std::fmax(det, 1e-7f));
+            const f32 over = lvl - thr;
+
+            // Static curve with a quadratic soft knee centred on the threshold:
+            // continuous in value AND in slope at both knee edges, which is
+            // what stops a knee from sounding like a second, softer threshold.
+            f32 target;
+            if (knee > 0.f && over > -0.5f * knee && over < 0.5f * knee) {
+                const f32 t = over + 0.5f * knee;
+                target = slope * t * t / (2.f * knee);
+            } else {
+                target = over > 0.f ? slope * over : 0.f;
+            }
+
+            env_ += (target - env_) * (target > env_ ? att : rel);
+            env_ = flushDenormal(env_);
+            if (env_ > peakGr) peakGr = env_;
+
+            const f32 g = dbToGain(-env_) * makeup_.next();
+            for (int c = 0; c < nc; ++c) {
+                if (!dst[c]) continue;
+                dst[c][i] = (c == 0 ? l : r) * g;
+            }
+        }
+
+        if (!dsp::sane(env_)) env_ = 0.f;
+        // One value per block: the meter the UI draws is the worst reduction in
+        // the block, which is the number an engineer actually wants to see.
+        setReadout(pGr_, peakGr);
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh = 2;
+
+    int pThresh_ = 0, pRatio_ = 0, pAttack_ = 0, pRelease_ = 0, pKnee_ = 0,
+        pMakeup_ = 0, pGr_ = 0;
+
+    f32           env_ = 0.f;                            // current GR, dB, >= 0
+    dsp::Smoother makeup_;
+    bool          first_ = true;
+};
+
+// --- Delay -----------------------------------------------------------------
+// Stereo delay with a filtered feedback path and a ping-pong mode.
+//
+// THE TEMPO SITUATION, in full, because it is the one thing here that is not
+// self-contained:
+//
+// PluginInstance (host.h) carries audio, MIDI, parameters and latency. It does
+// NOT carry transport: there is no tempo, no beat position and no time
+// signature on the contract, and the engine's process loop calls
+// fx->process(bufs, bufs, 2, n) with nothing else. The engine has the tempo
+// (Engine::tempo_, and the atomic it publishes for the GUI), but src/plugin
+// deliberately does not depend on src/audio, and the plugin layer lives in the
+// daemon process where reaching for a UI-side session struct would be a lie
+// anyway.
+//
+// So sync is implemented in full -- the division table, the beats-to-samples
+// conversion, the switch -- against a TEMPO PARAMETER on the device, defaulting
+// to 120 BPM. Everything except the source of the number is done. The wart is
+// exactly one field wide: the user (or an automation lane) has to tell the
+// device what the session tempo is, and nothing tells them when it drifts out
+// of agreement with the transport.
+//
+// What host.h would need, stated so it can be done in one pass when a contract
+// change is on the table:
+//
+//     // REALTIME. Called before this block's process() with the transport
+//     // state the block will be rendered at. Default no-op.
+//     virtual void setTransport(f64 bpm, f64 beat, bool playing) {}
+//
+// plus the three fx->process() call sites in engine.cpp calling it first, and
+// LV2/CLAP forwarding it (LV2: a time:Position atom on the event input; CLAP:
+// clap_event_transport_t in the process struct -- both formats already have a
+// place for it, which is the strongest argument that the shape above is the
+// right one). This device would then drop its Tempo parameter and read the
+// transport instead. The division maths, which is the part that can be wrong,
+// is already written and already tested.
+//
+// Feedback path: the delayed signal is lowpassed BEFORE it re-enters the line
+// and not on the way out, so each repeat is one filter pass darker than the
+// last -- the tape/BBD behaviour every musician expects -- while the first
+// repeat is exactly what went in.
+//
+// Ping-pong sums the input to mono and injects it into the left line only; left
+// feeds right, right feeds back into left. That gives strict alternation.
+// Cross-feeding both lines from a stereo input, which is the other common
+// implementation, gives two delays that lean rather than one that bounces.
+class Delay final : public InternalInstance {
+public:
+    explicit Delay(const PluginDesc& d) : InternalInstance(d) {
+        pSync_  = addBoolParam("Sync", true);
+        pDiv_   = addIntParam ("Division", 0, kDivCount - 1, 3);   // 1/8
+        pTime_  = addParam("Time",     "ms",  1.f,   2000.f,  350.f, true);
+        pTempo_ = addParam("Tempo",    "BPM", 20.f,  999.f,   120.f);
+        pFb_    = addParam("Feedback", "",    0.f,   0.95f,   0.35f);
+        pTone_  = addParam("Tone",     "Hz",  200.f, 18000.f, 6000.f, true);
+        pPing_  = addBoolParam("Ping Pong", false);
+        pMix_   = addParam("Dry/Wet",  "",    0.f,   1.f,     0.3f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        // GUI thread: the only allocation in the device, and the size is fixed
+        // for the lifetime of the instance. Four seconds is 1 bar at 60 BPM,
+        // which is the longest musically meaningful division; slower sets clamp
+        // (documented in the parameter range rather than silently wrapping).
+        const int n = (int)(kMaxDelaySec * sr_) + 8;
+        lineL_.resize(n);
+        lineR_.resize(n);
+        lineL_.reset();
+        lineR_.reset();
+        lpL_.reset();
+        lpR_.reset();
+
+        time_.setTime(sr_, 0.05f);      // 50 ms: a time change bends, not clicks
+        fb_.setTime(sr_, 0.02f);
+        mix_.setTime(sr_, 0.02f);
+        fb_.snap(clampv(p(pFb_), 0.f, 0.95f));
+        mix_.snap(clampv(p(pMix_), 0.f, 1.f));
+        first_ = true;                  // snap the delay time on the first block
+        return true;
+    }
+
+    // REALTIME.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in || lineL_.buf.empty()) { passthrough(in, out, channels, nframes); return; }
+
+        const bool sync = p(pSync_) >= 0.5f;
+        const bool ping = p(pPing_) >= 0.5f;
+
+        f32 sec;
+        if (sync) {
+            const int div = (int)clampv(p(pDiv_) + 0.5f, 0.f, (f32)(kDivCount - 1));
+            const f32 bpm = clampv(p(pTempo_), 20.f, 999.f);
+            sec = kDivBeats[div] * 60.f / bpm;
+        } else {
+            sec = clampv(p(pTime_), 1.f, 2000.f) * 1e-3f;
+        }
+        const f32 maxD = (f32)lineL_.capacity() - 2.f;
+        const f32 want = clampv(sec * (f32)sr_, 1.f, maxD);
+        time_.set(want);
+        fb_.set(clampv(p(pFb_), 0.f, 0.95f));
+        mix_.set(clampv(p(pMix_), 0.f, 1.f));
+        // First block after prepare: whatever the parameters say now IS the
+        // starting state, so a restored 100%-dry delay is silent from sample
+        // zero and a restored delay time is exact rather than bent into place.
+        if (first_) { time_.settle(); fb_.settle(); mix_.settle(); first_ = false; }
+        lpL_.setCutoff(sr_, clampv(p(pTone_), 200.f, 18000.f));
+        lpR_.a = lpL_.a;
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        for (int i = 0; i < nframes; ++i) {
+            const f32 xl = src[0] ? src[0][i] : 0.f;
+            const f32 xr = (nc > 1 && src[1]) ? src[1][i] : xl;
+
+            const f32 d   = time_.next();
+            const f32 dl  = lineL_.tapLerp(d);
+            const f32 dr  = lineR_.tapLerp(d);
+            const f32 fb  = fb_.next();
+            const f32 mix = mix_.next();
+
+            const f32 fl = lpL_.process(dl);
+            const f32 fr = lpR_.process(dr);
+
+            f32 wl, wr;
+            if (ping) {
+                const f32 mono = 0.5f * (xl + xr);
+                wl = mono + fr * fb;
+                wr = fl * fb;
+            } else {
+                wl = xl + fl * fb;
+                wr = xr + fr * fb;
+            }
+            // The clamp is a guard, not a sound: feedback is capped at 0.95 and
+            // the tone filter has unity DC gain, so the line's steady state is
+            // bounded by 20x the input and cannot reach this. It exists so that
+            // a denormal-flushed NaN arriving from upstream cannot become
+            // permanent state in a feedback loop.
+            lineL_.push(flushDenormal(clampv(wl, -32.f, 32.f)));
+            lineR_.push(flushDenormal(clampv(wr, -32.f, 32.f)));
+
+            if (dst[0]) dst[0][i] = xl * (1.f - mix) + dl * mix;
+            if (nc > 1 && dst[1]) dst[1][i] = xr * (1.f - mix) + dr * mix;
+        }
+
+        lpL_.check();
+        lpR_.check();
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh = 2;
+    static constexpr f64 kMaxDelaySec = 4.0;
+
+    // 1/32 .. 1 bar, in beats. Triplets and dotted values are included because
+    // a delay without a dotted eighth is a delay nobody uses. "1 bar" is four
+    // beats: the time signature is not on the plugin contract either, and 4/4
+    // is the honest default rather than a guess we could get wrong.
+    static constexpr int kDivCount = 9;
+    static constexpr f32 kDivBeats[kDivCount] = {
+        0.125f,      // 1/32
+        0.25f,       // 1/16
+        1.f / 3.f,   // 1/8 triplet
+        0.5f,        // 1/8
+        0.75f,       // 1/8 dotted
+        1.f,         // 1/4
+        1.5f,        // 1/4 dotted
+        2.f,         // 1/2
+        4.f,         // 1 bar
+    };
+
+    int pSync_ = 0, pDiv_ = 0, pTime_ = 0, pTempo_ = 0, pFb_ = 0, pTone_ = 0,
+        pPing_ = 0, pMix_ = 0;
+
+    dsp::DelayLine lineL_, lineR_;
+    dsp::OnePole   lpL_, lpR_;
+    dsp::Smoother  time_, fb_, mix_;
+    bool           first_ = true;
+};
+
+// --- Reverb ----------------------------------------------------------------
+// A Dattorro/Griesinger plate: input diffusion into a figure-of-eight tank,
+// output taken as a fistful of decorrelated taps from inside the tank.
+//
+// Structure (Dattorro, "Effect Design Part 1: Reverberator and Other
+// Filters", JAES 1997), with the delay lengths scaled from the paper's
+// 29761 Hz reference to whatever rate we were prepared at:
+//
+//   in -> mono -> pre-delay -> bandwidth LP -> 4 diffusion allpasses -> x
+//   left  half: (x + right output) -> modulated AP -> delay -> damping ->
+//               decay -> AP -> delay -> right half
+//   right half: (x + left output)  -> modulated AP -> delay -> damping ->
+//               decay -> AP -> delay -> left half
+//
+// Decisions:
+//
+//   * Decay is a TIME, in seconds, not a dimensionless feedback number. The two
+//     per-loop multipliers are solved for the requested RT60 from the actual
+//     loop length at the actual sample rate: g = 10^(-1.5*loop/(sr*rt60)), so
+//     g^2 per loop is exactly -60 dB after rt60 seconds. A "decay" knob from 0
+//     to 1 means nothing to a user and cannot be tested; a knob in seconds is
+//     both a promise and a measurement.
+//   * The tank's first allpass in each half is modulated by a slow quadrature
+//     LFO (~0.7 and ~1.1 Hz, a few samples of excursion). This is what stops
+//     the tank's modes from ringing on a fixed set of frequencies -- an
+//     unmodulated plate on a sustained note sounds metallic within a second.
+//   * The input is summed to mono before the tank, which is what a plate is:
+//     one driver, one sheet. Stereo comes from taking the output taps in two
+//     different sets, and the Width control collapses those towards mono
+//     without collapsing the reverb itself.
+//   * Damping is a one-pole lowpass inside each half of the tank, so it
+//     compounds once per pass: high frequencies decay faster than low ones,
+//     which is the single largest difference between a reverb that sounds like
+//     a room and one that sounds like a delay network.
+//
+// Defaults: 20 ms pre-delay, 2 s decay, 6 kHz damping, 25% wet. Audible,
+// flattering, and nowhere near loud enough to be destructive on a first play.
+class Reverb final : public InternalInstance {
+public:
+    explicit Reverb(const PluginDesc& d) : InternalInstance(d) {
+        pPre_   = addParam("Pre-Delay", "ms", 0.f,   250.f,   20.f);
+        pDecay_ = addParam("Decay",     "s",  0.2f,  12.f,    2.f,    true);
+        pDamp_  = addParam("Damping",   "Hz", 500.f, 18000.f, 6000.f, true);
+        pDiff_  = addParam("Diffusion", "",   0.f,   1.f,     0.7f);
+        pWidth_ = addParam("Width",     "",   0.f,   1.f,     1.f);
+        pMix_   = addParam("Dry/Wet",   "",   0.f,   1.f,     0.25f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        const f64 k = sr_ / 29761.0;                  // the paper's rate
+        auto S = [k](int n) { const int v = (int)(n * k + 0.5); return v < 1 ? 1 : v; };
+
+        for (int i = 0; i < 4; ++i) {
+            lenDif_[i] = S(kRefDif[i]);
+            dif_[i].resize(lenDif_[i] + 4);
+        }
+        lenApA_ = S(672);  lenDlA_ = S(4453); lenApB_ = S(1800); lenDlB_ = S(3720);
+        lenApC_ = S(908);  lenDlC_ = S(4217); lenApD_ = S(2656); lenDlD_ = S(3163);
+
+        // Modulation excursion, in samples, never more than a quarter of the
+        // allpass it modulates (the fractional read must stay above 1).
+        mod_ = (f32)S(8);
+        mod_ = std::fmin(mod_, (f32)(lenApA_ < lenApC_ ? lenApA_ : lenApC_) * 0.25f);
+
+        apA_.resize(lenApA_ + (int)mod_ + 8);
+        apC_.resize(lenApC_ + (int)mod_ + 8);
+        apB_.resize(lenApB_ + 4);
+        apD_.resize(lenApD_ + 4);
+        dlA_.resize(lenDlA_ + 4);
+        dlB_.resize(lenDlB_ + 4);
+        dlC_.resize(lenDlC_ + 4);
+        dlD_.resize(lenDlD_ + 4);
+        pre_.resize((int)(0.25 * sr_) + 8);
+
+        // Output taps. The positions are the paper's, scaled, and clamped into
+        // the line they are read from -- a tap is only ever "how long ago", so
+        // any position the buffer can hold is a legitimate read.
+        for (int i = 0; i < kTaps; ++i) {
+            tapL_[i] = clampTap(S(kRefTapL[i]), tapLineL(i));
+            tapR_[i] = clampTap(S(kRefTapR[i]), tapLineR(i));
+        }
+
+        loop_ = (f32)(lenApA_ + lenDlA_ + lenApB_ + lenDlB_ +
+                      lenApC_ + lenDlC_ + lenApD_ + lenDlD_);
+
+        // Quadrature LFOs: a rotating unit vector each, one multiply-add per
+        // sample and no std::sin in the loop.
+        lfoKA_ = (f32)(dsp::kTwoPi * 0.70 / sr_);
+        lfoKC_ = (f32)(dsp::kTwoPi * 1.13 / sr_);
+        sA_ = 0.f; cA_ = 1.f; sC_ = 0.f; cC_ = 1.f;
+
+        inLp_.setCutoff(sr_, (f32)std::fmin(16000.0, sr_ * 0.45));
+        preT_.setTime(sr_, 0.08f);
+        preT_.snap(clampv(p(pPre_), 0.f, 250.f) * 1e-3f * (f32)sr_);
+        width_.setTime(sr_, 0.02f);
+        width_.snap(clampv(p(pWidth_), 0.f, 1.f));
+        mix_.setTime(sr_, 0.02f);
+        mix_.snap(clampv(p(pMix_), 0.f, 1.f));
+        decay_.setTime(sr_, 0.1f);
+        decay_.snap(decayGain());
+        first_ = true;
+
+        clear();
+        return true;
+    }
+
+    // REALTIME.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        // Unlike the other effects, "no input" is not "nothing to do": the tank
+        // still has to ring out. A null input block is processed as silence.
+        if (bypassed_ || pre_.buf.empty()) { passthrough(in, out, channels, nframes); return; }
+
+        dampA_.setCutoff(sr_, clampv(p(pDamp_), 500.f, 18000.f));
+        dampC_.a = dampA_.a;
+        preT_.set(clampv(p(pPre_), 0.f, 250.f) * 1e-3f * (f32)sr_);
+        width_.set(clampv(p(pWidth_), 0.f, 1.f));
+        mix_.set(clampv(p(pMix_), 0.f, 1.f));
+        decay_.set(decayGain());
+        if (first_) {
+            preT_.settle(); width_.settle(); mix_.settle(); decay_.settle();
+            first_ = false;
+        }
+
+        const f32 dif = clampv(p(pDiff_), 0.f, 1.f);
+        const f32 g1 = 0.75f * (0.35f + 0.65f * dif);
+        const f32 g2 = 0.625f * (0.35f + 0.65f * dif);
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in ? in[c] : nullptr; dst[c] = out[c]; }
+
+        for (int i = 0; i < nframes; ++i) {
+            const f32 xl = src[0] ? src[0][i] : 0.f;
+            const f32 xr = (nc > 1 && src[1]) ? src[1][i] : xl;
+
+            // --- input chain
+            const f32 mono = 0.5f * (xl + xr);
+            const f32 xp = pre_.tapLerp(preT_.next());
+            pre_.push(flushDenormal(mono));
+
+            f32 v = inLp_.process(xp);
+            v = dsp::allpassTick(dif_[0], (f32)lenDif_[0], g1, v);
+            v = dsp::allpassTick(dif_[1], (f32)lenDif_[1], g1, v);
+            v = dsp::allpassTick(dif_[2], (f32)lenDif_[2], g2, v);
+            v = dsp::allpassTick(dif_[3], (f32)lenDif_[3], g2, v);
+
+            // --- LFOs
+            sA_ += lfoKA_ * cA_; cA_ -= lfoKA_ * sA_;
+            sC_ += lfoKC_ * cC_; cC_ -= lfoKC_ * sC_;
+
+            const f32 dg = decay_.next();
+
+            // --- left half: fed by the right half's output from last sample.
+            f32 a = dsp::allpassTick(apA_, (f32)lenApA_ + mod_ * sA_, kTankAp1, v + fromD_);
+            f32 t = dlA_.tap(lenDlA_);
+            dlA_.push(flushDenormal(a));
+            t = dampA_.process(t) * dg;
+            t = dsp::allpassTick(apB_, (f32)lenApB_, kTankAp2, t);
+            const f32 outB = dlB_.tap(lenDlB_);
+            dlB_.push(flushDenormal(t));
+
+            // --- right half: fed by the left half's output from this sample.
+            // The loop still has thousands of samples of delay in it, so there
+            // is no delay-free path; taking the fresher value simply makes the
+            // figure-of-eight one sample tighter.
+            f32 b = dsp::allpassTick(apC_, (f32)lenApC_ + mod_ * sC_, kTankAp1, v + outB);
+            f32 u = dlC_.tap(lenDlC_);
+            dlC_.push(flushDenormal(b));
+            u = dampC_.process(u) * dg;
+            u = dsp::allpassTick(apD_, (f32)lenApD_, kTankAp2, u);
+            const f32 outD = dlD_.tap(lenDlD_);
+            dlD_.push(flushDenormal(u));
+            fromD_ = flushDenormal(outD);
+
+            // --- output taps: six per side, alternating signs, read from the
+            // opposite half's lines wherever possible so the two outputs share
+            // as little as possible.
+            const f32 yl = kTapGain * ( dlC_.tap(tapL_[0]) + dlC_.tap(tapL_[1])
+                                      - dlD_.tap(tapL_[2]) + dlA_.tap(tapL_[3])
+                                      - dlB_.tap(tapL_[4]) - dlB_.tap(tapL_[5]) );
+            const f32 yr = kTapGain * ( dlA_.tap(tapR_[0]) + dlA_.tap(tapR_[1])
+                                      - dlB_.tap(tapR_[2]) + dlC_.tap(tapR_[3])
+                                      - dlD_.tap(tapR_[4]) - dlD_.tap(tapR_[5]) );
+
+            const f32 w   = width_.next();
+            const f32 mid = 0.5f * (yl + yr);
+            const f32 sid = 0.5f * (yl - yr) * w;
+            const f32 mix = mix_.next();
+
+            if (dst[0]) dst[0][i] = xl * (1.f - mix) + (mid + sid) * mix;
+            if (nc > 1 && dst[1]) dst[1][i] = xr * (1.f - mix) + (mid - sid) * mix;
+        }
+
+        // Renormalise the LFO vectors (they drift by O(k^2) per sample) and
+        // check the recursive state. A tank that has gone non-finite never
+        // recovers on its own, so the check is the difference between one bad
+        // block and a dead device.
+        renorm(sA_, cA_);
+        renorm(sC_, cC_);
+        inLp_.check(); dampA_.check(); dampC_.check();
+        if (!dsp::sane(fromD_)) { fromD_ = 0.f; clear(); }
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh   = 2;
+    static constexpr int kTaps = 6;
+    static constexpr f32 kTankAp1 = 0.7f;    // "decay diffusion 1"
+    static constexpr f32 kTankAp2 = 0.5f;    // "decay diffusion 2"
+    // Six uncorrelated taps sum like a random walk, so ~1/sqrt(6) keeps a wet
+    // signal in the same neighbourhood as the dry one. Measured, not guessed:
+    // see the level check in tests/internal_device_test.cpp.
+    static constexpr f32 kTapGain = 0.6f;
+
+    static constexpr int kRefDif[4]  = { 142, 107, 379, 277 };
+    static constexpr int kRefTapL[6] = { 266, 2974, 1913, 1990, 187, 1066 };
+    static constexpr int kRefTapR[6] = { 353, 3627, 1228, 2673, 335, 2111 };
+
+    const dsp::DelayLine& tapLineL(int i) const {
+        return (i < 2) ? dlC_ : (i == 2 ? dlD_ : (i == 3 ? dlA_ : dlB_));
+    }
+    const dsp::DelayLine& tapLineR(int i) const {
+        return (i < 2) ? dlA_ : (i == 2 ? dlB_ : (i == 3 ? dlC_ : dlD_));
+    }
+    static int clampTap(int t, const dsp::DelayLine& l) {
+        const int m = l.capacity();
+        return t < 1 ? 1 : (t > m ? m : t);
+    }
+
+    // Solve the two per-loop multipliers for the requested RT60.
+    f32 decayGain() const {
+        const f32 rt = clampv(p(pDecay_), 0.2f, 12.f);
+        const f32 loops = loop_ / (f32)(sr_ * rt);      // loop traversals per RT60
+        return clampv(std::pow(10.f, -1.5f * loops), 0.f, 0.98f);
+    }
+
+    static void renorm(f32& s, f32& c) {
+        const f32 n = s * s + c * c;
+        if (n > 1e-6f && n < 4.f) { const f32 k = 1.5f - 0.5f * n; s *= k; c *= k; }
+        else { s = 0.f; c = 1.f; }
+    }
+
+    void clear() {
+        pre_.reset();
+        for (auto& d : dif_) d.reset();
+        apA_.reset(); apB_.reset(); apC_.reset(); apD_.reset();
+        dlA_.reset(); dlB_.reset(); dlC_.reset(); dlD_.reset();
+        inLp_.reset(); dampA_.reset(); dampC_.reset();
+        fromD_ = 0.f;
+    }
+
+    int pPre_ = 0, pDecay_ = 0, pDamp_ = 0, pDiff_ = 0, pWidth_ = 0, pMix_ = 0;
+
+    dsp::DelayLine pre_, dif_[4];
+    dsp::DelayLine apA_, dlA_, apB_, dlB_;      // left half
+    dsp::DelayLine apC_, dlC_, apD_, dlD_;      // right half
+    dsp::OnePole   inLp_, dampA_, dampC_;
+    dsp::Smoother  preT_, width_, mix_, decay_;
+
+    int lenDif_[4] = { 1, 1, 1, 1 };
+    int lenApA_ = 1, lenDlA_ = 1, lenApB_ = 1, lenDlB_ = 1;
+    int lenApC_ = 1, lenDlC_ = 1, lenApD_ = 1, lenDlD_ = 1;
+    int tapL_[kTaps] = { 1, 1, 1, 1, 1, 1 };
+    int tapR_[kTaps] = { 1, 1, 1, 1, 1, 1 };
+    f32 mod_ = 0.f, loop_ = 1.f;
+    f32 lfoKA_ = 0.f, lfoKC_ = 0.f, sA_ = 0.f, cA_ = 1.f, sC_ = 0.f, cC_ = 1.f;
+    f32 fromD_ = 0.f;
+    bool first_ = true;
+};
+
 PluginDesc saturatorDesc() {
     PluginDesc d;
     d.format     = PluginFormat::Internal;
@@ -518,13 +1292,40 @@ PluginDesc pulseDesc() {
     return d;
 }
 
+// Effects share every field but the identity, so the descriptor is built once
+// and stamped. A new stock effect is now three lines plus its DSP.
+PluginDesc effectDesc(const char* uri, const char* name, const char* category,
+                      int paramCount) {
+    PluginDesc d;
+    d.format     = PluginFormat::Internal;
+    d.uri        = uri;
+    d.name       = name;
+    d.vendor     = "NxTakt";
+    d.category   = category;
+    d.kind       = PluginKind::Effect;
+    d.audioIn    = 2;
+    d.audioOut   = 2;
+    d.hasMidiIn  = false;
+    d.paramCount = paramCount;
+    return d;
+}
+
+PluginDesc eq3Desc()        { return effectDesc(kEq3Uri,        "EQ Three",   "EQ",      7); }
+PluginDesc compressorDesc() { return effectDesc(kCompressorUri, "Compressor", "Dynamics", 7); }
+PluginDesc delayDesc()      { return effectDesc(kDelayUri,      "Delay",      "Delay",    8); }
+PluginDesc reverbDesc()     { return effectDesc(kReverbUri,     "Reverb",     "Reverb",   6); }
+
 } // namespace
 
 // --- entry points ----------------------------------------------------------
 void scanInternal(std::vector<PluginDesc>& out) {
     out.push_back(saturatorDesc());
     out.push_back(pulseDesc());
-    LOGI("internal: 2 devices");
+    out.push_back(eq3Desc());
+    out.push_back(compressorDesc());
+    out.push_back(delayDesc());
+    out.push_back(reverbDesc());
+    LOGI("internal: 6 devices");
 }
 
 std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
@@ -537,6 +1338,14 @@ std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
         inst = std::make_unique<Saturator>(saturatorDesc());
     else if (d.uri == kPulseUri || d.uri == kPulseUriLegacy)
         inst = std::make_unique<Pulse>(pulseDesc());
+    else if (d.uri == kEq3Uri)
+        inst = std::make_unique<Eq3>(eq3Desc());
+    else if (d.uri == kCompressorUri)
+        inst = std::make_unique<Compressor>(compressorDesc());
+    else if (d.uri == kDelayUri)
+        inst = std::make_unique<Delay>(delayDesc());
+    else if (d.uri == kReverbUri)
+        inst = std::make_unique<Reverb>(reverbDesc());
     else {
         LOGE("internal: unknown device %s", d.uri.c_str());
         return nullptr;
