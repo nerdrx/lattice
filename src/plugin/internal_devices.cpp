@@ -17,7 +17,11 @@
 #include "host.h"
 #include "internal_dsp.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace lat {
@@ -60,6 +64,7 @@ constexpr const char* kEq3Uri        = "nxtakt:eq3";
 constexpr const char* kCompressorUri = "nxtakt:compressor";
 constexpr const char* kDelayUri      = "nxtakt:delay";
 constexpr const char* kReverbUri     = "nxtakt:reverb";
+constexpr const char* kRackUri       = "nxtakt:rack";
 
 // Pre-rename spellings. Append-only; an entry may never be removed.
 constexpr const char* kSaturatorUriLegacy = "lattice:saturator";
@@ -1262,6 +1267,486 @@ private:
     bool first_ = true;
 };
 
+// --- Rack ------------------------------------------------------------------
+// Up to eight devices in series behind eight macro knobs.
+//
+// THE WHOLE IDEA: a rack is a PluginInstance that owns PluginInstances. It
+// therefore has to honour every clause of the contract in host.h *and forward
+// it*, which is where all the interesting decisions are:
+//
+//   * latencyFrames() is the SUM of the chain. Reporting 0 would be a lie the
+//     engine acts on -- it compensates with the number we give it, so a rack
+//     containing a lookahead limiter would smear every parallel path in the
+//     project by exactly the amount we failed to declare.
+//   * midi() is forwarded to sub-devices that declare a note input, so a rack
+//     can contain an instrument.
+//   * setParamRT() drives macros from the automation path, which means the
+//     macro -> target scaling runs on the audio thread and must be a pure
+//     lerp over values resolved at edit time.
+//   * bypass short-circuits the entire chain, not each device individually.
+//
+// THREADING, in full, because a container has a problem a leaf device does not.
+// The audio thread walks a chain that the GUI thread can edit underneath it.
+// The chain and the mappings are therefore never mutated in place: an edit
+// builds a complete new Layout in a slot of a small ring and publishes it with
+// one release store, and process()/midi()/setParamRT() take one acquire load
+// and then read a structure nobody will touch again. The ring is four deep so
+// that four edits would have to land inside a single audio block before the
+// layout being read could be rewritten -- that is a user's hand against a
+// 5.3 ms block at 256 frames.
+//
+// What that buys is safe UNLINKING. What it cannot buy is safe DELETION: no
+// code inside a PluginInstance can know when the audio thread last dereferenced
+// a pointer. So a removed sub-device is retired, not deleted -- it stays owned
+// by the rack until the rack dies or RackControl::reclaim() is called at a
+// moment the caller knows is quiet. Retiring is bounded (kOwnedCap) so a script
+// hammering removeDevice() fails loudly instead of eating memory.
+class Rack final : public InternalInstance, public RackControl {
+public:
+    Rack(const PluginDesc& d, PluginRegistry* reg) : InternalInstance(d), reg_(reg) {
+        char nm[16];
+        for (int i = 0; i < kRackMacros; ++i) {
+            std::snprintf(nm, sizeof nm, "Macro %d", i + 1);
+            // 0..1 rather than Live's 0..127: the contract has one parameter
+            // type and one range convention, an automation lane draws a
+            // normalised curve, and every mapping is a lerp of this value.
+            addParam(nm, "", 0.f, 1.f, 0.f);
+        }
+        // ring_[0] is the empty layout an unprepared, unfilled rack presents.
+        // It is published immediately so process() never sees a null.
+        live_.store(&ring_[0], std::memory_order_release);
+        next_ = 1;
+    }
+
+    RackControl* rack() override { return this; }
+
+    // GUI thread. Every sub-device is prepared at the rack's rate and block
+    // size, and the chain sum is recomputed from what they report afterwards.
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_       = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        // The only allocation in the device, on the GUI thread, like the
+        // Delay's line. Two stereo buffers is all a series chain needs: the
+        // last device writes straight into the caller's output, so N devices
+        // ping-pong between A and B for the N-1 intermediate results.
+        for (int b = 0; b < 2; ++b)
+            for (int c = 0; c < kCh; ++c)
+                scratch_[b][c].assign((size_t)maxBlock_, 0.f);
+        scratchFrames_ = maxBlock_;
+
+        bool ok = true;
+        for (const auto& up : owned_)
+            if (up && !up->prepare(sr_, maxBlock_)) ok = false;
+
+        republish();
+        return ok;
+    }
+
+    // REALTIME. The chain, in series, through the scratch pair.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        const Layout* L = live_.load(std::memory_order_acquire);
+
+        // An empty rack is a wire. A block bigger than the one we were prepared
+        // for degrades to a wire too, rather than to a heap call.
+        if (bypassed_ || !L || L->n == 0 || nframes > scratchFrames_) {
+            passthrough(in, out, channels, nframes);
+            return;
+        }
+
+        const int nc = channels < kCh ? channels : kCh;
+
+        const f32* cur[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) cur[c] = in ? in[c] : nullptr;
+
+        int which = 0;
+        for (int i = 0; i < L->n; ++i) {
+            if (i == L->n - 1) {
+                // The last device writes into the caller's buffer. With one
+                // device in the rack this is `dev->process(in, out, ...)`
+                // verbatim -- the same call the device would get standing on a
+                // track by itself, aliasing and all -- which is what makes a
+                // rack containing one device bit-exact with that device.
+                L->dev[i]->process(cur, out, nc, nframes);
+                break;
+            }
+            f32* dst[kCh] = { scratch_[which][0].data(), scratch_[which][1].data() };
+            L->dev[i]->process(cur, dst, nc, nframes);
+            for (int c = 0; c < nc; ++c) cur[c] = dst[c];
+            which ^= 1;
+        }
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+    // REALTIME. Forwarded to the sub-devices that declare a note input, so a
+    // rack can hold an instrument. `hasMidiIn` is cached in the layout rather
+    // than read through desc() per event: desc() is a virtual call returning a
+    // struct full of std::string, and nothing on the audio thread should be
+    // anywhere near one.
+    //
+    // Bypass drops events, because bypass short-circuits the chain and
+    // delivering notes to devices that are not being rendered would leave a
+    // rack that had been bypassed through a phrase holding voices nobody asked
+    // for. A note held across the bypass edge resumes when it is lifted.
+    void midi(const u8* data, int len, int frameOffset) override {
+        if (bypassed_) return;
+        const Layout* L = live_.load(std::memory_order_acquire);
+        if (!L) return;
+        for (int i = 0; i < L->n; ++i)
+            if (L->midi[i]) L->dev[i]->midi(data, len, frameOffset);
+    }
+
+    // GUI thread. Store the macro, then drive its targets down the GUI-side
+    // parameter path.
+    void setParam(int i, f32 v) override {
+        InternalInstance::setParam(i, v);
+        applyMacro(i, false);
+    }
+
+    // REALTIME (host.h): the automation path.
+    //
+    // Returns false when any target of this macro has no realtime parameter
+    // path of its own. A rack macro can only be automated as well as the worst
+    // device it drives, and saying so is what lets the engine grey the lane
+    // instead of drawing an envelope that does nothing. Every internal device
+    // accepts, so an all-internal rack is always automatable.
+    bool setParamRT(int i, f32 v) override {
+        InternalInstance::setParamRT(i, v);
+        return applyMacro(i, true);
+    }
+
+    // The chain sum, published with the topology so it can never disagree with
+    // it. NOTE the contract friction, stated where it will be read: host.h says
+    // latency is constant after prepare(), and the engine caches it when the
+    // chain is published. Editing a live rack changes this number. The caller
+    // must republish the track's chain after a rack edit for the engine's
+    // compensation to follow -- see the report.
+    int latencyFrames() const override {
+        const Layout* L = live_.load(std::memory_order_acquire);
+        return L ? L->lat : 0;
+    }
+
+    // --- RackControl (GUI thread) ------------------------------------------
+
+    int deviceCount() const override { return (int)chain_.size(); }
+
+    PluginInstance* device(int i) const override {
+        return (i >= 0 && i < (int)chain_.size()) ? chain_[(size_t)i] : nullptr;
+    }
+
+    bool addDevice(const PluginDesc& d) override { return insertDevice((int)chain_.size(), d); }
+
+    bool insertDevice(int at, const PluginDesc& d) override {
+        if ((int)chain_.size() >= kRackMaxDevices) {
+            LOGE("rack: full (%d devices), cannot add %s", kRackMaxDevices, d.uri.c_str());
+            return false;
+        }
+        if (!reg_) {
+            LOGE("rack: no registry behind this instance, cannot add %s", d.uri.c_str());
+            return false;
+        }
+        if ((int)owned_.size() >= kOwnedCap) {
+            LOGE("rack: %d retired devices; call reclaim() while the rack is idle", kOwnedCap);
+            return false;
+        }
+        // The one call that has to be here and nowhere near process(): slow,
+        // allocating, GUI-thread-only, and already prepared on the way out.
+        std::unique_ptr<PluginInstance> inst = reg_->instantiate(d, sr_, maxBlock_);
+        if (!inst) return false;
+
+        PluginInstance* raw = inst.get();
+        owned_.push_back(std::move(inst));
+
+        at = clampv(at, 0, (int)chain_.size());
+        chain_.insert(chain_.begin() + at, raw);
+        for (RackMapping& m : maps_) if (m.device >= at) ++m.device;
+
+        republish();
+        applyAllMacros();
+        return true;
+    }
+
+    bool removeDevice(int i) override {
+        if (i < 0 || i >= (int)chain_.size()) return false;
+        chain_.erase(chain_.begin() + i);
+        // Mappings that pointed at it are gone; the ones above it slide down.
+        maps_.erase(std::remove_if(maps_.begin(), maps_.end(),
+                                   [i](const RackMapping& m) { return m.device == i; }),
+                    maps_.end());
+        for (RackMapping& m : maps_) if (m.device > i) --m.device;
+        republish();                      // the instance stays in owned_: see reclaim()
+        return true;
+    }
+
+    bool moveDevice(int from, int to) override {
+        const int n = (int)chain_.size();
+        if (from < 0 || from >= n || to < 0 || to >= n || from == to) return false;
+        PluginInstance* d = chain_[(size_t)from];
+        chain_.erase(chain_.begin() + from);
+        chain_.insert(chain_.begin() + to, d);
+        // Renumber so every mapping still points at the device it was made for.
+        for (RackMapping& m : maps_) {
+            if (m.device == from)                             m.device = to;
+            else if (from < to && m.device > from && m.device <= to) --m.device;
+            else if (to < from && m.device >= to && m.device < from) ++m.device;
+        }
+        republish();
+        return true;
+    }
+
+    int mappingCount() const override { return (int)maps_.size(); }
+
+    const RackMapping& mapping(int i) const override {
+        static const RackMapping kNone{};
+        return (i >= 0 && i < (int)maps_.size()) ? maps_[(size_t)i] : kNone;
+    }
+
+    int addMapping(const RackMapping& in) override {
+        if ((int)maps_.size() >= kRackMaxMappings) return -1;
+        if (in.macro < 0 || in.macro >= kRackMacros) return -1;
+        if (in.device < 0 || in.device >= (int)chain_.size()) return -1;
+
+        PluginInstance* d = chain_[(size_t)in.device];
+        const int pi = paramIndexOf(*d, in.param);
+        if (pi < 0) return -1;
+
+        // Clamp the endpoints into the target's own range, which PRESERVES
+        // inversion (min and max are clamped independently, so min > max stays
+        // min > max) and makes mapping() report what the macro will really do
+        // rather than what was asked for. A non-finite endpoint is a caller bug
+        // that would poison the target on the audio thread, so it is refused.
+        const ParamInfo& info = d->paramInfo(pi);
+        const f32 lo = info.min < info.max ? info.min : info.max;
+        const f32 hi = info.min < info.max ? info.max : info.min;
+        RackMapping m = in;
+        if (!std::isfinite(m.min) || !std::isfinite(m.max)) return -1;
+        m.min = clampv(m.min, lo, hi);
+        m.max = clampv(m.max, lo, hi);
+
+        maps_.push_back(m);
+        republish();
+        applyMacro(m.macro, false);       // the target snaps to where the macro already is
+        return (int)maps_.size() - 1;
+    }
+
+    bool removeMapping(int i) override {
+        if (i < 0 || i >= (int)maps_.size()) return false;
+        maps_.erase(maps_.begin() + i);
+        republish();
+        return true;
+    }
+
+    void clearMacro(int macro) override {
+        maps_.erase(std::remove_if(maps_.begin(), maps_.end(),
+                                   [macro](const RackMapping& m) { return m.macro == macro; }),
+                    maps_.end());
+        republish();
+    }
+
+    RackState state() const override {
+        RackState s;
+        for (PluginInstance* d : chain_) {
+            RackState::Device sd;
+            sd.uri    = d->desc().uri;
+            sd.bypass = d->bypassed();
+            for (int i = 0; i < d->paramCount(); ++i)
+                sd.params.emplace_back(d->paramInfo(i).id, d->getParam(i));
+            if (RackControl* nested = d->rack())      // a rack inside a rack
+                sd.state = rackStateToString(nested->state());
+            s.devices.push_back(std::move(sd));
+        }
+        for (int i = 0; i < kRackMacros; ++i) s.macros[i] = getParam(i);
+        s.mappings = maps_;
+        return s;
+    }
+
+    bool setState(const RackState& s) override { return setStateDepth(s, 0); }
+
+    void reclaim() override {
+        for (size_t i = 0; i < owned_.size(); ) {
+            PluginInstance* raw = owned_[i].get();
+            if (std::find(chain_.begin(), chain_.end(), raw) == chain_.end())
+                owned_.erase(owned_.begin() + (std::ptrdiff_t)i);
+            else
+                ++i;
+        }
+    }
+
+private:
+    static constexpr int kCh       = 2;
+    static constexpr int kRing     = 4;
+    static constexpr int kOwnedCap = 64;
+
+    // A mapping with the id already resolved to an index, because setParamRT
+    // takes an index and resolving one means walking paramInfo() -- a loop over
+    // std::string-carrying structs that has no business on the audio thread.
+    struct LiveMap {
+        int macro = 0, device = 0, pidx = 0;
+        f32 min = 0.f, max = 1.f;
+    };
+
+    // Everything the audio thread reads, in one immutable-once-published block.
+    struct Layout {
+        int             n   = 0;
+        int             lat = 0;                    // chain sum, frames
+        PluginInstance* dev[kRackMaxDevices]  = {};
+        bool            midi[kRackMaxDevices] = {};
+        int             nMaps = 0;
+        LiveMap         map[kRackMaxMappings];
+    };
+
+    static int paramIndexOf(const PluginInstance& d, u32 id) {
+        const int n = d.paramCount();
+        for (int i = 0; i < n; ++i)
+            if (d.paramInfo(i).id == id) return i;
+        return -1;
+    }
+
+    // GUI thread. Builds the next layout from the editable master copies and
+    // swaps it in with one release store.
+    void republish() {
+        Layout& L = ring_[next_];
+        L.n   = 0;
+        L.lat = 0;
+        for (PluginInstance* d : chain_) {
+            if (L.n >= kRackMaxDevices) break;
+            L.dev[L.n]  = d;
+            L.midi[L.n] = d->desc().hasMidiIn;
+            const int l = d->latencyFrames();
+            L.lat += l > 0 ? l : 0;                 // a negative figure is a bug, not a credit
+            ++L.n;
+        }
+
+        L.nMaps = 0;
+        for (const RackMapping& m : maps_) {
+            if (L.nMaps >= kRackMaxMappings) break;
+            if (m.macro < 0 || m.macro >= kRackMacros) continue;
+            if (m.device < 0 || m.device >= L.n) continue;
+            const int pi = paramIndexOf(*L.dev[m.device], m.param);
+            if (pi < 0) continue;                   // the device no longer has that parameter
+            L.map[L.nMaps] = { m.macro, m.device, pi, m.min, m.max };
+            ++L.nMaps;
+        }
+
+        live_.store(&L, std::memory_order_release);
+        next_ = (next_ + 1) % kRing;
+    }
+
+    // THE SCALING RULE, in one line: target = min + (max - min) * macro, with
+    // the macro in 0..1 and min/max in the TARGET's own units.
+    //
+    // That is all of it, and everything the feature promises falls out of it:
+    //   * a partial range (min/max inside the parameter's range) sweeps only
+    //     that slice;
+    //   * an inverted range (min > max) walks the target down as the macro goes
+    //     up, because (max - min) is negative;
+    //   * two mappings on one macro move both targets, each in its own units;
+    //   * two mappings on one target from different macros are applied in
+    //     mapping order and the last write wins -- there is no summing, because
+    //     "which knob owns this parameter" is a question with one answer.
+    //
+    // `rt` picks the sub-device's realtime path over its GUI path. That is not
+    // cosmetic: host.h documents setParam() as the single producer on backends
+    // whose parameter path is a queue (CLAP), so a rack calling setParam() from
+    // the audio thread would be exactly the data race that entry point exists
+    // to prevent.
+    bool applyMacro(int macro, bool rt) {
+        if (macro < 0 || macro >= kRackMacros) return true;
+        const Layout* L = live_.load(std::memory_order_acquire);
+        if (!L || L->nMaps == 0) return true;
+
+        const f32 t = clampv(p(macro), 0.f, 1.f);
+        bool ok = true;
+        for (int k = 0; k < L->nMaps; ++k) {
+            const LiveMap& m = L->map[k];
+            if (m.macro != macro) continue;
+            const f32 v = m.min + (m.max - m.min) * t;
+            PluginInstance* d = L->dev[m.device];
+            if (rt) { if (!d->setParamRT(m.pidx, v)) ok = false; }
+            else    d->setParam(m.pidx, v);
+        }
+        return ok;
+    }
+
+    void applyAllMacros() {
+        for (int i = 0; i < kRackMacros; ++i) applyMacro(i, false);
+    }
+
+    bool setStateDepth(const RackState& s, int depth) {
+        chain_.clear();
+        maps_.clear();
+        republish();                                 // unlink before anything else moves
+
+        bool ok = true;
+        if (!reg_ && !s.devices.empty()) {
+            LOGE("rack: no registry behind this instance, cannot restore %zu devices",
+                 s.devices.size());
+            ok = false;
+        }
+
+        for (const RackState::Device& sd : s.devices) {
+            if ((int)chain_.size() >= kRackMaxDevices) { ok = false; break; }
+            if (!reg_) break;
+            const PluginDesc* pd = reg_->find(sd.uri);   // resolves lattice: -> nxtakt: too
+            if (!pd) { LOGE("rack: device not installed: %s", sd.uri.c_str()); ok = false; continue; }
+            if (!addDevice(*pd)) { ok = false; continue; }
+
+            PluginInstance* d = chain_.back();
+            for (const auto& pv : sd.params) {
+                const int pi = paramIndexOf(*d, pv.first);
+                if (pi >= 0) d->setParam(pi, pv.second);
+            }
+            d->setBypassed(sd.bypass);
+            if (RackControl* nested = d->rack()) {
+                if (depth + 1 >= kRackMaxDepth) {
+                    LOGE("rack: nesting deeper than %d, inner rack left empty", kRackMaxDepth);
+                    ok = false;
+                } else if (!sd.state.empty()) {
+                    RackState inner;
+                    if (rackStateFromString(sd.state, inner)) {
+                        // Depth is carried down the concrete type, so the cap
+                        // is enforced by the loader rather than by a hostile
+                        // file's own idea of how deep it goes.
+                        if (Rack* r = dynamic_cast<Rack*>(nested)) ok = r->setStateDepth(inner, depth + 1) && ok;
+                        else ok = nested->setState(inner) && ok;
+                    } else {
+                        LOGE("rack: nested state did not parse");
+                        ok = false;
+                    }
+                }
+            }
+        }
+
+        for (const RackMapping& m : s.mappings)
+            if (addMapping(m) < 0) ok = false;
+
+        // Macros are written WITHOUT re-driving their targets: the parameter
+        // values restored above already are what these macro positions produced
+        // when the state was saved, and re-applying would only round them.
+        for (int i = 0; i < kRackMacros; ++i)
+            InternalInstance::setParam(i, s.macros[i]);
+
+        republish();
+        return ok;
+    }
+
+    PluginRegistry* reg_ = nullptr;
+
+    // GUI-side master copies. The audio thread never reads these.
+    std::vector<std::unique_ptr<PluginInstance>> owned_;   // append-only until reclaim()
+    std::vector<PluginInstance*>                 chain_;   // processing order
+    std::vector<RackMapping>                     maps_;
+
+    Layout                      ring_[kRing];
+    std::atomic<const Layout*>  live_{nullptr};
+    int                         next_ = 0;
+
+    std::vector<f32> scratch_[2][kCh];
+    int              scratchFrames_ = 0;
+};
+
 PluginDesc saturatorDesc() {
     PluginDesc d;
     d.format     = PluginFormat::Internal;
@@ -1310,6 +1795,35 @@ PluginDesc effectDesc(const char* uri, const char* name, const char* category,
     return d;
 }
 
+// The rack is not built by effectDesc() because of one field: hasMidiIn.
+//
+// It is true unconditionally, and the descriptor never changes to reflect what
+// is actually inside. A rack that contains Pulse has to be fed notes, and the
+// engine decides what to feed from the descriptor, which it reads once when the
+// device is added -- so a descriptor that only became note-capable after the
+// user dropped an instrument in would be read too late to matter. Declaring the
+// input and forwarding nothing when the rack holds no instrument costs one
+// branch per event.
+//
+// `kind` stays Effect for the same reason in reverse: it is what the browser
+// sorts and filters on, and a rack in the browser is empty, so "instrument" is
+// a claim about a rack that does not exist yet. A rack containing an instrument
+// therefore reports kind Effect -- see the report.
+PluginDesc rackDesc() {
+    PluginDesc d;
+    d.format     = PluginFormat::Internal;
+    d.uri        = kRackUri;
+    d.name       = "Rack";
+    d.vendor     = "NxTakt";
+    d.category   = "Rack";
+    d.kind       = PluginKind::Effect;
+    d.audioIn    = 2;
+    d.audioOut   = 2;
+    d.hasMidiIn  = true;
+    d.paramCount = kRackMacros;
+    return d;
+}
+
 PluginDesc eq3Desc()        { return effectDesc(kEq3Uri,        "EQ Three",   "EQ",      7); }
 PluginDesc compressorDesc() { return effectDesc(kCompressorUri, "Compressor", "Dynamics", 7); }
 PluginDesc delayDesc()      { return effectDesc(kDelayUri,      "Delay",      "Delay",    8); }
@@ -1325,11 +1839,13 @@ void scanInternal(std::vector<PluginDesc>& out) {
     out.push_back(compressorDesc());
     out.push_back(delayDesc());
     out.push_back(reverbDesc());
-    LOGI("internal: 6 devices");
+    out.push_back(rackDesc());
+    LOGI("internal: 7 devices");
 }
 
 std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
-                                                    f64 sampleRate, int maxBlock) {
+                                                    f64 sampleRate, int maxBlock,
+                                                    PluginRegistry* reg) {
     // Both spellings, always: see the note at kSaturatorUri. A descriptor that
     // came from a pre-rename project file rather than from the registry still
     // arrives here carrying `lattice:`.
@@ -1346,6 +1862,12 @@ std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
         inst = std::make_unique<Delay>(delayDesc());
     else if (d.uri == kReverbUri)
         inst = std::make_unique<Reverb>(reverbDesc());
+    else if (d.uri == kRackUri)
+        // The one device that is handed the registry: it has to be able to
+        // instantiate the devices it contains, and PluginRegistry::instantiate
+        // is GUI-thread-only and allocating, which is exactly why that happens
+        // here and at edit time rather than anywhere near process().
+        inst = std::make_unique<Rack>(rackDesc(), reg);
     else {
         LOGE("internal: unknown device %s", d.uri.c_str());
         return nullptr;
@@ -1357,4 +1879,197 @@ std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
 }
 
 } // namespace detail
+
+// ---------------------------------------------------------------------------
+// The rack's passive form, as text
+//
+// One line of printable ASCII with no whitespace, no quotes and no newline, so
+// the persistence layer can carry it as an opaque scalar and never learn what a
+// rack is. src/core owns the project format; this owns what a rack means; the
+// string is the seam between them.
+//
+//   nxrack1;m=<8 floats>;d=<uri>,<bypass>,<nested|->,<id>:<v>...;x=<macro>,<dev>,<id>,<min>,<max>
+//
+// Records are ';'-separated and tagged by their first two characters, so a
+// later version may add records and an older reader will skip them. `d` records
+// are positional -- their order IS the chain order -- and `x` records name
+// their device by that position.
+//
+// URIs (and nested rack states) are percent-escaped over the five characters
+// that could be confused with structure plus anything non-printable, which
+// makes an http:// LV2 URI with a query string safe and lets a nested rack
+// nest to any depth: each level escapes the level below exactly once.
+//
+// Floats go through snprintf/strtod in the C locale. main.cpp pins LC_NUMERIC
+// to "C" for the whole process precisely so a de_DE user's decimal comma cannot
+// get into a project file; the same reasoning applies here and the same trick
+// as project.cpp's fmtF32 finds the shortest round-tripping form.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kRackTag = "nxrack1";
+
+bool rackNeedsEsc(unsigned char c) {
+    return c <= ' ' || c >= 0x7F || c == '%' || c == ';' || c == ',' || c == ':' || c == '=';
+}
+
+void rackEsc(std::string& o, const std::string& s) {
+    static const char kHex[] = "0123456789ABCDEF";
+    for (char ch : s) {
+        const unsigned char c = (unsigned char)ch;
+        if (rackNeedsEsc(c)) { o += '%'; o += kHex[c >> 4]; o += kHex[c & 15]; }
+        else                   o += ch;
+    }
+}
+
+int rackHex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+std::string rackUnesc(const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const int hi = rackHex(s[i + 1]), lo = rackHex(s[i + 2]);
+            if (hi >= 0 && lo >= 0) { o += (char)((hi << 4) | lo); i += 2; continue; }
+        }
+        o += s[i];
+    }
+    return o;
+}
+
+// project.cpp's fmtF32, reproduced rather than shared because src/core is not
+// this layer's to reach into for a formatting helper.
+std::string rackFmt(f32 v) {
+    if (!std::isfinite(v)) v = 0.f;
+    char buf[64];
+    for (int p = 4; p <= 9; ++p) {
+        std::snprintf(buf, sizeof buf, "%.*g", p, (f64)v);
+        if ((f32)std::strtod(buf, nullptr) == v) break;
+    }
+    return buf;
+}
+
+f32 rackF32(const std::string& s) {
+    const f32 v = (f32)std::strtod(s.c_str(), nullptr);
+    return std::isfinite(v) ? v : 0.f;
+}
+
+std::vector<std::string> rackSplit(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == sep) { out.push_back(s.substr(start, i - start)); start = i + 1; }
+    }
+    return out;
+}
+
+} // namespace
+
+std::string rackStateToString(const RackState& s) {
+    std::string o = kRackTag;
+
+    o += ";m=";
+    for (int i = 0; i < kRackMacros; ++i) {
+        if (i) o += ',';
+        o += rackFmt(s.macros[i]);
+    }
+
+    for (const RackState::Device& d : s.devices) {
+        o += ";d=";
+        rackEsc(o, d.uri);
+        o += ',';
+        o += d.bypass ? '1' : '0';
+        o += ',';
+        // A single '-' rather than an empty field, so a device with no nested
+        // state and a device whose nested state failed to serialise cannot be
+        // told apart by accident.
+        if (d.state.empty()) o += '-';
+        else                 rackEsc(o, d.state);
+        for (const auto& pv : d.params) {
+            o += ',';
+            o += std::to_string(pv.first);
+            o += ':';
+            o += rackFmt(pv.second);
+        }
+    }
+
+    for (const RackMapping& m : s.mappings) {
+        o += ";x=";
+        o += std::to_string(m.macro);  o += ',';
+        o += std::to_string(m.device); o += ',';
+        o += std::to_string(m.param);  o += ',';
+        o += rackFmt(m.min);           o += ',';
+        o += rackFmt(m.max);
+    }
+    return o;
+}
+
+bool rackStateFromString(const std::string& text, RackState& out) {
+    out = RackState{};
+    if (text.empty()) return false;
+
+    const std::vector<std::string> recs = rackSplit(text, ';');
+    if (recs.empty() || recs[0] != kRackTag) return false;
+
+    for (size_t r = 1; r < recs.size(); ++r) {
+        const std::string& rec = recs[r];
+        if (rec.size() < 2 || rec[1] != '=') continue;      // unknown shape: skip, do not fail
+        const std::string body = rec.substr(2);
+        const std::vector<std::string> f = rackSplit(body, ',');
+
+        switch (rec[0]) {
+            case 'm':
+                for (size_t i = 0; i < f.size() && i < (size_t)kRackMacros; ++i)
+                    out.macros[i] = clampv(rackF32(f[i]), 0.f, 1.f);
+                break;
+
+            case 'd': {
+                if (f.size() < 3) break;
+                if ((int)out.devices.size() >= kRackMaxDevices) break;
+                RackState::Device d;
+                d.uri    = rackUnesc(f[0]);
+                d.bypass = f[1] == "1";
+                if (f[2] != "-") d.state = rackUnesc(f[2]);
+                for (size_t i = 3; i < f.size(); ++i) {
+                    const size_t colon = f[i].find(':');
+                    if (colon == std::string::npos) continue;
+                    d.params.emplace_back((u32)std::strtoul(f[i].substr(0, colon).c_str(), nullptr, 10),
+                                          rackF32(f[i].substr(colon + 1)));
+                }
+                out.devices.push_back(std::move(d));
+                break;
+            }
+
+            case 'x': {
+                if (f.size() < 5) break;
+                if ((int)out.mappings.size() >= kRackMaxMappings) break;
+                RackMapping m;
+                m.macro  = (int)std::strtol(f[0].c_str(), nullptr, 10);
+                m.device = (int)std::strtol(f[1].c_str(), nullptr, 10);
+                m.param  = (u32)std::strtoul(f[2].c_str(), nullptr, 10);
+                m.min    = rackF32(f[3]);
+                m.max    = rackF32(f[4]);
+                // Structural validation only. Whether the parameter exists is a
+                // question for the rack, which has the device; RackControl::
+                // addMapping is where a mapping that no longer resolves is
+                // dropped, and it is the only place that could know.
+                if (m.macro < 0 || m.macro >= kRackMacros) break;
+                if (m.device < 0 || m.device >= kRackMaxDevices) break;
+                out.mappings.push_back(m);
+                break;
+            }
+
+            default:
+                break;                                       // a record from a newer writer
+        }
+    }
+    return true;
+}
+
 } // namespace lat

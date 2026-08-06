@@ -109,7 +109,10 @@ std::unique_ptr<PluginInstance> PluginRegistry::instantiate(const PluginDesc& d,
         case PluginFormat::CLAP:
             return detail::instantiateCLAP(d, sampleRate, maxBlock);
         case PluginFormat::Internal:
-            return detail::instantiateInternal(d, sampleRate, maxBlock);
+            // `this` is how a rack reaches the registry to build its own chain.
+            // It is the only backend that needs it, and it needs it on the GUI
+            // thread only -- see RackControl in host.h.
+            return detail::instantiateInternal(d, sampleRate, maxBlock, this);
         case PluginFormat::VST3:
             // TODO(vst3): return detail::instantiateVST3(d, sampleRate, maxBlock);
             LOGE("VST3 hosting not implemented (%s)", d.name.c_str());

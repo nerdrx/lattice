@@ -224,12 +224,25 @@ build/daemon_test: tests/daemon_test.cpp $(IPC_H) src/audio/engine.h build/nxtak
 	@mkdir -p build
 	$(CXX) $(IPC_CF) $< -o $@ -lrt -lpthread
 
+# The internal devices, exercised through the same PluginInstance contract every
+# third-party plugin goes through. This had no target for a long time and its
+# header said "built by hand" -- which meant several hundred assertions that CI
+# had never once run, and a suite nobody runs is a suite that rots. It needs the
+# plugin backends linked because host.cpp reaches into both of them.
+build/internal_device_test: tests/internal_device_test.cpp src/plugin/host.cpp \
+                            src/plugin/lv2_host.cpp src/plugin/clap_host.cpp \
+                            src/plugin/internal_devices.cpp src/core/common.cpp
+	@mkdir -p build
+	$(CXX) $(TOOL_CF) $^ -o $@ $(shell pkg-config --libs lilv-0) -ldl
+
 # Full headless check: engine unit tests, then a real render that must not be
 # silent, then a plugin scan.
-test: build/engine_test build/ipc_test build/daemon_test build/render build/gen_demo build/plugin_scan
+test: build/engine_test build/ipc_test build/daemon_test build/internal_device_test \
+      build/render build/gen_demo build/plugin_scan
 	./build/engine_test
 	./build/ipc_test
 	./build/daemon_test
+	./build/internal_device_test
 	./build/gen_demo /tmp/nxtakt-selftest >/dev/null
 	./build/render /tmp/nxtakt-selftest/demo.lattice /tmp/nxtakt-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3

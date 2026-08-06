@@ -16,9 +16,13 @@
 #include "../core/common.h"
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lat {
+
+class PluginRegistry;
+class RackControl;
 
 // Internal = NxTakt's own stock devices. They implement PluginInstance like
 // any other backend, so they inherit the browser, knobs, bypass, chains and
@@ -124,6 +128,139 @@ public:
     // copies input to output and does not call into the plugin at all.
     virtual void setBypassed(bool b) = 0;
     virtual bool bypassed() const = 0;
+
+    // GUI thread. Non-null only for a device that hosts a chain of its own --
+    // today exactly one, `nxtakt:rack`. This is the whole of the contract
+    // addition racks needed: a rack IS a PluginInstance, so the browser, the
+    // device strip, bypass, automation and the chain scheduler already work on
+    // it, and the only thing they cannot express is "and it has an inside".
+    //
+    // A virtual accessor rather than a dynamic_cast because the concrete Rack
+    // lives in an anonymous namespace in internal_devices.cpp and is not a type
+    // any caller can name -- and because a future CLAP/VST3 container could
+    // answer the same question without being our class at all.
+    virtual RackControl* rack() { return nullptr; }
+};
+
+// ---------------------------------------------------------------------------
+// Racks
+//
+// A Rack is a PluginInstance that contains a chain of PluginInstances in series
+// and exposes eight macro parameters, each of which drives zero or more
+// parameters on the devices inside it. It needs no UI of its own to be usable:
+// it appears in the browser like any other device and its macros appear in the
+// device strip like any other knobs.
+//
+// Everything below is GUI-THREAD ONLY. The audio thread reaches a rack through
+// PluginInstance alone.
+// ---------------------------------------------------------------------------
+
+inline constexpr int kRackMacros      = 8;
+inline constexpr int kRackMaxDevices  = 8;
+inline constexpr int kRackMaxMappings = 64;
+// Racks nest (a rack is a device like any other). The cap exists so a corrupt
+// or hostile saved state cannot recurse the loader off the stack.
+inline constexpr int kRackMaxDepth    = 4;
+
+// One macro -> one target parameter, over the slice of that parameter's range
+// the macro should sweep.
+//
+// Entirely passive: no pointers, no identity, trivially copyable, safe to write
+// to a file. `min > max` is legal and INVERTS the mapping -- the target moves
+// down as the macro moves up. That is not an edge case to tolerate, it is half
+// the reason macro knobs exist (one knob that opens a filter while it closes a
+// send). min == max pins the target to a constant.
+//
+// The parameter is named by ParamInfo::id, not by index, because the id is what
+// SavedDevice already persists and what survives a plugin gaining a parameter.
+// The rack resolves id -> index once per edit, never in process().
+struct RackMapping {
+    int macro  = 0;      // 0 .. kRackMacros-1
+    int device = 0;      // index into the rack's chain, in processing order
+    u32 param  = 0;      // ParamInfo::id on that device
+    f32 min    = 0.f;    // target value when the macro reads 0
+    f32 max    = 1.f;    // target value when the macro reads 1
+};
+
+// The complete contents of a rack in passive form: what persistence has to
+// carry, with no live object in it anywhere.
+//
+// Device order is chain order. `params` is deliberately the same shape as
+// SavedDevice::params, (ParamInfo::id, value), so the project layer can reuse
+// the code it already has for a device's parameters.
+struct RackState {
+    struct Device {
+        std::string uri;                             // PluginDesc::uri
+        std::vector<std::pair<u32, f32>> params;     // (ParamInfo::id, value)
+        bool        bypass = false;
+        std::string state;                           // nested rack, compact form; else empty
+    };
+    std::vector<Device>      devices;
+    f32                      macros[kRackMacros] = {};
+    std::vector<RackMapping> mappings;
+};
+
+// The compact form: one line of printable ASCII with no whitespace, no quotes
+// and no newline, so it drops into any line-oriented format (project.cpp's
+// `kv`) without needing that format to know anything about racks. Round-trips
+// exactly; nested racks are escaped once per level.
+//
+// Numbers are written and read through the C locale, like the rest of the
+// project format -- main.cpp pins LC_NUMERIC to "C" precisely so this is true.
+std::string rackStateToString(const RackState& s);
+bool        rackStateFromString(const std::string& text, RackState& out);
+
+// The editing face of a rack. GUI THREAD ONLY, every method.
+//
+// Sub-device creation goes through PluginRegistry::instantiate, which is
+// GUI-thread-only and allocating -- so it happens here, at edit time, and never
+// in process(). A rack holds a pointer to the registry that instantiated it;
+// the registry must outlive the rack.
+class RackControl {
+public:
+    virtual ~RackControl() = default;
+
+    virtual int             deviceCount() const = 0;
+    virtual PluginInstance* device(int i) const = 0;   // null if i is out of range
+
+    // Instantiate and splice in. `at` is clamped into the chain. Returns false
+    // if the chain is full, the plugin would not load, or this rack has no
+    // registry behind it. Mappings that pointed past the insertion point are
+    // renumbered so they keep pointing at the same device.
+    virtual bool addDevice(const PluginDesc& d) = 0;
+    virtual bool insertDevice(int at, const PluginDesc& d) = 0;
+
+    // Unlinks the device. Mappings that targeted it are dropped and the rest
+    // renumbered. The instance itself is RETIRED, not destroyed -- see
+    // reclaim() for why.
+    virtual bool removeDevice(int i) = 0;
+    virtual bool moveDevice(int from, int to) = 0;
+
+    virtual int                mappingCount() const = 0;
+    virtual const RackMapping& mapping(int i) const = 0;
+
+    // Returns the new mapping's index, or -1 if the macro, the device or the
+    // parameter does not exist. `min`/`max` are clamped into the target
+    // parameter's own range on the way in (which preserves inversion), so what
+    // mapping() reports back is what the macro will actually do.
+    virtual int  addMapping(const RackMapping& m) = 0;
+    virtual bool removeMapping(int i) = 0;
+    virtual void clearMacro(int macro) = 0;
+
+    virtual RackState state() const = 0;
+    // Replaces the entire contents. Restored parameter values are written
+    // verbatim and macros are NOT re-applied over them, because a state that
+    // was saved from a consistent rack already reflects its macro positions.
+    virtual bool      setState(const RackState& s) = 0;
+
+    // Frees the instances that removeDevice()/setState() unlinked.
+    //
+    // They are retained rather than deleted because a rack can be edited while
+    // it is live in the engine, and nothing inside a PluginInstance can know
+    // when the audio thread has finished with a pointer. Unlinking is safe (the
+    // new topology is published atomically); deleting is not. Call this only
+    // when the rack is NOT in a chain the engine is processing.
+    virtual void reclaim() = 0;
 };
 
 // Backend entry points. One pair per format; host.cpp dispatches to them.
@@ -131,7 +268,12 @@ namespace detail {
     void scanLV2(std::vector<PluginDesc>& out);
     std::unique_ptr<PluginInstance> instantiateLV2(const PluginDesc& d, f64 sampleRate, int maxBlock);
     void scanInternal(std::vector<PluginDesc>& out);
-    std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d, f64 sampleRate, int maxBlock);
+    // `reg` is the registry doing the instantiating, and is handed on to the
+    // one internal device that needs to create devices of its own (the rack).
+    // A null registry yields a rack that works but cannot be filled -- which is
+    // what a caller reaching for detail:: directly, outside a registry, gets.
+    std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d, f64 sampleRate,
+                                                        int maxBlock, PluginRegistry* reg = nullptr);
     // TODO(vst3): void scanVST3(std::vector<PluginDesc>&);
 }
 

@@ -5,7 +5,7 @@
 // device chain use, not a private constructor. Failures are recorded, not
 // thrown, so one broken case never hides the rest.
 //
-// There is no Makefile target for this one; it is built by hand. The include
+// Built by `make build/internal_device_test`, and run by `make test`. The include
 // flags are not optional -- lv2_host.cpp needs lilv's headers and clap_host.cpp
 // needs the vendored CLAP ones:
 //
@@ -1319,8 +1319,12 @@ static void testHostedInstrument(PluginRegistry& reg, PluginFormat fmt, const ch
 static void testInternalLatency(PluginRegistry& reg) {
     banner("latency: internal devices");
 
+    // The rack is in the list because an EMPTY rack is zero-latency like the
+    // rest of them. What it reports when it has something in it is the chain
+    // sum, and that is testRackLatency's business.
     for (const char* uri : { "nxtakt:saturator", "nxtakt:pulse", "nxtakt:eq3",
-                             "nxtakt:compressor", "nxtakt:delay", "nxtakt:reverb" }) {
+                             "nxtakt:compressor", "nxtakt:delay", "nxtakt:reverb",
+                             "nxtakt:rack" }) {
         const PluginDesc* d = reg.find(uri);
         CHECK(d != nullptr, "%s: in the registry", uri);
         if (!d) continue;
@@ -1408,6 +1412,684 @@ static void testLv2Latency(PluginRegistry& reg) {
 }
 
 // ---------------------------------------------------------------------------
+// Rack
+//
+// A rack is a PluginInstance that contains PluginInstances, so almost every
+// test here is a COMPARISON: the rack is measured against the thing it is
+// supposed to be indistinguishable from. "The rack works" is not a claim that
+// can fail usefully; "a rack containing the Saturator is bit-for-bit the
+// Saturator" is.
+// ---------------------------------------------------------------------------
+
+// Fills a buffer pair with the same deterministic noise every time, so two
+// chains can be fed identical input and their outputs compared sample for
+// sample.
+static void fillNoise(Buf& b, u32 seed) {
+    Noise ns;
+    ns.s = seed;
+    for (size_t i = 0; i < b.l.size(); ++i) b.l[i] = b.r[i] = 0.3f * ns.next();
+}
+
+// Largest absolute difference between two buffers.
+static f32 maxDiff(const Buf& a, const Buf& b) {
+    f32 m = 0.f;
+    for (size_t i = 0; i < a.l.size(); ++i) {
+        m = std::fmax(m, std::fabs(a.l[i] - b.l[i]));
+        m = std::fmax(m, std::fabs(a.r[i] - b.r[i]));
+    }
+    return m;
+}
+
+static RackControl* asRack(PluginInstance* p) { return p ? p->rack() : nullptr; }
+
+// Builds a rack containing the named devices, in order. Returns null if
+// anything refused, so a failing case reports once rather than crashing.
+static std::unique_ptr<PluginInstance> makeRack(PluginRegistry& reg,
+                                                std::vector<const char*> uris) {
+    const PluginDesc* rd = reg.find("nxtakt:rack");
+    if (!rd) return nullptr;
+    auto inst = reg.instantiate(*rd, kSR, kBlock);
+    if (!inst) return nullptr;
+    RackControl* rc = asRack(inst.get());
+    if (!rc) return nullptr;
+    for (const char* u : uris) {
+        const PluginDesc* d = reg.find(u);
+        if (!d || !rc->addDevice(*d)) return nullptr;
+    }
+    return inst;
+}
+
+static void testRack(PluginRegistry& reg) {
+    banner("Rack: the container contract");
+
+    const PluginDesc* rd = reg.find("nxtakt:rack");
+    CHECK(rd != nullptr, "registry finds nxtakt:rack");
+    if (!rd) return;
+    CHECK(rd->format == PluginFormat::Internal && rd->audioIn == 2 && rd->audioOut == 2,
+          "descriptor: internal, %d in / %d out", rd->audioIn, rd->audioOut);
+    CHECK(rd->hasMidiIn, "descriptor declares a MIDI input, so a rack can hold an instrument");
+    CHECK(rd->paramCount == kRackMacros, "descriptor advertises %d macros", rd->paramCount);
+
+    auto empty = reg.instantiate(*rd, kSR, kBlock);
+    CHECK(empty != nullptr, "instantiate + prepare");
+    if (!empty) return;
+
+    RackControl* rc = asRack(empty.get());
+    CHECK(rc != nullptr, "PluginInstance::rack() exposes the editing face");
+    if (!rc) return;
+    CHECK(empty->paramCount() == kRackMacros, "the instance has %d macro parameters",
+          empty->paramCount());
+    CHECK(empty->paramInfo(0).name == "Macro 1" &&
+          empty->paramInfo(kRackMacros - 1).name == "Macro 8",
+          "macros are named Macro 1 .. Macro %d", kRackMacros);
+    CHECK(empty->paramInfo(0).min == 0.f && empty->paramInfo(0).max == 1.f,
+          "a macro runs 0..1");
+
+    bool rtOk = true;
+    for (int i = 0; i < empty->paramCount(); ++i) if (!empty->setParamRT(i, 0.5f)) rtOk = false;
+    CHECK(rtOk, "every macro accepts a realtime write on an empty rack");
+    for (int i = 0; i < empty->paramCount(); ++i) empty->setParam(i, 0.f);
+
+    // 1. An empty rack is a wire. Not "nearly" -- the samples are the input's.
+    CHECK(rc->deviceCount() == 0, "a fresh rack is empty");
+    Buf in, out;
+    fillNoise(in, 0x2468ACE1u);
+    out.clear();
+    empty->process(in.p, out.p, 2, kBlock);
+    CHECK(maxDiff(in, out) == 0.f, "an empty rack is a bit-exact passthrough");
+    CHECK(empty->latencyFrames() == 0, "an empty rack reports 0 frames of latency");
+
+    // 2. A rack containing one device IS that device. Measured against a bare
+    //    Saturator fed the same samples with the same parameters, sample for
+    //    sample -- so a scratch-buffer copy that dropped or duplicated a frame
+    //    would show up here as a nonzero difference rather than as "sounds ok".
+    banner("Rack: one device is that device");
+    const PluginDesc* sd = reg.find("nxtakt:saturator");
+    CHECK(sd != nullptr, "registry finds nxtakt:saturator");
+    if (sd) {
+        auto bare = reg.instantiate(*sd, kSR, kBlock);
+        auto rack = makeRack(reg, { "nxtakt:saturator" });
+        CHECK(bare && rack, "built a bare Saturator and a rack containing one");
+        if (bare && rack) {
+            RackControl* r = asRack(rack.get());
+            PluginInstance* inner = r ? r->device(0) : nullptr;
+            CHECK(inner != nullptr, "the rack hands back the device it contains");
+            CHECK(r && r->deviceCount() == 1, "deviceCount is 1");
+            if (inner) {
+                CHECK(inner->desc().uri == "nxtakt:saturator",
+                      "and it is the right one (%s)", inner->desc().uri.c_str());
+
+                const int pDrive = paramIndex(*bare, "Drive");
+                const int pMix   = paramIndex(*bare, "Mix");
+                bare->setParam(pDrive, 18.f);  bare->setParam(pMix, 0.8f);
+                inner->setParam(pDrive, 18.f); inner->setParam(pMix, 0.8f);
+
+                Buf a, b;
+                f32 worst = 0.f;
+                for (int blk = 0; blk < 8; ++blk) {
+                    fillNoise(in, 0x1111u + (u32)blk);
+                    a.clear(); b.clear();
+                    bare->process(in.p, a.p, 2, kBlock);
+                    rack->process(in.p, b.p, 2, kBlock);
+                    worst = std::fmax(worst, maxDiff(a, b));
+                }
+                CHECK(worst == 0.f,
+                      "a rack containing the Saturator is bit-exact with the Saturator alone "
+                      "(max diff %.9f)", (double)worst);
+            }
+        }
+    }
+
+    // 3. Two devices in a rack == the same two devices in series on a track.
+    //    The engine runs a track chain as fx->process(bufs, bufs, ...), in
+    //    place, so that is exactly how the reference is built here.
+    banner("Rack: two in series equals two on a track");
+    {
+        auto refA = reg.instantiate(*reg.find("nxtakt:eq3"), kSR, kBlock);
+        auto refB = reg.instantiate(*reg.find("nxtakt:compressor"), kSR, kBlock);
+        auto rack = makeRack(reg, { "nxtakt:eq3", "nxtakt:compressor" });
+        CHECK(refA && refB && rack, "built the reference pair and the rack");
+        if (refA && refB && rack) {
+            RackControl* r = asRack(rack.get());
+            CHECK(r && r->deviceCount() == 2, "the rack holds two devices");
+
+            // Same non-default settings on both sides, so the test is not
+            // comparing two flat EQs and two idle compressors.
+            struct { const char* name; f32 v; } kEq[] = {
+                { "Low Gain", 6.f }, { "Mid Gain", -8.f }, { "Mid Freq", 2200.f },
+                { "High Gain", 4.f },
+            };
+            struct { const char* name; f32 v; } kComp[] = {
+                { "Threshold", -30.f }, { "Ratio", 8.f }, { "Attack", 3.f },
+                { "Release", 60.f }, { "Makeup", 4.f },
+            };
+            for (const auto& p : kEq) {
+                refA->setParam(paramIndex(*refA, p.name), p.v);
+                r->device(0)->setParam(paramIndex(*r->device(0), p.name), p.v);
+            }
+            for (const auto& p : kComp) {
+                refB->setParam(paramIndex(*refB, p.name), p.v);
+                r->device(1)->setParam(paramIndex(*r->device(1), p.name), p.v);
+            }
+
+            Buf a, b;
+            f32 worst = 0.f;
+            bool fin = true;
+            for (int blk = 0; blk < 12; ++blk) {
+                fillNoise(in, 0x7777u + (u32)blk);
+                a.clear(); b.clear();
+                // Track: in -> a, then a -> a in place. Rack: in -> b.
+                refA->process(in.p, a.p, 2, kBlock);
+                refB->process(a.p, a.p, 2, kBlock);
+                rack->process(in.p, b.p, 2, kBlock);
+                worst = std::fmax(worst, maxDiff(a, b));
+                if (!b.finite()) fin = false;
+            }
+            CHECK(fin, "the rack's output is finite");
+            CHECK(worst == 0.f,
+                  "EQ Three -> Compressor inside a rack equals the same two on a track "
+                  "(max diff %.9f)", (double)worst);
+
+            // Order matters, and the rack has to honour it: swapping the two
+            // must change the sound, or the chain is not really in series.
+            CHECK(r->moveDevice(0, 1), "moveDevice reorders the chain");
+            CHECK(r->device(0)->desc().uri == "nxtakt:compressor" &&
+                  r->device(1)->desc().uri == "nxtakt:eq3", "the order actually changed");
+            fillNoise(in, 0x7777u);
+            b.clear();
+            rack->process(in.p, b.p, 2, kBlock);
+            Buf c;
+            refA->process(in.p, c.p, 2, kBlock);
+            refB->process(c.p, c.p, 2, kBlock);
+            CHECK(maxDiff(b, c) > 0.f, "and the reordered chain no longer matches the old order");
+            CHECK(r->moveDevice(1, 0), "moveDevice puts it back");
+        }
+    }
+
+    // 4. Bypass short-circuits the whole chain, not each device.
+    banner("Rack: bypass short-circuits the chain");
+    {
+        auto rack = makeRack(reg, { "nxtakt:saturator", "nxtakt:eq3" });
+        CHECK(rack != nullptr, "built a two-device rack");
+        if (rack) {
+            RackControl* r = asRack(rack.get());
+            // Make both devices audibly non-transparent first, so "bypass is a
+            // copy" is a real claim rather than a coincidence.
+            r->device(0)->setParam(paramIndex(*r->device(0), "Drive"), 30.f);
+            r->device(1)->setParam(paramIndex(*r->device(1), "Low Gain"), 12.f);
+
+            fillNoise(in, 0x515Au);
+            out.clear();
+            rack->process(in.p, out.p, 2, kBlock);
+            CHECK(maxDiff(in, out) > 0.001f,
+                  "the un-bypassed rack changes the signal (max diff %.5f)",
+                  (double)maxDiff(in, out));
+
+            rack->setBypassed(true);
+            out.clear();
+            rack->process(in.p, out.p, 2, kBlock);
+            CHECK(maxDiff(in, out) == 0.f, "bypass is a bit-exact copy of the input");
+            rack->setBypassed(false);
+        }
+    }
+
+    // 5. Macros. The scaling rule is target = min + (max - min) * macro, and
+    //    each of its three interesting consequences gets its own case.
+    banner("Rack: macro mapping");
+    {
+        auto rack = makeRack(reg, { "nxtakt:saturator", "nxtakt:delay" });
+        CHECK(rack != nullptr, "built a Saturator + Delay rack");
+        if (rack) {
+            RackControl* r = asRack(rack.get());
+            PluginInstance* sat = r->device(0);
+            PluginInstance* dly = r->device(1);
+            const int pDrive = paramIndex(*sat, "Drive");
+            const int pMix   = paramIndex(*sat, "Mix");
+            const int pFb    = paramIndex(*dly, "Feedback");
+
+            // (a) one macro, one target, over part of the parameter's range.
+            RackMapping m;
+            m.macro = 0; m.device = 0; m.param = sat->paramInfo(pDrive).id;
+            m.min = 6.f; m.max = 30.f;
+            const int mi = r->addMapping(m);
+            CHECK(mi == 0, "addMapping accepts a mapping onto Drive (index %d)", mi);
+            CHECK(r->mappingCount() == 1, "the rack reports one mapping");
+
+            rack->setParam(0, 0.f);
+            CHECK(sat->getParam(pDrive) == 6.f, "macro 0 -> Drive %.3f (want 6)",
+                  (double)sat->getParam(pDrive));
+            rack->setParam(0, 1.f);
+            CHECK(sat->getParam(pDrive) == 30.f, "macro 1 -> Drive %.3f (want 30)",
+                  (double)sat->getParam(pDrive));
+            rack->setParam(0, 0.5f);
+            CHECK(std::fabs(sat->getParam(pDrive) - 18.f) < 1e-4f,
+                  "macro 0.5 -> Drive %.4f (want 18, the midpoint of the MAPPED range "
+                  "and not of the parameter's)", (double)sat->getParam(pDrive));
+            CHECK(r->mapping(0).min == 6.f && r->mapping(0).max == 30.f,
+                  "the mapping reads back with the range it was given");
+
+            // The mapped slice is a slice: the macro cannot reach the ends of
+            // the parameter's own range, which is the point of a partial range.
+            rack->setParam(0, 0.f);
+            CHECK(sat->getParam(pDrive) > sat->paramInfo(pDrive).min,
+                  "at macro 0 the target sits above the parameter's own minimum");
+
+            // (b) INVERTED. Same macro, a second target, running the other way.
+            RackMapping inv;
+            inv.macro = 0; inv.device = 0; inv.param = sat->paramInfo(pMix).id;
+            inv.min = 1.f; inv.max = 0.f;                 // down as the macro goes up
+            CHECK(r->addMapping(inv) == 1, "addMapping accepts an inverted range");
+
+            rack->setParam(0, 0.f);
+            const f32 mixLow = sat->getParam(pMix);
+            const f32 drvLow = sat->getParam(pDrive);
+            rack->setParam(0, 1.f);
+            const f32 mixHigh = sat->getParam(pMix);
+            const f32 drvHigh = sat->getParam(pDrive);
+            CHECK(mixLow == 1.f && mixHigh == 0.f,
+                  "an inverted mapping runs Mix %.3f -> %.3f as the macro goes 0 -> 1",
+                  (double)mixLow, (double)mixHigh);
+            CHECK(mixHigh < mixLow && drvHigh > drvLow,
+                  "one macro drives one target up and the other down at the same time");
+            rack->setParam(0, 0.25f);
+            CHECK(std::fabs(sat->getParam(pMix) - 0.75f) < 1e-5f,
+                  "and it interpolates the inverted range correctly (%.5f at 0.25, want 0.75)",
+                  (double)sat->getParam(pMix));
+
+            // (c) one macro, two targets on DIFFERENT devices.
+            RackMapping two;
+            two.macro = 1; two.device = 1; two.param = dly->paramInfo(pFb).id;
+            two.min = 0.f; two.max = 0.9f;
+            CHECK(r->addMapping(two) == 2, "a mapping onto the second device");
+            RackMapping twoB;
+            twoB.macro = 1; twoB.device = 0; twoB.param = sat->paramInfo(pDrive).id;
+            twoB.min = 0.f; twoB.max = 12.f;
+            CHECK(r->addMapping(twoB) == 3, "and a second target for the same macro");
+
+            rack->setParam(1, 1.f);
+            CHECK(std::fabs(dly->getParam(pFb) - 0.9f) < 1e-5f &&
+                  std::fabs(sat->getParam(pDrive) - 12.f) < 1e-4f,
+                  "one macro moved both targets (Feedback %.4f, Drive %.4f)",
+                  (double)dly->getParam(pFb), (double)sat->getParam(pDrive));
+            rack->setParam(1, 0.f);
+            CHECK(dly->getParam(pFb) == 0.f && sat->getParam(pDrive) == 0.f,
+                  "and both came back");
+
+            // (d) the automation path drives macros too, not just the GUI one.
+            CHECK(rack->setParamRT(1, 1.f),
+                  "setParamRT on a macro succeeds (all targets are internal devices)");
+            CHECK(std::fabs(dly->getParam(pFb) - 0.9f) < 1e-5f,
+                  "and it moved the target (Feedback %.4f)", (double)dly->getParam(pFb));
+            rack->setParamRT(1, 0.f);
+
+            // (e) endpoints outside the target's range are clamped in, and
+            //     clamping does not silently un-invert anything.
+            RackMapping wild;
+            wild.macro = 2; wild.device = 0; wild.param = sat->paramInfo(pMix).id;
+            wild.min = 5.f; wild.max = -5.f;              // Mix is 0..1
+            const int wi = r->addMapping(wild);
+            CHECK(wi >= 0, "a mapping with out-of-range endpoints is accepted");
+            if (wi >= 0)
+                CHECK(r->mapping(wi).min == 1.f && r->mapping(wi).max == 0.f,
+                      "and clamped to 1 -> 0, still inverted (%.2f -> %.2f)",
+                      (double)r->mapping(wi).min, (double)r->mapping(wi).max);
+
+            // (f) a mapping onto a parameter that does not exist is refused
+            //     rather than silently doing nothing at run time.
+            RackMapping bad;
+            bad.macro = 3; bad.device = 0; bad.param = 9999u;
+            CHECK(r->addMapping(bad) < 0, "a mapping onto a nonexistent parameter is refused");
+            bad.macro = 3; bad.device = 7; bad.param = 0;
+            CHECK(r->addMapping(bad) < 0, "a mapping onto a nonexistent device is refused");
+
+            // (g) removing a device takes its mappings with it and renumbers
+            //     the rest, or macro 1 would end up driving the wrong knob.
+            const int before = r->mappingCount();
+            CHECK(r->removeDevice(1), "removeDevice unlinks the Delay");
+            CHECK(r->deviceCount() == 1, "the chain is one device shorter");
+            CHECK(r->mappingCount() == before - 1,
+                  "the mapping that targeted it went with it (%d -> %d)",
+                  before, r->mappingCount());
+            bool renumbered = true;
+            for (int i = 0; i < r->mappingCount(); ++i)
+                if (r->mapping(i).device >= r->deviceCount()) renumbered = false;
+            CHECK(renumbered, "every surviving mapping still points inside the chain");
+
+            // The rack still works after the edit.
+            fillNoise(in, 0x9090u);
+            out.clear();
+            rack->process(in.p, out.p, 2, kBlock);
+            CHECK(out.finite() && out.peak() > 0.f, "the rack still passes audio after an edit");
+        }
+    }
+
+    // 6. A rack containing an instrument responds to midi().
+    banner("Rack: an instrument inside");
+    {
+        auto rack = makeRack(reg, { "nxtakt:pulse" });
+        CHECK(rack != nullptr, "built a rack containing nxtakt:pulse");
+        if (rack) {
+            RackControl* r = asRack(rack.get());
+            PluginInstance* syn = r->device(0);
+            syn->setParam(paramIndex(*syn, "Attack"), 0.005f);
+            syn->setParam(paramIndex(*syn, "Decay"), 2.f);
+            syn->setParam(paramIndex(*syn, "Release"), 0.05f);
+
+            Buf o;
+            CHECK(runFor(*rack, o, 8) == 0.f, "no midi through the rack -> silence");
+
+            noteOn(*rack, 60, 100);
+            bool fin = false;
+            const f32 peak = runFor(*rack, o, 20, &fin);
+            CHECK(peak > 0.01f, "midi() forwarded through the rack makes sound (peak %.4f)",
+                  (double)peak);
+            CHECK(fin, "and the output is finite");
+
+            noteOff(*rack, 60);
+            runFor(*rack, o, (int)(kSR / kBlock));
+            CHECK(runFor(*rack, o, 8) == 0.f, "note-off is forwarded too");
+
+            // Bypass drops events rather than feeding a chain nobody renders.
+            rack->setBypassed(true);
+            noteOn(*rack, 64, 110);
+            CHECK(runFor(*rack, o, 8) == 0.f, "a bypassed rack is silent and eats the note");
+            rack->setBypassed(false);
+            const u8 cc[3] = { 0xB0, 123, 0 };
+            rack->midi(cc, 3, 0);
+            runFor(*rack, o, (int)(kSR / kBlock));
+        }
+    }
+
+    // 7. Macro sweeps while processing. The macro path writes parameters on
+    //    two devices from two threads' worth of entry points; the one thing
+    //    that must never come out of it is a NaN.
+    banner("Rack: macro sweeps during processing");
+    {
+        auto rack = makeRack(reg, { "nxtakt:delay", "nxtakt:reverb", "nxtakt:compressor" });
+        CHECK(rack != nullptr, "built a three-device rack");
+        if (rack) {
+            RackControl* r = asRack(rack.get());
+            // Map every macro onto something, several of them inverted, so the
+            // sweep exercises the real mapping loop and not an empty one.
+            struct { int dev; const char* param; f32 lo, hi; } kMaps[] = {
+                { 0, "Feedback", 0.f,   0.95f  }, { 0, "Dry/Wet",  1.f,   0.f    },
+                { 0, "Tone",     18000.f, 200.f }, { 1, "Decay",   0.2f,  12.f   },
+                { 1, "Damping",  500.f, 18000.f }, { 1, "Dry/Wet", 0.f,   1.f    },
+                { 2, "Threshold", 0.f,  -60.f  }, { 2, "Ratio",    1.f,   20.f   },
+            };
+            int made = 0;
+            for (int i = 0; i < kRackMacros; ++i) {
+                PluginInstance* d = r->device(kMaps[i].dev);
+                const int pi = paramIndex(*d, kMaps[i].param);
+                if (pi < 0) continue;
+                RackMapping m;
+                m.macro = i; m.device = kMaps[i].dev; m.param = d->paramInfo(pi).id;
+                m.min = kMaps[i].lo; m.max = kMaps[i].hi;
+                if (r->addMapping(m) >= 0) ++made;
+            }
+            CHECK(made == kRackMacros, "all %d macros mapped (%d)", kRackMacros, made);
+
+            Noise ns;
+            bool ok = true;
+            f32 peak = 0.f;
+            for (int b = 0; b < 400 && ok; ++b) {
+                f32 t = (f32)(b % 100) / 50.f;
+                if (t > 1.f) t = 2.f - t;
+                for (int i = 0; i < kRackMacros; ++i) {
+                    // Half the macros through the GUI path, half through the
+                    // realtime one, because they are different code.
+                    const f32 v = (i & 1) ? t : 1.f - t;
+                    if (i & 1) rack->setParam(i, v);
+                    else       rack->setParamRT(i, v);
+                }
+                for (int i = 0; i < kBlock; ++i)
+                    in.l[(size_t)i] = in.r[(size_t)i] = 0.25f * ns.next();
+                out.clear();
+                rack->process(in.p, out.p, 2, kBlock);
+                if (!out.finite() || out.peak() > 32.f) ok = false;
+                peak = std::fmax(peak, out.peak());
+            }
+            CHECK(ok, "macro sweeps during processing stay finite and bounded (peak %.3f)",
+                  (double)peak);
+
+            fillNoise(in, 0xBEEFu);
+            out.clear();
+            rack->process(in.p, out.p, 2, kBlock);
+            CHECK(out.peak() > 0.f, "and it is still a working device afterwards");
+        }
+    }
+
+    // 8. The passive form round-trips. This is what persistence will carry, so
+    //    it is checked as a value, not as a side effect.
+    banner("Rack: the serializable description");
+    {
+        auto rack = makeRack(reg, { "nxtakt:eq3", "nxtakt:saturator" });
+        CHECK(rack != nullptr, "built a rack to describe");
+        if (rack) {
+            RackControl* r = asRack(rack.get());
+            r->device(0)->setParam(paramIndex(*r->device(0), "Mid Gain"), -7.5f);
+            r->device(1)->setBypassed(true);
+            RackMapping m;
+            m.macro = 4; m.device = 1;
+            m.param = r->device(1)->paramInfo(paramIndex(*r->device(1), "Drive")).id;
+            m.min = 24.f; m.max = 3.f;                    // inverted, partial
+            CHECK(r->addMapping(m) >= 0, "mapped a macro for the round trip");
+            rack->setParam(4, 0.375f);
+
+            const RackState s = r->state();
+            CHECK(s.devices.size() == 2, "state() lists both devices in chain order");
+            CHECK(s.devices.size() == 2 && s.devices[0].uri == "nxtakt:eq3" &&
+                  s.devices[1].uri == "nxtakt:saturator", "and in the right order");
+            CHECK(s.devices.size() == 2 && s.devices[1].bypass,
+                  "a bypassed sub-device is recorded as bypassed");
+            CHECK(s.mappings.size() == 1 && s.mappings[0].min == 24.f && s.mappings[0].max == 3.f,
+                  "the inverted mapping survives into the passive form");
+            CHECK(std::fabs(s.macros[4] - 0.375f) < 1e-6f, "macro positions are recorded");
+
+            const std::string text = rackStateToString(s);
+            CHECK(!text.empty(), "the compact form is not empty");
+            CHECK(text.find('\n') == std::string::npos && text.find(' ') == std::string::npos,
+                  "it has no newline and no whitespace, so it survives a line-oriented format");
+            CHECK(text.compare(0, 8, "nxrack1;") == 0, "it carries a version tag");
+
+            RackState back;
+            CHECK(rackStateFromString(text, back), "and it parses back");
+            CHECK(back.devices.size() == s.devices.size(), "with the same device count");
+            bool same = back.devices.size() == s.devices.size() &&
+                        back.mappings.size() == s.mappings.size();
+            for (size_t i = 0; same && i < s.devices.size(); ++i)
+                same = back.devices[i].uri == s.devices[i].uri &&
+                       back.devices[i].bypass == s.devices[i].bypass &&
+                       back.devices[i].params == s.devices[i].params;
+            for (size_t i = 0; same && i < s.mappings.size(); ++i)
+                same = back.mappings[i].macro  == s.mappings[i].macro &&
+                       back.mappings[i].device == s.mappings[i].device &&
+                       back.mappings[i].param  == s.mappings[i].param &&
+                       back.mappings[i].min    == s.mappings[i].min &&
+                       back.mappings[i].max    == s.mappings[i].max;
+            for (int i = 0; same && i < kRackMacros; ++i) same = back.macros[i] == s.macros[i];
+            CHECK(same, "the round trip is exact: uris, params, bypass, mappings and macros");
+            CHECK(rackStateToString(back) == text, "and re-serialising produces the same bytes");
+
+            // A rejected parse clears its output, so these use a scratch value
+            // rather than the one being carried into setState below.
+            RackState junk;
+            CHECK(!rackStateFromString("", junk), "an empty string is rejected");
+            CHECK(!rackStateFromString("not-a-rack;d=x", junk), "so is a foreign tag");
+            CHECK(junk.devices.empty(), "and a rejected parse leaves nothing behind");
+
+            // Restoring into a fresh rack rebuilds it: same devices, same
+            // parameter values, same macro positions.
+            auto fresh = reg.instantiate(*rd, kSR, kBlock);
+            RackControl* fr = asRack(fresh.get());
+            CHECK(fr && fr->setState(back), "setState rebuilds a rack from the passive form");
+            if (fr) {
+                CHECK(fr->deviceCount() == 2, "the restored rack has both devices");
+                CHECK(fr->deviceCount() == 2 &&
+                      fr->device(0)->desc().uri == "nxtakt:eq3" &&
+                      fr->device(1)->desc().uri == "nxtakt:saturator",
+                      "in chain order");
+                CHECK(fr->deviceCount() == 2 && fr->device(1)->bypassed(),
+                      "with the sub-device bypass restored");
+                CHECK(fr->deviceCount() == 2 &&
+                      std::fabs(fr->device(0)->getParam(paramIndex(*fr->device(0), "Mid Gain"))
+                                + 7.5f) < 1e-4f,
+                      "and the parameter values restored verbatim");
+                CHECK(std::fabs(fresh->getParam(4) - 0.375f) < 1e-6f, "macro 4 is where it was");
+                CHECK(fr->mappingCount() == 1, "and the mapping came back");
+
+                // The restored rack sounds like the original, which is the only
+                // property a user cares about.
+                fillNoise(in, 0xC0DEu);
+                Buf a, b;
+                rack->process(in.p, a.p, 2, kBlock);
+                fresh->process(in.p, b.p, 2, kBlock);
+                CHECK(maxDiff(a, b) == 0.f, "and it sounds identical to the rack it came from");
+            }
+        }
+    }
+
+    // 9. Nesting. A rack is a device, so a rack can contain one, and the
+    //    passive form has to survive the recursion.
+    banner("Rack: a rack inside a rack");
+    {
+        auto outer = makeRack(reg, { "nxtakt:rack" });
+        CHECK(outer != nullptr, "a rack accepts a rack as a sub-device");
+        if (outer) {
+            RackControl* o = asRack(outer.get());
+            RackControl* i = asRack(o->device(0));
+            CHECK(i != nullptr, "the inner rack exposes its own RackControl");
+            if (i) {
+                const PluginDesc* satd = reg.find("nxtakt:saturator");
+                CHECK(satd && i->addDevice(*satd), "and it can be filled");
+                i->device(0)->setParam(paramIndex(*i->device(0), "Drive"), 21.f);
+
+                const std::string text = rackStateToString(o->state());
+                CHECK(text.find("nxrack1") != std::string::npos, "the outer form carries the tag");
+
+                RackState st;
+                CHECK(rackStateFromString(text, st), "the nested form parses");
+                CHECK(st.devices.size() == 1 && !st.devices[0].state.empty(),
+                      "and the inner rack's state rode along as an opaque field");
+
+                auto rebuilt = reg.instantiate(*rd, kSR, kBlock);
+                RackControl* rb = asRack(rebuilt.get());
+                CHECK(rb && rb->setState(st), "setState restores the nest");
+                if (rb && rb->deviceCount() == 1) {
+                    RackControl* inner = asRack(rb->device(0));
+                    CHECK(inner && inner->deviceCount() == 1,
+                          "the inner rack came back with its device");
+                    if (inner && inner->deviceCount() == 1)
+                        CHECK(std::fabs(inner->device(0)->getParam(
+                                  paramIndex(*inner->device(0), "Drive")) - 21.f) < 1e-4f,
+                              "and with its parameter value");
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rack latency: the chain sum.
+//
+// The internal devices are all zero-latency by construction, so a rack made of
+// them can only ever prove that 0 + 0 = 0. The real claim -- that the rack ADDS
+// -- needs a device that actually delays, and the only ones on a Linux box are
+// third-party. So the witness is discovered at runtime exactly the way
+// testLv2Latency finds one, and if the machine has none the section says so and
+// passes.
+// ---------------------------------------------------------------------------
+
+static void testRackLatency(PluginRegistry& reg) {
+    banner("Rack: latencyFrames is the chain sum");
+
+    const PluginDesc* rd = reg.find("nxtakt:rack");
+    if (!rd) { note("no rack in the registry; skipping"); return; }
+
+    // Internal-only first: the sum of six zeroes is a zero, and a rack that
+    // reported anything else would be inventing delay compensation.
+    {
+        auto rack = makeRack(reg, { "nxtakt:eq3", "nxtakt:compressor", "nxtakt:saturator" });
+        CHECK(rack != nullptr, "built a three internal-device rack");
+        if (rack)
+            CHECK(rack->latencyFrames() == 0,
+                  "a rack of zero-latency devices reports 0 (%d)", rack->latencyFrames());
+    }
+
+    // Now a real latent plugin. Same discovery as testLv2Latency: no URI is
+    // hard-coded, because the point is to work on whatever is installed.
+    static const char* kHints[] = {
+        "limiter", "lookahead", "look-ahead", "dpl", "linear phase", "linearphase",
+        "convol", "oversampl",
+    };
+    std::vector<const PluginDesc*> candidates;
+    for (const char* hint : kHints)
+        for (const PluginDesc& d : reg.plugins()) {
+            if (d.format != PluginFormat::LV2 || d.audioOut == 0 || d.audioIn == 0) continue;
+            if (lower(d.name + " " + d.uri).find(hint) == std::string::npos) continue;
+            if (std::find(candidates.begin(), candidates.end(), &d) == candidates.end())
+                candidates.push_back(&d);
+        }
+
+    const int kTries = (int)candidates.size() < 12 ? (int)candidates.size() : 12;
+    for (int c = 0; c < kTries; ++c) {
+        const PluginDesc* d = candidates[(size_t)c];
+        auto probe = reg.instantiate(*d, kSR, kBlock);
+        if (!probe) continue;
+        const int lat = probe->latencyFrames();
+        if (lat <= 0) continue;
+        probe.reset();
+
+        note((d->name + ": using this as the latent witness").c_str());
+
+        auto rack = reg.instantiate(*rd, kSR, kBlock);
+        RackControl* r = asRack(rack.get());
+        CHECK(rack && r, "built an empty rack");
+        if (!rack || !r) return;
+
+        CHECK(rack->latencyFrames() == 0, "empty: 0 frames");
+
+        CHECK(r->addDevice(*d), "%s: added to the rack", d->name.c_str());
+        CHECK(rack->latencyFrames() == lat,
+              "one latent device: the rack reports its %d frames (%d)",
+              lat, rack->latencyFrames());
+
+        // A zero-latency device between them must not change the total.
+        const PluginDesc* eq = reg.find("nxtakt:eq3");
+        CHECK(eq && r->addDevice(*eq), "EQ Three added");
+        CHECK(rack->latencyFrames() == lat,
+              "adding a zero-latency device leaves the sum at %d (%d)",
+              lat, rack->latencyFrames());
+
+        // Two of the latent one: the sum, and nothing else. This is the check
+        // that a rack reporting max(), or first(), or 0 would fail.
+        CHECK(r->addDevice(*d), "%s: added a second time", d->name.c_str());
+        CHECK(rack->latencyFrames() == 2 * lat,
+              "two latent devices sum to %d frames (%d) -- not %d, not 0",
+              2 * lat, rack->latencyFrames(), lat);
+
+        // And it survives actually running, like every other backend's figure.
+        Buf in, out;
+        for (int b = 0; b < 4; ++b) { out.clear(); rack->process(in.p, out.p, 2, kBlock); }
+        CHECK(rack->latencyFrames() == 2 * lat, "unchanged after processing (%d)",
+              rack->latencyFrames());
+
+        // Removing one takes its share back out.
+        CHECK(r->removeDevice(2), "removed the second latent device");
+        CHECK(rack->latencyFrames() == lat,
+              "the sum came back down to %d (%d)", lat, rack->latencyFrames());
+
+        // Re-preparing must not double-count or forget.
+        CHECK(rack->prepare(kSR, kBlock) && rack->latencyFrames() == lat,
+              "re-prepare leaves the sum at %d (%d)", lat, rack->latencyFrames());
+        return;
+    }
+
+    note("no installed LV2 plugin reports a nonzero latency; the chain sum is unverified "
+         "against a real latent device here");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("internal device tests\n");
@@ -1421,7 +2103,7 @@ int main() {
         if (reg.plugins()[i].format == PluginFormat::Internal) ++internals;
         else if (firstNonInternal < 0) firstNonInternal = (int)i;
     }
-    CHECK(internals == 6, "scan lists every internal device (%d)", internals);
+    CHECK(internals == 7, "scan lists every internal device (%d)", internals);
     CHECK(firstNonInternal < 0 || firstNonInternal == internals,
           "internal devices sort to the front of the list");
 
@@ -1433,8 +2115,10 @@ int main() {
     testCompressor(reg);
     testDelay(reg);
     testReverb(reg);
+    testRack(reg);
     testInternalLatency(reg);
     testLv2Latency(reg);
+    testRackLatency(reg);
     testHostedInstrument(reg, PluginFormat::LV2, "LV2 instrument (real plugin, atom MIDI path)");
     testHostedInstrument(reg, PluginFormat::CLAP, "CLAP instrument (real plugin, note events)");
 
