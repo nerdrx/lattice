@@ -65,7 +65,11 @@ inline constexpr u64 kShmMagic = 0x4C54435F53484D31ull;
 //
 //   v2 — SharedStateT gained recState[]/recSlotIdx[] so the block mirrors
 //        Engine's published atomics exactly (wave 2, the engine daemon).
-inline constexpr u32 kShmVersion = 2;
+//   v3 — SharedStateT gained arrOverride and journalDropped (wave 8g, the
+//        arrangement across the boundary: ARRANGEMENT.md §9.1). The block still
+//        mirrors Engine's published atomics exactly, which is the rule that
+//        decides what belongs here — and both of those are now among them.
+inline constexpr u32 kShmVersion = 3;
 
 // Indices and payload sit on separate lines so the producer's write index does
 // not invalidate the consumer's cache line on every push. Cross-process this
@@ -685,6 +689,22 @@ struct SharedStateT {
     std::atomic<i32> recState[NTracks];
     std::atomic<i32> recSlotIdx[NTracks];
 
+    // --- the arrangement (docs/ARRANGEMENT.md §4.2, §5.3) -------------------
+    //
+    // Bit i set == track i's arrangement lane is suspended because a session
+    // clip was launched on it, until Cmd::BackToArrangement. ENGINE-owned and
+    // set at the quantized launch the engine computes, which is precisely why
+    // it has to be published rather than inferred: the GUI knows when it asked
+    // for a launch, not which bar line the engine put it on.
+    //
+    // journalDropped is the ENGINE's refused-push count for the record journal.
+    // It is mirrored here rather than left in the daemon's header because it is
+    // one of Engine's published atomics and this block is what mirrors those;
+    // the daemon's own second-hop drop count lives in ControlHeader beside it
+    // (§9.6 — there are two hops, and a take has to be able to see both).
+    std::atomic<u32> arrOverride;
+    std::atomic<u32> journalDropped;
+
     enum : u32 { StateBooting = 0, StateRunning = 1, StateDraining = 2, StateStopping = 3 };
 
     // Creator only, before publishReady(). Defaults match Engine's, including
@@ -715,6 +735,8 @@ struct SharedStateT {
         }
         masterMeterL.store(0.f, std::memory_order_relaxed);
         masterMeterR.store(0.f, std::memory_order_relaxed);
+        arrOverride.store(0, std::memory_order_relaxed);
+        journalDropped.store(0, std::memory_order_relaxed);
     }
 
     // Engine, last statement of publish(): stamps the block so the GUI can tell

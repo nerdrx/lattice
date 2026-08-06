@@ -420,13 +420,22 @@ static void testTransport(ipc::EngineClient& c) {
           "the daemon counted it as forwarded (%llu)",
           (unsigned long long)c.header().eventsForwarded.load());
 
-    // The engine rewinds on stop, so "frozen" here means frozen at zero.
+    // STOP DOES NOT REWIND, AND A SECOND STOP DOES (docs/ARRANGEMENT.md §3.6
+    // and the orchestrator's answer 4). Once there is a timeline, stopping to
+    // fix a fill and resuming where you were is the whole point — but the
+    // muscle memory that expects a rewind still has to find one. The double
+    // press is STATE and not timing: a stop received while already stopped
+    // locates to zero, so there is no window to miss on a slow hand.
     const f64 frozen = c.state().beat.load();
-    CHECK(std::fabs(frozen) < 1e-9, "stopping rewinds to beat 0 (%.4f)", frozen);
+    CHECK(frozen > 0.0, "the first stop leaves the beat where it was (%.4f)", frozen);
     sleepMs(120);
     CHECK(std::fabs(c.state().beat.load() - frozen) < 1e-9,
           "and the beat stays put while stopped (%.4f -> %.4f)",
           frozen, c.state().beat.load());
+
+    CHECK(c.pushCommand(Cmd::SetPlaying, 0), "push a SECOND SetPlaying 0");
+    const bool rewound = waitUntil([&] { return std::fabs(c.state().beat.load()) < 1e-9; }, 1000);
+    CHECK(rewound, "which locates the timeline to zero (%.4f)", c.state().beat.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,6 +1727,892 @@ static void testDrainsExactness(ipc::EngineClient& c) {
          (unsigned long long)c.pool().liveBlocks());
 }
 
+// ===========================================================================
+// 16. the arrangement across the boundary (docs/ARRANGEMENT.md §9, §10.7)
+// ===========================================================================
+//
+// Runs here, against the live daemon, rather than at the end of the file:
+// sections 13 and 14 kill the engine and then unlink everything, so they own
+// the end. The numbering follows the design document, which calls this gate
+// §16, not the order the file happens to run in.
+
+// -- blob helpers -----------------------------------------------------------
+
+static ipc::WireArrItem arrItem(f64 start, f64 length, i32 clip,
+                                f64 fadeIn = 0.0, f64 fadeOut = 0.0, f64 offset = 0.0) {
+    ipc::WireArrItem it{};
+    it.start   = start;
+    it.length  = length;
+    it.offset  = offset;
+    it.fadeIn  = (f32)fadeIn;
+    it.fadeOut = (f32)fadeOut;
+    it.clip    = clip;
+    return it;
+}
+
+// A clip inside an arrangement blob is the same WireClip a session cell
+// carries, which is the point: the daemon runs the SAME validation over it.
+static ipc::WireClip arrClip(u64 ref, i64 frames, int channels, f64 lengthBeats = 4.0) {
+    ipc::WireClip c = audioClip(ref, frames, channels);
+    c.lengthBeats = lengthBeats;
+    return c;
+}
+
+static const ipc::WireEvent* findArrAck(const std::vector<ipc::WireEvent>& v) {
+    const ipc::WireEvent* last = nullptr;
+    for (const ipc::WireEvent& e : v) if (e.type == ipc::EvArrangementAck) last = &e;
+    return last;
+}
+
+static bool waitArrIdle(ipc::EngineClient& c, int track, int timeoutMs = 2000) {
+    return waitUntil([&] { drainEvents(c); return !c.arrangementBusy(track); }, timeoutMs);
+}
+
+// Publishes `ref` on `track` and returns true if it was REFUSED and nothing
+// reached the engine. Mirrors pushClipRefused() exactly.
+static bool pushArrRefused(ipc::EngineClient& c, int track, u64 ref, u32& reason) {
+    const ipc::ControlHeader& h = c.header();
+    drainEvents(c);
+    const u64 applied0 = h.arrangementsApplied.load();
+    reason = ipc::RejectNone;
+    if (!c.setArrangement(track, ref)) return false;
+    std::vector<ipc::WireEvent> evs;
+    const bool answered = waitUntil([&] {
+        drainEvents(c, &evs);
+        return !c.arrangementBusy(track);
+    }, 2000);
+    const ipc::WireEvent* ack = findArrAck(evs);
+    if (ack) reason = (u32)ack->x;
+    return answered && ack && (ack->flags & ipc::ArrAckRefused) &&
+           h.arrangementsApplied.load() == applied0;
+}
+
+// ---------------------------------------------------------------------------
+// 16a. the four commands 8a appended now classify, and cross
+// ---------------------------------------------------------------------------
+//
+// The hand-off: commandIsKnown() bounded at Cmd::RecordMidiSlot, so
+// SetArrangement/SetTrackAutos/Locate/BackToArrangement (26–29) classified as
+// unknown and were answered with RejectUnknownCommand. That failed CLOSED,
+// which is why 8a could land the header compiled-and-unused — and it is what
+// this section proves is over.
+
+static void testArrangementCommands(ipc::EngineClient& c) {
+    banner("16a. SetArrangement / SetTrackAutos / Locate / BackToArrangement classify and cross");
+
+    resetMixer(c);
+    drainEvents(c);
+    const ipc::ControlHeader& h = c.header();
+
+    // Stop first, and wait for it: Locate ASSIGNS beat_, so the round trip is
+    // measurable to the bit — but only against a clock that is not moving.
+    // Earlier sections leave the transport rolling.
+    c.pushCommand(Cmd::SetPlaying, 0);
+    const bool halted = waitUntil([&] { return c.state().playing.load() == 0; }, 2000);
+    CHECK(halted, "the transport is stopped before the locate assertions");
+
+    const u64 rejected0 = h.commandsRejected.load();
+    CHECK(c.locate(64.0), "push Locate 64");
+    const bool located = waitUntil([&] {
+        return std::fabs(c.state().beat.load() - 64.0) < 1e-9;
+    }, 2000);
+    const f64 atLocate = c.state().beat.load();
+    CHECK(located, "the engine located to beat 64 exactly (%.6f)", atLocate);
+    CHECK(h.commandsRejected.load() == rejected0,
+          "and nothing was refused — the command is no longer 'unknown'");
+
+    CHECK(c.locate(0.0), "push Locate 0");
+    const bool rewound = waitUntil([&] { return std::fabs(c.state().beat.load()) < 1e-9; }, 2000);
+    CHECK(rewound, "back to beat 0 (%.6f)", c.state().beat.load());
+
+    const u64 applied0 = h.commandsApplied.load();
+    CHECK(c.backToArrangement(-1), "push BackToArrangement -1 (every track)");
+    const bool forwarded = waitUntil([&] { return h.commandsApplied.load() > applied0; }, 2000);
+    CHECK(forwarded, "which the daemon forwarded rather than refusing");
+
+    // The clear form of both pooled commands: ref == 0 names nothing, so it
+    // needs no pool and is answered like any other.
+    for (int t = 0; t < 2; ++t) {
+        CHECK(c.clearArrangement(t), "push SetArrangement{track %d, ref 0}", t);
+        CHECK(waitArrIdle(c, t), "answered by an EvArrangementAck");
+    }
+    CHECK(c.clearTrackAutos(0), "push SetTrackAutos{track 0, ref 0}");
+    CHECK(waitUntil([&] { drainEvents(c); return !c.trackAutosBusy(0); }, 2000),
+          "answered too");
+
+    // And the refusals that are still refusals. Every one of these would have
+    // been RejectUnknownCommand a moment ago, which is exactly why asserting the
+    // *reason* matters and asserting "it was refused" would not.
+    struct Bad { const char* what; Cmd cmd; i32 a; f64 x; u32 want; };
+    const Bad bad[] = {
+        {"Locate with a NaN beat",       Cmd::Locate,            0,  std::numeric_limits<f64>::quiet_NaN(), ipc::RejectNotFinite},
+        {"Locate to a negative beat",    Cmd::Locate,            0,  -1.0,   ipc::RejectBadArrangement},
+        {"Locate past the beat ceiling", Cmd::Locate,            0,  1e18,   ipc::RejectBadArrangement},
+        {"BackToArrangement on track 99",Cmd::BackToArrangement, 99, 0.0,    ipc::RejectBadIndex},
+        {"BackToArrangement on track -2",Cmd::BackToArrangement, -2, 0.0,    ipc::RejectBadIndex},
+    };
+    for (const Bad& b : bad) {
+        drainEvents(c);
+        CHECK(c.pushCommand(b.cmd, b.a, 0, b.x), "push %s", b.what);
+        std::vector<ipc::WireEvent> evs;
+        const bool answered = waitUntil([&] {
+            drainEvents(c, &evs);
+            return findReject(evs, b.cmd) != nullptr;
+        }, 2000);
+        const ipc::WireEvent* r = findReject(evs, b.cmd);
+        CHECK(answered && r && (u32)r->b == b.want, "%s is refused with %s (got %s)", b.what,
+              ipc::rejectReasonName(b.want),
+              ipc::rejectReasonName(r ? (u32)r->b : 0u));
+    }
+    CHECK(c.alive(), "the daemon survived all of them");
+}
+
+// ---------------------------------------------------------------------------
+// 16b. a blob uploads, is TRANSLATED, and plays
+// ---------------------------------------------------------------------------
+//
+// The assertion that matters is the meter. An arrangement item built in this
+// process, written into shared memory as offsets, rebuilt as RtClips in the
+// daemon's own address space and scheduled by an engine in another process has
+// to come back out at the level it went in at.
+
+static void testArrangementPlays(ipc::EngineClient& c) {
+    banner("16b. an arrangement blob uploads, translates in the daemon, and plays");
+
+    resetMixer(c);
+    drainEvents(c);
+    c.pushCommand(Cmd::SetPlaying, 0);
+    waitUntil([&] { return c.state().playing.load() == 0; }, 2000);
+    c.locate(0.0);
+    const bool atZero = waitUntil([&] { return std::fabs(c.state().beat.load()) < 1e-9; }, 2000);
+    CHECK(atZero, "stopped at beat 0 to start from (%.4f)", c.state().beat.load());
+
+    // Two seconds of DC at 0.5, which is four beats at 120 BPM: the item's
+    // length and the clip's length agree, so nothing is resampled and the meter
+    // is a measurement rather than an approximation.
+    const i64 kFrames = 96000;
+    const std::vector<f32> dc = makeDc(kFrames, 1, 0.5f);
+    const u64 sample = c.poolWrite(dc.data(), kFrames, 1, 48000.0, /*key*/0xA11ull);
+    CHECK(sample != 0, "a 2 s DC block in the pool at %llu", (unsigned long long)sample);
+    if (!sample) return;
+
+    ipc::WireArrHeader hdr{};
+    std::vector<ipc::WireArrItem> items{arrItem(0.0, 4.0, 0), arrItem(4.0, 4.0, 0)};
+    std::vector<ipc::WireClip>    clips{arrClip(sample, kFrames, 1)};
+    const u64 blob = c.poolWriteArrangement(hdr, items, clips);
+    CHECK(blob != 0, "the blob written at %llu (%zu B: header + 2 items + 1 clip)",
+          (unsigned long long)blob, (size_t)ipc::arrangementBytes(2, 1));
+    CHECK(c.pool().blockAt(blob) && c.pool().blockAt(blob)->kind == ipc::PoolKindArrangement,
+          "and tagged PoolKindArrangement");
+
+    const u64 applied0 = c.header().arrangementsApplied.load();
+    CHECK(c.setArrangement(0, blob), "publish it as track 0's lane");
+    CHECK(c.arrangementBusy(0), "the lane is blocked until the daemon answers");
+    CHECK(waitArrIdle(c, 0), "and the acknowledgement arrives");
+    CHECK(c.header().arrangementsApplied.load() == applied0 + 1,
+          "the daemon translated and forwarded it (%llu)",
+          (unsigned long long)c.header().arrangementsApplied.load());
+    CHECK(c.arrangementShadow(0) == blob, "the client's shadow names the blob it sent");
+    CHECK(c.pool().stateOf(sample) == ipc::BlockLive,
+          "and the SAMPLE it referenced is Live (%s) — the blob is not, because "
+          "the daemon copied it out", ipc::poolStateName(c.pool().stateOf(sample)));
+
+    // The transport cell: an arrangement addressed as track -1, carrying no
+    // items and only the loop brace.
+    const u64 cell = c.poolWriteTransport(0.0, 8.0, /*on*/false);
+    CHECK(cell != 0, "a transport cell blob at %llu", (unsigned long long)cell);
+    CHECK(c.setArrangement(-1, cell) && waitArrIdle(c, -1),
+          "published as track -1 and acknowledged");
+
+    // Roll it.
+    const f64 beat0 = c.state().beat.load();
+    CHECK(c.pushCommand(Cmd::SetPlaying, 1), "start the transport");
+    const f32 peak = peakTrack(c, 0, 700);
+    const f64 beat1 = c.state().beat.load();
+    CHECK(std::fabs(peak - 0.5f) < 0.06f,
+          "the arrangement item is sounding on track 0: meter %.4f (want 0.5)", (double)peak);
+    CHECK(beat1 > beat0 + 0.5, "and the cursor advanced (%.4f -> %.4f)", beat0, beat1);
+
+    // §4.2: a session launch takes the track OUT of the arrangement, and the
+    // engine sets the bit at the quantized launch it computes — which is why
+    // the flag is published rather than inferred by the GUI.
+    ipc::WireClip sess = audioClip(sample, kFrames, 1);
+    sess.gain = 0.5f;                       // 0.25 at the meter: audibly not the lane
+    CHECK(c.setClip(0, 0, sess) && waitClipIdle(c, 0, 0), "publish a session clip into [0][0]");
+    CHECK(c.pushCommand(Cmd::LaunchClip, 0, 0), "launch it");
+    const bool overrode = waitUntil([&] { drainEvents(c); return (c.arrOverride() & 1u) != 0; }, 3000);
+    CHECK(overrode, "SharedState::arrOverride bit 0 is set (0x%08x)", c.arrOverride());
+
+    CHECK(c.backToArrangement(0), "push BackToArrangement 0");
+    const bool back = waitUntil([&] { drainEvents(c); return (c.arrOverride() & 1u) == 0; }, 3000);
+    CHECK(back, "which clears it again (0x%08x)", c.arrOverride());
+
+    c.pushCommand(Cmd::StopAll);
+    c.pushCommand(Cmd::SetPlaying, 0);
+    CHECK(c.clearClip(0, 0) && waitClipIdle(c, 0, 0), "clear the session cell");
+    CHECK(c.clearArrangement(0) && waitArrIdle(c, 0), "clear the lane");
+    CHECK(c.clearArrangement(-1) && waitArrIdle(c, -1), "clear the transport cell");
+    CHECK(waitRetired(c, sample), "the sample retires once nothing names it");
+    CHECK(c.poolRelease(sample), "and frees");
+}
+
+// ---------------------------------------------------------------------------
+// 16c. hostile blobs
+// ---------------------------------------------------------------------------
+//
+// Every one of these is a number a peer wrote that becomes an index, a count or
+// a multiply operand in the daemon. The IPC audit's F1 was exactly this
+// discipline applied to `noteCount` and not to `frames` two lines away, so the
+// table below attacks the counts, the extents, the offsets and the structural
+// invariants in turn — and then a good blob has to work immediately afterwards,
+// which is what proves the refusals left nothing broken behind them.
+
+static void testHostileArrangements(ipc::EngineClient& c) {
+    banner("16c. a hostile arrangement blob is refused, and the daemon survives every one");
+
+    const i64 kFrames = 4800;
+    const std::vector<f32> dc = makeDc(kFrames, 1, 0.3f);
+    const u64 sample = c.poolWrite(dc.data(), kFrames, 1, 48000.0);
+    const std::vector<ipc::WireNote> notes = makeNotes(8, 60, 0.5, 0.25);
+    const u64 noteRef = c.poolWriteNotes(notes.data(), (i64)notes.size());
+    CHECK(sample && noteRef, "a sample block and a notes block to reference");
+    if (!sample || !noteRef) return;
+
+    const std::vector<ipc::WireClip> oneClip{arrClip(sample, kFrames, 1)};
+    int refused = 0, total = 0;
+
+    // Each case builds a legal blob and then corrupts it, which is exactly the
+    // threat model: the client is the pool's only writer and may write anything.
+    const auto attack = [&](const char* what,
+                            const std::vector<ipc::WireArrItem>& items,
+                            const std::vector<ipc::WireClip>& clips,
+                            void (*poke)(ipc::WireArrHeader*)) {
+        ++total;
+        ipc::WireArrHeader hdr{};
+        const u64 ref = c.poolWriteArrangement(hdr, items, clips);
+        if (!ref) { CHECK(false, "could not write the blob for '%s'", what); return; }
+        if (poke) poke(c.pool().data<ipc::WireArrHeader>(ref));
+        u32 reason = 0;
+        const bool ok = pushArrRefused(c, 5, ref, reason) &&
+                        reason == ipc::RejectBadArrangement;
+        if (ok) ++refused;
+        CHECK(ok, "%s is refused with %s", what, ipc::rejectReasonName(reason));
+        // The ack frees the blob for us: a refused publication must never leave
+        // the client holding a block it can never free.
+        CHECK(c.pool().stateOf(ref) == ipc::BlockFree ||
+              c.pool().stateOf(ref) == ipc::BlockQuiescent,
+              "  and its blob was released rather than stranded (%s)",
+              ipc::poolStateName(c.pool().stateOf(ref)));
+    };
+
+    attack("an item count of 2^31", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->itemCount = (i64)1 << 31; });
+    attack("an item count of 2^62 (the multiply that would wrap)", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->itemCount = (i64)1 << 62; });
+    attack("a negative item count", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->itemCount = -1; });
+    attack("a clip count larger than the item count", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->clipCount = 9; });
+    attack("a declared note count past kMaxArrNotes", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->noteCount = 1 << 20; });
+    attack("a blob shorter than its own declared counts", {arrItem(0, 4, 0)}, oneClip,
+           [](ipc::WireArrHeader* h) { h->itemCount = 400; h->clipCount = 1; });
+    attack("an inverted loop brace", {}, {},
+           [](ipc::WireArrHeader* h) { h->loopOn = 1; h->loopStart = 8.0; h->loopEnd = 4.0; });
+    attack("an empty loop brace", {}, {},
+           [](ipc::WireArrHeader* h) { h->loopOn = 1; h->loopStart = 4.0; h->loopEnd = 4.0; });
+    attack("a non-finite loop brace", {}, {},
+           [](ipc::WireArrHeader* h) {
+               h->loopOn = 1; h->loopStart = 0.0;
+               h->loopEnd = std::numeric_limits<f64>::infinity();
+           });
+
+    // The structural rules — the three §9.4 bolds. These need no poking: the
+    // items themselves are the attack.
+    const auto structural = [&](const char* what, const std::vector<ipc::WireArrItem>& items) {
+        ++total;
+        ipc::WireArrHeader hdr{};
+        const u64 ref = c.poolWriteArrangement(hdr, items, oneClip);
+        if (!ref) { CHECK(false, "could not write the blob for '%s'", what); return; }
+        u32 reason = 0;
+        const bool ok = pushArrRefused(c, 5, ref, reason) &&
+                        reason == ipc::RejectBadArrangement;
+        if (ok) ++refused;
+        CHECK(ok, "%s is refused with %s", what, ipc::rejectReasonName(reason));
+    };
+
+    structural("an unsorted lane",
+               {arrItem(8.0, 4.0, 0), arrItem(0.0, 4.0, 0)});
+    structural("three items sounding at once (c.start < a.end)",
+               {arrItem(0.0, 8.0, 0, 0, 2.0), arrItem(6.0, 8.0, 0, 2.0, 2.0),
+                arrItem(7.0, 4.0, 0, 2.0)});
+    structural("an overlap of 5 beats (past kMaxOverlapBeats)",
+               {arrItem(0.0, 8.0, 0, 0, 5.0), arrItem(3.0, 8.0, 0, 5.0)});
+    structural("an overlap of 2 beats with only one fade",
+               {arrItem(0.0, 8.0, 0, 0, 2.0), arrItem(6.0, 8.0, 0, 0.0)});
+    structural("an item of zero length",
+               {arrItem(0.0, 0.0, 0)});
+    structural("an item shorter than kMinArrBeats",
+               {arrItem(0.0, 1.0 / 128.0, 0)});
+    structural("a NaN item start",
+               {arrItem(std::numeric_limits<f64>::quiet_NaN(), 4.0, 0)});
+    structural("a negative item start",
+               {arrItem(-1.0, 4.0, 0)});
+    structural("fades longer than the item they are on",
+               {arrItem(0.0, 4.0, 0, 3.0, 3.0)});
+    structural("a clip index past clipCount",
+               {arrItem(0.0, 4.0, 7)});
+    structural("a negative clip index",
+               {arrItem(0.0, 4.0, -1)});
+
+    // A WireClip inside the blob, carrying §10.5's bad offsets. The daemon runs
+    // the SAME buildClip() over it that a session cell goes through, so these
+    // must be refused for the same reasons — reported as RejectBadArrangement
+    // because the whole blob is refused, with the clip's own reason in the log.
+    const auto badClip = [&](const char* what, ipc::WireClip bc) {
+        ++total;
+        ipc::WireArrHeader hdr{};
+        const u64 ref = c.poolWriteArrangement(hdr, {arrItem(0.0, 4.0, 0)}, {bc});
+        if (!ref) { CHECK(false, "could not write the blob for '%s'", what); return; }
+        u32 reason = 0;
+        const bool ok = pushArrRefused(c, 5, ref, reason) &&
+                        reason == ipc::RejectBadArrangement;
+        if (ok) ++refused;
+        CHECK(ok, "a clip inside the blob with %s is refused (%s)", what,
+              ipc::rejectReasonName(reason));
+    };
+
+    const u64 blockBytes = c.pool().blockAt(sample)->bytes;
+    badClip("a wild offset far past the arena",   arrClip(1ull << 40, kFrames, 1));
+    badClip("an offset inside the pool header",   arrClip(1024, kFrames, 1));
+    badClip("a misaligned offset",                arrClip(sample + 8, kFrames, 1));
+    badClip("an offset one block past a good one",
+            arrClip(sample + blockBytes + 64, kFrames, 1));
+    badClip("the maximum u64",                    arrClip(~0ull, kFrames, 1));
+    badClip("a read past the end of its block",   arrClip(sample, 1 << 20, 1));
+    badClip("a wild channel count",               arrClip(sample, kFrames, 99));
+    {   // F1 inside an arrangement: the extent multiply that wrapped u64 to 0.
+        ipc::WireClip bc = arrClip(sample, kFrames, 1);
+        bc.frames = (i64)1 << 62;
+        bc.loopEnd = bc.frames;
+        badClip("frames = 2^62 (the F1 extent wrap)", bc);
+    }
+    {   // A note count that overflows the extent of the block it names.
+        ipc::WireClip bc = arrClip(noteRef, 0, 1);
+        bc.isMidi    = 1;
+        bc.sampleRef = 0;
+        bc.notesRef  = noteRef;
+        bc.noteCount = 1 << 20;                  // 24 MB of notes in a 192 B block
+        bc.frames    = 0;
+        badClip("a note count overflowing its own block", bc);
+    }
+    {   // F2 inside an arrangement: a finite denormal clipBpm.
+        ipc::WireClip bc = arrClip(sample, kFrames, 1);
+        bc.clipBpm = 1e-320;
+        badClip("a denormal clipBpm (the F2 derived-rate overflow)", bc);
+    }
+
+    // The blob offset itself, rather than anything in it.
+    {
+        ++total;
+        u32 reason = 0;
+        const bool ok = pushArrRefused(c, 5, 1ull << 40, reason) &&
+                        reason == ipc::RejectBadArrangement;
+        if (ok) ++refused;
+        CHECK(ok, "a blob offset past the arena is refused (%s)",
+              ipc::rejectReasonName(reason));
+    }
+    {   // A blob offset that names a real block of the WRONG KIND. This is the
+        // check that stops a sample buffer being read as an arrangement header.
+        //
+        // It gets a block of its own rather than reusing `sample`: a refused
+        // publication frees the blob the client published, which is right — the
+        // client allocated it for a command that was refused — and would
+        // therefore take the sample with it.
+        ++total;
+        const u64 decoy = c.poolWrite(dc.data(), 64, 1, 48000.0);
+        u32 reason = 0;
+        const bool ok = decoy && pushArrRefused(c, 5, decoy, reason) &&
+                        reason == ipc::RejectBadArrangement;
+        if (ok) ++refused;
+        CHECK(ok, "a sample block published as an arrangement is refused (%s)",
+              ipc::rejectReasonName(reason));
+    }
+
+    CHECK(refused == total, "all %d hostile blobs refused (%d)", total, refused);
+    CHECK(c.alive(), "the daemon is still alive after every one of them");
+    CHECK(c.header().arrOrderViolations.load() == 0, "and no retirement ordering was violated");
+    CHECK(c.state().slotState[5].load() == (int)SlotState::Empty ||
+          c.state().activeSlot[5].load() < 0,
+          "track 5 never got a lane (activeSlot %d)", c.state().activeSlot[5].load());
+
+    // A good blob still works right afterwards.
+    ipc::WireArrHeader hdr{};
+    const u64 good = c.poolWriteArrangement(hdr, {arrItem(0.0, 4.0, 0)}, oneClip);
+    CHECK(good != 0, "a valid blob after all of them");
+    CHECK(c.setArrangement(5, good) && waitArrIdle(c, 5), "is accepted");
+    CHECK(c.pool().stateOf(sample) == ipc::BlockLive, "and its sample is Live (%s)",
+          ipc::poolStateName(c.pool().stateOf(sample)));
+    CHECK(c.clearArrangement(5) && waitArrIdle(c, 5), "clear it again");
+    CHECK(waitRetired(c, sample), "the sample retires");
+    CHECK(c.poolRelease(sample), "and frees");
+    CHECK(c.poolRelease(noteRef), "and so does the notes block");
+}
+
+// ---------------------------------------------------------------------------
+// 16c-2. arrangement automation, and the odd-lane-count alignment trap
+// ---------------------------------------------------------------------------
+//
+// RtAutoLane is 36 bytes and 4-aligned; RtAutoPoint begins with an f64. An ODD
+// lane count therefore leaves the point array on a 4-byte boundary in any
+// layout that just concatenates the two arrays — a misaligned read on the
+// engine side, which is where the f64 is actually loaded. Both the wire form
+// and the daemon's built block have to round up, so both are exercised here
+// with lane counts that are deliberately odd.
+
+static bool waitAutosIdle(ipc::EngineClient& c, int track, int timeoutMs = 2000) {
+    return waitUntil([&] { drainEvents(c); return !c.trackAutosBusy(track); }, timeoutMs);
+}
+
+static ipc::WireAutoLane autoLane(i32 target, i32 first, i32 count) {
+    ipc::WireAutoLane l{};
+    l.target  = target;
+    l.index   = 0;
+    l.devSlot = -1;
+    l.xform   = (i32)AutoXform::Direct;
+    l.first   = first;
+    l.count   = count;
+    l.lo      = 0.f;
+    l.hi      = 1.f;
+    return l;
+}
+
+static void testTrackAutos(ipc::EngineClient& c) {
+    banner("16c-2. SetTrackAutos crosses, including at an odd lane count");
+
+    resetMixer(c);
+    drainEvents(c);
+
+    // ODD lane counts on purpose: 1, 3, 5. Each one puts the point array on a
+    // 4-byte boundary if anything in the chain forgets to round up.
+    for (int lanes = 1; lanes <= 5; lanes += 2) {
+        std::vector<ipc::WireAutoLane>  ls;
+        std::vector<ipc::WireAutoPoint> ps;
+        for (int i = 0; i < lanes; ++i) {
+            ls.push_back(autoLane((i32)AutoTarget::TrackVol, (i32)ps.size(), 3));
+            for (int k = 0; k < 3; ++k) {
+                ipc::WireAutoPoint p{};
+                p.beat  = (f64)(i * 4 + k);
+                p.value = 0.25f * (f32)(k + 1);
+                ps.push_back(p);
+            }
+        }
+        const u64 ref = c.poolWriteTrackAutos(ls, ps);
+        CHECK(ref != 0, "a %d-lane, %zu-point automation blob (%llu B)",
+              lanes, ps.size(),
+              (unsigned long long)ipc::trackAutosBytes(lanes, (i64)ps.size()));
+        const bool ok = ref && c.setTrackAutos(2, ref) && waitAutosIdle(c, 2);
+        CHECK(ok, "  crosses, translates and is accepted at an odd lane count");
+        CHECK(c.trackAutosShadow(2) == ref, "  and the client's shadow names it");
+    }
+
+    // Let the engine actually evaluate them for a while: a misaligned f64 read
+    // is a fault or a UBSan report, and it only happens when the points are
+    // touched rather than when they are published.
+    c.pushCommand(Cmd::SetPlaying, 1);
+    sleepMs(200);
+    c.pushCommand(Cmd::SetPlaying, 0);
+    CHECK(c.alive(), "the engine evaluated them without faulting");
+
+    // Hostile automation blobs. The lane window is THE bound: autoValueAt
+    // bisects points[first, first+count), so `first` and `count` are the two
+    // numbers that decide whether the evaluator reads inside the block.
+    const auto attackAutos = [&](const char* what, std::vector<ipc::WireAutoLane> ls,
+                                 std::vector<ipc::WireAutoPoint> ps,
+                                 void (*pokeHdr)(ipc::WireAutoSetHeader*)) {
+        const u64 ref = c.poolWriteTrackAutos(ls, ps);
+        if (!ref) { CHECK(false, "could not write the blob for '%s'", what); return; }
+        if (pokeHdr) pokeHdr(c.pool().data<ipc::WireAutoSetHeader>(ref));
+        drainEvents(c);
+        const u64 applied0 = c.header().arrangementsApplied.load();
+        if (!c.setTrackAutos(2, ref)) { CHECK(false, "could not push '%s'", what); return; }
+        std::vector<ipc::WireEvent> evs;
+        const bool answered = waitUntil([&] {
+            drainEvents(c, &evs);
+            return !c.trackAutosBusy(2);
+        }, 2000);
+        const ipc::WireEvent* ack = findArrAck(evs);
+        const bool ok = answered && ack && (ack->flags & ipc::ArrAckRefused) &&
+                        (ack->flags & ipc::ArrAckAutos) &&
+                        (u32)ack->x == ipc::RejectBadArrangement &&
+                        c.header().arrangementsApplied.load() == applied0;
+        CHECK(ok, "%s is refused with %s", what,
+              ipc::rejectReasonName(ack ? (u32)ack->x : 0u));
+    };
+
+    std::vector<ipc::WireAutoPoint> three(3);
+    for (int k = 0; k < 3; ++k) three[k].beat = (f64)k;
+
+    attackAutos("a lane count past kMaxArrLanes", {autoLane(1, 0, 3)}, three,
+                [](ipc::WireAutoSetHeader* h) { h->laneCount = 33; });
+    attackAutos("a lane count of 2^31", {autoLane(1, 0, 3)}, three,
+                [](ipc::WireAutoSetHeader* h) { h->laneCount = (i64)1 << 31; });
+    attackAutos("a negative lane count", {autoLane(1, 0, 3)}, three,
+                [](ipc::WireAutoSetHeader* h) { h->laneCount = -1; });
+    attackAutos("a point count past kMaxArrPoints", {autoLane(1, 0, 3)}, three,
+                [](ipc::WireAutoSetHeader* h) { h->pointCount = 1 << 20; });
+    attackAutos("a blob shorter than its declared counts", {autoLane(1, 0, 3)}, three,
+                [](ipc::WireAutoSetHeader* h) { h->laneCount = 30; });
+    attackAutos("a lane window running past the point array",
+                {autoLane((i32)AutoTarget::TrackVol, 0, 99)}, three, nullptr);
+    attackAutos("a lane window starting past the point array",
+                {autoLane((i32)AutoTarget::TrackVol, 99, 1)}, three, nullptr);
+    attackAutos("a negative lane window",
+                {autoLane((i32)AutoTarget::TrackVol, -1, 2)}, three, nullptr);
+    attackAutos("a lane naming an unknown AutoTarget", {autoLane(77, 0, 3)}, three, nullptr);
+    attackAutos("a lane on a device slot past the chain",
+                {[] { ipc::WireAutoLane l = autoLane(4, 0, 3); l.devSlot = 99; return l; }()},
+                three, nullptr);
+    {
+        std::vector<ipc::WireAutoPoint> nan3 = three;
+        nan3[1].beat = std::numeric_limits<f64>::quiet_NaN();
+        attackAutos("a point with a NaN beat", {autoLane(1, 0, 3)}, nan3, nullptr);
+    }
+    {
+        std::vector<ipc::WireAutoPoint> neg3 = three;
+        neg3[2].beat = -5.0;
+        attackAutos("a point at a negative beat", {autoLane(1, 0, 3)}, neg3, nullptr);
+    }
+    {
+        std::vector<ipc::WireAutoLane> wild{autoLane(1, 0, 3)};
+        wild[0].lo = std::numeric_limits<f32>::infinity();
+        attackAutos("a lane with a non-finite clamp", wild, three, nullptr);
+    }
+
+    CHECK(c.alive(), "the daemon survived every hostile automation blob");
+    CHECK(c.header().arrOrderViolations.load() == 0, "with no ordering violations");
+    CHECK(c.clearTrackAutos(2) && waitAutosIdle(c, 2), "and the lane clears again");
+}
+
+// ---------------------------------------------------------------------------
+// 16d. the ORDERED two-layer retirement
+// ---------------------------------------------------------------------------
+//
+// The subtlety §9.5 exists for. The daemon's built RtClip::data and ::notes
+// point INTO the pool, so a pool block outlives the built block that names it.
+// Echoing EvBlockRetired on the same proof, in either order, is a cross-process
+// use-after-free: it tells the client it may reuse memory the daemon's own
+// struct still points at.
+//
+// The ordering is structural in the daemon — a layer-2 entry does not exist
+// until layer 1 has been freed — and this is how it is made observable from
+// out here. ControlHeader::arrBuiltFreed is bumped BETWEEN the free and the
+// queueing, so it precedes the echo's ring push in program order; the push is a
+// release store and popEvent()'s read is an acquire, so a client that has seen
+// the echo CANNOT fail to see the free. Reading the counter at the instant an
+// echo arrives is therefore a real assertion about the daemon's ordering and
+// not a race we happened to win.
+
+static void testArrangementRetirementOrder(ipc::EngineClient& c) {
+    banner("16d. the pool echo cannot precede the built-block free (§9.5)");
+
+    resetMixer(c);
+    drainEvents(c);
+    const ipc::ControlHeader& h = c.header();
+    if (h.drainsExact.load() != 1) {
+        note("Engine::drains never moved; this section would be measuring a timer.");
+        return;
+    }
+
+    // Three distinct pool blocks under one lane, so "the echoes" is a set and
+    // not a single event that could pass by luck.
+    const i64 kFrames = 4800;
+    const std::vector<f32> dc = makeDc(kFrames, 1, 0.25f);
+    u64 refs[3] = {};
+    for (int i = 0; i < 3; ++i) refs[i] = c.poolWrite(dc.data(), kFrames, 1, 48000.0);
+    CHECK(refs[0] && refs[1] && refs[2] && refs[0] != refs[1] && refs[1] != refs[2],
+          "three blocks in the pool (%llu, %llu, %llu)",
+          (unsigned long long)refs[0], (unsigned long long)refs[1],
+          (unsigned long long)refs[2]);
+
+    ipc::WireArrHeader hdr{};
+    std::vector<ipc::WireArrItem> items{arrItem(0.0, 4.0, 0), arrItem(4.0, 4.0, 1),
+                                        arrItem(8.0, 4.0, 2)};
+    std::vector<ipc::WireClip>    clips{arrClip(refs[0], kFrames, 1),
+                                        arrClip(refs[1], kFrames, 1),
+                                        arrClip(refs[2], kFrames, 1)};
+    const u64 blobA = c.poolWriteArrangement(hdr, items, clips);
+    CHECK(blobA && c.setArrangement(1, blobA) && waitArrIdle(c, 1),
+          "publish a three-block lane on track 1");
+    for (int i = 0; i < 3; ++i)
+        CHECK(c.pool().stateOf(refs[i]) == ipc::BlockLive, "block %d is Live", i);
+
+    // A replacement that names none of them.
+    const u64 refD = c.poolWrite(dc.data(), kFrames, 1, 48000.0);
+    const u64 blobB = c.poolWriteArrangement(hdr, {arrItem(0.0, 4.0, 0)},
+                                             {arrClip(refD, kFrames, 1)});
+    CHECK(refD && blobB, "a fourth block and a replacement lane");
+
+    const u64 freed0  = h.arrBuiltFreed.load();
+    const u64 drains0 = h.engineDrains.load();
+    const u64 t0      = ipc::monotonicNs();
+    CHECK(c.setArrangement(1, blobB), "displace the lane");
+
+    // The race, constructed: poll with NO sleep from the moment of the
+    // displacement, and for every echo naming one of the three blocks, read the
+    // free counter at that instant.
+    int  seen = 0, echoedTooEarly = 0, pollsBeforeFree = 0;
+    bool sawUnfreedWindow = false;
+    const bool allEchoed = waitUntil([&] {
+        const u64 freedNow = h.arrBuiltFreed.load();
+        if (freedNow == freed0) { ++pollsBeforeFree; sawUnfreedWindow = true; }
+        ipc::WireEvent e;
+        while (c.popEvent(e)) {
+            if (e.type != ipc::EvBlockRetired) continue;
+            for (int i = 0; i < 3; ++i) {
+                if (e.ref != refs[i]) continue;
+                ++seen;
+                // THE assertion. The echo is in our hands; the free must
+                // already be counted.
+                if (h.arrBuiltFreed.load() <= freed0) ++echoedTooEarly;
+            }
+        }
+        return seen >= 3;
+    }, 4000, /*pollMs*/0);
+    const u64 elapsedNs = ipc::monotonicNs() - t0;
+
+    CHECK(allEchoed, "all three pool blocks were echoed (%d/3)", seen);
+    CHECK(echoedTooEarly == 0,
+          "and NONE of them was echoed before the built block was freed (%d violations)",
+          echoedTooEarly);
+    CHECK(sawUnfreedWindow,
+          "the poll was watching before the free happened (%d polls with the counter "
+          "still at %llu) — so the check above had a window to fail in",
+          pollsBeforeFree, (unsigned long long)freed0);
+    CHECK(h.arrBuiltFreed.load() >= freed0 + 1,
+          "the built block was freed (layer 1: %llu -> %llu)",
+          (unsigned long long)freed0, (unsigned long long)h.arrBuiltFreed.load());
+    CHECK(h.arrRefsEchoed.load() >= 3,
+          "three pool refs were queued behind it (layer 2: %llu)",
+          (unsigned long long)h.arrRefsEchoed.load());
+    CHECK(h.engineDrains.load() >= drains0 + 2,
+          "on the drain proof, with the counter advanced by at least two (%llu -> %llu)",
+          (unsigned long long)drains0, (unsigned long long)h.engineDrains.load());
+    CHECK(h.arrOrderViolations.load() == 0,
+          "the daemon's own ordering guard never fired (%llu)",
+          (unsigned long long)h.arrOrderViolations.load());
+    note("displacement to the last echo: %.1f ms", (double)elapsedNs / 1e6);
+
+    for (int i = 0; i < 3; ++i) {
+        CHECK(c.pool().stateOf(refs[i]) != ipc::BlockRetiring &&
+              c.pool().stateOf(refs[i]) != ipc::BlockLive,
+              "block %d is freeable (%s)", i, ipc::poolStateName(c.pool().stateOf(refs[i])));
+        CHECK(c.poolRelease(refs[i]), "and the client freed it");
+    }
+
+    CHECK(c.clearArrangement(1) && waitArrIdle(c, 1), "clear the lane");
+    CHECK(waitRetired(c, refD), "the fourth block retires on the same proof");
+    CHECK(c.poolRelease(refD), "and frees");
+}
+
+// ---------------------------------------------------------------------------
+// 16e. shared blocks
+// ---------------------------------------------------------------------------
+//
+// "A sample legitimately backs a session clip and six arrangement items at
+// once, and losing one of the seven is not a retirement" (§9.5).
+
+static void testArrangementSharedBlocks(ipc::EngineClient& c) {
+    banner("16e. one sample under a session clip and six arrangement items");
+
+    resetMixer(c);
+    drainEvents(c);
+
+    const i64 kFrames = 4800;
+    const std::vector<f32> dc = makeDc(kFrames, 1, 0.4f);
+    const u64 shared = c.poolWrite(dc.data(), kFrames, 1, 48000.0);
+    CHECK(shared != 0, "one block, at %llu", (unsigned long long)shared);
+    if (!shared) return;
+
+    CHECK(c.setClip(6, 0, audioClip(shared, kFrames, 1)) && waitClipIdle(c, 6, 0),
+          "it backs session cell [6][0]");
+
+    ipc::WireArrHeader hdr{};
+    std::vector<ipc::WireArrItem> six;
+    for (int i = 0; i < 6; ++i) six.push_back(arrItem(i * 4.0, 4.0, 0));
+    const u64 blob6 = c.poolWriteArrangement(hdr, six, {arrClip(shared, kFrames, 1)});
+    CHECK(blob6 && c.setArrangement(6, blob6) && waitArrIdle(c, 6),
+          "and six items of track 6's lane");
+    CHECK(c.pool().stateOf(shared) == ipc::BlockLive, "it is Live (%s)",
+          ipc::poolStateName(c.pool().stateOf(shared)));
+
+    // Lose one of the seven: five items instead of six, same block.
+    std::vector<ipc::WireArrItem> five(six.begin(), six.begin() + 5);
+    const u64 blob5 = c.poolWriteArrangement(hdr, five, {arrClip(shared, kFrames, 1)});
+    const u64 echoed0 = c.header().blocksRetired.load();
+    CHECK(blob5 && c.setArrangement(6, blob5) && waitArrIdle(c, 6),
+          "displace the lane with a five-item version over the same block");
+    // Give the retirement machinery time to be wrong.
+    sleepMs(120);
+    drainEvents(c);
+    CHECK(c.pool().stateOf(shared) == ipc::BlockLive,
+          "the block is still Live — losing one of the seven is not a retirement (%s)",
+          ipc::poolStateName(c.pool().stateOf(shared)));
+    CHECK(c.header().blocksRetired.load() == echoed0,
+          "and nothing was echoed for it (%llu)",
+          (unsigned long long)c.header().blocksRetired.load());
+
+    // Drop the whole lane: the session cell still names it.
+    CHECK(c.clearArrangement(6) && waitArrIdle(c, 6), "clear the lane entirely");
+    sleepMs(120);
+    drainEvents(c);
+    CHECK(c.pool().stateOf(shared) == ipc::BlockLive,
+          "still Live, because the session cell still names it (%s)",
+          ipc::poolStateName(c.pool().stateOf(shared)));
+
+    // Now the last holder goes.
+    CHECK(c.clearClip(6, 0) && waitClipIdle(c, 6, 0), "clear the session cell too");
+    CHECK(waitRetired(c, shared), "NOW it retires");
+    CHECK(c.poolRelease(shared), "and frees");
+    CHECK(c.header().arrOrderViolations.load() == 0, "with no ordering violations");
+}
+
+// ---------------------------------------------------------------------------
+// 16f. the journal ring
+// ---------------------------------------------------------------------------
+//
+// §9.6: a ninth control-region section, daemon pump -> client, deliberately NOT
+// the event ring. The recording gesture that fills it is 8f's; what belongs to
+// this milestone is the channel, its capacity, and the two drop counters that
+// make §5.4's "refuse, do not commit short" decidable across two hops.
+
+static void testJournalRing(ipc::EngineClient& c) {
+    banner("16f. the record journal crosses on a ring of its own");
+
+    CHECK(ipc::JournalRing::capacity() == 4095,
+          "the journal ring carries %u entries, matching Engine's own Ring<ArrJournal,4096>",
+          ipc::JournalRing::capacity());
+    CHECK(sizeof(ipc::WireJournal) == 24,
+          "a journal entry is %zu B, pointer-free", sizeof(ipc::WireJournal));
+    CHECK(ipc::control::kJournal > ipc::control::kParams,
+          "and it is the ninth section, appended past the param table (offset %zu)",
+          ipc::control::kJournal);
+
+    // Both hops report, and both report zero: nothing has recorded yet, which
+    // is exactly the state a take would need to see before it began.
+    drainEvents(c);
+    ipc::WireJournal j{};
+    int drained = 0;
+    while (c.popJournal(j)) ++drained;
+    CHECK(drained == 0, "no entries yet (%d), because nothing has recorded", drained);
+    CHECK(c.journalForwarded() == 0, "the daemon has forwarded none (%llu)",
+          (unsigned long long)c.journalForwarded());
+    CHECK(c.journalDropped() == 0, "and dropped none on its own hop (%llu)",
+          (unsigned long long)c.journalDropped());
+    CHECK(c.engineJournalDropped() == 0,
+          "the engine's own drop counter is mirrored and reads 0 (%u) — two hops, "
+          "two counters, so a take can be refused on either",
+          c.engineJournalDropped());
+
+    // Playing does not put anything on it either: a journal entry is a
+    // RECORDING event, and the ring must stay empty until one happens.
+    c.pushCommand(Cmd::SetPlaying, 1);
+    sleepMs(150);
+    while (c.popJournal(j)) ++drained;
+    c.pushCommand(Cmd::SetPlaying, 0);
+    CHECK(drained == 0, "and playing the transport does not put anything on it (%d)", drained);
+    note("the entries themselves arrive with 8f: the engine has the ring and the");
+    note("seq counter, and nothing pushes to it until there is a take to journal.");
+}
+
+// ---------------------------------------------------------------------------
+// 16g. SIGKILL with an arrangement loaded, and republishArrangements()
+// ---------------------------------------------------------------------------
+//
+// The pool is the session's, so the blobs and the samples they name are exactly
+// where they were. Putting the arrangement back is therefore one command per
+// lane and no re-encoding of anything — which is the whole reason the blob
+// stays allocated as the client's shadow instead of being retired after the
+// daemon copies it out.
+
+static void testArrangementSurvival(ipc::EngineClient& c, pid_t& daemon) {
+    banner("16g. SIGKILL with an arrangement playing: respawn and republish");
+
+    resetMixer(c);
+    drainEvents(c);
+    c.locate(0.0);
+
+    const i64 kFrames = 96000;
+    const std::vector<f32> dc = makeDc(kFrames, 1, 0.5f);
+    const u64 sample = c.poolWrite(dc.data(), kFrames, 1, 48000.0, /*key*/0xA22ull);
+    ipc::WireArrHeader hdr{};
+    const u64 blob = c.poolWriteArrangement(hdr, {arrItem(0.0, 4.0, 0), arrItem(4.0, 4.0, 0)},
+                                            {arrClip(sample, kFrames, 1)});
+    CHECK(sample && blob, "a lane in the pool (sample %llu, blob %llu)",
+          (unsigned long long)sample, (unsigned long long)blob);
+    if (!sample || !blob) return;
+
+    CHECK(c.setArrangement(0, blob) && waitArrIdle(c, 0), "published on track 0");
+    CHECK(c.pushCommand(Cmd::SetPlaying, 1), "transport rolling");
+    const f32 before = peakTrack(c, 0, 500);
+    CHECK(std::fabs(before - 0.5f) < 0.06f, "and sounding at %.4f", (double)before);
+
+    ::kill(daemon, SIGKILL);
+    int status = 0;
+    const bool reaped = ipc::EngineClient::waitFor(daemon, 2000, &status);
+    CHECK(reaped && WIFSIGNALED(status), "the daemon died of SIGKILL");
+    for (int i = 0; i < gDaemonCount; ++i) if (gDaemons[i] == daemon) gDaemons[i] = 0;
+
+    // Both blocks are still here, because the pool is ours.
+    CHECK(shmExists(gPool), "the pool is still in /dev/shm");
+    CHECK(c.pool().blockAt(blob) && c.pool().blockAt(blob)->kind == ipc::PoolKindArrangement,
+          "the arrangement blob is still a live allocation");
+    CHECK(c.pool().stateOf(sample) == ipc::BlockLive,
+          "the sample it names is still Live (%s)", ipc::poolStateName(c.pool().stateOf(sample)));
+    CHECK(c.pool().findByKey(0xA22ull) == sample, "and the content key still finds it");
+
+    // The corpse is still in /dev/shm — nobody unlinked it — and attach() fails
+    // FAST on a region whose creator is gone rather than retrying, so the
+    // orphan is cleared before the replacement is spawned. §4.1's hook, used
+    // exactly as a supervising GUI would use it.
+    c.detach();
+    CHECK(ipc::EngineClient::reapStale(gSession), "the orphan control region is reaped");
+    CHECK(shmExists(gPool), "and reaping it left the pool alone");
+
+    daemon = spawnDaemon(gSession);
+    CHECK(daemon > 0, "respawn nxtaktd (pid %d)", (int)daemon);
+    const bool back = waitUntil([&] { return c.attach(gSession, 500); }, 8000, /*pollMs*/20);
+    CHECK(back, "attach to the replacement%s%s", back ? "" : ": ", back ? "" : c.error());
+    if (!back) return;
+    const bool poolBack = waitUntil([&] { drainEvents(c); return c.poolReady(); }, 3000);
+    CHECK(poolBack, "which mapped the same pool (epoch %llu)",
+          (unsigned long long)c.header().poolAttachedEpoch.load());
+
+    // §10.7: republishClips() plus republishArrangements(). One command per
+    // occupied lane, against the same offsets, with nothing decoded or copied.
+    CHECK(c.arrangementShadow(0) == blob, "the client's shadow survived the engine");
+    const int sent = c.republishArrangements();
+    CHECK(sent == 1, "republishArrangements() re-sent %d lane(s)", sent);
+    const bool reapplied = waitUntil([&] {
+        drainEvents(c);
+        return c.header().arrangementsApplied.load() > 0;
+    }, 3000);
+    CHECK(reapplied, "which the new engine translated and applied (%llu)",
+          (unsigned long long)c.header().arrangementsApplied.load());
+
+    resetMixer(c);
+    CHECK(c.pushCommand(Cmd::SetPlaying, 1), "roll the new engine");
+    const f32 after = peakTrack(c, 0, 700);
+    CHECK(std::fabs(after - 0.5f) < 0.06f,
+          "and the same lane is sounding again: meter %.4f", (double)after);
+
+    c.pushCommand(Cmd::SetPlaying, 0);
+    CHECK(c.clearArrangement(0) && waitArrIdle(c, 0), "clear the lane");
+    CHECK(waitRetired(c, sample), "the sample retires");
+    CHECK(c.poolRelease(sample), "and frees");
+    CHECK(c.header().arrOrderViolations.load() == 0, "no ordering violations, end to end");
+}
+
 // ---------------------------------------------------------------------------
 // 13. engine crash: SIGKILL, detect, reap, respawn — with the pool attached
 // ---------------------------------------------------------------------------
@@ -1994,6 +2889,14 @@ int main(int argc, char** argv) {
         testCommandFloodHeartbeat(client);
         testDevices(client);
         testDrainsExactness(client);
+        testArrangementCommands(client);
+        testArrangementPlays(client);
+        testHostileArrangements(client);
+        testTrackAutos(client);
+        testArrangementRetirementOrder(client);
+        testArrangementSharedBlocks(client);
+        testJournalRing(client);
+        testArrangementSurvival(client, daemon);
         testCrashAndRespawn(client, daemon);
         testCleanShutdown(client, daemon);
     }

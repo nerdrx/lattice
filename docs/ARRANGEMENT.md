@@ -2534,3 +2534,198 @@ Three notes for the milestones after this one:
   inside. Neither is arrangement work: the metronome is cosmetic and the take
   stamp belongs to 8f, which owns `engine.cpp` after this and should fold the
   sub-block origin into `captureMidiRange` when it does.
+
+---
+
+## 16. 8g shipped — the arrangement across the process boundary
+
+Protocol v3 → **v5**, pool v2 → **v4**, shm v2 → **v3**. `nxtaktd` translates a
+lane, plays it, and retires it in two ordered layers. 521 daemon checks and 100
+IPC checks, green over six consecutive runs and clean under ASan + UBSan with
+both the daemon and the test sanitised; `make test` green with and without
+system plugins; `/dev/shm` clean after every run.
+
+### 16.1 The region layout change
+
+One new section, **appended**, so no existing offset moved:
+
+```
+kHeader kState kCmds kEvts kMidi kClips kDevices kParams  kJournal   <- new, ninth
+                                                          ShmSpscRing<WireJournal,4096>
+```
+
+1 895 488 → 1 993 920 B. `ControlHeader` grew seven counters
+(`arrangementsApplied`, `arrangementsRejected`, `arrBuiltFreed`,
+`arrRefsEchoed`, `arrOrderViolations`, `journalForwarded`, `journalDropped`) and
+`SharedStateT` grew two (`arrOverride`, `journalDropped`, both mirrored from
+`Engine`'s own published atomics), which is why `kShmVersion` moved as well as
+the layout hash. The seed is re-spelled `nxtakt.control.v5` and the new section
+offset, `sizeof(WireJournal)`, `JournalRing::capacity()` and both arrangement
+wire sizes are folded in, so a v3 binary and a v5 binary refuse each other at
+`attach()` with a specific message.
+
+**The version numbers skip 4 / 3.** AUTOMATION.md §8.3 names protocol 4 / pool 3
+and `PoolKindAutomation = 4` / `RejectBadAutomation = 15` for clip envelopes
+crossing the boundary, and that wave has not shipped in this tree. Reusing its
+numbers would make "protocol v4" mean one thing in a document and another in a
+header, so they are burned and declared: `PoolKindAutomation` and
+`RejectBadAutomation` exist in the enums, unused, purely so the next wave finds
+its own numbers free. §9.1 assumed automation had already landed; it had not,
+and the named target (v5 / v4) is what shipped.
+
+### 16.2 How the two retirement layers are ordered, and how that is tested
+
+The ordering is **structural, not asserted**: a layer-2 entry does not *exist*
+until layer 1 has happened.
+
+```c++
+r.mem.reset();                                   // LAYER 1: the built block
+map_.hdr->arrBuiltFreed.fetch_add(1, relaxed);
+for (const PoolRef& p : r.refs) retireArrRef(r, p);   // LAYER 2, and not one line earlier
+```
+
+`retireArrRef()` re-checks `owner.mem` and, if layer 1 has *not* happened,
+counts `ControlHeader::arrOrderViolations` and **refuses to queue the echo**.
+That is a queue-time check on purpose, and the reason is worth recording because
+the obvious design does not work:
+
+> The free and the echo are two statements in two different functions one pump
+> tick apart. Anything asking *"had layer 1 happened when the event went out?"*
+> is answered "yes" by the end of every tick **whichever order the code is in**
+> — which makes it useless as a regression check. The invariant that actually
+> distinguishes the two orderings is *"a layer-2 entry may only be created for
+> an owner whose layer-1 block is already gone."*
+
+This was found by injecting the bug rather than by reasoning about it. The first
+version of `daemon_test` §16d watched `arrBuiltFreed` at the instant each
+`EvBlockRetired` arrived — sound in principle, since the counter's relaxed store
+precedes the ring's release push — and it **passed against a deliberately
+reordered daemon**, for exactly the reason above. With the queue-time check in
+place, reordering those two steps now fails five checks at once (`0/3` blocks
+echoed, the guard fired 5 times, blocks left `Retiring`), and it fails **safe**:
+the client keeps a block nobody can free instead of freeing one the daemon still
+points at.
+
+`§16d` also constructs the race rather than assuming it — it polls with no sleep
+from the moment of displacement and asserts it observed a window (76 polls on
+this machine) in which the free had not yet happened, so the check had somewhere
+to fail. `publishRetired()` carries a second, independent guard
+(`arrangementHolds()`), and shutdown frees every built block before queueing any
+echo, for the same reason.
+
+### 16.3 The validation bounds
+
+`RejectBadArrangement`, whole-blob, never partially obeyed. The blob is
+**snapshotted** into daemon-side vectors before any check runs — `translateClip`'s
+`const WireClip c = *cell` at blob scale — which retires the whole TOCTOU class
+(F3/F4) for ~82 KB of `memcpy` on a non-realtime thread.
+
+| # | bound | what it stops |
+|---|---|---|
+| 1 | `poolValidate(ref, PoolKindArrangement, sizeof(WireArrHeader))` | reading a header out of a block that cannot hold one; wrong-kind blocks |
+| 2 | `0 <= itemCount <= kMaxArrItems` (512) | `2^31`/`2^62` item counts, and the extent multiply that would wrap |
+| 3 | `0 <= clipCount <= itemCount` | a clip array larger than the lane that indexes it |
+| 4 | `0 <= noteCount <= kMaxArrNotes` (65536) | an absurd declared total |
+| 5 | `loopOn <= 1`; brace finite, `>= 0`, `<= kMaxArrBeat`; `loopOn ⇒ loopEnd > loopStart` | a zero-length or inverted brace, which makes the internal locate a spin |
+| 6 | `arrangementBytes(itemCount, clipCount) <= the extent validation PROVED` | a blob smaller than its own declared contents, caught before a pointer exists |
+| 7 | per item: `start`/`length`/`offset`/fades finite; `start,offset ∈ [0, kMaxArrBeat]`; `length ∈ [kMinArrBeats, kMaxArrBeat]`; fades `>= 0`; `fadeIn+fadeOut <= length`; `fadeShape ∈ [0,255]` | wild scalars, zero-length items, NaN starts |
+| 8 | `clip ∈ [0, clipCount)` | an item naming a clip that is not there |
+| 9 | **items sorted by `start`** | an unsorted lane, which makes the engine's bisection read outside the array |
+| 10 | **every overlap `<= kMaxOverlapBeats` and covered by both fades** | §2.3 rule 4 |
+| 11 | **`c.start >= a.end` for every consecutive triple** | a third simultaneous voice the engine does not have |
+| 12 | every `WireClip` through the existing `buildClip()` — §10.5's table verbatim, including F1's `frames <= INT32_MAX` and F2's `clipBpm ∈ [1, 1e6]` | everything that table already catches, now inside a blob |
+| 13 | `Σ noteCount <= kMaxArrNotes`, and the **computed** total is what reaches `RtArrangement::noteCount` | a lying header propagating downstream |
+| 14 | track autos: `0 <= laneCount <= kMaxArrLanes` (32), `0 <= pointCount <= kMaxArrPoints`, declared extent `<=` proved extent | absurd counts |
+| 15 | per lane: `target ∈ [0, DeviceParam]`, `xform ∈ [0,1]`, `index ∈ [0, kMaxDevParams)`, `devSlot ∈ [-1, kMaxChainFx)`, clamps finite, **`first >= 0 && count >= 0 && first + count <= pointCount`** | the bold one is THE bound: `autoValueAt` bisects `points[first, first+count)` |
+| 16 | per point: `beat` finite and `∈ [0, kMaxArrBeat]`, `value` finite | a wild beat downstream of every tempo multiply |
+| 17 | `Cmd::Locate`: `x ∈ [0, kMaxArrBeat]`; `Cmd::BackToArrangement`: `a ∈ [-1, kMaxTracks)` | the two new scalars, bounded like every other multiply operand |
+
+`Cmd::SetArrangement{a}` accepts `-1` (the transport cell) and
+`SetTrackAutos{a}` does not, because there is no such thing as the transport's
+automation.
+
+**Alignment is a bound too.** `RtAutoLane` is 36 B and 4-aligned while
+`RtAutoPoint` leads with an `f64`, so an odd lane count leaves the point array
+on a 4-byte boundary. Two independent places round up and both say so:
+`buildTrackAutos` aligns every array offset to its member's own alignment, and
+`WireAutoLane` spells out a trailing pad word with a `static_assert` that its
+size divides `alignof(WireAutoPoint)`. `daemon_test` §16c-2 publishes 1-, 3- and
+5-lane sets and lets the engine evaluate them under UBSan.
+
+### 16.4 Deliberate deviations from §9
+
+1. **`EvArrangementAck`, which §9 does not name.** Exactly one answers every
+   `SetArrangement` and every `SetTrackAutos`, accepted or refused, in
+   `EvClipAck`'s shape (`ref` = generation, `x` = reason). Without it a refused
+   publication leaves the client holding a pool blob it can never free and a
+   lane it can never republish — the same argument §11.2 makes for answering
+   every device command. The command carries the generation in its unused `b`.
+2. **One reject reason for the whole class.** A bad blob offset, a bad clip
+   inside the blob and a broken invariant all answer `RejectBadArrangement`,
+   with the precise cause in the log line. Every one has the same client-side
+   recovery — free it, fix it, re-publish — and §9.4's own framing is the
+   whole-blob refusal discipline of `RejectBadClip`.
+3. **The blob is NOT `markLive`d, and the daemon never retires it.** §10.7 says
+   "the blobs are still `Live`" after a `SIGKILL`; they are still *allocated*,
+   which is what that sentence needs, but they are the client's own memory in
+   the client's own region rather than something the engine holds. The daemon
+   copies the blob out at translate time and never reads it again — it is a
+   `PoolKindString` in that respect — so the client keeps it as its shadow and
+   frees it when the ack for its replacement arrives. That is precisely what
+   makes `republishArrangements()` **one command per lane with nothing
+   re-encoded**. What *does* go through `markLive`/`markDisplaced`/
+   `confirmRetired` is the sample and note blocks the blob named, which is where
+   the two-layer retirement lives.
+4. **`PoolKindTrackAutos = 6`**, a second new kind. §9.2 names only
+   `PoolKindArrangement`, but `Cmd::SetTrackAutos` has to carry `RtAutoSetN`
+   across too, and a blob handed to the wrong builder is exactly what `kind`
+   exists to refuse. 4 stays reserved for AUTOMATION.md.
+5. **`commandIsArrangement()` is a fifth command class**, not a fourth flavour
+   of `pooled`. A pooled command names a cell in a table that exists whether or
+   not anything is in it and is answered by `EvClipAck`; this one names a
+   variable-length blob and has a daemon-heap allocation with a two-layer
+   retirement behind it.
+
+### 16.5 What the frozen `engine.h` could not express
+
+- **`Ev::ArrangementRetired` cannot name *which* of two identical pointers it
+  retires.** `Event` carries one `void*`, so the daemon matches on the pointer
+  value alone (`ArrRetire::watch`). It is sufficient because an entry is dropped
+  in the same loop iteration in which it is freed, so a re-used address can
+  never match a stale entry — but it is a property of the daemon's bookkeeping
+  rather than something the event proves.
+- **`RtArrangement::noteCount` is documented "for the daemon's bounds
+  arithmetic"**, and the wire header carries a declared `noteCount` beside it.
+  The daemon publishes the *counted* total instead and uses the declared one
+  only as a bound to reject against. A peer's number is never propagated to
+  something downstream that would trust it.
+- **`ArrJournal::kind` is a `u32`, not `JournalKind`**, so nothing at the
+  boundary can range-check it structurally; the daemon forwards it verbatim
+  because the journal is engine → client and the engine is the trusted producer.
+  If a journal ever flows the other way that stops being true.
+- **The split gate §10.7 asks for — the same arrangement rendered in-process and
+  through the daemon, asserted bit-identical — is not in `daemon_test`.** That
+  binary deliberately links neither `engine.cpp` nor any audio library (`IPC_CF`,
+  no `sndfile`, no `lilv`), which is the property that keeps the client side of
+  the protocol honest, and linking an `Engine` into it to satisfy one assertion
+  would cost more than the assertion is worth. What is asserted instead is the
+  measurement the split gate exists for: a 0.5 DC item published as offsets,
+  translated in another process and **read back at 0.5000 on the track meter**,
+  plus the cursor advancing and `arrOverride` round-tripping. The bit-identity
+  claim belongs in `engine_test`, where an in-process `Engine` already lives.
+- **The journal's *entries* are not exercised end to end**, because nothing
+  pushes to `Engine::journal_` yet — recording is 8f. What ships and is tested
+  is the channel: the ring as the ninth section, both drop counters, and a
+  cross-process test (`ipc_test` §9) that deliberately overruns a real
+  `JournalRing` and asserts the resulting **gap in `seq` measures exactly the
+  number of refused pushes** — the two sides of §5.4's "a take with a gap is
+  refused" reporting the same fact.
+
+### 16.6 One hand-off
+
+- **`daemon_test` §2 was updated for answer 4.** It asserted "stopping rewinds
+  to beat 0"; 8b+8c landed stop-does-not-rewind while this milestone was in
+  flight, so the section now asserts the decided semantics — the first stop
+  leaves the beat where it was, and a *second* `SetPlaying 0` locates to zero.
+  Recorded here because the file is 8g's and the decision is 8b+8c's, and a note
+  in a finished agent's report is not a place work survives.

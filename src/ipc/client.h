@@ -32,6 +32,7 @@
 #pragma once
 #include "control.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -167,6 +168,7 @@ public:
         // by republishClips(), so the un-acknowledged value was never part of
         // anything's state.
         rollbackPendingCells();
+        rollbackPendingArrangements();
         // Device ids belong to the engine that issued them and die with it: a
         // respawned daemon re-instantiates from scratch and numbers from zero.
         // Keeping the old generations would let a param write land on a
@@ -364,6 +366,166 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // The arrangement (wave 8g, docs/ARRANGEMENT.md §9)
+    // -----------------------------------------------------------------------
+    //
+    // A track's lane crosses as ONE pool blob and one 32-byte command. The blob
+    // is the client's own memory in the client's own region, which is what
+    // makes republishArrangements() a command per track and not a re-encode:
+    // the daemon copies the blob out at translate time and never looks at it
+    // again, so the blob stays allocated here as the client's shadow and
+    // survives the engine exactly as the samples do.
+    //
+    // OWNERSHIP, and why the blob is NOT markLive()d. markLive/markDisplaced/
+    // confirmRetired is the protocol for memory the ENGINE will hold. The blob
+    // is not that: the daemon reads it once, on its pump thread, and builds its
+    // own RtArrangement from it (§9.3), exactly as it copies a URI string out
+    // of a PoolKindString block. What the engine ends up holding is the built
+    // block plus pointers into the sample and note blocks the blob NAMED, and
+    // those are the ones that go through the state machine. The blob itself is
+    // ordinary client-owned memory, freed by the client when the ack for its
+    // replacement arrives.
+
+    // Writes [WireArrHeader][WireArrItem[]][WireClip[]] into the pool and
+    // returns the offset, or 0. `hdr.itemCount`/`clipCount` are taken from the
+    // vectors, so a header that disagrees with them cannot be built by accident
+    // here — a client that wants to send a disagreeing blob (the tests do) sets
+    // the counts after the fact through the pool.
+    u64 poolWriteArrangement(const WireArrHeader& hdr,
+                             const std::vector<WireArrItem>& items,
+                             const std::vector<WireClip>& clips) {
+        if (!pool_.valid()) return 0;
+        WireArrHeader h = hdr;
+        h.itemCount = (i64)items.size();
+        h.clipCount = (i64)clips.size();
+        const u64 bytes = arrangementBytes(h.itemCount, h.clipCount);
+        const u64 ref = pool_.alloc((size_t)bytes, PoolKindArrangement,
+                                    h.itemCount, 0, 0.0, 0);
+        if (!ref) { setErr("%s", pool_.error()); return 0; }
+        u8* p = pool_.data<u8>(ref);
+        if (!p) return 0;
+        std::memcpy(p, &h, sizeof h);
+        if (!items.empty())
+            std::memcpy(p + sizeof h, items.data(), items.size() * sizeof(WireArrItem));
+        if (!clips.empty())
+            std::memcpy(p + sizeof h + items.size() * sizeof(WireArrItem),
+                        clips.data(), clips.size() * sizeof(WireClip));
+        return ref;
+    }
+
+    // The transport cell (§3.6): an arrangement addressed as track -1, with no
+    // items and only the loop brace in it.
+    u64 poolWriteTransport(f64 loopStart, f64 loopEnd, bool loopOn) {
+        WireArrHeader h{};
+        h.loopStart = loopStart;
+        h.loopEnd   = loopEnd;
+        h.loopOn    = loopOn ? 1u : 0u;
+        return poolWriteArrangement(h, {}, {});
+    }
+
+    // [WireAutoSetHeader][WireAutoLane[]][WireAutoPoint[]] — the RtAutoSetN
+    // payload (§6.2). References nothing else in the pool, so its retirement is
+    // one layer rather than two.
+    u64 poolWriteTrackAutos(const std::vector<WireAutoLane>& lanes,
+                            const std::vector<WireAutoPoint>& points) {
+        if (!pool_.valid()) return 0;
+        WireAutoSetHeader h{};
+        h.laneCount  = (i64)lanes.size();
+        h.pointCount = (i64)points.size();
+        const u64 bytes = trackAutosBytes(h.laneCount, h.pointCount);
+        const u64 ref = pool_.alloc((size_t)bytes, PoolKindTrackAutos, h.laneCount, 0, 0.0, 0);
+        if (!ref) { setErr("%s", pool_.error()); return 0; }
+        u8* p = pool_.data<u8>(ref);
+        if (!p) return 0;
+        std::memcpy(p, &h, sizeof h);
+        if (!lanes.empty())
+            std::memcpy(p + sizeof h, lanes.data(), lanes.size() * sizeof(WireAutoLane));
+        if (!points.empty())
+            std::memcpy(p + sizeof h + lanes.size() * sizeof(WireAutoLane),
+                        points.data(), points.size() * sizeof(WireAutoPoint));
+        return ref;
+    }
+
+    // Publishes `blobRef` as track `track`'s lane; -1 is the transport cell and
+    // 0 clears. Returns false — and changes nothing — for the same three
+    // "try again next frame" reasons setClip() does: a previous publication for
+    // this track is still un-acknowledged, the ring is full, or nothing is
+    // attached.
+    bool setArrangement(int track, u64 blobRef) {
+        return publishArr(track, blobRef, Cmd::SetArrangement);
+    }
+    bool clearArrangement(int track) { return publishArr(track, 0, Cmd::SetArrangement); }
+
+    bool setTrackAutos(int track, u64 blobRef) {
+        return publishArr(track, blobRef, Cmd::SetTrackAutos);
+    }
+    bool clearTrackAutos(int track) { return publishArr(track, 0, Cmd::SetTrackAutos); }
+
+    // Both scalars, both refused by the daemon if `x` is not finite.
+    bool locate(f64 beat)                 { return pushCommand(Cmd::Locate, 0, 0, beat); }
+    bool backToArrangement(int track = -1) { return pushCommand(Cmd::BackToArrangement, track); }
+
+    // §10.7 step 3, the arrangement's half of the respawn story. The blobs are
+    // still in the pool — it is the session's region and outlives the engine —
+    // so putting the arrangement back is one command per occupied lane and no
+    // re-encoding of anything.
+    int republishArrangements() {
+        if (!attached()) return 0;
+        int sent = 0;
+        for (int i = 0; i <= kMaxTracks; ++i) {
+            const int track = (i == kMaxTracks) ? -1 : i;
+            if (arrShadow_[i].blob) {
+                if (!pushArrCommand(Cmd::SetArrangement, track, arrShadow_[i].blob,
+                                    arrShadow_[i].generation)) return sent;
+                arrPending_[i] = arrShadow_[i];      // already in sync: no bookkeeping
+                ++sent;
+            }
+            if (i < kMaxTracks && autosShadow_[i].blob) {
+                if (!pushArrCommand(Cmd::SetTrackAutos, track, autosShadow_[i].blob,
+                                    autosShadow_[i].generation)) return sent;
+                autosPending_[i] = autosShadow_[i];
+                ++sent;
+            }
+        }
+        return sent;
+    }
+
+    u64  arrangementShadow(int track) const {
+        const int i = arrIndex(track);
+        return i < 0 ? 0 : arrShadow_[i].blob;
+    }
+    u64  trackAutosShadow(int track) const {
+        return (track >= 0 && track < kMaxTracks) ? autosShadow_[track].blob : 0;
+    }
+    bool arrangementBusy(int track) const {
+        const int i = arrIndex(track);
+        return i >= 0 && arrPending_[i].generation != arrShadow_[i].generation;
+    }
+    bool trackAutosBusy(int track) const {
+        return track >= 0 && track < kMaxTracks &&
+               autosPending_[track].generation != autosShadow_[track].generation;
+    }
+
+    // -- the record journal (§5.3, §9.6) ------------------------------------
+    //
+    // Its own ring, so a burst of entries cannot evict an event and a lost
+    // event cannot swallow a take. TWO hops can lose an entry — the engine's
+    // ring into the daemon's pump, the pump's ring into here — so both drop
+    // counters are exposed, and §5.4's contiguity check runs on the ENGINE's
+    // `seq`, which covers both by construction.
+    bool popJournal(WireJournal& j) {
+        return attached() && map_.journal->pop(j);
+    }
+    u64 journalForwarded() const { return header().journalForwarded.load(std::memory_order_relaxed); }
+    u64 journalDropped()   const { return header().journalDropped.load(std::memory_order_relaxed); }
+    u32 engineJournalDropped() const {
+        return state().journalDropped.load(std::memory_order_relaxed);
+    }
+
+    // Bit i set == track i's arrangement lane is suspended by a session launch.
+    u32 arrOverride() const { return state().arrOverride.load(std::memory_order_relaxed); }
+
+    // -----------------------------------------------------------------------
     // Devices (phase 3)
     // -----------------------------------------------------------------------
     //
@@ -554,6 +716,7 @@ public:
             case EvDeviceChanged:
             case EvScanComplete:
                 return true;
+            case EvArrangementAck: return onArrangementAck(e);
             default:             return false;
         }
     }
@@ -723,6 +886,146 @@ private:
         return true;
     }
 
+    // -- the arrangement ----------------------------------------------------
+    //
+    // One shadow slot per track plus one for the transport cell, which is
+    // addressed as track -1 and lands at index kMaxTracks. Doing it that way
+    // rather than with a separate member is the same call ControlMap::clip()
+    // makes: one array and one index function, so the "is this the transport?"
+    // branch exists in exactly one place.
+    struct ArrPub {
+        u64 blob = 0;                 // pool offset of the blob, 0 = cleared
+        u32 generation = 0;
+        std::vector<u64> refs;        // DISTINCT sample/notes offsets it names
+    };
+
+    static int arrIndex(int track) {
+        if (track == -1) return kMaxTracks;
+        return (track >= 0 && track < kMaxTracks) ? track : -1;
+    }
+
+    // Reads back a blob this client wrote and collects the distinct pool
+    // offsets its clips name. Trusted memory — the client is the pool's only
+    // writer and it wrote this a moment ago — but bounded anyway, because the
+    // cost of the bound is nothing and the alternative is a helper that goes
+    // wrong quietly if a caller ever hands it somebody else's offset.
+    std::vector<u64> collectArrRefs(u64 blobRef) const {
+        std::vector<u64> refs;
+        if (!blobRef || !pool_.valid()) return refs;
+        const PoolBlock* b = pool_.blockAt(blobRef);
+        if (!b || b->kind != PoolKindArrangement) return refs;
+        const u8* p = pool_.data<u8>(blobRef);
+        if (!p || b->bytes < sizeof(WireArrHeader)) return refs;
+        WireArrHeader h{};
+        std::memcpy(&h, p, sizeof h);
+        if (h.itemCount < 0 || h.clipCount < 0 ||
+            h.itemCount > kMaxArrItems || h.clipCount > kMaxArrItems) return refs;
+        if (arrangementBytes(h.itemCount, h.clipCount) > b->bytes) return refs;
+        const u8* cp = p + sizeof h + (size_t)h.itemCount * sizeof(WireArrItem);
+        for (i64 i = 0; i < h.clipCount; ++i) {
+            WireClip c{};
+            std::memcpy(&c, cp + (size_t)i * sizeof(WireClip), sizeof c);
+            for (u64 r : {c.sampleRef, c.notesRef})
+                if (r && std::find(refs.begin(), refs.end(), r) == refs.end())
+                    refs.push_back(r);
+        }
+        return refs;
+    }
+
+    // The one place a lane is published. The order is the protocol, and it is
+    // writeCell()'s order with the table step removed:
+    //
+    //   1. refuse if the previous publication for this track has not been
+    //      acknowledged, or the ring is full. Measuring the ring FIRST is what
+    //      lets everything after it be unconditional — this client is the
+    //      ring's only producer.
+    //   2. mark every block the blob NAMES Live before publishing, so a
+    //      concurrent poolRelease() cannot free something the engine is about
+    //      to be handed. The blob itself is deliberately not marked: see the
+    //      ownership note above.
+    //   3. push. The displacement bookkeeping waits for the acknowledgement,
+    //      because until the daemon has read the blob we do not know whether
+    //      the old lane was displaced or the write was refused.
+    bool publishArr(int track, u64 blobRef, Cmd cmd) {
+        const bool autos = (cmd == Cmd::SetTrackAutos);
+        const int i = autos ? ((track >= 0 && track < kMaxTracks) ? track : -1) : arrIndex(track);
+        if (i < 0 || !attached()) return false;
+        ArrPub* shadow  = autos ? &autosShadow_[i]  : &arrShadow_[i];
+        ArrPub* pending = autos ? &autosPending_[i] : &arrPending_[i];
+        if (pending->generation != shadow->generation) return false;
+        if (map_.cmds->size() >= CommandRing::capacity()) return false;
+
+        ArrPub next;
+        next.blob       = blobRef;
+        next.generation = shadow->generation + 1;
+        if (!autos) next.refs = collectArrRefs(blobRef);
+        for (u64 r : next.refs) pool_.markLive(r);
+
+        *pending = next;
+        pushArrCommand(cmd, track, blobRef, next.generation);   // space measured above
+        return true;
+    }
+
+    bool pushArrCommand(Cmd cmd, int track, u64 blobRef, u32 generation) {
+        WireCommand w{};
+        w.type = (u32)cmd;
+        w.a    = track;
+        w.b    = (i32)generation;
+        w.ref  = blobRef;
+        return pushCommand(w);
+    }
+
+    bool onArrangementAck(const WireEvent& e) {
+        const bool autos = (e.flags & ArrAckAutos) != 0;
+        const int i = autos ? ((e.a >= 0 && e.a < kMaxTracks) ? e.a : -1) : arrIndex(e.a);
+        if (i < 0) return true;
+        ArrPub& shadow  = autos ? autosShadow_[i]  : arrShadow_[i];
+        ArrPub& pending = autos ? autosPending_[i] : arrPending_[i];
+        if (pending.generation != (u32)e.ref) return true;          // stale echo
+        if (pending.generation == shadow.generation) return true;   // republish
+
+        if (e.flags & ArrAckRefused) {
+            // The engine never saw it, so nothing was displaced and the blocks
+            // optimistically marked Live are not published after all. The blob
+            // is ours and unreferenced: free it here rather than leaking a
+            // block whose only purpose was a command that was refused.
+            for (u64 r : pending.refs) pool_.unmarkLive(r);
+            if (pending.blob) pool_.release(pending.blob);
+            shadow.generation = pending.generation;   // keep them monotonic
+            pending = shadow;
+            pending.refs = shadow.refs;
+            return true;
+        }
+
+        // Accepted. Whatever the lane used to name is displaced — and the old
+        // BLOB is now dead outright, because the daemon copied it into its own
+        // address space at translate time and will never read it again. Note
+        // this runs unconditionally on the old refs, including when the new
+        // blob names the same block: markLive/markDisplaced are a counted pair
+        // and a re-publish that changed only a fade must not leave the count
+        // high.
+        for (u64 r : shadow.refs) pool_.markDisplaced(r);
+        if (shadow.blob && shadow.blob != pending.blob) pool_.release(shadow.blob);
+        shadow = pending;
+        return true;
+    }
+
+    void rollbackPendingArrangements() {
+        for (int i = 0; i <= kMaxTracks; ++i) {
+            ArrPub* pairs[2] = {&arrPending_[i], i < kMaxTracks ? &autosPending_[i] : nullptr};
+            ArrPub* shad[2]  = {&arrShadow_[i],  i < kMaxTracks ? &autosShadow_[i]  : nullptr};
+            for (int k = 0; k < 2; ++k) {
+                if (!pairs[k]) continue;
+                if (pairs[k]->generation == shad[k]->generation) continue;
+                for (u64 r : pairs[k]->refs) pool_.unmarkLive(r);
+                if (pairs[k]->blob && pairs[k]->blob != shad[k]->blob)
+                    pool_.release(pairs[k]->blob);
+                shad[k]->generation = pairs[k]->generation;
+                *pairs[k] = *shad[k];
+            }
+        }
+    }
+
     void rollbackPendingCells() {
         for (int i = 0; i < kCells; ++i) {
             if (pending_[i].generation == shadow_[i].generation) continue;
@@ -772,6 +1075,14 @@ private:
     // whole point of the shadow is to outlive one.
     WireClip    shadow_[kCells]  = {};
     WireClip    pending_[kCells] = {};
+
+    // The same two-table idea for the arrangement, and client memory for the
+    // same reason: the control region dies with the engine, and the whole point
+    // of a shadow is to outlive one. Index kMaxTracks is the transport cell.
+    ArrPub      arrShadow_[kMaxTracks + 1];
+    ArrPub      arrPending_[kMaxTracks + 1];
+    ArrPub      autosShadow_[kMaxTracks];
+    ArrPub      autosPending_[kMaxTracks];
 
     // The slot generation this client last saw for each device id. 0 means
     // "nothing there as far as I know", which is also what a stale param write

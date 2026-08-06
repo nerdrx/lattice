@@ -320,11 +320,37 @@ private:
     // A translated command plus what the boundary has to remember about it
     // until the engine has actually taken it. Declared up here because member
     // function *signatures* below need the type complete.
+    // A pool offset with the kind it was validated as. The kind travels with
+    // the offset because EvBlockRetired carries it and because re-deriving it
+    // later would mean re-reading a field the peer can write.
+    struct PoolRef {
+        u64 ref  = 0;
+        u32 kind = 0;
+    };
+
     struct Staged {
         Command       cmd{};
         ipc::WireClip cell{};
         bool          pooled  = false;
         bool          isClear = false;
+
+        // -- the arrangement (docs/ARRANGEMENT.md §9) ------------------------
+        //
+        // `built` is the block the ENGINE will hold: one allocation containing
+        // [RtArrangement][RtArrItem[]][RtClip[]], made here in the daemon's own
+        // address space because RtClip holds pointers and a blob therefore
+        // cannot be cast into place. Ownership moves to arrHeld_ at commit(),
+        // which is also what makes a translation that is refused, or a push the
+        // engine's ring had no room for, free it on the way out with no
+        // bookkeeping at all.
+        bool          arr     = false;   // SetArrangement or SetTrackAutos
+        bool          arrAutos = false;  // ...which of the two
+        int           arrIdx  = 0;       // 0..kMaxTracks; kMaxTracks = transport
+        i32           arrTrack = 0;      // as it came off the wire (-1 = transport)
+        u32           arrGen  = 0;       // echoed in EvArrangementAck::ref
+        bool          arrClear = false;
+        std::unique_ptr<u8[]> built;
+        std::vector<PoolRef>  refs;      // what the built RtClips point INTO
     };
 
     // A pool block that no clip cell references any more, waiting for the
@@ -338,6 +364,43 @@ private:
         u64  dueNs      = 0;      // legacy fallback, see drainsExact_
         u64  dueBlocks  = 0;
         bool confirmed  = false;  // the engine proved it (Ev::NotesRetired)
+    };
+
+    // What the engine currently holds for one lane (or for the transport cell,
+    // or for one track's arrangement automation).
+    struct ArrBuilt {
+        std::unique_ptr<u8[]> mem;      // the single allocation
+        const void*           p = nullptr;  // what was handed to pushCommand
+        std::vector<PoolRef>  refs;     // pool blocks the RtClips point into
+    };
+
+    // A displaced lane, mid-retirement. TWO OWNERS, TWO LAYERS, ONE PROOF, and
+    // the order between the layers is not optional (§9.5):
+    //
+    //   layer 1  this `mem`, freed once the engine has provably drained past
+    //            the replacement;
+    //   layer 2  the pool blocks in `refs`, echoed to the client as
+    //            EvBlockRetired — and echoed ONLY AFTER layer 1 has happened,
+    //            because the built RtClip::data / ::notes point INTO them. A
+    //            pool block outlives the built block that names it. Echoing
+    //            earlier would tell the client it may reuse memory this
+    //            daemon's own struct still points at: a use-after-free with the
+    //            free happening in another process, which is the worst shape
+    //            this bug class comes in.
+    //
+    // The ordering is structural rather than asserted: the layer-2 entries do
+    // not EXIST until `mem` has been reset, so no code path can publish them
+    // early even by accident. publishRetired() carries the belt to that pair of
+    // braces (ControlHeader::arrOrderViolations).
+    struct ArrRetire {
+        std::unique_ptr<u8[]> mem;
+        const void*           watch = nullptr;   // matched against Ev::*Retired
+        std::vector<PoolRef>  refs;
+        i32   track     = 0;
+        bool  autos     = false;
+        u64   dueDrains = 0;
+        u64   dueNs     = 0;
+        bool  confirmed = false;
     };
 
     // -- devices ------------------------------------------------------------
@@ -432,6 +495,13 @@ private:
             pumpParams();
             pumpMidi();
             pumpEvents();
+            pumpJournal();
+            // Before pumpRetirements(), so a layer-2 echo that becomes legal on
+            // this tick goes out on this tick. The ORDER BETWEEN THE LAYERS does
+            // not depend on the order of these two calls — it cannot, because a
+            // layer-2 entry does not exist until its layer-1 block is freed —
+            // but a tick of latency is free to avoid and so it is avoided.
+            pumpArrRetirements();
             pumpRetirements();
             pumpChainRetirements();
             map_.hdr->heartbeat.fetch_add(1, std::memory_order_relaxed);
@@ -578,11 +648,12 @@ private:
             u32 reason = ipc::RejectNone;
             if (!translate(w, st, reason)) {
                 reject(w, reason);
-                if (ipc::commandIsPooled(w.type)) ackClip(w, reason);
+                if (ipc::commandIsPooled(w.type))      ackClip(w, reason);
+                if (ipc::commandIsArrangement(w.type)) ackArrangement(w, reason);
                 continue;
             }
             if (!engine_->pushCommand(st.cmd)) {
-                pending_     = st;
+                pending_     = std::move(st);
                 havePending_ = true;
                 map_.hdr->commandsDeferred.fetch_add(1, std::memory_order_relaxed);
                 return;                      // resume from here next tick
@@ -596,8 +667,9 @@ private:
     // point a tick later and must have exactly the same effects — the clip
     // shadow and the retirement clock in particular, which key off "the engine
     // has it", not "the client sent it".
-    void commit(const Staged& st) {
+    void commit(Staged& st) {
         map_.hdr->commandsApplied.fetch_add(1, std::memory_order_relaxed);
+        if (st.arr) { installArrangement(st); return; }
         if (!st.pooled) return;
         installClip(st.cmd.a, st.cmd.b, st.cell);
         map_.hdr->clipsApplied.fetch_add(1, std::memory_order_relaxed);
@@ -634,6 +706,7 @@ private:
     bool translate(const ipc::WireCommand& w, Staged& out, u32& reason) {
         if (!ipc::commandIsKnown(w.type)) { reason = ipc::RejectUnknownCommand; return false; }
         if (ipc::commandIsPooled(w.type)) return translateClip(w, out, reason);
+        if (ipc::commandIsArrangement(w.type)) return translateArrangement(w, out, reason);
         if (!ipc::commandIsScalar(w.type)) { reason = ipc::RejectPointerPayload; return false; }
         if (!std::isfinite(w.x)) { reason = ipc::RejectNotFinite; return false; }
 
@@ -655,6 +728,19 @@ private:
         if (needsSlot  && (w.b < 0 || w.b >= kMaxScenes)) { reason = ipc::RejectBadIndex; return false; }
         if (t == Cmd::LaunchScene && (w.a < 0 || w.a >= kMaxScenes)) {
             reason = ipc::RejectBadIndex;
+            return false;
+        }
+        // The arrangement's two scalars (wave 8g). BackToArrangement takes a
+        // track or -1 for every track; Locate takes a BEAT, which the engine
+        // ASSIGNS to beat_ and then multiplies by the tempo everywhere
+        // downstream — so it is bounded like every other multiply operand off
+        // the wire, and not merely checked for finiteness.
+        if (t == Cmd::BackToArrangement && (w.a < -1 || w.a >= kMaxTracks)) {
+            reason = ipc::RejectBadIndex;
+            return false;
+        }
+        if (t == Cmd::Locate && !(w.x >= 0.0 && w.x <= ipc::kMaxArrBeat)) {
+            reason = ipc::RejectBadArrangement;
             return false;
         }
 
@@ -719,6 +805,29 @@ private:
         out.cmd.type = Cmd::SetClip;
         out.cell     = c;
 
+        RtClip rc{};
+        PoolRef sampleRef{}, notesRef{};
+        if (!buildClip(c, rc, reason, w.a, w.b, sampleRef, notesRef)) return false;
+        out.cmd.clip = rc;
+        return true;
+    }
+
+    // The whole of the validation contract above, on ONE WireClip, with no
+    // reference to the clip table. Factored out of translateClip so that
+    // translateArrangement can run *the same code* over every clip in a blob:
+    // every check docs/PROCESS-SPLIT.md §10.5 tabulates, unchanged, rather than
+    // a second implementation that starts identical and drifts. It is a small
+    // amount of new code guarding a large amount of reviewed code, which is the
+    // right ratio (ARRANGEMENT.md §9.3).
+    //
+    // `t`/`s` are for the log line only. The two out-params report which pool
+    // blocks the resulting RtClip points into, so a caller that has to retire
+    // them later does not re-derive it from a peer-writable field.
+    bool buildClip(const ipc::WireClip& c, RtClip& rc, u32& reason, int t, int s,
+                   PoolRef& outSample, PoolRef& outNotes) {
+        outSample = PoolRef{};
+        outNotes  = PoolRef{};
+
         const f64 scalars[] = {c.clipBpm, c.lengthBeats, c.prob, c.followBeats, (f64)c.gain};
         for (f64 v : scalars) if (!std::isfinite(v)) { reason = ipc::RejectNotFinite; return false; }
 
@@ -755,7 +864,6 @@ private:
             return false;
         }
 
-        RtClip rc{};
         if (c.valid) {
             if (c.isMidi) {
                 if (!c.notesRef || c.noteCount <= 0) { reason = ipc::RejectBadClip; return false; }
@@ -774,17 +882,18 @@ private:
             const u64 need = (u64)c.frames * (u64)c.channels * sizeof(f32);
             const char* why = "";
             if (!pool_.validate(c.sampleRef, ipc::PoolKindSamples, need, &why)) {
-                logBadRef("sample", c.sampleRef, w.a, w.b, why);
+                logBadRef("sample", c.sampleRef, t, s, why);
                 reason = ipc::RejectBadPoolRef;
                 return false;
             }
-            rc.data = (const f32*)pool_.at(c.sampleRef);
+            rc.data   = (const f32*)pool_.at(c.sampleRef);
+            outSample = PoolRef{c.sampleRef, ipc::PoolKindSamples};
         }
         if (c.notesRef) {
             const u64 need = (u64)c.noteCount * sizeof(ipc::WireNote);
             const char* why = "";
             if (!pool_.validate(c.notesRef, ipc::PoolKindNotes, need, &why)) {
-                logBadRef("notes", c.notesRef, w.a, w.b, why);
+                logBadRef("notes", c.notesRef, t, s, why);
                 reason = ipc::RejectBadPoolRef;
                 return false;
             }
@@ -792,6 +901,7 @@ private:
             // so this is a reinterpretation and not a conversion — which is
             // what keeps a 10 000-note clip free at the boundary.
             rc.notes = (const RtNote*)pool_.at(c.notesRef);
+            outNotes = PoolRef{c.notesRef, ipc::PoolKindNotes};
         }
 
         rc.frames       = c.frames;
@@ -810,8 +920,553 @@ private:
         rc.noteCount    = (int)c.noteCount;
         rc.isMidi       = c.isMidi != 0;
         rc.valid        = c.valid != 0;
-        out.cmd.clip    = rc;
+        // autos / markers / transients stay null, and there is no wire field
+        // that could set them: three of RtClip's five pointers are not
+        // expressible over this protocol at all, which is the cheapest possible
+        // way to be sure a client never chose one.
         return true;
+    }
+
+    // =======================================================================
+    // The arrangement (docs/ARRANGEMENT.md §9)
+    // =======================================================================
+    //
+    // TRANSLATED, NOT REINTERPRETED — the one structural difference from every
+    // other pooled payload, and the reason it is stated as a rule rather than
+    // described as a technique:
+    //
+    //   A WireNote blob is *reinterpreted*. WireNote mirrors RtNote field for
+    //   field and holds no pointers, so (const RtNote*)(poolBase + ref) is
+    //   honest and a 10 000-note clip costs nothing at the boundary. An
+    //   arrangement blob cannot be. **RtClip holds five pointers** — data,
+    //   notes, autos, markers, transients — **and a pointer in a
+    //   client-writable region is a pointer the client chose.**
+    //
+    // So the daemon BUILDS. It allocates its own
+    // [RtArrangement][RtArrItem[]][RtClip[]] on its own heap, runs the existing
+    // buildClip() over every clip in the blob so that each RtClip's pointers
+    // are `poolBase + validated offset` and nothing else, copies the items
+    // across bounds-checking every index, and hands the built pointer to the
+    // engine. Nothing the client wrote is ever cast into a struct with a
+    // pointer in it.
+    //
+    // The notes are the deliberate exception and they are not an exception to
+    // the rule: they stay in the pool, named by each WireClip's own notesRef,
+    // and go through the same poolValidate + reinterpretation a session clip's
+    // notes already do. That is the point of not putting them in the blob.
+
+    static int arrSlot(i32 track) { return track == -1 ? kMaxTracks : (int)track; }
+
+    bool badArrangement(const char* why, i32 track, u32& reason) {
+        if (opt_.verbose || badArrLogged_ < kRejectLogLimit) {
+            ++badArrLogged_;
+            LOGW("arrangement for track %d refused: %s%s", (int)track, why,
+                 (!opt_.verbose && badArrLogged_ == kRejectLogLimit)
+                     ? " [further bad arrangements silent]" : "");
+        }
+        reason = ipc::RejectBadArrangement;
+        return false;
+    }
+
+    bool translateArrangement(const ipc::WireCommand& w, Staged& out, u32& reason) {
+        const bool autos = (Cmd)w.type == Cmd::SetTrackAutos;
+        const i32  track = w.a;
+
+        // The transport cell is SetArrangement's alone: a = -1 names the loop
+        // brace, and there is no such thing as the transport's automation.
+        if (autos ? (track < 0 || track >= kMaxTracks)
+                  : (track < -1 || track >= kMaxTracks)) {
+            reason = ipc::RejectBadIndex;
+            return false;
+        }
+
+        out.arr      = true;
+        out.arrAutos = autos;
+        out.arrIdx   = autos ? (int)track : arrSlot(track);
+        out.arrTrack = track;
+        out.arrGen   = (u32)w.b;
+        out.arrClear = (w.ref == 0);
+        out.cmd.type = (Cmd)w.type;
+        out.cmd.a    = track;
+        out.cmd.b    = 0;
+        out.cmd.x    = 0.0;
+        out.cmd.p    = nullptr;
+
+        if (w.ref == 0) return true;                 // the clear form: names nothing
+        if (!pool_.valid()) { reason = ipc::RejectNoPool; return false; }
+        return autos ? buildTrackAutos(w.ref, track, out, reason)
+                     : buildArrangement(w.ref, track, out, reason);
+    }
+
+    // ONE lane, off the wire and into the daemon's own memory.
+    //
+    // Every scalar here that becomes an index, a count or a multiply operand
+    // gets a bound, and the bound comes BEFORE the arithmetic that uses it. The
+    // IPC audit's F1 was exactly this discipline being applied to `noteCount`
+    // and not to `frames` two lines away.
+    bool buildArrangement(u64 ref, i32 track, Staged& out, u32& reason) {
+        const char* why = "";
+        u64 blockBytes  = 0;
+
+        // 1. The header has to be inside the block before anything reads it.
+        //    poolValidate hands back the extent it PROVED, so nothing below
+        //    re-reads b->bytes from peer-writable memory (F3/F4).
+        if (!pool_.validate(ref, ipc::PoolKindArrangement, sizeof(ipc::WireArrHeader),
+                            &why, &blockBytes)) {
+            logBadRef("arrangement", ref, track, -1, why);
+            // ONE reason for the whole class, deliberately. Every way a blob can
+            // be refused has the same client-side recovery — free it, fix it,
+            // re-publish — and the precise cause is in the log line above, where
+            // a developer can read it, rather than in a wire field where a GUI
+            // would only be able to print it. This is the whole-blob refusal
+            // discipline of RejectBadClip: a client that sent something
+            // impossible is TOLD, not partially obeyed.
+            reason = ipc::RejectBadArrangement;
+            return false;
+        }
+        ipc::WireArrHeader h{};
+        std::memcpy(&h, pool_.at(ref), sizeof h);
+
+        // 2. Counts, before any arithmetic uses them.
+        if (h.itemCount < 0 || h.itemCount > ipc::kMaxArrItems)
+            return badArrangement("item count out of range", track, reason);
+        if (h.clipCount < 0 || h.clipCount > h.itemCount)
+            return badArrangement("clip count out of range (must be <= item count)", track, reason);
+        if (h.noteCount < 0 || h.noteCount > ipc::kMaxArrNotes)
+            return badArrangement("declared note count out of range", track, reason);
+        if (h.loopOn > 1)
+            return badArrangement("loopOn is neither 0 nor 1", track, reason);
+
+        // 3. The transport cell. A zero-length or inverted brace would make the
+        //    engine's internal locate a spin, so it is refused rather than
+        //    clamped — and only the brace's own cell may carry one at all.
+        if (!std::isfinite(h.loopStart) || !std::isfinite(h.loopEnd))
+            return badArrangement("loop brace is not finite", track, reason);
+        if (h.loopStart < 0.0 || h.loopEnd < 0.0 ||
+            h.loopStart > ipc::kMaxArrBeat || h.loopEnd > ipc::kMaxArrBeat)
+            return badArrangement("loop brace is out of range", track, reason);
+        if (h.loopOn && !(h.loopEnd > h.loopStart))
+            return badArrangement("loop brace is empty or inverted", track, reason);
+
+        // 4. The extent the DECLARED counts imply, against the extent
+        //    validation proved. A blob smaller than its own declared contents is
+        //    caught here, before a pointer into it exists. The multiply cannot
+        //    wrap: both counts are already bounded by 512.
+        const u64 need = ipc::arrangementBytes(h.itemCount, h.clipCount);
+        if (need > blockBytes)
+            return badArrangement("blob is smaller than its own declared contents", track, reason);
+
+        // 5. Snapshot. From here on nothing reads the pool's copy of the blob
+        //    again: the client may rewrite it the moment it sees the ack, and
+        //    every check below plus the block that comes out of them must be
+        //    reasoning about ONE copy. This is translateClip's `const WireClip c
+        //    = *cell` at blob scale, and it retires the whole TOCTOU class for
+        //    82 KB of memcpy on a non-realtime thread.
+        std::vector<ipc::WireArrItem> items((size_t)h.itemCount);
+        std::vector<ipc::WireClip>    wclips((size_t)h.clipCount);
+        const u8* base = pool_.at(ref);
+        if (!items.empty())
+            std::memcpy(items.data(), base + sizeof h, items.size() * sizeof(ipc::WireArrItem));
+        if (!wclips.empty())
+            std::memcpy(wclips.data(), base + sizeof h + items.size() * sizeof(ipc::WireArrItem),
+                        wclips.size() * sizeof(ipc::WireClip));
+
+        // 6. Per item: wild scalars, and an out-of-range clip index.
+        for (size_t i = 0; i < items.size(); ++i) {
+            const ipc::WireArrItem& it = items[i];
+            if (!std::isfinite(it.start) || !std::isfinite(it.length) || !std::isfinite(it.offset))
+                return badArrangement("item scalar is not finite", track, reason);
+            if (!std::isfinite(it.fadeIn) || !std::isfinite(it.fadeOut))
+                return badArrangement("item fade is not finite", track, reason);
+            if (!(it.start >= 0.0) || it.start > ipc::kMaxArrBeat)
+                return badArrangement("item start is out of range", track, reason);
+            if (!(it.length >= ipc::kMinArrBeats) || it.length > ipc::kMaxArrBeat)
+                return badArrangement("item length is out of range", track, reason);
+            if (!(it.offset >= 0.0) || it.offset > ipc::kMaxArrBeat)
+                return badArrangement("item offset is out of range", track, reason);
+            if (!(it.fadeIn >= 0.f) || !(it.fadeOut >= 0.f))
+                return badArrangement("item fade is negative", track, reason);
+            if ((f64)it.fadeIn + (f64)it.fadeOut > it.length + ipc::kArrOverlapEps)
+                return badArrangement("item fades are longer than the item", track, reason);
+            if (it.fadeShape < 0 || it.fadeShape > 255)
+                return badArrangement("item fadeShape is out of range", track, reason);
+            if (it.clip < 0 || (i64)it.clip >= h.clipCount)
+                return badArrangement("item names a clip index past clipCount", track, reason);
+        }
+
+        // 7. THE THREE STRUCTURAL RULES. These would not exist if the lane
+        //    invariant were merely an editor convention. They are here because
+        //    the engine's per-block cost is O(1) only while the invariant
+        //    holds, and the engine is downstream of an untrusted process — the
+        //    same argument §10.5 makes for loopEnd: a wild loopEnd walks fetch()
+        //    off the end just as effectively as a wild offset.
+        for (size_t i = 1; i < items.size(); ++i)
+            if (items[i].start < items[i - 1].start)
+                return badArrangement("items are not sorted by start "
+                                      "(an unsorted lane reads outside the array)", track, reason);
+        for (size_t i = 0; i + 1 < items.size(); ++i) {
+            const f64 aEnd = items[i].start + items[i].length;
+            const f64 ov   = aEnd - items[i + 1].start;
+            if (ov <= ipc::kArrOverlapEps) continue;      // float noise from a trim
+            if (ov > ipc::kMaxOverlapBeats)
+                return badArrangement("overlap exceeds kMaxOverlapBeats", track, reason);
+            if ((f64)items[i].fadeOut < ov - ipc::kArrOverlapEps ||
+                (f64)items[i + 1].fadeIn < ov - ipc::kArrOverlapEps)
+                return badArrangement("overlap is not covered by both fades", track, reason);
+        }
+        for (size_t i = 0; i + 2 < items.size(); ++i)
+            if (items[i + 2].start < items[i].start + items[i].length - ipc::kArrOverlapEps)
+                return badArrangement("three items sound at once (the engine has two voices)",
+                                      track, reason);
+
+        // 8. Every clip, through the existing translateClip validation. This is
+        //    the large amount of reviewed code the small amount of new code
+        //    above is guarding.
+        std::vector<RtClip>  rclips(wclips.size());
+        std::vector<PoolRef> refs;
+        i64 notes = 0;
+        for (size_t i = 0; i < wclips.size(); ++i) {
+            PoolRef s{}, n{};
+            u32 clipReason = ipc::RejectNone;
+            if (!buildClip(wclips[i], rclips[i], clipReason, track, (int)i, s, n)) {
+                char msg[128];
+                std::snprintf(msg, sizeof msg, "clip %zu: %s", i,
+                              ipc::rejectReasonName(clipReason));
+                return badArrangement(msg, track, reason);
+            }
+            notes += rclips[i].noteCount;
+            if (notes > ipc::kMaxArrNotes)
+                return badArrangement("the lane's clips carry more than kMaxArrNotes notes",
+                                      track, reason);
+            for (const PoolRef& p : {s, n}) {
+                if (!p.ref) continue;
+                bool seen = false;
+                for (const PoolRef& q : refs) if (q.ref == p.ref) { seen = true; break; }
+                if (!seen) refs.push_back(p);
+            }
+        }
+
+        // 9. One allocation, always. `items`, `clips` and the struct itself all
+        //    address memory in this same block, so the whole lane is one new[]
+        //    and one delete[] and the retirement protocol has exactly ONE
+        //    pointer to talk about (engine.h, RtArrangement).
+        const size_t offItems = ipc::alignUp(sizeof(RtArrangement), alignof(RtArrItem));
+        const size_t offClips = ipc::alignUp(offItems + items.size() * sizeof(RtArrItem), alignof(RtClip));
+        const size_t bytes    = offClips + rclips.size() * sizeof(RtClip);
+        std::unique_ptr<u8[]> mem(new u8[bytes]);
+        RtArrangement* arr = new (mem.get()) RtArrangement{};
+        RtArrItem*     ri  = (RtArrItem*)(mem.get() + offItems);
+        RtClip*        rc  = (RtClip*)(mem.get() + offClips);
+        for (size_t i = 0; i < items.size(); ++i) {
+            RtArrItem* p = new (ri + i) RtArrItem{};
+            p->start     = items[i].start;
+            p->length    = items[i].length;
+            p->offset    = items[i].offset;
+            p->fadeIn    = items[i].fadeIn;
+            p->fadeOut   = items[i].fadeOut;
+            p->fadeShape = items[i].fadeShape;
+            p->clip      = items[i].clip;
+        }
+        for (size_t i = 0; i < rclips.size(); ++i) new (rc + i) RtClip(rclips[i]);
+
+        arr->items     = items.empty()  ? nullptr : ri;
+        arr->clips     = rclips.empty() ? nullptr : rc;
+        arr->itemCount = (int)items.size();
+        arr->clipCount = (int)rclips.size();
+        // The COMPUTED total, never the declared one. `h.noteCount` is a number
+        // a peer wrote; this is the number the daemon counted while validating
+        // each clip, and it is the one anything downstream should be able to
+        // trust.
+        arr->noteCount = (int)notes;
+        // "Transport cell only (a = -1); zero on every track's lane" — stated in
+        // engine.h and enforced here rather than assumed of the client.
+        arr->loopStart = (track == -1) ? h.loopStart : 0.0;
+        arr->loopEnd   = (track == -1) ? h.loopEnd   : 0.0;
+        arr->loopOn    = (track == -1) ? h.loopOn    : 0u;
+
+        out.built   = std::move(mem);
+        out.refs    = std::move(refs);
+        out.cmd.p   = (void*)arr;
+        return true;
+    }
+
+    // One track's arrangement automation (§6.2). Built rather than
+    // reinterpreted for the same reason a lane is: RtAutoSetN holds two
+    // pointers. It references nothing else in the pool, so its retirement has
+    // one layer rather than two.
+    bool buildTrackAutos(u64 ref, i32 track, Staged& out, u32& reason) {
+        const char* why = "";
+        u64 blockBytes  = 0;
+        if (!pool_.validate(ref, ipc::PoolKindTrackAutos, sizeof(ipc::WireAutoSetHeader),
+                            &why, &blockBytes)) {
+            logBadRef("track autos", ref, track, -1, why);
+            reason = ipc::RejectBadArrangement;      // one reason per class, as above
+            return false;
+        }
+        ipc::WireAutoSetHeader h{};
+        std::memcpy(&h, pool_.at(ref), sizeof h);
+
+        if (h.laneCount < 0 || h.laneCount > ipc::kMaxArrLanes)
+            return badArrangement("lane count out of range", track, reason);
+        if (h.pointCount < 0 || h.pointCount > ipc::kMaxArrPoints)
+            return badArrangement("point count out of range", track, reason);
+        const u64 need = ipc::trackAutosBytes(h.laneCount, h.pointCount);
+        if (need > blockBytes)
+            return badArrangement("automation blob is smaller than its declared contents",
+                                  track, reason);
+
+        std::vector<ipc::WireAutoLane>  lanes((size_t)h.laneCount);
+        std::vector<ipc::WireAutoPoint> points((size_t)h.pointCount);
+        const u8* base = pool_.at(ref);
+        if (!lanes.empty())
+            std::memcpy(lanes.data(), base + sizeof h, lanes.size() * sizeof(ipc::WireAutoLane));
+        if (!points.empty())
+            std::memcpy(points.data(), base + sizeof h + lanes.size() * sizeof(ipc::WireAutoLane),
+                        points.size() * sizeof(ipc::WireAutoPoint));
+
+        for (const ipc::WireAutoLane& l : lanes) {
+            if (l.target < 0 || l.target > (i32)AutoTarget::DeviceParam)
+                return badArrangement("lane target is not a known AutoTarget", track, reason);
+            if (l.xform < 0 || l.xform > (i32)AutoXform::Fader)
+                return badArrangement("lane transform is out of range", track, reason);
+            if (l.index < 0 || l.index >= (i32)ipc::kMaxDevParams)
+                return badArrangement("lane index is out of range", track, reason);
+            if (l.devSlot < -1 || l.devSlot >= kMaxChainFx)
+                return badArrangement("lane device slot is out of range", track, reason);
+            if (!std::isfinite(l.lo) || !std::isfinite(l.hi))
+                return badArrangement("lane clamp is not finite", track, reason);
+            // THE window bound: autoValueAt bisects points[first, first+count),
+            // so these two numbers are the ones that decide whether the
+            // evaluator reads inside the block or outside it.
+            if (l.first < 0 || l.count < 0)
+                return badArrangement("lane window is negative", track, reason);
+            if ((i64)l.first + (i64)l.count > h.pointCount)
+                return badArrangement("lane window runs past the point array", track, reason);
+        }
+        for (const ipc::WireAutoPoint& p : points) {
+            if (!std::isfinite(p.beat) || !std::isfinite(p.value))
+                return badArrangement("automation point is not finite", track, reason);
+            if (p.beat < 0.0 || p.beat > ipc::kMaxArrBeat)
+                return badArrangement("automation point beat is out of range", track, reason);
+        }
+
+        // EVERY array offset is rounded up to its member's own alignment, and
+        // this one is the reason the rule is stated rather than assumed:
+        // sizeof(RtAutoLane) is 36 and alignof is 4, while RtAutoPoint begins
+        // with an f64. An ODD lane count concatenated without this alignUp puts
+        // the point array on a 4-byte boundary — which UBSan catches on the
+        // engine side, where the f64 is actually read. Today's sizes do not
+        // divide; do not assume any future set does either.
+        const size_t offLanes  = ipc::alignUp(sizeof(RtAutoSetN), alignof(RtAutoLane));
+        const size_t offPoints = ipc::alignUp(offLanes + lanes.size() * sizeof(RtAutoLane),
+                                              alignof(RtAutoPoint));
+        const size_t bytes     = offPoints + points.size() * sizeof(RtAutoPoint);
+        std::unique_ptr<u8[]> mem(new u8[bytes]);
+        RtAutoSetN*  set = new (mem.get()) RtAutoSetN{};
+        RtAutoLane*  rl  = (RtAutoLane*)(mem.get() + offLanes);
+        RtAutoPoint* rp  = (RtAutoPoint*)(mem.get() + offPoints);
+        for (size_t i = 0; i < lanes.size(); ++i) {
+            RtAutoLane* p = new (rl + i) RtAutoLane{};
+            p->target  = lanes[i].target;
+            p->index   = lanes[i].index;
+            p->devSlot = lanes[i].devSlot;
+            p->xform   = lanes[i].xform;
+            p->first   = lanes[i].first;
+            p->count   = lanes[i].count;
+            p->lo      = lanes[i].lo;
+            p->hi      = lanes[i].hi;
+            p->flags   = lanes[i].flags;
+        }
+        for (size_t i = 0; i < points.size(); ++i) {
+            RtAutoPoint* p = new (rp + i) RtAutoPoint{};
+            p->beat  = points[i].beat;
+            p->value = points[i].value;
+            p->curve = points[i].curve;
+        }
+        set->lanes      = lanes.empty()  ? nullptr : rl;
+        set->points     = points.empty() ? nullptr : rp;
+        set->laneCount  = (int)lanes.size();
+        set->pointCount = (int)points.size();
+
+        out.built = std::move(mem);
+        out.cmd.p = (void*)set;
+        return true;
+    }
+
+    // Runs from commit(), i.e. only once Engine::pushCommand has returned true.
+    // That ordering is what makes the +2 drain proof hold (§11.5) and it is why
+    // the displaced lane is queued here and not from translate().
+    void installArrangement(Staged& st) {
+        ArrBuilt& slot = st.arrAutos ? autosHeld_[st.arrIdx] : arrHeld_[st.arrIdx];
+
+        if (slot.mem || !slot.refs.empty()) {
+            ArrRetire r;
+            r.mem       = std::move(slot.mem);
+            r.watch     = slot.p;
+            r.refs      = std::move(slot.refs);
+            r.track     = st.arrTrack;
+            r.autos     = st.arrAutos;
+            r.dueDrains = drainProof();              // read AFTER the push
+            r.dueNs     = ipc::monotonicNs() + kRetireGraceNs;
+            arrRetire_.push_back(std::move(r));
+        }
+        slot.mem  = std::move(st.built);
+        slot.p    = st.cmd.p;
+        slot.refs = st.refs;
+        // A block that has just come back is not retiring, it is in use again —
+        // the same cancellation installClip() makes, and for the same reason: an
+        // event that says "you may free this" about a block that is in use is
+        // the kind of thing that is true today and load-bearing tomorrow.
+        for (const PoolRef& p : slot.refs) cancelRetire(p.ref);
+
+        map_.hdr->arrangementsApplied.fetch_add(1, std::memory_order_relaxed);
+        ackArrangement(st.arrTrack, st.arrAutos, st.arrGen, ipc::RejectNone,
+                       st.arrClear, /*refused*/false);
+    }
+
+    // Exactly one of these answers every SetArrangement and every
+    // SetTrackAutos, accepted or refused. Same shape as EvClipAck: ref is the
+    // generation the client stamped, x is the reason. A silent refusal would
+    // leave the client holding a pool blob it can never free and a lane it can
+    // never republish.
+    void ackArrangement(i32 track, bool autos, u32 generation, u32 reason,
+                        bool wasClear, bool refused) {
+        ipc::WireEvent e{};
+        e.type  = ipc::EvArrangementAck;
+        e.a     = track;
+        e.b     = 0;
+        e.ref   = generation;
+        e.x     = (f64)reason;
+        e.flags = (refused  ? ipc::ArrAckRefused  : 0u) |
+                  (wasClear ? ipc::ArrAckWasClear : 0u) |
+                  (autos    ? ipc::ArrAckAutos    : 0u);
+        map_.evts->push(e);
+    }
+
+    void ackArrangement(const ipc::WireCommand& w, u32 reason) {
+        map_.hdr->arrangementsRejected.fetch_add(1, std::memory_order_relaxed);
+        ackArrangement(w.a, (Cmd)w.type == Cmd::SetTrackAutos, (u32)w.b, reason,
+                       w.ref == 0, /*refused*/true);
+    }
+
+    // True while ANY built block — one the engine holds, or one that is
+    // retiring but has not been freed yet — still points into this pool block.
+    // §9.5's shadow rule, and the reason a sample that backs a session clip and
+    // six arrangement items at once does not retire when one of the seven goes.
+    bool arrangementHolds(u64 ref) const {
+        for (const ArrBuilt& b : arrHeld_)
+            for (const PoolRef& p : b.refs) if (p.ref == ref) return true;
+        for (const ArrRetire& r : arrRetire_) {
+            if (!r.mem) continue;                    // layer 1 already freed
+            for (const PoolRef& p : r.refs) if (p.ref == ref) return true;
+        }
+        return false;
+    }
+
+    // THE ordering check, and the one place layer 2 is allowed to begin.
+    //
+    // It is a queue-time check on purpose. The free and the echo are two
+    // statements in two different functions one pump tick apart, so anything
+    // asking "had layer 1 happened when the event went out?" is answered "yes"
+    // by the end of every tick whichever order the code is in — which makes it
+    // useless as a regression check. The invariant that actually distinguishes
+    // the two orderings is *this* one: **a layer-2 entry may only be created
+    // for an owner whose layer-1 block is already gone.** Reordering the two
+    // steps makes this fire, refuse the queueing, and leave the blocks
+    // unretired, which is a loud, testable, and above all SAFE failure — the
+    // client keeps a block nobody can free rather than freeing one the daemon
+    // still points at. daemon_test §16d asserts the counter stays 0.
+    void retireArrRef(const ArrRetire& owner, const PoolRef& p) {
+        if (owner.mem) {
+            map_.hdr->arrOrderViolations.fetch_add(1, std::memory_order_relaxed);
+            LOGE("refusing to retire pool block %llu: the built arrangement that points "
+                 "into it has not been freed (this is ARRANGEMENT.md §9.5's ordering)",
+                 (unsigned long long)p.ref);
+            return;
+        }
+        considerRetire(p.ref, p.kind, owner.track, -1);
+        map_.hdr->arrRefsEchoed.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // THE ORDERED TWO LAYERS.
+    void pumpArrRetirements() {
+        if (arrRetire_.empty()) return;
+        const u64 now = ipc::monotonicNs();
+        size_t keep = 0;
+        for (size_t i = 0; i < arrRetire_.size(); ++i) {
+            ArrRetire& r = arrRetire_[i];
+            const bool due = r.confirmed ||
+                             (drainsExact_ ? drainProven(r.dueDrains) : now >= r.dueNs);
+            if (!due) {
+                if (keep != i) arrRetire_[keep] = std::move(r);
+                ++keep;
+                continue;
+            }
+
+            // LAYER 1. The built RtClip::data / ::notes point INTO the pool, so
+            // this free must happen before any echo naming those blocks EXISTS.
+            // The counter is bumped here, between the free and the queueing
+            // below, which is what makes the ordering observable from another
+            // process: the ring push that carries a layer-2 echo is a release
+            // store that this relaxed store precedes in program order, so a
+            // client that has popped the echo cannot fail to see the free.
+            r.mem.reset();
+            r.watch = nullptr;
+            map_.hdr->arrBuiltFreed.fetch_add(1, std::memory_order_relaxed);
+
+            // LAYER 2, and not one line earlier. Every ref goes through
+            // retireArrRef(), which re-checks that layer 1 has actually
+            // happened before it queues anything.
+            for (const PoolRef& p : r.refs) retireArrRef(r, p);
+            r.refs.clear();
+            // r is dropped: `keep` is not advanced.
+        }
+        arrRetire_.resize(keep);
+    }
+
+    // Ev::ArrangementRetired / Ev::TrackAutosRetired name the exact pointer and
+    // are pushed from inside drainCommands(), so their arrival IS the drain and
+    // beats the counter by up to one block. Consumed rather than forwarded, for
+    // the same reason Ev::ChainRetired is: the pointer is an address in THIS
+    // process and the daemon knows what it names.
+    void confirmArrRetire(const void* p) {
+        for (ArrRetire& r : arrRetire_)
+            if (r.watch == p) { r.confirmed = true; return; }
+    }
+
+    // -- the journal (§5.3, §9.6) -------------------------------------------
+    //
+    // Drained here, at the pump's 1 ms cadence, onto a ring of its own. NOT the
+    // event ring: mixing them lets a burst of journal entries evict events, and
+    // events carry EvClipAck — a lost ack wedges a clip cell for the rest of the
+    // session. The two channels have different failure budgets. An event must
+    // not be lost; a journal entry must be KNOWN to be lost, which is what the
+    // two drop counters are for.
+    //
+    // An entry popped from the engine that will not fit the client's ring is
+    // GONE — there is nowhere to put it back — and that is exactly the loss the
+    // counter records and §5.4 makes a take refusable on.
+    void pumpJournal() {
+        ArrJournal j;
+        u32 budget = kJournalBudget;
+        while (budget-- && engine_->popJournal(j)) {
+            ipc::WireJournal e{};
+            e.kind  = j.kind;
+            e.seq   = j.seq;
+            e.track = j.track;
+            e.a     = j.a;
+            e.beat  = j.beat;
+            if (!map_.journal->push(e)) {
+                map_.hdr->journalDropped.fetch_add(1, std::memory_order_relaxed);
+                if (!journalDropLogged_) {
+                    journalDropLogged_ = true;
+                    LOGW("the journal ring is full and entries are being lost "
+                         "(the client is not draining it) [further drops silent]");
+                }
+                return;
+            }
+            map_.hdr->journalForwarded.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Rate-limited like reject(): a GUI with a stale project can produce one of
@@ -1453,6 +2108,29 @@ private:
              (!opt_.verbose && deviceLogged_ == kRejectLogLimit) ? " [further device failures silent]" : "");
     }
 
+    // Layer 1 for everything, then layer 2 for everything. Called once the
+    // driver has stopped.
+    void destroyAllArrangements() {
+        std::vector<PoolRef> refs;
+        const auto take = [&](ArrBuilt& b) {
+            b.mem.reset();
+            b.p = nullptr;
+            for (const PoolRef& p : b.refs) refs.push_back(p);
+            b.refs.clear();
+        };
+        for (ArrRetire& r : arrRetire_) {
+            r.mem.reset();
+            r.watch = nullptr;
+            for (const PoolRef& p : r.refs) refs.push_back(p);
+            r.refs.clear();
+        }
+        arrRetire_.clear();
+        for (ArrBuilt& b : arrHeld_)   take(b);
+        for (ArrBuilt& b : autosHeld_) take(b);
+        // Only now, with arrangementHolds() answering false for everything.
+        for (const PoolRef& p : refs) considerRetire(p.ref, p.kind, -1, -1);
+    }
+
     // Everything the daemon owns that the engine might still be inside. Called
     // once the driver has stopped, when every proof is trivially satisfied.
     void destroyAllDevices() {
@@ -1536,6 +2214,7 @@ private:
     static constexpr u32 kCmdBudget  = ipc::CommandRing::capacity();
     static constexpr u32 kMidiBudget = ipc::MidiRing::capacity();
     static constexpr u32 kEvtBudget  = ipc::EventRing::capacity();
+    static constexpr u32 kJournalBudget = ipc::JournalRing::capacity();
 
     // Retirement-queue ceiling. `retiring_` drains only when the client pops
     // events; a client that never pops while it keeps issuing SetClips grows it
@@ -1577,6 +2256,12 @@ private:
         for (int t = 0; t < kMaxTracks; ++t)
             for (int s = 0; s < kMaxScenes; ++s)
                 if (shadow_[t][s].sampleRef == ref || shadow_[t][s].notesRef == ref) return;
+        // Still named by a built arrangement — one the engine holds, or one
+        // that is retiring and has NOT been freed yet? Same answer, and §9.5
+        // says so in as many words: a sample legitimately backs a session clip
+        // and six arrangement items at once, and losing one of the seven is not
+        // a retirement.
+        if (arrangementHolds(ref)) return;
         for (const Retire& r : retiring_) if (r.ref == ref) return;
 
         Retire r{};
@@ -1643,6 +2328,19 @@ private:
     }
 
     bool publishRetired(const Retire& r) {
+        // The belt to §9.5's pair of braces. A built block that has not been
+        // freed still points into this pool block, so telling the client it may
+        // free it would be a use-after-free with the free happening in another
+        // process. The ordering that prevents it is structural — a layer-2
+        // entry does not exist until layer 1 has happened — so this can only
+        // fire if somebody later reorders those two steps, which is exactly the
+        // day you want a counter rather than a memory of having been careful.
+        if (arrangementHolds(r.ref)) {
+            map_.hdr->arrOrderViolations.fetch_add(1, std::memory_order_relaxed);
+            LOGE("refusing to echo block %llu: a built arrangement still points into it",
+                 (unsigned long long)r.ref);
+            return false;                                    // retry; never publish
+        }
         ipc::WireEvent e{};
         e.type  = ipc::EvBlockRetired;
         e.flags = r.kind;
@@ -1679,6 +2377,10 @@ private:
             }
             if (ev.type == Ev::ChainRetired) {
                 confirmChainRetire(ev.p);
+                continue;
+            }
+            if (ev.type == Ev::ArrangementRetired || ev.type == Ev::TrackAutosRetired) {
+                confirmArrRetire(ev.p);
                 continue;
             }
             if (!ipc::eventIsScalar((u32)ev.type)) {
@@ -1745,6 +2447,15 @@ private:
                                  std::memory_order_relaxed);
             s.masterMeterR.store(e.masterMeterR.load(std::memory_order_relaxed),
                                  std::memory_order_relaxed);
+            // Wave 8g. Both are Engine's own published atomics, so they mirror
+            // here with everything else rather than being derived anywhere: the
+            // override bitmask is set at the quantized launch the ENGINE
+            // computes, and the journal's engine-side drop count is one of the
+            // two numbers a take is refused on (§5.4).
+            s.arrOverride.store(e.arrOverride.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+            s.journalDropped.store(e.journalDropped.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
 
             if (nullDriver_)
                 s.blocksRendered.store(nullDriver_->blocks(), std::memory_order_relaxed);
@@ -1786,6 +2497,13 @@ private:
         // somebody else's atexit handler.
         if (scanThread_.joinable()) scanThread_.join();
         destroyAllDevices();
+
+        // The arrangement, in the same two layers and the same order. There is
+        // no audio thread left to be inside a built block, so every proof is
+        // trivially satisfied — but the ordering is kept anyway, because the
+        // reason for it does not depend on the engine running: a pool echo for a
+        // block a live RtClip still points at is wrong whoever is looking.
+        destroyAllArrangements();
 
         // Rendering has stopped, so every outstanding retirement is trivially
         // true: there is no audio thread left to be inside a clip. Publishing
@@ -1836,6 +2554,17 @@ private:
         LOGI("engine drains: %llu (%s)",
              (unsigned long long)map_.hdr->engineDrains.load(),
              drainsExact_ ? "exact retirement" : "no counter — legacy deadline");
+        LOGI("arrangement: %llu applied, %llu refused; %llu built blocks freed, "
+             "%llu pool refs echoed after them, %llu ordering violations",
+             (unsigned long long)map_.hdr->arrangementsApplied.load(),
+             (unsigned long long)map_.hdr->arrangementsRejected.load(),
+             (unsigned long long)map_.hdr->arrBuiltFreed.load(),
+             (unsigned long long)map_.hdr->arrRefsEchoed.load(),
+             (unsigned long long)map_.hdr->arrOrderViolations.load());
+        LOGI("journal: %llu forwarded, %llu dropped here, %u dropped by the engine",
+             (unsigned long long)map_.hdr->journalForwarded.load(),
+             (unsigned long long)map_.hdr->journalDropped.load(),
+             map_.state->journalDropped.load());
     }
 
     static constexpr int kRejectLogLimit = 8;
@@ -1870,6 +2599,17 @@ private:
     std::vector<Retire>            retiring_;
     u64                            retiringDropped_    = 0;      // F7: overflow drops
     bool                           retiringDropLogged_ = false;
+
+    // -- the arrangement (wave 8g) -------------------------------------------
+    //
+    // arrHeld_[kMaxTracks] is the transport cell, addressed on the wire as
+    // track -1. One array with one index function rather than a separate
+    // member, so the "is this the transport?" branch exists in one place.
+    ArrBuilt                       arrHeld_[kMaxTracks + 1];
+    ArrBuilt                       autosHeld_[kMaxTracks];
+    std::vector<ArrRetire>         arrRetire_;
+    int                            badArrLogged_      = 0;
+    bool                           journalDropLogged_ = false;
 
     // -- phase 3 ------------------------------------------------------------
     PluginRegistry                  registry_;          // the catalog, once scanned

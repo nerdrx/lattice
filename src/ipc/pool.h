@@ -98,7 +98,18 @@ inline constexpr u64 kPoolBlockMagic = 0x4C54435F424C4B31ull;  // "LTC_BLK1"
 //        "not sample data" rather than misreading it. Bumping is still the
 //        right call: the two builds no longer agree about what a pool can
 //        contain, and that is exactly what this number is for.
-inline constexpr u32 kPoolVersion = 2;
+//   v3 — RESERVED for AUTOMATION.md §8.2 (PoolKindAutomation, clip envelopes
+//        across the boundary). That design is written and its numbers are
+//        spelled out in the doc; it has not shipped in this tree. The number is
+//        burned rather than reused, because "pool v3" already means something
+//        specific to anyone reading that document, and two meanings for one
+//        version is exactly the confusion a version exists to prevent.
+//   v4 — the arrangement (ARRANGEMENT.md §9.2): PoolKindArrangement and
+//        PoolKindTrackAutos. Again no layout moved and again the *meaning* of
+//        `kind` grew: a v2 daemon handed an arrangement blob would refuse it as
+//        "not sample data", which is correct behaviour and still not a version
+//        two builds should be able to disagree about silently.
+inline constexpr u32 kPoolVersion = 4;
 
 // Every block — header and data — starts on a 64-byte line. Blocks are large
 // (a stereo bar of audio is hundreds of kilobytes) so the padding is noise,
@@ -137,6 +148,36 @@ enum : u32 {
     // reaches the audio thread, so its retirement needs no proof at all. See
     // docs/PROCESS-SPLIT.md §11.2.
     PoolKindString  = 3,
+
+    // RESERVED, not implemented here. AUTOMATION.md §8.2 names this number for
+    // clip envelopes crossing the boundary. It is declared so that a later wave
+    // finds its own number free rather than discovering that 8g took it.
+    PoolKindAutomation = 4,
+
+    // One track's arrangement lane (docs/ARRANGEMENT.md §9.2), or -- for the
+    // cell addressed as track -1 -- the transport's loop brace.
+    //
+    //   [WireArrHeader][WireArrItem[itemCount]][WireClip[clipCount]]
+    //
+    // The notes are NOT in the blob: each WireClip names its own notesRef into
+    // the pool exactly as a session clip's does, so the existing WireNote
+    // reinterpretation and the existing per-block retirement both keep working
+    // unchanged.
+    //
+    // Unlike every other kind here this one is *translated, not reinterpreted*:
+    // RtClip holds five pointers, and a pointer in a client-writable region is a
+    // pointer the client chose. See Daemon::translateArrangement.
+    PoolKindArrangement = 5,
+
+    // One track's arrangement automation (§6.2), the RtAutoSetN payload:
+    //
+    //   [WireAutoSetHeader][WireAutoLane[laneCount]][WireAutoPoint[pointCount]]
+    //
+    // Distinct from PoolKindAutomation because the containers differ --
+    // RtAutoSet has sixteen lanes by value, RtAutoSetN has a variable count
+    // behind a pointer -- and a blob that is handed to the wrong builder is
+    // exactly what the `kind` field exists to refuse.
+    PoolKindTrackAutos = 6,
 };
 
 // The longest string the pool will carry. Not a buffer size — a policy: the
@@ -153,6 +194,18 @@ enum : u32 {
     BlockLive      = 2,  // published to the engine through a clip cell
     BlockRetiring  = 3,  // displaced, awaiting the daemon's offset echo
 };
+
+inline const char* poolKindName(u32 k) {
+    switch (k) {
+        case PoolKindSamples:     return "samples";
+        case PoolKindNotes:       return "notes";
+        case PoolKindString:      return "string";
+        case PoolKindAutomation:  return "automation";
+        case PoolKindArrangement: return "arrangement";
+        case PoolKindTrackAutos:  return "track-autos";
+        default:                  return "none";
+    }
+}
 
 inline const char* poolStateName(u32 s) {
     switch (s) {
@@ -355,9 +408,12 @@ inline bool poolValidate(const u8* base, size_t payloadBytes, const PoolHeader* 
     const u32 st = b->state.load(std::memory_order_acquire);
     if (st == BlockFree)                     return no("block has been freed");
     if (wantKind != PoolKindNone && kind != wantKind)
-        return no(wantKind == PoolKindSamples ? "block does not hold sample data"
-                : wantKind == PoolKindNotes   ? "block does not hold notes"
-                                              : "block does not hold a string");
+        return no(wantKind == PoolKindSamples     ? "block does not hold sample data"
+                : wantKind == PoolKindNotes       ? "block does not hold notes"
+                : wantKind == PoolKindString      ? "block does not hold a string"
+                : wantKind == PoolKindArrangement ? "block does not hold an arrangement"
+                : wantKind == PoolKindTrackAutos  ? "block does not hold track automation"
+                                                  : "block is of the wrong kind");
     if (needBytes > bytes)                   return no("block is smaller than the clip claims");
     // Hand the validated extent back so callers never re-read the mutable field
     // (F4): the scan/copy bound must come from what validation proved, not from

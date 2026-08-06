@@ -730,6 +730,247 @@ static void testAdoptedPoolLiveness() {
 }
 
 // ---------------------------------------------------------------------------
+// 8. the wire classifiers and shapes wave 8g adds
+// ---------------------------------------------------------------------------
+//
+// 8a appended four commands and two events to engine.h and left them
+// compiled-and-unused; commandIsKnown() still bounded at Cmd::RecordMidiSlot,
+// so all four classified as UNKNOWN. That failed closed — which is why the tree
+// was safe — and this is the assertion that it is now classified properly and
+// that nothing else moved class while we were in there.
+
+static void testArrangementClassifiers() {
+    banner("8. the arrangement's commands and events classify (the 8a hand-off)");
+
+    // The four appended commands. Two are pure scalars; two carry a pool blob.
+    // None of them may be "unknown" any more, and none may be mistaken for a
+    // pointer-carrying command — which is what a wrong answer here would mean
+    // in the daemon: a permanent refusal that no client could work around.
+    struct Row { const char* name; Cmd c; bool known, scalar, pooled, arr, ptr; };
+    const Row rows[] = {
+        {"SetArrangement",    Cmd::SetArrangement,    true,  false, false, true,  false},
+        {"SetTrackAutos",     Cmd::SetTrackAutos,     true,  false, false, true,  false},
+        {"Locate",            Cmd::Locate,            true,  true,  false, false, false},
+        {"BackToArrangement", Cmd::BackToArrangement, true,  true,  false, false, false},
+        // Unchanged neighbours, so a reclassification cannot slip in unnoticed.
+        {"SetClip",           Cmd::SetClip,           true,  false, true,  false, false},
+        {"SetChain",          Cmd::SetChain,          true,  false, false, false, true},
+        {"RecordMidiSlot",    Cmd::RecordMidiSlot,    true,  false, false, false, true},
+        {"SetTempo",          Cmd::SetTempo,          true,  true,  false, false, false},
+    };
+    for (const Row& r : rows) {
+        const u32 t = (u32)r.c;
+        const bool ok = ipc::commandIsKnown(t)       == r.known  &&
+                        ipc::commandIsScalar(t)      == r.scalar &&
+                        ipc::commandIsPooled(t)      == r.pooled &&
+                        ipc::commandIsArrangement(t) == r.arr    &&
+                        ipc::commandCarriesPointer(t)== r.ptr;
+        CHECK(ok, "%s (%u): known=%d scalar=%d pooled=%d arrangement=%d pointer=%d",
+              r.name, t, (int)ipc::commandIsKnown(t), (int)ipc::commandIsScalar(t),
+              (int)ipc::commandIsPooled(t), (int)ipc::commandIsArrangement(t),
+              (int)ipc::commandCarriesPointer(t));
+    }
+    CHECK(!ipc::commandIsKnown((u32)Cmd::BackToArrangement + 1),
+          "and one past the last enumerator is still unknown — the bound is the "
+          "enum's end, not a hand-copied number");
+
+    // Both new events carry a pointer to a block the DAEMON built, so both are
+    // consumed rather than forwarded. A `true` here would send a daemon-heap
+    // address to another process.
+    CHECK(!ipc::eventIsScalar((u32)Ev::ArrangementRetired), "Ev::ArrangementRetired is not scalar");
+    CHECK(!ipc::eventIsScalar((u32)Ev::TrackAutosRetired),  "Ev::TrackAutosRetired is not scalar");
+    CHECK(ipc::eventIsScalar((u32)Ev::ClipStarted), "and the scalar events still are");
+
+    // The wire shapes, and the mirrors that make a memcpy honest.
+    CHECK(sizeof(ipc::WireArrHeader) == 48 && sizeof(ipc::WireArrItem) == 40,
+          "WireArrHeader is %zu B and WireArrItem is %zu B",
+          sizeof(ipc::WireArrHeader), sizeof(ipc::WireArrItem));
+    CHECK(sizeof(ipc::WireJournal) == sizeof(ArrJournal),
+          "WireJournal mirrors ArrJournal (%zu B)", sizeof(ipc::WireJournal));
+    CHECK(ipc::arrangementBytes(2, 1) == 48 + 2 * 40 + 120,
+          "a two-item, one-clip blob is %llu B",
+          (unsigned long long)ipc::arrangementBytes(2, 1));
+    CHECK(ipc::kMaxArrLanes == kMaxRtArrLanes,
+          "the wire lane bound and the engine's agree (%d)", (int)ipc::kMaxArrLanes);
+    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 3,
+          "protocol v%u, pool v%u, shm v%u", ipc::kProtocolVersion, ipc::kPoolVersion,
+          ipc::kShmVersion);
+    CHECK(ipc::control::kJournal > ipc::control::kParams &&
+          ipc::control::kBytes == ipc::control::kJournal + ipc::JournalRing::bytes(),
+          "the journal is the ninth section, appended at %zu of %zu B",
+          ipc::control::kJournal, ipc::control::kBytes);
+}
+
+// ---------------------------------------------------------------------------
+// 9. the journal ring across a real process boundary, and its drop counter
+// ---------------------------------------------------------------------------
+//
+// §9.6: the journal gets a ring of its own because the two channels have
+// different failure budgets. An event must not be lost — EvClipAck wedges a
+// clip cell for the rest of the session if it is — while a journal entry must
+// be KNOWN to be lost, because §5.4 refuses a take whose journal has a gap
+// rather than committing it short.
+//
+// So both halves are asserted here: that a full run of entries crosses with its
+// `seq` contiguous, and that an OVERRUN is visible as a gap in `seq` and as a
+// drop count. Overflowing the ring on purpose is the point — the failure has to
+// be observable, or "refuse, do not commit short" is not decidable.
+
+static void testJournalRingCrossProcess() {
+    banner("9. the journal ring carries entries, and a gap is observable (§5.4, §9.6)");
+
+    char nm[64];
+    std::snprintf(nm, sizeof nm, "nxtakt-ipc-journal-%d", (int)::getpid());
+    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "%s", nm);
+
+    // A region holding exactly one journal ring plus a phase word. The phase is
+    // what makes the overflow DETERMINISTIC rather than a race we hope to win:
+    // the consumer is held off while the producer overruns the ring, and only
+    // then allowed to drain, so the gap lands in a known place with a known
+    // size.
+    struct JStatus {
+        std::atomic<u64> seen, gaps, gapSize, bad;
+        std::atomic<u32> phase;      // see the handshake below
+    };
+    const size_t kStatusOff = 0;
+    const size_t kRingOff   = ipc::alignUp(sizeof(JStatus), ipc::kCacheLine);
+    const size_t kBytes     = kRingOff + ipc::JournalRing::bytes();
+    const u32    kHash      = ipc::fnv1a("nxtakt.journal_test.v1");
+
+    ipc::ShmRegion region;
+    if (!region.create(nm, kBytes, kHash)) {
+        CHECK(false, "create the journal region: %s", region.error());
+        return;
+    }
+    JStatus* st = region.at<JStatus>(kStatusOff);
+    ipc::JournalRing* ring = ipc::JournalRing::createAt(region, kRingOff);
+    CHECK(st && ring, "a %zu B region holding one JournalRing", kBytes);
+    if (!st || !ring) return;
+    st->seen.store(0); st->gaps.store(0); st->gapSize.store(0); st->bad.store(0);
+    st->phase.store(0, std::memory_order_release);
+    region.publishReady();
+
+    const u32 kBurstA = 12000;                       // overruns the ring on purpose
+    const u32 kBurstB = 200;                         // sent after the drain: the gap
+    CHECK(kBurstA > ipc::JournalRing::capacity(),
+          "burst A is %u entries through a %u-slot ring, so it must overflow",
+          kBurstA, ipc::JournalRing::capacity());
+
+    // The payload every entry carries, derived from seq so a torn slot is a
+    // hard failure rather than a plausible one.
+    const auto fill = [](u32 i) {
+        ipc::WireJournal j{};
+        j.kind  = (u32)JournalKind::NoteOn;
+        j.seq   = i;
+        j.track = (i32)(i % 32);
+        j.a     = 60 + (i32)(i % 12);
+        j.beat  = (f64)i * 0.25;
+        return j;
+    };
+
+    std::fflush(stdout);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        gOwnsShm = false;                            // the child never unlinks
+        ipc::ShmRegion r;
+        if (!r.attach(nm, kHash, ipc::kShmVersion, 3000)) ::_exit(1);
+        JStatus* cs = r.at<JStatus>(kStatusOff);
+        ipc::JournalRing* cr = ipc::JournalRing::attachAt(r, kRingOff);
+        if (!cs || !cr) ::_exit(1);
+
+        u64 seen = 0, gaps = 0, gapSize = 0, bad = 0;
+        u32  expect = 0;
+        bool first  = true;
+        const auto drain = [&](u32 untilPhase) {
+            const u64 deadline = ipc::monotonicNs() + 10ull * 1000000000ull;
+            for (;;) {
+                ipc::WireJournal j;
+                while (cr->pop(j)) {
+                    ++seen;
+                    if (j.kind != (u32)JournalKind::NoteOn || j.track != (i32)(j.seq % 32) ||
+                        j.beat != (f64)j.seq * 0.25)
+                        ++bad;
+                    // A consumer that sees seq jump knows exactly HOW MANY
+                    // entries it lost and WHERE. That is the whole reason seq
+                    // increments on every attempted push and not on every
+                    // successful one.
+                    if (!first && j.seq != expect) { ++gaps; gapSize += j.seq - expect; }
+                    first  = false;
+                    expect = j.seq + 1;
+                }
+                if (cs->phase.load(std::memory_order_acquire) >= untilPhase && cr->empty())
+                    return;
+                if (ipc::monotonicNs() >= deadline) return;
+            }
+        };
+
+        // Held off until the producer has finished overrunning the ring.
+        while (cs->phase.load(std::memory_order_acquire) < 1) {}
+        drain(1);
+        cs->phase.store(2, std::memory_order_release);   // "I am empty, send more"
+        while (cs->phase.load(std::memory_order_acquire) < 3) {}
+        drain(3);
+
+        cs->seen.store(seen, std::memory_order_relaxed);
+        cs->gaps.store(gaps, std::memory_order_relaxed);
+        cs->gapSize.store(gapSize, std::memory_order_relaxed);
+        cs->bad.store(bad, std::memory_order_relaxed);
+        cs->phase.store(4, std::memory_order_release);
+        ::_exit(0);
+    }
+    if (pid < 0) { CHECK(false, "fork failed"); region.close(); return; }
+
+    // Burst A, with nobody draining: an entry that will not fit is GONE,
+    // because there is nowhere to put it back. This is the daemon's own
+    // behaviour and the engine's before it.
+    u64 dropped = 0;
+    for (u32 i = 0; i < kBurstA; ++i) if (!ring->push(fill(i))) ++dropped;
+    st->phase.store(1, std::memory_order_release);
+
+    const auto waitPhase = [&](u32 want) {
+        const u64 deadline = ipc::monotonicNs() + 10ull * 1000000000ull;
+        while (ipc::monotonicNs() < deadline)
+            if (st->phase.load(std::memory_order_acquire) >= want) return true;
+        return false;
+    };
+    const bool drained = waitPhase(2);
+    CHECK(drained, "the consumer drained burst A and asked for more");
+
+    // Burst B, into a ring that is now empty: every one of these arrives, so
+    // the loss shows up as an INTERIOR gap rather than a truncated tail.
+    for (u32 i = 0; i < kBurstB; ++i)
+        if (!ring->push(fill(kBurstA + i))) ++dropped;
+    st->phase.store(3, std::memory_order_release);
+
+    const bool finished = waitPhase(4);
+    ::waitpid(pid, nullptr, 0);
+    CHECK(finished, "and finished");
+
+    const u64 seen = st->seen.load(), gaps = st->gaps.load(),
+              gapSize = st->gapSize.load(), bad = st->bad.load();
+    CHECK(bad == 0, "every entry that crossed arrived intact (%llu torn)",
+          (unsigned long long)bad);
+    CHECK(seen + dropped == kBurstA + kBurstB,
+          "%llu entries crossed and %llu were refused: %llu of %u sent",
+          (unsigned long long)seen, (unsigned long long)dropped,
+          (unsigned long long)(seen + dropped), kBurstA + kBurstB);
+    CHECK(dropped > 0, "the ring did overflow, so the failure being tested happened "
+          "(%llu refused)", (unsigned long long)dropped);
+    CHECK(gaps == 1, "the loss is VISIBLE to the consumer as a gap in seq (%llu gap)",
+          (unsigned long long)gaps);
+    CHECK(gapSize == dropped,
+          "and the gap measures EXACTLY what was lost: %llu missing, %llu refused — "
+          "the same fact reported from both sides, which is what makes 'refuse the "
+          "take, do not commit it short' decidable",
+          (unsigned long long)gapSize, (unsigned long long)dropped);
+    note("a consumer seeing this discards the take and names the count, per §5.4.");
+
+    region.close();
+    CHECK(!shmExistsPool(nm), "the journal region unlinks cleanly");
+    gShmNameAlt[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);   // survives fork() without duplicating output
@@ -746,8 +987,10 @@ int main() {
     testStaleReap();
     testForgedRetirement();
     testAdoptedPoolLiveness();
+    testArrangementClassifiers();
+    testJournalRingCrossProcess();
 
-    banner("8. /dev/shm is clean");
+    banner("10. /dev/shm is clean");
     cleanupShm();
     const int leftover = countNxTaktShm();
     CHECK(leftover == 0, "no nxtakt region left in /dev/shm (found %d)", leftover);

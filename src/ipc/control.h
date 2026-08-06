@@ -16,6 +16,9 @@
 //   kEvts     ShmSpscRing<WireEvent,4096>   engine -> GUI
 //   kMidi     ShmSpscRing<WireMidi,1024>    GUI/MIDI reader -> engine
 //   kClips    WireClip[32][32]              the clip table, GUI -> engine
+//   kDevices  WireDeviceInfo[320]           device metadata, daemon -> GUI
+//   kParams   WireDeviceParams[320]         param values, GUI -> daemon
+//   kJournal  ShmSpscRing<WireJournal,4096> the record journal, daemon -> GUI
 //
 // The doc's map has three payload sections; this adds two. ControlHeader exists
 // because ShmHeader is the *transport's* header (magic, layout, creator
@@ -54,7 +57,20 @@ namespace lat::ipc {
 //        the scalars; Cmd::SetChain and its return/master siblings become
 //        daemon-internal and are refused on the wire *permanently* rather than
 //        pending a phase.
-inline constexpr u32 kProtocolVersion = 3;
+//   v4 — RESERVED for AUTOMATION.md §8.3 (clip envelopes across the boundary,
+//        WireClip growing by autoRef/autoLaneCount/autoPointCount). That design
+//        names v4 explicitly and has not shipped in this tree. Burning the
+//        number is cheaper than having "protocol v4" mean one thing in a
+//        document and another in a header.
+//   v5 — the arrangement (ARRANGEMENT.md §9.1). Cmd::SetArrangement /
+//        SetTrackAutos / Locate / BackToArrangement classify and cross;
+//        PoolKindArrangement and PoolKindTrackAutos ride the pool;
+//        RejectBadArrangement; EvArrangementAck; and the control region grows a
+//        NINTH section, the record journal's own ring (§9.6). This is a
+//        deliberate incompatibility on a shipped protocol: a v3 binary and a v5
+//        binary refuse each other at attach() with a specific message, which is
+//        the mechanism working as designed.
+inline constexpr u32 kProtocolVersion = 5;
 
 // Daemon-generated wire events start here, well clear of lat::Ev. The event
 // ring carries a superset of Ev: the boundary itself has things to report
@@ -175,6 +191,29 @@ enum : u32 {
 
     // The plugin scan finished. a = plugin count, x = seconds it took.
     EvScanComplete    = kDaemonEventBase + 10,
+
+    // --- the arrangement (wave 8g) -----------------------------------------
+    //
+    // a = track (-1 = SetArrangement's transport cell), b unused, ref = the
+    // generation the client stamped on the command, x = a RejectReason, flags
+    // per EvArrAckFlag below. Exactly one of these answers every
+    // SetArrangement and every SetTrackAutos, accepted or refused.
+    //
+    // §9 does not name this event; it is here for the reason §11.2 gives for
+    // answering every device command and §10.4 gives for answering every clip
+    // cell. An arrangement blob is a pool block the client allocated, so a
+    // silent refusal would leave the client holding a block it can never free
+    // and a track it can never re-publish. "Answered exactly once" is the
+    // discipline EvClipAck established and this is the same shape: ref is the
+    // generation, x is the reason, and the flags say which command it answers.
+    EvArrangementAck  = kDaemonEventBase + 11,
+};
+
+// EvArrangementAck::flags.
+enum : u32 {
+    ArrAckRefused  = 1u << 0,   // the engine did not get it; x says why
+    ArrAckWasClear = 1u << 1,   // the command carried ref == 0
+    ArrAckAutos    = 1u << 2,   // it answers SetTrackAutos, not SetArrangement
 };
 
 // EvDeviceChanged::flags.
@@ -212,6 +251,18 @@ enum : u32 {
     RejectBadDevice      = 12, // no such device id, or its generation is stale
     RejectBadString      = 13, // the URI blob is not a terminated string
     RejectScanBusy       = 14, // the scan is running and the queue is full
+
+    // RESERVED for AUTOMATION.md §8.4, which names this number. Declared, never
+    // returned here, so that wave finds its number free.
+    RejectBadAutomation  = 15,
+
+    // --- the arrangement (wave 8g) ------------------------------------------
+    //
+    // The whole-blob refusal discipline of RejectBadClip, applied to a payload
+    // that is a hundred structures rather than one: a client that sent
+    // something impossible is TOLD, not partially obeyed. There is no
+    // "the daemon took the first forty items" outcome.
+    RejectBadArrangement = 16,
 };
 
 inline const char* rejectReasonName(u32 r) {
@@ -230,6 +281,8 @@ inline const char* rejectReasonName(u32 r) {
         case RejectBadDevice:       return "no such device";
         case RejectBadString:       return "the string blob is not terminated";
         case RejectScanBusy:        return "the plugin scan is busy and the queue is full";
+        case RejectBadAutomation:   return "the automation blob is inconsistent";
+        case RejectBadArrangement:  return "the arrangement blob is inconsistent";
         default:                    return "none";
     }
 }
@@ -341,6 +394,191 @@ inline WireClip defaultWireClip() {
 // The name the task-level API uses for the same thing; RtClip's wire twin is
 // only ever sent by Cmd::SetClip, so both spellings mean this struct.
 using WireSetClip = WireClip;
+
+// ---------------------------------------------------------------------------
+// The arrangement on the wire (docs/ARRANGEMENT.md §9.2)
+// ---------------------------------------------------------------------------
+//
+// One blob per track, allocated and written by the client, referenced by
+// Cmd::SetArrangement{a = track, b = generation, ref = poolOffset}. Layout:
+//
+//   [WireArrHeader][WireArrItem[itemCount]][WireClip[clipCount]]
+//
+// The notes are NOT in the blob. Each WireClip names its own notesRef into the
+// pool exactly as a session clip's does, so the existing WireNote
+// reinterpretation and the existing per-block retirement both keep working.
+//
+// TRANSLATED, NOT REINTERPRETED. This is the one structural difference from
+// every other pooled payload and it is a security property rather than a
+// stylistic one. A WireNote blob is *reinterpreted* — WireNote mirrors RtNote
+// field for field and holds no pointers, so (const RtNote*)(poolBase + ref) is
+// honest and a 10 000-note clip costs nothing at the boundary. An arrangement
+// blob cannot be: RtClip holds five pointers (data, notes, autos, markers,
+// transients) and **a pointer in a client-writable region is a pointer the
+// client chose**. So the daemon BUILDS — see Daemon::translateArrangement.
+
+// The bounds, mirrored from src/ui/session.h. They are protocol from v5 on
+// rather than editor policy: the engine's per-block cost is O(1) only while the
+// lane invariant holds, and the engine is downstream of an untrusted process.
+// src/ipc may not include src/ui, so the numbers are repeated here and the one
+// that also exists in engine.h is asserted against it.
+inline constexpr i64 kMaxArrItems  = 512;      // items per track
+inline constexpr i64 kMaxArrNotes  = 65536;    // notes per track, over every item
+inline constexpr i64 kMaxArrLanes  = 32;       // arrangement automation lanes per track
+inline constexpr i64 kMaxArrPoints = 65536;    // breakpoints per track across its lanes
+inline constexpr f64 kMaxOverlapBeats = 4.0;   // the longest admissible crossfade
+inline constexpr f64 kMinArrBeats     = 1.0 / 64.0;
+inline constexpr f64 kArrOverlapEps   = 1e-9;  // float noise from a trim, not an overlap
+// The timeline is finite in the only sense that matters here: every beat a
+// client sends becomes a multiply against the tempo somewhere downstream, so it
+// gets a bound like every other multiply operand. 2^31 beats is ~340 years at
+// 120 BPM and leaves start+length far inside f64's exact-integer range.
+inline constexpr f64 kMaxArrBeat = 2147483648.0;
+
+static_assert((int)kMaxArrLanes == kMaxRtArrLanes,
+              "the wire lane bound and the engine's must be the same number");
+
+struct WireArrHeader {
+    i64 itemCount, clipCount, noteCount;
+    f64 loopStart, loopEnd;
+    u32 loopOn, pad;
+};
+
+struct WireArrItem {
+    f64 start, length, offset;
+    f32 fadeIn, fadeOut;
+    i32 fadeShape, clip;         // `clip` indexes the blob's WireClip[]
+};
+
+static_assert(std::is_trivially_copyable_v<WireArrHeader>);
+static_assert(std::is_trivially_copyable_v<WireArrItem>);
+static_assert(sizeof(WireArrHeader) == 48, "WireArrHeader is protocol");
+static_assert(sizeof(WireArrItem)   == 40, "WireArrItem is protocol");
+static_assert(alignof(WireArrHeader) == 8 && alignof(WireArrItem) == 8);
+// Every section of the blob has to land 8-aligned given an offset that is
+// 64-aligned by poolValidate, or the daemon's reads are unaligned by
+// construction rather than by a client's choice.
+static_assert(sizeof(WireArrHeader) % 8 == 0 && sizeof(WireArrItem) % 8 == 0 &&
+              sizeof(WireClip) % 8 == 0);
+
+// The byte extent a blob with these declared counts must have. Callers bound
+// the counts FIRST — this is deliberately not defensive, so that a caller which
+// forgot the bound gets a wrong answer in a test rather than a silent clamp in
+// production. (Every caller in this tree bounds them; daemon_test proves it.)
+inline constexpr u64 arrangementBytes(i64 itemCount, i64 clipCount) {
+    return (u64)sizeof(WireArrHeader) + (u64)itemCount * sizeof(WireArrItem) +
+           (u64)clipCount * sizeof(WireClip);
+}
+
+// ---------------------------------------------------------------------------
+// Arrangement automation on the wire (§6.2)
+// ---------------------------------------------------------------------------
+//
+//   [WireAutoSetHeader][WireAutoLane[laneCount]][WireAutoPoint[pointCount]]
+//
+// The same single-allocation shape RtAutoSetN has. The two element types mirror
+// RtAutoLane/RtAutoPoint field for field, asserted below — but unlike WireNote
+// the mirror does NOT license a cast, because RtAutoSetN itself holds two
+// pointers. The mirror is here so a copy is a memcpy and so the engine's
+// structs cannot change under the protocol without the build noticing.
+
+// ALIGNMENT IS NOT INCIDENTAL HERE, and it is not theoretical: `RtAutoLane` is
+// 36 bytes and 4-aligned, while `RtAutoPoint` begins with an f64. An ODD lane
+// count therefore leaves the point array on a 4-byte boundary in any layout
+// that just concatenates the two arrays — which UBSan catches, on the engine
+// side, where the misaligned f64 is actually read.
+//
+// Two independent places have to get this right and both do it explicitly
+// rather than by arithmetic that happens to divide today:
+//
+//   * the WIRE blob, below, where WireAutoLane spells out a trailing pad word
+//     so its size is a multiple of alignof(WireAutoPoint). The static_assert is
+//     the guard: remove the pad and this stops compiling.
+//   * the DAEMON's built block, which rounds every array offset up to the
+//     member's own alignment (Daemon::buildTrackAutos). That one cannot use the
+//     wire's trick, because it lays out RtAutoLane and not WireAutoLane.
+struct WireAutoSetHeader { i64 laneCount, pointCount; };
+
+struct WireAutoLane {
+    i32 target, index, devSlot, xform;
+    i32 first, count;
+    f32 lo, hi;
+    u32 flags;
+    u32 pad;             // load-bearing: see the alignment note above
+};
+
+struct WireAutoPoint {
+    f64 beat;
+    f32 value;
+    u8  curve;
+    u8  pad[3];
+};
+
+static_assert(std::is_trivially_copyable_v<WireAutoSetHeader>);
+static_assert(sizeof(WireAutoSetHeader) == 16, "WireAutoSetHeader is protocol");
+static_assert(sizeof(WireAutoPoint) == sizeof(RtAutoPoint), "WireAutoPoint must mirror RtAutoPoint");
+static_assert(alignof(WireAutoPoint) == alignof(RtAutoPoint));
+static_assert(offsetof(WireAutoPoint, beat)  == offsetof(RtAutoPoint, beat));
+static_assert(offsetof(WireAutoPoint, value) == offsetof(RtAutoPoint, value));
+static_assert(offsetof(WireAutoPoint, curve) == offsetof(RtAutoPoint, curve));
+// RtAutoLane has no trailing pad member of its own; the wire twin spells one
+// out so the struct's size is stated rather than inherited from the ABI.
+static_assert(sizeof(WireAutoLane) == sizeof(RtAutoLane) + 4 ||
+              sizeof(WireAutoLane) == sizeof(RtAutoLane),
+              "WireAutoLane must mirror RtAutoLane's fields");
+static_assert(offsetof(WireAutoLane, target)  == offsetof(RtAutoLane, target));
+static_assert(offsetof(WireAutoLane, index)   == offsetof(RtAutoLane, index));
+static_assert(offsetof(WireAutoLane, devSlot) == offsetof(RtAutoLane, devSlot));
+static_assert(offsetof(WireAutoLane, xform)   == offsetof(RtAutoLane, xform));
+static_assert(offsetof(WireAutoLane, first)   == offsetof(RtAutoLane, first));
+static_assert(offsetof(WireAutoLane, count)   == offsetof(RtAutoLane, count));
+static_assert(offsetof(WireAutoLane, lo)      == offsetof(RtAutoLane, lo));
+static_assert(offsetof(WireAutoLane, hi)      == offsetof(RtAutoLane, hi));
+static_assert(offsetof(WireAutoLane, flags)   == offsetof(RtAutoLane, flags));
+
+// The blob's sections concatenate with no padding, which is only legal because
+// each one's size is a multiple of the NEXT one's alignment. Asserted rather
+// than assumed: RtAutoLane's real size is 36 and it is only WireAutoLane's
+// explicit pad word that makes an odd lane count safe here.
+static_assert(sizeof(WireAutoSetHeader) % alignof(WireAutoLane) == 0);
+static_assert(sizeof(WireAutoLane) % alignof(WireAutoPoint) == 0,
+              "an odd lane count would leave the point array misaligned: "
+              "WireAutoLane needs its trailing pad");
+static_assert(sizeof(WireArrHeader) % alignof(WireArrItem) == 0);
+static_assert(sizeof(WireArrItem) % alignof(WireClip) == 0,
+              "an odd item count would leave the clip array misaligned");
+
+inline constexpr u64 trackAutosBytes(i64 laneCount, i64 pointCount) {
+    return (u64)sizeof(WireAutoSetHeader) + (u64)laneCount * sizeof(WireAutoLane) +
+           (u64)pointCount * sizeof(WireAutoPoint);
+}
+
+// ---------------------------------------------------------------------------
+// WireJournal — the recording journal's message (§5.3, §9.6)
+// ---------------------------------------------------------------------------
+//
+// lat::ArrJournal field for field, pointer-free, asserted to mirror. It rides a
+// ring of its own and NOT the event ring, because the two channels have
+// different failure budgets: an event must not be lost (EvClipAck wedges a clip
+// cell for the rest of the session if it is), and a journal entry must be
+// *known* to be lost (a take with a gap is refused rather than committed short).
+// Mixing them lets a burst of journal entries evict an acknowledgement.
+struct WireJournal {
+    u32 kind;      // lat::JournalKind
+    u32 seq;       // monotonic per engine run; a gap means a drop
+    i32 track;
+    i32 a;         // slot / pitch / velocity, per kind
+    f64 beat;      // the ENGINE's beat, exact
+};
+
+static_assert(std::is_trivially_copyable_v<WireJournal>);
+static_assert(sizeof(WireJournal) == sizeof(ArrJournal), "WireJournal must mirror ArrJournal");
+static_assert(alignof(WireJournal) == alignof(ArrJournal));
+static_assert(offsetof(WireJournal, kind)  == offsetof(ArrJournal, kind));
+static_assert(offsetof(WireJournal, seq)   == offsetof(ArrJournal, seq));
+static_assert(offsetof(WireJournal, track) == offsetof(ArrJournal, track));
+static_assert(offsetof(WireJournal, a)     == offsetof(ArrJournal, a));
+static_assert(offsetof(WireJournal, beat)  == offsetof(ArrJournal, beat));
 
 // ---------------------------------------------------------------------------
 // Devices: two tables, opposite directions
@@ -507,10 +745,15 @@ inline constexpr bool commandIsScalar(u32 type) {
         // pure numbers into the engine's mixer and always were; they only look
         // new because the engine grew return buses in the same wave.
         case Cmd::SendLevel: case Cmd::ReturnVol:
+        // Wave 8g: the arrangement's two pure scalars. Locate is {x = the beat
+        // to go to} and BackToArrangement is {a = track, or -1 for all} — no
+        // payload, no pool reference, nothing to translate.
+        case Cmd::Locate: case Cmd::BackToArrangement:
             return true;
         case Cmd::SetClip: case Cmd::ClearClip:
         case Cmd::SetChain: case Cmd::SetReturnChain: case Cmd::SetMasterChain:
         case Cmd::RecordSlot: case Cmd::RecordMidiSlot:
+        case Cmd::SetArrangement: case Cmd::SetTrackAutos:
             return false;
     }
     return false;
@@ -523,6 +766,19 @@ inline constexpr bool commandIsPooled(u32 type) {
            ((Cmd)type == Cmd::SetClip || (Cmd)type == Cmd::ClearClip);
 }
 
+// Carries a pool BLOB rather than a table cell: `ref` names a block the client
+// allocated and the daemon *builds* from (§9.3). A fifth class rather than a
+// fourth flavour of `pooled`, because the two behave differently in every way
+// that matters at the boundary: a pooled command names a cell in a table that
+// exists whether or not anything is in it and is answered by EvClipAck; this
+// one names a variable-length blob, is answered by EvArrangementAck, and its
+// payload is a daemon-heap allocation with a two-layer retirement behind it.
+// `ref == 0` is the clear form and is legal.
+inline constexpr bool commandIsArrangement(u32 type) {
+    return type < kDaemonCommandBase &&
+           ((Cmd)type == Cmd::SetArrangement || (Cmd)type == Cmd::SetTrackAutos);
+}
+
 // Consumed by the daemon, never forwarded verbatim.
 inline constexpr bool commandIsDevice(u32 type) {
     return type >= kDaemonCommandBase && type <= CmdScanPlugins;
@@ -531,14 +787,23 @@ inline constexpr bool commandIsDevice(u32 type) {
 // Names memory the sender does not own on the receiving side. Permanently
 // refused, not deferred.
 inline constexpr bool commandCarriesPointer(u32 type) {
-    return !commandIsScalar(type) && !commandIsPooled(type) && !commandIsDevice(type);
+    return !commandIsScalar(type) && !commandIsPooled(type) && !commandIsDevice(type) &&
+           !commandIsArrangement(type);
 }
 
 // True for a type this build knows at all. An unknown type is a peer from the
 // future; the version check should already have caught it, so this is the
 // belt to that pair of braces.
+//
+// The bound is the LAST enumerator, not a hand-copied number: 8a appended four
+// commands and this line still said RecordMidiSlot, so SetArrangement..
+// BackToArrangement classified as unknown. That failed closed — the daemon
+// answered RejectUnknownCommand — which is the right way for it to be wrong,
+// and it is why 8a could land the header compiled-and-unused without breaking
+// anything. Spelling the bound as the last enumerator is what keeps the next
+// append from repeating it.
 inline constexpr bool commandIsKnown(u32 type) {
-    return type <= (u32)Cmd::RecordMidiSlot || commandIsDevice(type);
+    return type <= (u32)Cmd::BackToArrangement || commandIsDevice(type);
 }
 
 // Events that cannot cross as they stand: each hands a pointer back to whoever
@@ -569,6 +834,13 @@ inline constexpr bool eventIsScalar(u32 type) {
         case Ev::MidiRecordFinished:
         // AutosRetired carries a pointer into GUI memory, like NotesRetired.
         case Ev::AutosRetired: case Ev::WarpRetired:
+        // Wave 8g. Both carry a pointer to a block the DAEMON built in its own
+        // address space (§9.3), so both are consumed rather than forwarded —
+        // the same treatment Ev::ChainRetired gets, and for the same reason.
+        // They are the tighter of the two accepted proofs for layer 1 of the
+        // arrangement's retirement: pushed from inside drainCommands(), so the
+        // event's arrival *is* the drain.
+        case Ev::ArrangementRetired: case Ev::TrackAutosRetired:
             return false;
     }
     return false;
@@ -626,6 +898,34 @@ struct ControlHeader {
     std::atomic<u32> drainsExact;       // 1 = the engine counts; retirement is a proof
     std::atomic<u32> reserved1;
 
+    // --- the arrangement (docs/ARRANGEMENT.md §9.5, §9.6) -------------------
+    //
+    // arrBuiltFreed is not decoration and not a diagnostic: it is the ONLY
+    // thing that makes the ordering between the two retirement layers
+    // observable from outside this process. The daemon bumps it at the instant
+    // it frees a built block and *then* queues that block's pool echoes, so a
+    // client that pops an EvBlockRetired for one of those refs and then reads
+    // this counter is guaranteed by the ring's release/acquire edge to see the
+    // free already counted. A test can therefore assert the ordering rather
+    // than trust it. See daemon_test §16d.
+    std::atomic<u64> arrangementsApplied;  // SetArrangement/SetTrackAutos forwarded
+    std::atomic<u64> arrangementsRejected; // refused with RejectBadArrangement
+    std::atomic<u64> arrBuiltFreed;        // layer 1: built blocks freed on the proof
+    std::atomic<u64> arrRefsEchoed;        // layer 2: pool blocks echoed after a free
+    // Layer-2 echoes refused because a built block that still points into the
+    // pool had not been freed yet. Structurally impossible; counted anyway,
+    // because "impossible" is what this class of bug is called right up until
+    // somebody reorders two lines. It must read 0 forever.
+    std::atomic<u64> arrOrderViolations;
+
+    // The journal's own accounting. journalDropped is the DAEMON's hop --
+    // entries popped from the engine that would not fit the client's ring --
+    // and it is published separately from the engine's (SharedState::
+    // journalDropped) because there are two hops and a take has to be refusable
+    // on either (§5.4, §9.6).
+    std::atomic<u64> journalForwarded;
+    std::atomic<u64> journalDropped;
+
     char driverName[32];             // "null", "JACK", "ALSA"
 
     // --- the sample-pool handshake (docs/PROCESS-SPLIT.md §3.5) ------------
@@ -679,6 +979,13 @@ struct ControlHeader {
         engineDrains.store(0, std::memory_order_relaxed);
         drainsExact.store(0, std::memory_order_relaxed);
         reserved1.store(0, std::memory_order_relaxed);
+        arrangementsApplied.store(0, std::memory_order_relaxed);
+        arrangementsRejected.store(0, std::memory_order_relaxed);
+        arrBuiltFreed.store(0, std::memory_order_relaxed);
+        arrRefsEchoed.store(0, std::memory_order_relaxed);
+        arrOrderViolations.store(0, std::memory_order_relaxed);
+        journalForwarded.store(0, std::memory_order_relaxed);
+        journalDropped.store(0, std::memory_order_relaxed);
         std::memset(driverName, 0, sizeof driverName);
         std::snprintf(driverName, sizeof driverName, "%s", driver ? driver : "?");
         std::memset(poolName, 0, sizeof poolName);
@@ -704,6 +1011,18 @@ using CommandRing = ShmSpscRing<WireCommand, 4096>;
 using EventRing   = ShmSpscRing<WireEvent, 4096>;
 using MidiRing    = ShmSpscRing<WireMidi, 1024>;
 
+// The record journal's own ring, daemon -> client (§9.6). 4096 slots, matching
+// Engine's own Ring<ArrJournal, 4096> exactly, so the two hops have the same
+// capacity and neither is the narrow one by accident: 24 B a slot is 96 KiB,
+// which is under one of the message rings.
+//
+// NOT the event ring. Mixing them lets a burst of journal entries evict events,
+// and events carry EvClipAck — a lost ack wedges a clip-table cell for the rest
+// of the session. NOT the pool either: the journal is fixed-size, high-rate and
+// continuous, which is what a ring is for and what an
+// allocate-write-publish-retire lifecycle emphatically is not.
+using JournalRing = ShmSpscRing<WireJournal, 4096>;
+
 // The clip table. 32 x 32 x 120 B is 120 KiB — the same order as one ring, and
 // preallocated for the same reason everything else here is: the engine cannot
 // wait for an allocation and a republish must not need one either.
@@ -726,17 +1045,24 @@ inline constexpr size_t kMidi    = alignUp(kEvts    + EventRing::bytes(),     kC
 inline constexpr size_t kClips   = alignUp(kMidi    + MidiRing::bytes(),      kCacheLine);
 inline constexpr size_t kDevices = alignUp(kClips   + kClipTableBytes,        kCacheLine);
 inline constexpr size_t kParams  = alignUp(kDevices + kDeviceTableBytes,      kCacheLine);
-inline constexpr size_t kBytes   = kParams + kParamTableBytes;
+// The ninth section (§9.6). Appended rather than inserted: every offset above
+// it is unchanged, so the only reason a v3 binary and a v5 binary refuse each
+// other is the hash and the version — which is the mechanism, not an accident
+// of layout churn.
+inline constexpr size_t kJournal = alignUp(kParams  + kParamTableBytes,       kCacheLine);
+inline constexpr size_t kBytes   = kJournal + JournalRing::bytes();
 
 // Everything that could move an offset out from under a peer goes into the
-// hash: the total size, every section offset, both message sizes, the ring
+// hash: the total size, every section offset, every message size, the ring
 // capacities and the protocol version.
 inline constexpr u32 kHash =
-    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
-        fnv1a("nxtakt.control.v3"),   // renamed seed: see the note at pool::kHash
+    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
+        fnv1a("nxtakt.control.v5"),   // reseeded per protocol: see pool::kHash
         (u64)kBytes), (u64)kState), (u64)kCmds), (u64)kEvts), (u64)kMidi), (u64)kClips),
-        (u64)kDevices), (u64)kParams),
+        (u64)kDevices), (u64)kParams), (u64)kJournal),
         (u64)(sizeof(WireCommand) * 65536 + sizeof(WireEvent) * 256 + sizeof(WireMidi))),
+        (u64)(sizeof(WireJournal) * 65536ull + JournalRing::capacity()) ^
+        (u64)(sizeof(WireArrHeader) * 65536ull + sizeof(WireArrItem))),
         (u64)(CommandRing::capacity() * 65536ull + EventRing::capacity()) ^
         (u64)(kProtocolVersion * 65536u + (u32)sizeof(WireClip)) ^
         (u64)(sizeof(WireDeviceInfo) * 65536ull + sizeof(WireDeviceParams)));
@@ -767,9 +1093,10 @@ struct ControlMap {
     WireClip*         clips   = nullptr;   // [kMaxTracks * kMaxScenes], row-major
     WireDeviceInfo*   devices = nullptr;   // [kMaxDevices], daemon -> client
     WireDeviceParams* params  = nullptr;   // [kMaxDevices], client -> daemon
+    JournalRing*      journal = nullptr;   // daemon pump -> client, §9.6
 
     bool valid() const {
-        return hdr && state && cmds && evts && midi && clips && devices && params;
+        return hdr && state && cmds && evts && midi && clips && devices && params && journal;
     }
 
     WireDeviceInfo* device(u32 id) {
@@ -810,6 +1137,7 @@ struct ControlMap {
         // know: it checks one T, and this is an array.
         if (clips && !r.at<WireClip>(control::kClips + kClipTableBytes - sizeof(WireClip)))
             clips = nullptr;
+        journal = JournalRing::createAt(r, control::kJournal);
         mapTables(r);
         return valid();
     }
@@ -823,6 +1151,7 @@ struct ControlMap {
         clips = r.at<WireClip>(control::kClips);
         if (clips && !r.at<WireClip>(control::kClips + kClipTableBytes - sizeof(WireClip)))
             clips = nullptr;
+        journal = JournalRing::attachAt(r, control::kJournal);
         mapTables(r);
         return valid();
     }
