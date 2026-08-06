@@ -139,6 +139,24 @@ struct RtClip {
     // borrows, a displaced set returns via Ev::AutosRetired before it is freed.
     const RtAutoSet* autos = nullptr;
 
+    // Warp markers: a piecewise-linear beat -> source map, replacing the single
+    // clipBpm/tempo ratio when present. Sorted, both sequences strictly
+    // increasing, 0 or >= 2 entries (one marker pins nothing). Same one-pointer
+    // retirement rule as `notes` and `autos` — a displaced array comes home in
+    // Ev::WarpRetired before the GUI may free it. WarpMarker lives in
+    // audio/sample.h until this header and that one merge their warp section.
+    const struct WarpMarker* markers = nullptr;
+    int markerCount = 0;
+
+    // Onset positions in the SOURCE, borrowed from the SampleBuffer. No
+    // retirement event, deliberately: transients belong to the sample and are
+    // built once at load and never rebuilt, so the pointer is stable for the
+    // life of the session exactly as `data` is. Markers belong to the clip;
+    // two clips over one sample share one transient array. Beats-mode grain
+    // scheduling aligns to these.
+    const i64* transients = nullptr;
+    int transientCount = 0;
+
     bool valid        = false;
 };
 
@@ -227,7 +245,8 @@ enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportSto
                       NotesRetired,   // p = the RtNote* array now safe to free
                       MidiRecordFinished, // a = track, b = slot, x = note count, p = the buffer
                       AutosRetired,   // p = the RtAutoSet* now safe to free
-                      AutoLaneInert   // a = track, b = slot, x = lane index
+                      AutoLaneInert,  // a = track, b = slot, x = lane index
+                      WarpRetired     // p = the WarpMarker* now safe to free
                     };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 

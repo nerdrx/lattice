@@ -568,7 +568,7 @@ inline constexpr bool eventIsScalar(u32 type) {
         case Ev::ChainRetired: case Ev::RecordFinished: case Ev::NotesRetired:
         case Ev::MidiRecordFinished:
         // AutosRetired carries a pointer into GUI memory, like NotesRetired.
-        case Ev::AutosRetired:
+        case Ev::AutosRetired: case Ev::WarpRetired:
             return false;
     }
     return false;
