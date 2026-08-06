@@ -24,6 +24,7 @@
 //
 #include "app.h"
 #include "app_internal.h"
+#include "arrtake.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -793,6 +794,242 @@ bool App::reapArrangementEvent(const Event& e) {
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// RECORDING INTO THE ARRANGEMENT (§5)
+//
+// The consumer half of the journal. Two functions: one drains, one commits.
+//
+// Everything about the timing is the ENGINE's. Nothing here reads a clock,
+// stamps an entry, or infers a beat from a frame it was noticed on — the whole
+// argument of §5.2 is that a recording timestamped by its reader is a recording
+// of the reader, so this side deals only in numbers that arrived from the audio
+// thread with the entries. That is also why the gate this milestone is measured
+// by is reachable at all: an item committed at beat 4.0 is at beat 4.0 because
+// the engine launched at beat 4.0, not because a frame happened to notice.
+// ---------------------------------------------------------------------------
+
+void App::pumpJournal(Engine& eng) {
+    // Read BEFORE the drain. A drop counted after we have drained belongs to
+    // entries that are not in this batch, and the whole point of the counter is
+    // to cover the entries a gap cannot show us.
+    const u32 droppedNow = eng.journalDropped.load(std::memory_order_relaxed);
+
+    ArrJournal j;
+    while (eng.popJournal(j)) {
+        // Contiguity over the whole stream, armed or not: `seq` is monotonic per
+        // engine run, so this is the cheapest and strictest place to notice a
+        // jump — and noticing it here means an unarmed stretch cannot hide one
+        // that straddles the moment the arm went on.
+        if (takeSeqValid_ && j.seq != takeLastSeq_ + 1u)
+            takeGaps_ += j.seq - takeLastSeq_ - 1u;
+        takeLastSeq_  = j.seq;
+        takeSeqValid_ = true;
+
+        if (j.kind == (u32)JournalKind::TakeStart) {
+            // A new pass. The ring was just drained, so it holds nothing and an
+            // overflow between the engine's push of this entry and this line is
+            // arithmetically impossible — which is what makes re-basing the drop
+            // counter here safe rather than a hole in §5.4's check.
+            takeLog_.clear();
+            takeGaps_ = 0;
+            takeDropBase_ = droppedNow;
+            takeOpen_ = arrArm_;
+        }
+        if (!takeOpen_) continue;                 // not armed: drained and dropped
+        // A bound on the GUI's own buffer, because the ring's bound does not
+        // bound this one: a pass that never ends accumulates forever. An entry
+        // this side refuses is exactly as lost as one the ring refused, so it is
+        // counted the same way and the take is refused with the same sentence —
+        // committing short is the one answer §5.4 rules out, whichever end of
+        // the channel did the losing. A million entries is hours of dense play.
+        if (takeLog_.size() >= kMaxTakeEntries) { ++takeGaps_; continue; }
+        takeLog_.push_back(j);
+        // The pass ends where the engine says it ended. A wrap or a locate ends
+        // it too (§5.5): overdub onto existing arrangement material is §11, and
+        // a take that crossed the brace is committed at the brace, which is
+        // honest and is what a first version can defend.
+        if (j.kind == (u32)JournalKind::TakeEnd ||
+            j.kind == (u32)JournalKind::LoopWrap ||
+            j.kind == (u32)JournalKind::Locate)
+            commitTake(eng.journalDropped.load(std::memory_order_relaxed));
+    }
+
+    // THE BACKSTOP, and it is not belt-and-braces: when the ring overflows it
+    // is the LAST entries of the pass that are refused, so the TakeEnd itself
+    // can be one of them — and a pass whose terminator was lost would otherwise
+    // sit open forever, committing nothing and saying nothing. That is exactly
+    // the silent failure §5.4 exists to prevent, arrived at from the other side.
+    //
+    // The transport's published state is a fair backstop precisely because it is
+    // not being used as the record: it carries no beat and decides no position,
+    // it only answers "is the pass still running". Every number in the take
+    // still came from the journal.
+    if (takeOpen_ && !eng.playing.load(std::memory_order_relaxed))
+        commitTake(eng.journalDropped.load(std::memory_order_relaxed));
+}
+
+void App::commitTake(u32 droppedNow) {
+    if (takeLog_.empty()) { takeOpen_ = false; return; }
+    // Read AFTER the drain by the caller, so the delta covers every entry of the
+    // pass including ones lost after the last one that reached us.
+    const u32 counterDelta = droppedNow - takeDropBase_;   // u32 wrap is a delta too
+
+    const TakeResult take = buildTake(takeLog_, takeGaps_ + counterDelta);
+
+    // The pass is over either way, and the accumulator is cleared BEFORE
+    // anything can fail: a refused take that stayed in the buffer would be
+    // re-refused on every subsequent stop.
+    takeLog_.clear();
+    takeOpen_ = false;
+    takeGaps_ = 0;
+    takeDropBase_ = droppedNow;
+
+    // §5.4, and answer #6's wording verbatim, because this is the line that will
+    // be quoted back in the bug report. Discard, no undo point, and SAY SO.
+    if (!take.ok) {
+        char buf[96];
+        snprintf(buf, sizeof buf, "take discarded: %u journal entries dropped",
+                 (unsigned)take.dropped);
+        LOGW("%s", buf);
+        status_ = buf;
+        return;
+    }
+    if (take.items.empty() && take.notes.empty()) {
+        // Nothing was performed, or the arm went on after the transport was
+        // already rolling — in which case there is no TakeStart to record
+        // against, and inventing one would be the GUI stamping the recording.
+        status_ = take.sawStart ? "Arrangement take: nothing played"
+                                : "Arrangement take: arm ARR before the transport rolls";
+        return;
+    }
+
+    // ONE undo point, AT COMMIT (§5.4). Not at take start — there is no coherent
+    // "half a recording", which is the same call App::cancelTakes already makes
+    // for session recording — and not per entry, which would exhaust kUndoDepth
+    // inside two bars. pushUndoNow and not undoPoint, for finishRecording's
+    // reason: this runs outside any widget gesture, so there is no `active` id to
+    // coalesce against and coalescing is not what is wanted anyway.
+    pushUndoNow("record arrangement");
+
+    bool dirty[kMaxTracks] = {};
+    int placed = 0;
+
+    // --- the launches ------------------------------------------------------
+    for (const TakeItem& it : take.items) {
+        if (it.track < 0 || it.track >= (int)ses_.tracks.size()) continue;
+        if (it.slot  < 0 || it.slot  >= kMaxScenes) continue;
+        TrackModel& tr = ses_.tracks[(size_t)it.track];
+        const ClipModel& src = tr.slots[(size_t)it.slot];
+        if (!src.valid()) continue;              // the slot emptied mid-take
+        if ((int)tr.arrange.size() >= kMaxArrItems) continue;
+
+        ArrangeClip c;
+        c.uid    = ses_.newUid();
+        c.start  = it.start;
+        c.length = it.length;
+        c.offset = it.offset;
+        // No fades. A performance has none: the launch is the attack and the
+        // stop is the engine's own declick, and inventing a crossfade here would
+        // be the arrangement adding something the session did not do — which is
+        // exactly what the bit-identity gate forbids.
+        c.fadeIn = c.fadeOut = 0.0;
+        c.sourceUid = src.uid;                   // provenance only (§2.1)
+        c.src = src;                             // Rule 1: placement COPIES
+        c.src.uid = c.uid;                       // 8e's rule: src.uid is the item's
+        tr.arrange.push_back(std::move(c));
+        dirty[it.track] = true;
+        ++placed;
+    }
+
+    // --- the notes (§5.5's MIDI take) --------------------------------------
+    //
+    // One fresh ClipModel per track that was PLAYED, with beats made
+    // clip-relative against the take's start, in one item at the take's start of
+    // the take's span. `sourceUid` stays 0: this material came from nowhere.
+    //
+    // A track that also launched clips keeps its launches instead. The lane is
+    // one row and holds one statement per stretch of time, so two answers for
+    // one track would be two overlapping items the invariant would immediately
+    // reclaim — and the launches are the answer the performer can see.
+    {
+        std::vector<std::vector<TakeNote>> perTrack((size_t)kMaxTracks);
+        for (const TakeNote& n : take.notes)
+            if (n.track >= 0 && n.track < kMaxTracks) perTrack[(size_t)n.track].push_back(n);
+
+        for (int t = 0; t < (int)ses_.tracks.size() && t < kMaxTracks; ++t) {
+            std::vector<TakeNote>& v = perTrack[(size_t)t];
+            if (v.empty() || dirty[t]) continue;
+            TrackModel& tr = ses_.tracks[(size_t)t];
+            if ((int)tr.arrange.size() >= kMaxArrItems) continue;
+
+            // The take's own start, not the first note's: silence at the head of
+            // a pass is part of the pass, and an item that began at the first
+            // note would slide the whole performance earlier.
+            f64 lastEnd = 0.0;
+            for (const TakeNote& n : v) lastEnd = std::max(lastEnd, n.beat + n.len);
+            const f64 start = take.startBeat;
+            const f64 span  = std::max(std::max(lastEnd, take.endBeat) - start, kMinArrBeats);
+
+            ArrangeClip c;
+            c.uid    = ses_.newUid();
+            c.start  = start;
+            c.length = span;
+            c.offset = 0.0;
+            c.sourceUid = 0;
+            c.src = ClipModel{};
+            c.src.uid = c.uid;
+            c.src.kind = ClipKind::Midi;
+            c.src.name = "Take";
+            c.src.colorIdx = tr.colorIdx;
+            c.src.clipBpm = ses_.tempo;
+            c.src.lengthBeats = span;
+            c.src.loop = true;                   // never reached: the item is one span
+            for (const TakeNote& n : v) {
+                NoteModel m;
+                m.beat  = std::max(0.0, n.beat - start);
+                m.len   = std::max(1.0 / 64.0, n.len);
+                m.pitch = (u8)clampv((int)n.pitch, 0, 127);
+                m.vel   = (u8)clampv((int)n.vel, 1, 127);
+                c.src.notes.push_back(m);
+            }
+            std::stable_sort(c.src.notes.begin(), c.src.notes.end(),
+                             [](const NoteModel& a, const NoteModel& b) { return a.beat < b.beat; });
+            tr.arrange.push_back(std::move(c));
+            dirty[t] = true;
+            ++placed;
+        }
+    }
+
+    // --- repair and publish -------------------------------------------------
+    //
+    // §5.5's last line: a take that landed on top of existing material trims it,
+    // exactly as a drop does. The repair is the same function every edit ends in,
+    // and the publish is the same publish — a committed take is not a special
+    // kind of arrangement.
+    int tracks = 0;
+    for (int t = 0; t < kMaxTracks; ++t) {
+        if (!dirty[t]) continue;
+        ++tracks;
+        arrangeRepair(ses_.tracks[(size_t)t].arrange);
+        publishArrangementFor(t);
+    }
+
+    // The override is KEPT, deliberately (§4.3): the tracks that were performed
+    // on are still in session mode, and having the arrangement leap back in under
+    // the performer is the surprise Live avoids. Back to Arrangement is one
+    // click, is unquantized, and now plays what was just recorded.
+    char buf[160];
+    snprintf(buf, sizeof buf,
+             "Arrangement take: %d item%s on %d track%s, beats %.2f-%.2f%s"
+             "  -  Back to Arrangement to hear it",
+             placed, placed == 1 ? "" : "s", tracks, tracks == 1 ? "" : "s",
+             take.startBeat, take.endBeat,
+             take.end == TakeResult::End::Wrap   ? " (ended at the loop brace)" :
+             take.end == TakeResult::End::Locate ? " (ended at a locate)" : "");
+    status_ = buf;
+    LOGI("%s", buf);
 }
 
 // The two destructors, out of line so this file is the only one that has to know

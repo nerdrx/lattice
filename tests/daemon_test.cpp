@@ -2498,31 +2498,68 @@ static void testJournalRing(ipc::EngineClient& c) {
           "and it is the ninth section, appended past the param table (offset %zu)",
           ipc::control::kJournal);
 
-    // Both hops report, and both report zero: nothing has recorded yet, which
-    // is exactly the state a take would need to see before it began.
+    // The entries themselves arrived with 8f, so what this section asserted as
+    // "still empty" is now the end-to-end check §10.7 asks for. Updated here for
+    // §16.6's reason in the other direction: the file is 8g's and the decision
+    // is 8f's, and a note in a finished agent's report is not a place work
+    // survives.
+    //
+    // Every section above this one has been launching clips and starting the
+    // transport, so the ring already holds the journal of all of it — and the
+    // first property to check is CONTIGUITY, because that is the one §5.4's
+    // refusal is decided on and it has to survive both hops.
     drainEvents(c);
     ipc::WireJournal j{};
     int drained = 0;
-    while (c.popJournal(j)) ++drained;
-    CHECK(drained == 0, "no entries yet (%d), because nothing has recorded", drained);
-    CHECK(c.journalForwarded() == 0, "the daemon has forwarded none (%llu)",
-          (unsigned long long)c.journalForwarded());
-    CHECK(c.journalDropped() == 0, "and dropped none on its own hop (%llu)",
+    u32 gaps = 0, lastSeq = 0;
+    bool haveSeq = false;
+    const auto absorb = [&]() {
+        while (c.popJournal(j)) {
+            if (haveSeq && j.seq != lastSeq + 1u) gaps += j.seq - lastSeq - 1u;
+            lastSeq = j.seq;
+            haveSeq = true;
+            ++drained;
+        }
+    };
+    absorb();
+    CHECK(drained > 0,
+          "the engine's own record of what it has performed crosses the boundary "
+          "(%d entries)", drained);
+    CHECK(gaps == 0, "with every sequence number contiguous end to end (%u lost)",
+          (unsigned)gaps);
+    CHECK(c.journalForwarded() >= (u64)drained,
+          "and the daemon's forwarded counter agrees (%llu forwarded, %d drained)",
+          (unsigned long long)c.journalForwarded(), drained);
+    CHECK(c.journalDropped() == 0, "it dropped none on its own hop (%llu)",
           (unsigned long long)c.journalDropped());
     CHECK(c.engineJournalDropped() == 0,
-          "the engine's own drop counter is mirrored and reads 0 (%u) — two hops, "
+          "and the engine's own drop counter is mirrored and reads 0 (%u) — two hops, "
           "two counters, so a take can be refused on either",
           c.engineJournalDropped());
 
-    // Playing does not put anything on it either: a journal entry is a
-    // RECORDING event, and the ring must stay empty until one happens.
+    // A transport start OPENS A TAKE (§5.5): one entry, carrying the engine's own
+    // beat, forwarded across unchanged. This is the pass's beat zero, and the
+    // reason it is the engine's number and not the client's is that the client
+    // is a millisecond pump hop and a frame's jitter away from the clock.
+    const int before = drained;
     c.pushCommand(Cmd::SetPlaying, 1);
     sleepMs(150);
-    while (c.popJournal(j)) ++drained;
+    int started = 0;
+    f64 startBeat = -1.0;
+    while (c.popJournal(j)) {
+        if (haveSeq && j.seq != lastSeq + 1u) gaps += j.seq - lastSeq - 1u;
+        lastSeq = j.seq;
+        haveSeq = true;
+        ++drained;
+        if (j.kind == (u32)lat::JournalKind::TakeStart) { ++started; startBeat = j.beat; }
+    }
     c.pushCommand(Cmd::SetPlaying, 0);
-    CHECK(drained == 0, "and playing the transport does not put anything on it (%d)", drained);
-    note("the entries themselves arrive with 8f: the engine has the ring and the");
-    note("seq counter, and nothing pushes to it until there is a take to journal.");
+    CHECK(started == 1 && drained > before,
+          "starting the transport opens exactly one take on the far side "
+          "(%d TakeStart, %d new entries)", started, drained - before);
+    CHECK(startBeat >= 0.0 && gaps == 0,
+          "carrying the beat the engine began rolling from, still contiguous "
+          "(beat %.3f, %u lost)", startBeat, (unsigned)gaps);
 }
 
 // ---------------------------------------------------------------------------

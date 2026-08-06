@@ -2994,3 +2994,264 @@ save → load → save round trip the snapshot is made of.
 - **§7.6's republish cost is real and is paid on release, not per frame.** An
   edit inside an item still republishes that track's whole lane; a drag no longer
   does so once a frame. See §17.2.
+
+---
+
+## 18. 8f shipped — the performance becomes the arrangement
+
+The last milestone, and the one the whole design was built toward: play the
+Session live and the performance is an arrangement. The journal's producer side
+is in `engine.cpp`, the take builder is `src/ui/arrtake.h`, `App::pumpJournal`
+and `App::commitTake` are in `app_arrange.cpp`, the ARR chip does something, and
+`NXTAKT_DEBUG_ARRTAKE` drives the whole path with no mouse, no window and no
+audio device.
+
+**`make test` green at 607 / 100 / 523**, the four demo renders `cmp`-identical,
+ASan + UBSan clean with a 64 MB stack, every touched translation unit at zero
+warnings with the wave flags.
+
+### 18.1 THE HEADLINE GATE, measured
+
+> A session performance recorded into the arrangement renders **BIT-IDENTICALLY**
+> to the performance itself.
+
+`engine_test` §36e: launch clip A at beat 0, clip B at beat 4 (asked for at beat
+3, quantized to a bar), stop at beat 8 (asked for at 7). The pass is journalled,
+`buildTake` turns it into items, the items are published as a lane, and the two
+renders are compared over **288 256 frames — identical, first difference at
+frame -1** (no difference). Both negative controls hold: the same arrangement
+with one item moved by a **single frame** (1/24000 of a beat) is *not* identical,
+so the gate can fail; and the performance is audible from frame 0, so it is not
+passing because both renders are silent.
+
+Two things had to be exactly right for it to hold, and neither was obvious:
+
+1. **The journal stamps `sched`, not `atBeat`.** In `fireDue`, `sched` is the
+   beat the engine *scheduled* the action for (from `quantum_`, the clip's own
+   `quantumIdx` and `beat_`); `atBeat` is the sub-block beat the splitter
+   happened to notice it on, which is `sched` rounded up to a frame through
+   `beat_`'s own accumulation. Recording `sched` is what makes the identity
+   **exact rather than usually right**: an item at `start == sched` is resolved
+   by `posOrigin + ceil((sched - origin) / bps - kFrameEps)`, which is the same
+   arithmetic on the same inputs that fired the launch, so it lands on the same
+   frame by construction. A beat inferred from `atBeat` round-trips through the
+   float and only happens to come back. It is also the musical answer: items land
+   on 4.0 and 8.0 rather than on 4.0000000001.
+2. **One item per LAUNCH, offset always 0** (§18.3). Merging repeats would erase
+   a re-attack; splitting a loop into laps would invent boundaries the voice
+   never took.
+
+Nothing else was needed. In particular no epsilon, no snapping and no tolerance:
+`Voice::fade` stays exactly `1.f` for an item with no fades, the release at an
+item's end is the same `releasing = true` a `Cmd::StopTrack` sets at a boundary,
+and a clip switch inside the arrangement is the same `startVoice` with the same
+`prev` hand-over. §1's claim that the arrangement adds no signal path is what
+made this reachable; this milestone only had to avoid spending it.
+
+### 18.2 How the journal timestamps what happened
+
+`journalPush` is a free function taking `journal_`, `journalSeq_` and
+`journalDropped` **by reference**, because `engine.h` is frozen and a private
+helper cannot be declared on the class — three member functions write to the ring
+and passing the members in keeps ONE body. `seq` is burnt on every *attempted*
+push, so a refused entry leaves a hole the next entry reveals.
+
+| entry | where | stamped with |
+|---|---|---|
+| `TakeStart` | `armTransport()` (every path that starts the clock, now including `Cmd::SetPlaying 1`) | `beat_`, the beat the transport began rolling from |
+| `TakeEnd` | `Cmd::SetPlaying 0`, after every track has been let go | the beat the stop landed on |
+| `ClipOn` | `fireDue` step 3, and `armOverdub`'s record-triggered launch | `sched` |
+| `ClipOff` | `fireDue` step 3's stop branch and its empty-slot branch, `a` = the slot that was sounding | `sched` |
+| `Locate` | inside `locateTo`, before the assignment | the beat being LEFT, not the destination |
+| `LoopWrap` | the brace, in `process()` | `loopEnd`, the brace itself, not the frame-rounded beat |
+| `NoteOn` / `NoteOff` | the sub-block loop, for **armed** tracks | absolute timeline beats at the message's own frame |
+
+Three consequences worth stating because they are decisions, not details:
+
+- **`JournalKind` has no "scene", and does not need one.** A scene launch is
+  recorded as the per-track `ClipOn`s it *actually performed* — which is not the
+  same list as the slots it named, because a probability roll can decline and an
+  empty slot stops the track instead. Recording the ask would have recorded a
+  performance that did not happen.
+- **Arrangement item starts are deliberately NOT journalled.** A take records
+  what was *performed*; journalling the lane's own starts would re-commit the
+  arrangement onto itself on every pass.
+- **`ArrJournal::a` packs a note's pitch and velocity** as `pitch | vel << 8`.
+  §5.3 describes `a` as "slot / pitch / velocity, per kind" of a field that can
+  hold one of them at a time; both are 7-bit, so the packing is lossless.
+
+`prepare()` restarts the run: `journalSeq_ = 0`, `journalDropped = 0`, and the
+ring is emptied, so a re-prepare cannot hand the next take a phantom gap.
+
+### 18.3 The commit rule, including the one §5 leaves to be derived
+
+`src/ui/arrtake.h` is a **pure transform** from a run of `ArrJournal` to items
+and notes: no `App`, no `Session`, no clock. It is its own header for one reason
+— the bit-identity gate lives in `engine_test`, which links `src/audio` and
+`src/core` and not one line of the GUI, and a gate measuring a *second copy* of
+the commit rule would prove nothing about the shipping one.
+
+- **A clip that played from X to Y becomes an item at X of length Y − X**, with
+  `offset = 0` and no fades. A performance has no crossfades: the launch is the
+  attack and the stop is the engine's own declick.
+- **Consecutive repeats of one clip stay SEPARATE items, one per launch.** This
+  is the rule §5 does not state, and it is not a stylistic choice — it is the
+  bit-identity gate speaking. A relaunch calls `startVoice`: `srcPos` returns to
+  zero, the declick envelope re-attacks over 3 ms, the grain phase resets.
+  Merging two launches into one long item would erase that and play the clip's
+  own loop wrap instead, which is a different sound. Kept separate, the two items
+  fail §3.5's contiguity condition (the second's `offset` is 0, not
+  `out.offset + (in.start - out.start)`), so the scheduler relaunches on exactly
+  the beat the performer did.
+- **Conversely, a clip left running across its own loop point is ONE item.** The
+  loop belongs to the clip, not to the timeline; the item plays the same looping
+  `RtClip` for the same span and wraps where the performance wrapped. An
+  arrangement that re-derived the laps would be inventing boundaries.
+- **A `LoopWrap` or a `Locate` inside a pass ends the take there** (§5.5's rule
+  for the wrap, extended to the locate for the same reason), and the open items
+  are closed at that beat.
+- Then `arrangeRepair`, then `publishArrangementFor` — a committed take is not a
+  special kind of arrangement, so it goes through the same repair and the same
+  publisher every edit does, and a take that landed on existing material trims it.
+
+### 18.4 Refusal, and the hole that only the hook found
+
+The refusal is decided on three signals, any one of which condemns the pass:
+a **gap in `seq`** across the accumulated stream, a **change in
+`Engine::journalDropped`** across the pass, and the consumer's own
+`kMaxTakeEntries` ceiling (a pass that never ends must not grow forever; an entry
+this side refuses is exactly as lost as one the ring refused). On failure:
+discard, `LOGW`, **no undo point**, and answer #6's sentence verbatim —
+
+```
+take discarded: 3906 journal entries dropped
+```
+
+**A full ring hides its own loss, and this is worth recording because §5.3 reads
+as though it does not.** When the ring overflows it is the *newest* entries that
+are refused, so the 4095 entries drained out of it are perfectly contiguous among
+themselves and the seq check sees nothing. The jump appears only on the next
+entry the consumer reads after catching up — measured in `engine_test` §36b,
+where the gap equals the drop count **exactly** — and until then `journalDropped`
+is the only witness. That asymmetry is precisely why §5.3 publishes both.
+
+**The hole:** when the ring overflows, the `TakeEnd` can be one of the entries it
+refuses — and a pass whose terminator was lost would sit open forever, committing
+nothing and *saying nothing*, which is the silent failure §5.4 exists to prevent
+arrived at from the other side. `pumpJournal` therefore has a backstop: if a take
+is open and the transport is no longer playing, the pass is closed and judged.
+The transport's published state is a fair backstop precisely because it is not
+being used as the record — it carries no beat and decides no position, it only
+answers "is the pass still running", and every number in the take still came from
+the journal. This was found by the headless hook, not by reasoning: the first
+version of it reported `REFUSED CLEANLY` with a status line still showing the
+*previous* take's message, which is what "nothing happened at all" looks like.
+
+### 18.5 The gesture, the arm, and the override
+
+- The ARR chip latches a take at the next `TakeStart`. **Arming while the
+  transport is already rolling records nothing until the next start**, and says
+  so, because there is no `TakeStart` to record against and inventing one would
+  be the GUI stamping the recording (§5.2).
+- **Disarming mid-pass commits what was played.** It is "stop recording", not
+  "throw the take away"; the journal already holds it, stamped by the engine.
+- **Launches are recorded on every track, not only record-armed ones.** §5.1
+  words the gesture as "one or more tracks record-armed", but arm means "this
+  track is listening to an input", and a session launch is a performance gesture
+  on a track that may have no input at all — Live writes all of them. Arm still
+  gates the *note* half, consistent with the live routing: an unarmed track is
+  not listening, so it has nothing to record either.
+- **The override is KEPT across the commit** (§4.3), and that is what makes the
+  result coherent rather than a track that silently changed masters: the
+  performed tracks are still in session mode, the freshly committed lane is
+  silent under them, and Back to Arrangement — unquantized, one click — plays
+  exactly what was just recorded. `engine_test` §36f asserts all three: the flag
+  survives publishing the take's own lane, the lane is silent while it is set,
+  and after `Cmd::BackToArrangement` the recorded items play at their recorded
+  beats.
+
+### 18.6 The headless hook
+
+**`NXTAKT_DEBUG_ARRTAKE=<track>`** scripts a performance, drains the journal
+through the real `pumpJournal`, and commits through the real `commitTake` —
+then **provokes a refusal on purpose** and checks that it changed nothing:
+
+```
+NXTAKT_DEBUG_ARRTAKE: track 3 'chord' performed slots 0,2 -> 4 journal entries
+  (as drained), 0 gaps, 0 engine drops, items 0 -> 2, undo entries 0 -> 1 (EXACTLY ONE)
+  seq 0  TakeStart track -1  a 0  beat 0.000000
+  seq 1  ClipOn    track 3  a 0  beat -0.000000
+  seq 2  ClipOn    track 3  a 2  beat 4.000000
+  seq 3  ClipOff   track 3  a 2  beat 8.000000
+  item 0 uid 27  start 0.000 len 4.000 off 0.000  from clip 'chord'
+  item 1 uid 28  start 4.000 len 4.000 off 0.000  from clip 'chord'
+  arrOverride now 0x8 (track 3 OVERRIDDEN, as it should be)
+NXTAKT_DEBUG_ARRTAKE: forced overflow -> 3906 entries refused by the ring,
+  take opened (items 2 -> 2, undo 1 -> 1) REFUSED CLEANLY
+  status: take discarded: 3906 journal entries dropped
+```
+
+It drives a **private, offline `Engine`** rather than the app's own, and the
+reason is not convenience: a performance takes eight beats of wall clock, so
+`init()` would have to block for four seconds and would depend on an audio device
+existing at all, which inside gamescope it may not. It is the same `Engine`
+class, the same scheduler, the same ring, the same accumulator and the same
+commit — only the transport is local. `pumpJournal` and `commitTake` take the
+producing engine and its drop counter as parameters for exactly this reason, so
+the hook cannot verify a path the app does not take.
+
+Note the `-0.000000` on the first `ClipOn`: `nextQuantum` computes
+`ceil(fromBeat / q - kEps) * q`, so a launch at beat 0 is scheduled for a
+**negative zero**. It compares equal to 0.0 everywhere and would have printed as
+`-0.000` in every log line and inspector for the rest of that set's life;
+`buildTake` normalises it, which is why the item reads `0.000`.
+
+### 18.7 Where §5 assumed something that is not true of the code
+
+- **§5.2's three reasons are all still true, and the second was verified rather
+  than trusted:** `Ev::ClipStopped` is pushed as `{Ev::ClipStopped, ti, 0, 0.0}`
+  at every site, so it carries neither the slot nor a beat.
+- **§5.4 asks the commit to check "the daemon's own `journalDropped` (§9.5)"
+  too.** `App` reads the in-process `Engine`'s counter only, because the app does
+  not consume the journal through `EngineClient` today — the daemon's counters
+  exist, are mirrored into `SharedStateT`, and are asserted by `daemon_test`
+  §16f, but nothing on the GUI side reads them yet. **Owed** by whoever wires the
+  app onto the daemon's control region: one more term in `commitTake`'s
+  `extraDropped`, which is why that argument is a parameter rather than a read.
+- **§5.5's audio take is not wired to the timeline.** `Cmd::RecordSlot` still
+  lands its buffer in a session slot; what the journal now supplies is the
+  `TakeStart` that says which timeline beat that buffer's frame 0 corresponds to.
+  Turning a finished audio take into an arrangement item is a small step on top
+  of this and is deliberately not in this milestone, which is about launches.
+- **§5.3's "a consumer that sees `seq` jump knows exactly how many entries it
+  lost" is true only once the consumer has caught up.** See §18.4.
+- **§5.3 says the ring holds 4096; it holds 4095**, as every `lat::Ring` does —
+  one slot distinguishes full from empty. `daemon_test` already asserted this of
+  the wire ring.
+- **`ArrJournal` is 24 bytes**, as 8a already corrected in §14.
+
+### 18.8 Hand-offs
+
+- **`daemon_test` §16f was updated, and the file is 8g's.** It asserted "no
+  entries yet, because nothing has recorded" — which was true until this
+  milestone and is the assertion 8f exists to falsify. It now checks what §10.7
+  asked for instead: that the engine's record crosses the boundary, that every
+  `seq` is contiguous end to end, that both drop counters read zero, and that
+  starting the transport opens exactly one take on the far side carrying the
+  engine's own beat. Recorded here for §16.6's reason, in the other direction.
+- **`captureMidiRange` now takes the sub-block origin**, closing §15's hand-off
+  from 8b+8c ("the MIDI-take stamp still reads `beat_` as the block's start beat,
+  so it is wrong for the remainder of a block a loop wrap fell inside... belongs
+  to 8f, which owns `engine.cpp` after this"). With no brace, `origin == beat_`
+  and `posOrigin == 0` and the expression is the one it always was, term for
+  term. **The metronome, the other half of that note, is still block-start** —
+  it is cosmetic and it is not arrangement work.
+- **Still open from §17.5, in a file this milestone did not own:** a chain
+  republish owes `publishArrangeAutos(track)` in `app_devices.cpp`. The other two
+  hand-offs on that list (`reapArrangementEvent` in `pumpEngineEvents`, and
+  `Ev::AutoLaneInert` with `b = -1`) are **closed** — both lines are in
+  `app_engine.cpp` now.
+- **`pushAll` outrunning the command ring** (§15) is unchanged and still queued
+  as its own item. Measured at **zero** `command ring full` warnings on the
+  five-track demo set, which is why it has not bitten yet: the burst scales with
+  tracks × scenes.

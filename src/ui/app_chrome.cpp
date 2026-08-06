@@ -170,8 +170,17 @@ void App::drawControlBar(const Rect& r) {
         if (hot) ui_.tip = "Arrangement arm: record armed tracks onto the timeline";
         if (hot && win_.input().pressed[0]) {
             arrArm_ = !arrArm_;
-            status_ = arrArm_ ? "Arrangement arm on - recording lands on the timeline"
-                              : "Arrangement arm off";
+            if (arrArm_) {
+                status_ = "Arrangement arm on - recording lands on the timeline";
+            } else if (takeOpen_) {
+                // Disarming mid-pass is "stop recording", not "throw the take
+                // away": what has been played has been played, and the journal
+                // already holds it stamped by the engine. commitTake reports
+                // what it did, so this sets no status of its own.
+                commitTake();
+            } else {
+                status_ = "Arrangement arm off";
+            }
         }
         x = arrR.right() + 12 * s;
     }
@@ -827,6 +836,192 @@ void App::debugArrangeEdit() {
          (undo_.size() == undoBefore + (did ? 1u : 0u)) ? "EXACTLY ONE" : "WRONG COUNT");
     status_ = std::string("NXTAKT_DEBUG_ARREDIT: ") + want +
               (did ? " applied" : " refused");
+}
+
+// NXTAKT_DEBUG_ARRTAKE=<track>: the whole of §5 without a mouse.
+//
+// Scripts a session performance -- launch the track's first clip at beat 0,
+// switch to its second at beat 4, stop at beat 8 -- drains the JOURNAL the engine
+// wrote while performing it, and commits the take through the real accumulator,
+// the real buildTake and the real App::commitTake. What it prints is what a
+// screenshot cannot see: the beats the engine stamped, that the sequence numbers
+// were contiguous, the items the commit produced, and that the whole thing cost
+// EXACTLY ONE undo entry.
+//
+// It drives a PRIVATE, OFFLINE Engine rather than the app's own, and the reason
+// is not convenience. A performance takes eight beats of wall clock; init() would
+// have to block for four seconds and would depend on an audio device existing at
+// all, which inside gamescope it may not. An engine driven synchronously here
+// answers the same question in milliseconds and answers it deterministically --
+// and it is the SAME Engine class, the same scheduler, the same journal ring, so
+// nothing about the path under test is a double. Only the transport is local.
+void App::debugArrangeTake() {
+    if (arrDebugTook_) return;
+    const char* want = env("DEBUG_ARRTAKE");
+    if (!want) return;
+    arrDebugTook_ = true;
+
+    int t = 0;
+    std::sscanf(want, "%d", &t);
+    if (t < 0 || t >= (int)ses_.tracks.size()) {
+        LOGW("NXTAKT_DEBUG_ARRTAKE: no track %d", t);
+        return;
+    }
+    TrackModel& tr = ses_.tracks[(size_t)t];
+    // Two slots, so the performance has a switch in it and not merely a launch.
+    // The second falls back to the first, which still exercises a relaunch --
+    // and a relaunch is the case the commit rule is about (see arrtake.h).
+    int slotA = -1, slotB = -1;
+    for (int i = 0; i < kMaxScenes && i < (int)ses_.scenes.size(); ++i) {
+        if (!tr.slots[i].valid() || tr.slots[i].kind == ClipKind::Midi) continue;
+        if (slotA < 0) slotA = i; else if (slotB < 0) { slotB = i; break; }
+    }
+    if (slotA < 0) {
+        LOGW("NXTAKT_DEBUG_ARRTAKE: track %d has no audio clip to perform with", t);
+        return;
+    }
+    if (slotB < 0) slotB = slotA;
+
+    // The hook's own minimal ClipModel -> RtClip conversion. NOT pushClip: that
+    // one publishes note arrays, envelope sets and warp maps into tables keyed to
+    // the app's engine, and pointing those at a private engine would corrupt the
+    // bookkeeping the real audio thread depends on. Audio clips only, which is
+    // why the slot search above skips MIDI.
+    const auto rtOf = [](const ClipModel& m) {
+        RtClip rc;
+        rc.data        = m.sample->data.data();
+        rc.frames      = m.sample->frames;
+        rc.channels    = m.sample->channels;
+        rc.loopStart   = m.loopStart;
+        rc.loopEnd     = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
+        rc.clipBpm     = m.clipBpm;
+        rc.warp        = (int)m.warp;
+        rc.lengthBeats = m.lengthBeats;
+        rc.gain        = m.gain;
+        rc.loop        = m.loop;
+        rc.quantumIdx  = m.quantumIdx;
+        rc.valid       = true;
+        return rc;
+    };
+
+    Engine eng;
+    const f64 sr = 48000.0;
+    const int blk = 512;
+    eng.prepare(sr, blk);
+    const auto cmd = [&](Cmd type, i32 a = 0, i32 b = 0, f64 x = 0.0) {
+        Command c; c.type = type; c.a = a; c.b = b; c.x = x; eng.pushCommand(c);
+    };
+    cmd(Cmd::SetTempo, 0, 0, ses_.tempo);
+    cmd(Cmd::SetQuantum, 4);                       // 1 Bar, so a launch is quantized
+    { Command c; c.type = Cmd::SetClip; c.a = t; c.b = slotA; c.clip = rtOf(tr.slots[slotA]);
+      eng.pushCommand(c); }
+    if (slotB != slotA) {
+        Command c; c.type = Cmd::SetClip; c.a = t; c.b = slotB; c.clip = rtOf(tr.slots[slotB]);
+        eng.pushCommand(c);
+    }
+
+    // Arm, and only then perform: the arm is what makes the pass a take, and a
+    // pass that opened before the arm is deliberately not recorded (there is no
+    // TakeStart to record against, and inventing one would be the GUI stamping
+    // the recording -- §5.2).
+    const bool wasArmed = arrArm_;
+    arrArm_ = true;
+
+    std::vector<f32> l((size_t)blk), r((size_t)blk);
+    const f64 bps = ses_.tempo / 60.0 / sr;
+    const auto runTo = [&](f64 beat) {
+        while (eng.beat.load() < beat - 1e-9) {
+            eng.process(nullptr, nullptr, l.data(), r.data(), blk);
+            pumpJournal(eng);                       // the REAL drain, per "frame"
+        }
+    };
+    cmd(Cmd::LaunchClip, t, slotA);                 // fires at beat 0
+    runTo(3.0);
+    cmd(Cmd::LaunchClip, t, slotB);                 // asked for at 3, HAPPENS at 4
+    runTo(7.0);
+    cmd(Cmd::StopTrack, t);                         // asked for at 7, happens at 8
+    runTo(9.0);
+    cmd(Cmd::SetPlaying, 0);
+    eng.process(nullptr, nullptr, l.data(), r.data(), blk);
+
+    // What the commit will be measured against.
+    const size_t undoBefore = undo_.size();
+    const size_t itemsBefore = tr.arrange.size();
+    const u32 gapsSeen = takeGaps_;
+    const size_t entries = takeLog_.size();
+    // The pass as drained SO FAR. The terminator is the entry that triggers the
+    // commit, and the commit clears the accumulator, so it is not in this copy --
+    // its beat is the second number in the status line the commit prints.
+    std::vector<ArrJournal> log = takeLog_;
+
+    pumpJournal(eng);                               // drains the TakeEnd -> commits
+    (void)bps;
+
+    const std::vector<ArrangeClip>& v = tr.arrange;
+    LOGI("NXTAKT_DEBUG_ARRTAKE: track %d '%s' performed slots %d,%d -> %zu journal "
+         "entries (as drained), %u gaps, %u engine drops, items %zu -> %zu, "
+         "undo entries %zu -> %zu (%s)",
+         t, tr.name.c_str(), slotA, slotB, entries, (unsigned)gapsSeen,
+         (unsigned)eng.journalDropped.load(), itemsBefore, v.size(),
+         undoBefore, undo_.size(),
+         (undo_.size() == undoBefore + 1) ? "EXACTLY ONE" : "WRONG COUNT");
+    static const char* kKind[] = {"none", "TakeStart", "TakeEnd", "ClipOn", "ClipOff",
+                                  "NoteOn", "NoteOff", "Locate", "LoopWrap"};
+    for (const ArrJournal& e : log)
+        LOGI("  seq %u  %-9s track %d  a %d  beat %.6f", (unsigned)e.seq,
+             e.kind < 9 ? kKind[e.kind] : "?", e.track, e.a, e.beat);
+    for (size_t i = 0; i < v.size(); ++i)
+        LOGI("  item %zu uid %llu  start %.3f len %.3f off %.3f  from clip '%s'",
+             i, (unsigned long long)v[i].uid, v[i].start, v[i].length, v[i].offset,
+             v[i].src.name.c_str());
+    // The override is the other half of §4: the launches took the track out of
+    // the arrangement, and it STAYS out until Back to Arrangement -- which is why
+    // the commit is coherent rather than a track that silently changed masters.
+    LOGI("  arrOverride now 0x%x (track %d %s), status: %s",
+         (unsigned)eng.arrOverride.load(), t,
+         (eng.arrOverride.load() & (1u << t)) ? "OVERRIDDEN, as it should be"
+                                             : "NOT overridden - WRONG",
+         status_.c_str());
+    // --- and then the refusal, provoked on purpose --------------------------
+    //
+    // §10.6 calls this the single most important assertion in the milestone,
+    // because the failure it guards is SILENT: a take committed with four bars
+    // missing looks exactly like a performance that had four bars of rest. So
+    // the hook does not merely record a good pass, it also stalls its own drain
+    // while a second pass pours notes into the ring, and then checks that the
+    // take was thrown away whole — no items, no undo entry, and a status line
+    // that says how many entries were lost.
+    const size_t itemsGood = tr.arrange.size();
+    const size_t undoGood  = undo_.size();
+    for (int a = 0; a < 8; ++a) cmd(Cmd::TrackArm, a, 1);
+    cmd(Cmd::SetPlaying, 1);
+    eng.process(nullptr, nullptr, l.data(), r.data(), blk);
+    pumpJournal(eng);                               // the pass opens...
+    const bool opened = takeOpen_;
+    for (int b = 0; b < 4; ++b) {                   // ...and then the GUI "stalls"
+        for (int i = 0; i < 250; ++i) {
+            MidiMsg m; m.status = 0x90; m.d1 = (u8)(40 + (i % 40)); m.d2 = 100;
+            m.frame = i % blk;
+            eng.pushMidi(m);
+        }
+        eng.process(nullptr, nullptr, l.data(), r.data(), blk);
+    }
+    cmd(Cmd::SetPlaying, 0);
+    eng.process(nullptr, nullptr, l.data(), r.data(), blk);
+    const u32 enginDrops = eng.journalDropped.load();
+    pumpJournal(eng);                               // drains, sees the gap, REFUSES
+    arrArm_ = wasArmed;
+
+    LOGI("NXTAKT_DEBUG_ARRTAKE: forced overflow -> %u entries refused by the ring, "
+         "take %s (items %zu -> %zu, undo %zu -> %zu) %s",
+         (unsigned)enginDrops, opened ? "opened" : "NEVER OPENED - WRONG",
+         itemsGood, tr.arrange.size(), undoGood, undo_.size(),
+         (enginDrops > 0 && tr.arrange.size() == itemsGood && undo_.size() == undoGood)
+             ? "REFUSED CLEANLY" : "WRONG - a gapped take changed something");
+    LOGI("  status: %s", status_.c_str());
+
+    if (t < kMaxTracks) arrExpanded_[t] = true;
+    view_ = MainView::Arrangement;
 }
 
 void App::drawArrangementView(const Rect& r) {

@@ -493,6 +493,14 @@ void App::pumpEngineEvents() {
     // ended by hand.
     if (autoRec_.active() && autoRec_.gesture != ui_.active) autoRecFinish();
 
+    // The record journal (§5), drained FIRST and unconditionally. First, because
+    // a take that ended in the block this frame is reporting should be committed
+    // before anything reads the arrangement; unconditionally, because the ring is
+    // the thing that overflows and a consumer that only drained while armed would
+    // arrive at its first take with the ring already full — which §5.4 would then
+    // correctly refuse, for a reason that was the reader's fault.
+    pumpJournal();
+
     Event e;
     while (engine_.popEvent(e)) {
         // Arrangement lanes and track-automation sets retire through their own

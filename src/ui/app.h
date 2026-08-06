@@ -988,6 +988,71 @@ private:
     bool arrDebugSeeded_ = false;
     bool arrDebugEdited_ = false;
     // === end arrangement view block ========================================
+
+    // =======================================================================
+    // ARRANGEMENT RECORDING (wave 8f)   docs/ARRANGEMENT.md §5
+    //
+    // The consumer half of the record journal. The engine writes every launch,
+    // stop and discontinuity it PERFORMS into its own ring, stamped with its own
+    // beat; this drains that ring, accumulates the pass, and — on the stop —
+    // turns it into ArrangeClips. One block, appended whole; everything here is
+    // GUI thread and lives in src/ui/app_arrange.cpp beside the publishers,
+    // because committing a take ends in exactly the publish an edit ends in.
+    //
+    // The rule the whole thing hangs on (§5.4, answer #6): a pass whose journal
+    // has a GAP is REFUSED. Not committed short — a recording silently missing
+    // four bars is indistinguishable from a performance that had four bars of
+    // rest in it, and by the time the user finds out it is the only take.
+    // =======================================================================
+public:
+    // Drains popJournal() dry, EVERY frame and armed or not. Draining
+    // unconditionally is not tidiness: the ring is what overflows, and a
+    // consumer that only drains while armed would arrive at its first take with
+    // the ring already full and every entry of that take refused.
+    void pumpJournal() { pumpJournal(engine_); }
+    // ...and the same body against any engine, which is what the headless hook
+    // drives: ONE accumulate rule, so the hook cannot verify a path the app does
+    // not take. `eng` is the app's own everywhere except there.
+    void pumpJournal(Engine& eng);
+    // Turns the accumulated pass into items on each track's timeline, or refuses
+    // it. ONE undo point, at commit (§5.4): a take in flight is not a state
+    // anyone wants to undo to, and an entry per journal entry would exhaust
+    // kUndoDepth inside two bars. The argument is the producing engine's
+    // journalDropped as of now — read by the caller, because the caller is the
+    // one that knows which engine produced the pass.
+    void commitTake(u32 droppedNow);
+    void commitTake() { commitTake(engine_.journalDropped.load(std::memory_order_relaxed)); }
+
+private:
+    // The pass, as drained. The ring's capacity bounds what one frame delivers
+    // and bounds nothing about a pass, so this carries its own ceiling —
+    // 24 MB of entries, which is hours of dense playing. Reaching it is counted
+    // as a loss and refuses the take, because a consumer that quietly stopped
+    // recording is the same failure as a ring that quietly stopped accepting.
+    static constexpr size_t kMaxTakeEntries = 1u << 20;
+    std::vector<ArrJournal> takeLog_;
+    bool takeOpen_ = false;             // a TakeStart has been seen while armed
+    // Contiguity, checked over the WHOLE drained stream rather than only over
+    // what is accumulated: `seq` is monotonic per engine run, so the cheapest
+    // and strictest place to notice a gap is where the entries arrive.
+    u32  takeLastSeq_ = 0;
+    bool takeSeqValid_ = false;
+    u32  takeGaps_ = 0;                 // entries lost since the pass opened
+    // Engine::journalDropped as of the pass's opening. §5.4 wants BOTH signals —
+    // the seq gap and the counter — because a consumer that has not drained the
+    // ring can still read the counter, and because the last entries of a pass
+    // can be lost with nothing arriving afterwards to show the jump.
+    u32  takeDropBase_ = 0;
+    // Set while a take is being committed, so the publish it ends in cannot be
+    // mistaken for an edit by anything watching for one.
+    bool arrDebugTook_ = false;
+    // NXTAKT_DEBUG_ARRTAKE=<track>: scripts a session performance through a
+    // private offline Engine, drains its journal, and commits the take through
+    // the real path. The whole of §5 without a mouse, a window or an audio
+    // device — see the note on the definition for why the offline engine rather
+    // than the app's own.
+    void debugArrangeTake();
+    // === end arrangement recording block ===================================
 };
 
 } // namespace lat

@@ -140,6 +140,9 @@ bool App::init(int argc, char** argv) {
     if (!arrView_) arrView_ = std::make_unique<ArrangeView>();
     debugSeedArrangement();
     debugArrangeEdit();
+    // And 8f's (§5): a scripted performance, journalled, committed. Last of the
+    // three, so a set it seeds is the set the other two left behind.
+    debugArrangeTake();
 
     // The other headless hook: undo cannot be clicked inside gamescope, so
     // NXTAKT_DEBUG_UNDO drives the restore path here instead. See

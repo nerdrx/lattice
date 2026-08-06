@@ -6043,6 +6043,599 @@ static void testArrangementAutomation() {
 }
 
 // ---------------------------------------------------------------------------
+// 36. recording into the arrangement (docs/ARRANGEMENT.md §5, §10.6)
+//
+// The journal, the take, and THE GATE. Everything above this section is about
+// playing an arrangement; this section is about an arrangement coming into
+// existence because somebody played the session -- and the last test in it is
+// the acceptance criterion for the whole wave:
+//
+//   an arrangement and a scripted session performance of the same music must
+//   render BIT-IDENTICALLY.
+//
+// The transform under test is the SHIPPING one: src/ui/arrtake.h is what
+// App::commitTake calls, and it is included here rather than reimplemented,
+// because a test that agreed with a second copy of the rule would prove nothing
+// about the first. It is a pure function over ArrJournal with no GUI in it,
+// which is why this binary -- which links src/audio and src/core and not one
+// line of src/ui -- can reach it.
+// ---------------------------------------------------------------------------
+
+#include "../src/ui/arrtake.h"
+
+static std::vector<ArrJournal> drainJournal(Host& h) {
+    std::vector<ArrJournal> v;
+    ArrJournal j;
+    while (h.e.popJournal(j)) v.push_back(j);
+    return v;
+}
+
+static const char* kindName(u32 k) {
+    static const char* n[] = {"none", "TakeStart", "TakeEnd", "ClipOn", "ClipOff",
+                              "NoteOn", "NoteOff", "Locate", "LoopWrap"};
+    return k < 9 ? n[k] : "?";
+}
+
+static int countKind(const std::vector<ArrJournal>& v, JournalKind k) {
+    int n = 0;
+    for (const ArrJournal& e : v) if (e.kind == (u32)k) ++n;
+    return n;
+}
+
+// --- a. the journal stamps the beat the launch HAPPENED on ----------------
+//
+// The whole of §5.2 in one assertion. The command is sent at an arbitrary beat;
+// the engine quantizes it to a bar line; the journal must carry the BAR LINE,
+// exactly, and that number must convert to the very frame the audio started on.
+// A recording stamped by its reader would carry neither.
+static void jrnStampsTheLaunchBeat() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+
+    // Two block sizes that share no common boundary, for the same reason §34a
+    // measures at both: a beat that depends on the buffer size is not a beat.
+    const int blocks[2] = {64, 8192};
+    for (int k = 0; k < 2; ++k) {
+        Host h; h.init(kSR, blocks[k]);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);              // 1 Bar
+        h.setClip(0, 0, arrClip(buf));
+        h.push(Cmd::SetPlaying, 1);              // the clock has to be running for
+        h.run(kBeat120);                         // the ask and the answer to differ
+        h.push(Cmd::LaunchClip, 0, 0);           // asked for at beat ~1, HAPPENS at 4
+        h.run(6 * kBeat120);
+
+        const auto j = drainJournal(h);
+        const ArrJournal* on = nullptr;
+        for (const ArrJournal& e : j) if (e.kind == (u32)JournalKind::ClipOn) { on = &e; break; }
+        CHECK(on != nullptr, "a launch writes a ClipOn into the journal (%d entries at "
+              "%d frames per block)", (int)j.size(), blocks[k]);
+        if (!on) continue;
+        CHECK(on->beat == 4.0 && on->track == 0 && on->a == 0,
+              "and it carries the beat the ENGINE launched on, not the one the "
+              "command arrived at: beat %.9f track %d slot %d (want 4.0, 0, 0)",
+              on->beat, on->track, on->a);
+        // Sample-accurate: the beat converts to the exact frame the clip started
+        // on, at both block sizes. This is the number an arrangement item built
+        // from this entry will be resolved to by the same splitter.
+        const i64 want = (i64)std::llround(on->beat * (f64)kBeat120);
+        const i64 got  = firstWhere(h.outL, 0, nonZero);
+        CHECK(got == want, "and the beat it carries IS the frame the audio began on "
+              "(%lld, want %lld, at %d frames per block)",
+              (long long)got, (long long)want, blocks[k]);
+    }
+
+    // The transport's own entries, and the shape of a whole pass.
+    {
+        Host h; h.init();
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);
+        h.setClip(0, 0, arrClip(buf));
+        h.push(Cmd::LaunchClip, 0, 0);
+        h.run(5 * kBeat120);
+        h.push(Cmd::StopTrack, 0);               // quantized to beat 8
+        h.run(4 * kBeat120);
+        h.push(Cmd::SetPlaying, 0);
+        h.runBlocks(1);
+        const auto j = drainJournal(h);
+        CHECK(countKind(j, JournalKind::TakeStart) == 1 &&
+              countKind(j, JournalKind::TakeEnd) == 1 &&
+              countKind(j, JournalKind::ClipOn) == 1 &&
+              countKind(j, JournalKind::ClipOff) == 1,
+              "a pass is TakeStart, ClipOn, ClipOff, TakeEnd -- one of each (%d entries)",
+              (int)j.size());
+        f64 offBeat = -1.0;
+        for (const ArrJournal& e : j) if (e.kind == (u32)JournalKind::ClipOff) offBeat = e.beat;
+        CHECK(offBeat == 8.0, "and the stop is stamped with its own quantized boundary "
+              "(%.9f, want 8.0)", offBeat);
+        // The transport start is the take's beat zero, and a stop that does not
+        // rewind means a SECOND pass opens where the first one ended.
+        CHECK(j[0].kind == (u32)JournalKind::TakeStart && j[0].beat == 0.0,
+              "the pass opens with TakeStart at the beat the transport began (%s %.3f)",
+              kindName(j[0].kind), j[0].beat);
+    }
+}
+
+// --- b. sequence numbers, and a forced overflow ---------------------------
+//
+// §5.4's detector, measured on both of its faces: the seq gap and the counter
+// must report the SAME number, because they are the same fact published twice.
+static void jrnSeqIsContiguousAndAGapIsVisible() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    {
+        Host h; h.init();
+        h.push(Cmd::SetQuantum, 0);              // None: every launch fires at once
+        for (int s = 0; s < 4; ++s) h.setClip(0, s, arrClip(buf));
+        h.push(Cmd::SetPlaying, 1);
+        for (int i = 0; i < 40; ++i) { h.push(Cmd::LaunchClip, 0, i % 4); h.runBlocks(2); }
+        h.push(Cmd::SetPlaying, 0);
+        h.runBlocks(1);
+        const auto j = drainJournal(h);
+        bool contiguous = j.size() > 40;
+        for (size_t i = 1; i < j.size(); ++i)
+            if (j[i].seq != j[i - 1].seq + 1u) contiguous = false;
+        CHECK(contiguous, "forty launches produce contiguous sequence numbers "
+              "(%d entries, first %u last %u)", (int)j.size(),
+              j.empty() ? 0u : j.front().seq, j.empty() ? 0u : j.back().seq);
+        CHECK(h.e.journalDropped.load() == 0,
+              "and nothing was dropped (%u)", (unsigned)h.e.journalDropped.load());
+    }
+
+    // THE OVERFLOW. Eight armed tracks and 256 MIDI messages a block is 2048
+    // entries a block; the ring holds 4095. Three blocks with no drain overruns
+    // it, which is precisely the "the GUI stopped" case §5.3 sized it for.
+    {
+        Host h; h.init();
+        for (int t = 0; t < 8; ++t) h.push(Cmd::TrackArm, t, 1);
+        h.push(Cmd::SetPlaying, 1);
+        h.runBlocks(1);                          // let the arms land
+        for (int b = 0; b < 4; ++b) {
+            for (int i = 0; i < 250; ++i) h.pushMidi(0x90, (u8)(40 + (i % 40)), 100, i % 64);
+            h.runBlocks(1);
+        }
+        const u32 dropped = h.e.journalDropped.load();
+        CHECK(dropped > 0, "a stalled consumer overruns the journal ring (%u refused)",
+              (unsigned)dropped);
+        // What a full ring holds is the OLDEST 4095 entries, so the loss is at
+        // the END and the entries drained out of it are perfectly contiguous
+        // among themselves. That is not a weakness of the seq check, it is the
+        // asymmetry §5.3 publishes the counter for -- and the gap becomes
+        // visible the moment the consumer catches up and reads the next entry,
+        // which is what a real drain does one frame later.
+        const auto j1 = drainJournal(h);
+        u32 within = 0;
+        for (size_t i = 1; i < j1.size(); ++i)
+            if (j1[i].seq != j1[i - 1].seq + 1u) within += j1[i].seq - j1[i - 1].seq - 1u;
+        CHECK(within == 0 && !j1.empty(),
+              "a full ring holds the OLDEST entries, contiguous among themselves "
+              "(%d entries, %u internal gaps)", (int)j1.size(), (unsigned)within);
+
+        for (int i = 0; i < 4; ++i) h.pushMidi(0x90, (u8)(50 + i), 100, i);
+        h.runBlocks(1);
+        const auto j2 = drainJournal(h);
+        const u32 gap = j2.empty() ? 0u : j2[0].seq - j1.back().seq - 1u;
+        CHECK(gap == dropped,
+              "and the very next entry MEASURES the loss exactly: seq jumped %u "
+              "against %u refused pushes", (unsigned)gap, (unsigned)dropped);
+
+        // And the take built across it is REFUSED, which is the assertion the
+        // whole detector exists for.
+        std::vector<ArrJournal> all = j1;
+        all.insert(all.end(), j2.begin(), j2.end());
+        const TakeResult r = buildTake(all, 0);
+        CHECK(!r.ok && r.items.empty(),
+              "and a take over a gapped journal is REFUSED, not committed short "
+              "(ok %d, %d items, %u dropped)", (int)r.ok, (int)r.items.size(),
+              (unsigned)r.dropped);
+    }
+}
+
+// --- c. what the commit builds --------------------------------------------
+//
+// The scripted performance §10.6 asks for -- launch A at 0, B at 4, stop at 8 --
+// and then the two rules that are not in §5 and had to be derived: one item per
+// LAUNCH, and a clip left running across its own loop point is ONE item.
+// `drainPerBlock` is §10.6's "the GUI is not the clock" gate, and it is the same
+// script either way: false is a consumer that stalled for the WHOLE take and
+// drained once at the end, true is one that kept up perfectly. Both must produce
+// the same beats, because the beats are the engine's.
+static std::vector<ArrJournal> scriptedPerformance(Host& h, const std::vector<f32>& a,
+                                                   const std::vector<f32>& b,
+                                                   bool drainPerBlock = false) {
+    std::vector<ArrJournal> j;
+    const auto go = [&](i64 frames) {
+        const i64 blocks = (frames + h.block - 1) / h.block;   // == run()'s own count
+        for (i64 i = 0; i < blocks; ++i) {
+            h.runBlocks(1);
+            if (!drainPerBlock) continue;
+            ArrJournal e;
+            while (h.e.popJournal(e)) j.push_back(e);
+        }
+    };
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                  // 1 Bar
+    h.setClip(0, 0, arrClip(a));
+    h.setClip(0, 1, arrClip(b));
+    h.push(Cmd::LaunchClip, 0, 0);               // fires at beat 0
+    go(3 * kBeat120);
+    h.push(Cmd::LaunchClip, 0, 1);               // asked at 3, fires at 4
+    go(4 * kBeat120);
+    h.push(Cmd::StopTrack, 0);                   // asked at 7, fires at 8
+    go(5 * kBeat120);
+    h.push(Cmd::SetPlaying, 0);
+    go(h.block);
+    const auto tail = drainJournal(h);
+    j.insert(j.end(), tail.begin(), tail.end());
+    return j;
+}
+
+static void takeBuildsTheExpectedItems() {
+    const auto A = rampBuf(kArrFrames);
+    const auto B = dcBuf(kArrFrames, 1, 0.5f);
+
+    Host h; h.init();
+    const auto j = scriptedPerformance(h, A, B);
+    const TakeResult r = buildTake(j, h.e.journalDropped.load());
+
+    CHECK(r.ok, "a gapless pass commits (%u dropped)", (unsigned)r.dropped);
+    CHECK(r.items.size() == 2, "and the performance is two items (%d)", (int)r.items.size());
+    if (r.items.size() != 2) return;
+    const TakeItem& i0 = r.items[0];
+    const TakeItem& i1 = r.items[1];
+    CHECK(i0.track == 0 && i0.slot == 0 && i0.start == 0.0 && i0.length == 4.0 &&
+          i0.offset == 0.0,
+          "item 0: track %d slot %d start %.9f len %.9f off %.9f (want 0/0/0/4/0)",
+          i0.track, i0.slot, i0.start, i0.length, i0.offset);
+    CHECK(i1.track == 0 && i1.slot == 1 && i1.start == 4.0 && i1.length == 4.0 &&
+          i1.offset == 0.0,
+          "item 1: track %d slot %d start %.9f len %.9f off %.9f (want 0/1/4/4/0)",
+          i1.track, i1.slot, i1.start, i1.length, i1.offset);
+    // Negative zero is not "the same as zero" for anything a human reads, and
+    // nextQuantum produces one at beat 0.
+    CHECK(!std::signbit(i0.start), "and the item at beat zero is +0.0, not -0.0");
+
+    // A clip left running for three laps of its own four-beat loop is ONE item,
+    // not three: the loop belongs to the clip and the item plays the same
+    // looping RtClip for the same span.
+    {
+        Host h2; h2.init();
+        h2.push(Cmd::SetQuantum, 4);
+        RtClip c = arrClip(A);
+        c.lengthBeats = 4.0;                     // loops twice inside 8 beats
+        h2.setClip(0, 0, c);
+        h2.push(Cmd::LaunchClip, 0, 0);
+        h2.run(9 * kBeat120);
+        h2.push(Cmd::SetPlaying, 0);
+        h2.runBlocks(1);
+        const TakeResult rr = buildTake(drainJournal(h2), 0);
+        CHECK(rr.ok && rr.items.size() == 1,
+              "a clip left running across its own loop point is ONE item (%d)",
+              (int)rr.items.size());
+    }
+
+    // But a RELAUNCH of the same clip is a second item, and this is the rule the
+    // bit-identity gate dictates: a relaunch resets srcPos and re-attacks the
+    // declick envelope, so merging the two would erase an audible event.
+    {
+        Host h3; h3.init();
+        h3.push(Cmd::SetQuantum, 4);
+        h3.setClip(0, 0, arrClip(A));
+        h3.push(Cmd::LaunchClip, 0, 0);
+        h3.run(3 * kBeat120);
+        h3.push(Cmd::LaunchClip, 0, 0);          // the SAME clip again, at beat 4
+        h3.run(6 * kBeat120);
+        h3.push(Cmd::SetPlaying, 0);
+        h3.runBlocks(1);
+        const TakeResult rr = buildTake(drainJournal(h3), 0);
+        CHECK(rr.ok && rr.items.size() == 2 && rr.items[1].start == 4.0 &&
+              rr.items[1].offset == 0.0,
+              "and consecutive repeats of one clip stay SEPARATE items, each at "
+              "offset 0 (%d items)", (int)rr.items.size());
+    }
+
+    // §10.6's "the GUI is not the clock". Every other assertion in this section
+    // drains once at the end, which IS a consumer that stalled for the whole
+    // take; this one drains after every single block, and the two takes have to
+    // be identical to the last bit. Under an event-based design they would not
+    // be, because the reader's cadence would be in the numbers.
+    {
+        Host hs; hs.init();
+        const TakeResult kept = buildTake(scriptedPerformance(hs, A, B, true), 0);
+        bool same = kept.ok && kept.items.size() == r.items.size();
+        for (size_t i = 0; same && i < kept.items.size(); ++i)
+            same = kept.items[i].start == r.items[i].start &&
+                   kept.items[i].length == r.items[i].length &&
+                   kept.items[i].slot == r.items[i].slot;
+        CHECK(same, "a consumer that drains every block and one that stalls for the "
+              "whole take record the SAME beats (%d items against %d)",
+              (int)kept.items.size(), (int)r.items.size());
+    }
+
+    // A scene launch is recorded as the per-track launches it actually
+    // performed, which is why JournalKind has no "scene" of its own.
+    {
+        Host h4; h4.init();
+        h4.push(Cmd::SetQuantum, 0);
+        for (int t = 0; t < 3; ++t) h4.setClip(t, 0, arrClip(A));
+        h4.push(Cmd::LaunchScene, 0);
+        h4.run(4 * kBeat120);
+        h4.push(Cmd::SetPlaying, 0);
+        h4.runBlocks(1);
+        const TakeResult rr = buildTake(drainJournal(h4), 0);
+        bool three = rr.items.size() == 3;
+        for (size_t i = 0; i < rr.items.size(); ++i)
+            if (rr.items[i].track != (int)i || rr.items[i].start != 0.0) three = false;
+        CHECK(rr.ok && three,
+              "a scene launch commits one item per track it actually launched on (%d)",
+              (int)rr.items.size());
+    }
+}
+
+// --- d. a gap refuses the take, and leaves nothing behind -----------------
+static void takeWithAGapIsRefused() {
+    const auto A = rampBuf(kArrFrames);
+    const auto B = dcBuf(kArrFrames, 1, 0.5f);
+    Host h; h.init();
+    auto j = scriptedPerformance(h, A, B);
+    CHECK(buildTake(j, 0).ok, "the control pass commits");
+
+    // One entry removed is one entry the recording is missing, and the resulting
+    // take is exactly as plausible as the complete one -- which is the failure
+    // §5.4 is about and the reason it must be refused rather than committed.
+    for (size_t cut = 1; cut + 1 < j.size(); ++cut) {
+        std::vector<ArrJournal> holed = j;
+        holed.erase(holed.begin() + (long)cut);
+        const TakeResult r = buildTake(holed, 0);
+        CHECK(!r.ok && r.items.empty() && r.dropped == 1,
+              "dropping entry %d (%s) REFUSES the take and builds nothing "
+              "(ok %d, %d items, dropped %u)", (int)cut, kindName(j[cut].kind),
+              (int)r.ok, (int)r.items.size(), (unsigned)r.dropped);
+    }
+    // And the counter alone is enough, with no gap to see: entries lost after
+    // the last one that arrived leave the sequence looking perfect.
+    const TakeResult byCounter = buildTake(j, 7);
+    CHECK(!byCounter.ok && byCounter.dropped == 7,
+          "and journalDropped alone refuses it, with no gap to see (%u)",
+          (unsigned)byCounter.dropped);
+}
+
+// --- e. THE HEADLINE GATE --------------------------------------------------
+//
+// Play the session. Record it. Commit it. Render the arrangement. The two
+// buffers must be identical to the last bit -- not close, identical -- because
+// §1's claim is that the arrangement adds no signal path, no second mixdown, no
+// alternate voice and no rounding. A tolerance here would defeat the point.
+static void arrRecordRoundTripIsBitIdentical() {
+    const auto A = rampBuf(kArrFrames);
+    const auto B = dcBuf(kArrFrames, 1, 0.5f);
+
+    // ONE rendering routine for both halves, so the two runs differ in what is
+    // scheduled and in NOTHING else -- same block count, same commands where
+    // they can be the same, same total frames. A comparison between two runs
+    // that rendered different numbers of blocks would be about buffer lengths.
+    RtArrangement* built = nullptr;
+    std::vector<ArrJournal> journal;
+    auto render = [&](const RtArrangement* arr) {
+        Host h; h.init();
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetQuantum, 4);
+        if (arr) {
+            pushArr(h, 0, arr);
+            h.push(Cmd::SetPlaying, 1);
+        } else {
+            h.setClip(0, 0, arrClip(A));
+            h.setClip(0, 1, arrClip(B));
+            h.push(Cmd::LaunchClip, 0, 0);
+        }
+        h.run(3 * kBeat120);
+        if (!arr) h.push(Cmd::LaunchClip, 0, 1);
+        h.run(4 * kBeat120);
+        if (!arr) h.push(Cmd::StopTrack, 0);
+        h.run(5 * kBeat120);
+        // Snapshotted HERE, before either half runs the blocks the other does
+        // not: the session pass needs a stop to close its take and the
+        // arrangement needs two blocks to retire its lane, and a comparison
+        // that included either would be about buffer lengths.
+        std::vector<f32> out = h.outL;
+        if (arr) {
+            pushArr(h, 0, nullptr);
+            h.runBlocks(2);
+        } else {
+            h.push(Cmd::SetPlaying, 0);
+            h.runBlocks(1);
+            journal = drainJournal(h);
+        }
+        return out;
+    };
+
+    const std::vector<f32> performed = render(nullptr);
+
+    // The commit, through the shipping transform. The only thing done by hand is
+    // what App::commitTake does with the model and this binary has no model for:
+    // slot -> clip. Everything about WHERE and HOW LONG comes from the take.
+    const TakeResult take = buildTake(journal, 0);
+    CHECK(take.ok && take.items.size() == 2,
+          "the performance was recorded gaplessly (%d items, %u dropped)",
+          (int)take.items.size(), (unsigned)take.dropped);
+    if (!take.ok || take.items.size() != 2) return;
+
+    std::vector<RtArrItem> items;
+    for (const TakeItem& t : take.items)
+        items.push_back(arrItem(t.start, t.length, t.offset, t.slot));
+    built = mkArr(items, {arrClip(A), arrClip(B)});
+
+    const std::vector<f32> arranged = render(built);
+
+    CHECK(performed.size() == arranged.size() && sameBits(performed, arranged),
+          "THE GATE: a session performance recorded into the arrangement renders "
+          "BIT-IDENTICALLY to the performance itself (%zu vs %zu frames, first "
+          "difference at frame %lld)", performed.size(), arranged.size(),
+          (long long)firstDiff(performed, arranged));
+
+    // The negative control, so the gate is known to be capable of failing: one
+    // item moved by a single FRAME (1/24000 of a beat here) must not be
+    // identical. Without this the assertion above could be passing because both
+    // renders are silent.
+    {
+        std::vector<RtArrItem> nudged = items;
+        nudged[1].start += 1.0 / (f64)kBeat120;
+        nudged[1].length -= 1.0 / (f64)kBeat120;
+        RtArrangement* off = mkArr(nudged, {arrClip(A), arrClip(B)});
+        const std::vector<f32> late = render(off);
+        CHECK(!sameBits(performed, late),
+              "and the same arrangement one frame late is NOT identical -- the gate "
+              "can fail");
+        freeArr(off);
+    }
+    // ...and that the renders are not silent, which is the other way a
+    // bit-identity claim can be true and worthless.
+    CHECK(firstWhere(performed, 0, nonZero) == 0,
+          "and the performance is audible from frame 0 (first non-zero %lld)",
+          (long long)firstWhere(performed, 0, nonZero));
+
+    freeArr(built);
+}
+
+// --- f. the override, after a commit ---------------------------------------
+//
+// §4 and §5 meeting: the launches took the track out of the arrangement, the
+// commit gave that track a lane, and the flag is still set -- so the lane is
+// silent until Back to Arrangement, and then it plays what was just recorded.
+static void arrOverrideIsCoherentAfterCommit() {
+    const auto A = rampBuf(kArrFrames);
+    const auto B = dcBuf(kArrFrames, 1, 0.5f);
+
+    Host h; h.init();
+    const auto j = scriptedPerformance(h, A, B);
+    CHECK((h.e.arrOverride.load() & 1u) != 0,
+          "the performance left track 0 overridden (0x%x)",
+          (unsigned)h.e.arrOverride.load());
+
+    const TakeResult take = buildTake(j, 0);
+    CHECK(take.ok && take.items.size() == 2, "and it committed two items");
+    if (!take.ok) return;
+    std::vector<RtArrItem> items;
+    for (const TakeItem& t : take.items)
+        items.push_back(arrItem(t.start, t.length, t.offset, t.slot));
+    RtArrangement* lane = mkArr(items, {arrClip(A), arrClip(B)});
+
+    // Publishing the committed lane does NOT clear the flag: a republish is an
+    // edit, not a statement about the performance (§4.3's table).
+    pushArr(h, 0, lane);
+    h.push(Cmd::Locate, 0, 0, 0.0);
+    h.push(Cmd::SetPlaying, 1);
+    const size_t silentMark = h.outL.size();
+    h.run(2 * kBeat120);
+    CHECK((h.e.arrOverride.load() & 1u) != 0,
+          "publishing the take's own lane leaves the override set (0x%x)",
+          (unsigned)h.e.arrOverride.load());
+    const f32 silent = levelAt(h.outL, (i64)silentMark + (i64)(1.5 * (f64)kBeat120));
+    CHECK(std::fabs(silent) < 1e-6f,
+          "so the recorded lane is silent while the track is overridden (%.6f)",
+          (double)silent);
+
+    // ...and Back to Arrangement plays exactly what was just recorded. Beat 1
+    // is inside item 0 (the ramp), beat 5 is inside item 1 (DC at 0.5).
+    h.push(Cmd::BackToArrangement, -1);
+    h.push(Cmd::Locate, 0, 0, 0.0);
+    const size_t mark = h.outL.size();
+    h.run(7 * kBeat120);
+    CHECK(h.e.arrOverride.load() == 0, "Back to Arrangement clears it (0x%x)",
+          (unsigned)h.e.arrOverride.load());
+    const f32 atOne  = levelAt(h.outL, (i64)mark + kBeat120);
+    const f32 atFive = levelAt(h.outL, (i64)mark + 5 * kBeat120);
+    CHECK(std::fabs(atOne - rampAtBeat(1.0)) < 2e-3f,
+          "and the recorded lane plays the first clip at beat 1 (%.4f, want %.4f)",
+          (double)atOne, (double)rampAtBeat(1.0));
+    CHECK(std::fabs(atFive - 0.5f) < 2e-3f,
+          "and the second at beat 5 (%.4f, want 0.5)", (double)atFive);
+
+    pushArr(h, 0, nullptr);
+    h.runBlocks(2);
+    freeArr(lane);
+}
+
+// --- g. notes, and the beat they were played on ---------------------------
+static void jrnStampsNotes() {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::TrackArm, 0, 1);
+    h.push(Cmd::SetPlaying, 1);
+    h.runBlocks(1);
+
+    // A message pushed between two process() calls is drained at the head of the
+    // next block, so its frame offset is measured from that block's own start —
+    // which makes the beat it must be stamped with exactly computable, and is
+    // the point of the assertion. kBlock does not divide a beat at 120 BPM, so
+    // the numbers below are deliberately not round ones: a stamp that were
+    // rounded to a beat, a block or a bar would fail this.
+    // The absolute frame each message lands on is the frames already rendered
+    // (the transport has been rolling since frame 0) plus its own offset, read
+    // from the output rather than counted, so the expectation cannot drift.
+    const int onFrame = 33;
+    h.runBlocks(94);
+    const f64 wantOn = (f64)((i64)h.outL.size() + onFrame) / (f64)kBeat120;
+    h.pushMidi(0x90, 60, 100, onFrame);
+    h.runBlocks(137);
+    const f64 wantOff = (f64)(i64)h.outL.size() / (f64)kBeat120;
+    h.pushMidi(0x80, 60, 0, 0);
+    h.runBlocks(2);
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(1);
+
+    const auto j = drainJournal(h);
+    const TakeResult r = buildTake(j, 0);
+    CHECK(r.ok && r.notes.size() == 1, "an armed track's notes are journalled (%d)",
+          (int)r.notes.size());
+    if (r.notes.empty()) return;
+    const TakeNote& n = r.notes[0];
+    CHECK(n.track == 0 && n.pitch == 60 && n.vel == 100,
+          "with pitch and velocity intact (track %d pitch %d vel %d)",
+          n.track, (int)n.pitch, (int)n.vel);
+    CHECK(std::fabs(n.beat - wantOn) < 1e-9 &&
+          std::fabs((n.beat + n.len) - wantOff) < 1e-9,
+          "at the beat the ENGINE saw it, in absolute timeline beats, to the FRAME "
+          "(beat %.9f want %.9f, ends %.9f want %.9f)",
+          n.beat, wantOn, n.beat + n.len, wantOff);
+}
+
+// --- h. a discontinuity ends the take (§5.5) ------------------------------
+static void takeEndsAtADiscontinuity() {
+    const auto A = rampBuf(kArrFrames);
+    Host h; h.init();
+    h.push(Cmd::SetQuantum, 4);
+    h.setClip(0, 0, arrClip(A));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(5 * kBeat120);
+    h.push(Cmd::Locate, 0, 0, 32.0);              // jumps away at beat ~5
+    h.run(2 * kBeat120);
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(1);
+
+    const TakeResult r = buildTake(drainJournal(h), 0);
+    CHECK(r.ok && r.end == TakeResult::End::Locate,
+          "a locate inside a pass ends the take there (end %d)", (int)r.end);
+    CHECK(r.items.size() == 1 && r.items[0].start == 0.0 &&
+          std::fabs(r.items[0].length - r.endBeat) < 1e-9,
+          "and the open item is closed at the beat the take was cut on "
+          "(%d items, len %.6f, cut %.6f)", (int)r.items.size(),
+          r.items.empty() ? 0.0 : r.items[0].length, r.endBeat);
+}
+
+static void testArrangementRecording() {
+    banner("36. recording into the arrangement");
+    note("The journal is the record, and the record has to be exact enough that "
+         "playing it back IS the performance.");
+    jrnStampsTheLaunchBeat();
+    jrnSeqIsContiguousAndAGapIsVisible();
+    takeBuildsTheExpectedItems();
+    takeWithAGapIsRefused();
+    arrRecordRoundTripIsBitIdentical();
+    arrOverrideIsCoherentAfterCommit();
+    jrnStampsNotes();
+    takeEndsAtADiscontinuity();
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -6085,6 +6678,7 @@ int main() {
     testArrangementTypes();
     testArrangementScheduler();
     testArrangementAutomation();
+    testArrangementRecording();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

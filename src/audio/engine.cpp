@@ -1370,6 +1370,41 @@ void arrRecomputeAnyLane(ArrState& s) {
         if (a.arr && a.arr->itemCount > 0) { s.anyLane = true; return; }
 }
 
+// ---------------------------------------------------------------------------
+// The record journal's producer side (§5.3, §5.4).
+//
+// A free function taking the three members by reference, because engine.h is
+// FROZEN and a private helper cannot be declared on the class: the ring, the
+// sequence counter and the drop counter are private, so only a member function
+// can name them, and this is called from three of them (drainCommands, fireDue,
+// process). Passing them in is the whole of the workaround, and it keeps ONE
+// body — which matters here for the same reason it matters for startVoice: `seq`
+// must be burnt on a refused push exactly as it is on an accepted one, and two
+// copies of that rule would eventually disagree.
+//
+// THE INVARIANT, and the reason a gap is detectable at all: `seq` increments on
+// every ATTEMPTED push. A refused entry burns its number, so the consumer sees
+// the next entry arrive with a sequence that jumped, and the size of the jump IS
+// the number of entries lost. `journalDropped` says the same thing a second time
+// (§5.3) for a consumer that has not drained the ring yet -- relaxed, because it
+// is a monotonic counter read for a report and never for control.
+//
+// Realtime cost: a 24-byte store into a preallocated ring. No allocation, no
+// lock, no syscall, and nothing on this path touches the samples -- a take being
+// recorded and the same performance not being recorded render identically,
+// which is what makes the bit-identity gate a statement about the SCHEDULER.
+inline void journalPush(Ring<ArrJournal, 4096>& ring, u32& seq,
+                        std::atomic<u32>& dropped,
+                        JournalKind kind, i32 track, i32 a, f64 beat) {
+    ArrJournal j;
+    j.kind  = (u32)kind;
+    j.seq   = seq++;
+    j.track = track;
+    j.a     = a;
+    j.beat  = beat;
+    if (!ring.push(j)) dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace
 
 // Track::fireBeat does double duty, and this is the one place to look for why.
@@ -1433,6 +1468,15 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
         LOGW("engine: no slot for arrangement state; the arrangement will not play");
     arrOverride.store(0, std::memory_order_relaxed);
     beat_ = 0.0;
+
+    // The journal is "monotonic per engine run" (engine.h), so a re-prepare is a
+    // new run: the sequence restarts at zero, the drop counter clears, and
+    // anything the last run left in the ring is thrown away here rather than
+    // being handed to the next take as a phantom gap. GUI thread, before the
+    // audio thread exists, exactly like the three acquires above.
+    journalSeq_ = 0;
+    journalDropped.store(0, std::memory_order_relaxed);
+    { ArrJournal j; while (journal_.pop(j)) {} }
 
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
@@ -1550,6 +1594,12 @@ void Engine::drainCommands() {
     AutoState* aut = autoFind(this);
     ArrState* as = arrFind(this);
 
+    // The record journal (§5.3). One spelling per member function that writes to
+    // it; see journalPush above for why it is a free function.
+    auto jrn = [&](JournalKind k, i32 track, i32 a, f64 beat) {
+        journalPush(journal_, journalSeq_, journalDropped, k, track, a, beat);
+    };
+
     // Every discontinuity in the timeline is these three steps (§3.6), and they
     // are written once so the loop brace's internal locate, Cmd::Locate, the
     // second stop and the transport starting cannot drift apart:
@@ -1569,6 +1619,11 @@ void Engine::drainCommands() {
             if (t.voice.active) flushOffs(t, t.voice, 0);
             if (t.prev.active)  flushOffs(t, t.prev, 0);
         }
+        // Journalled BEFORE the assignment and stamped with the beat we are
+        // leaving, not the one we are going to: a take is a stretch of timeline,
+        // and what a consumer has to know is where the stretch was cut. The
+        // destination is not lost -- the entries after this one carry it.
+        jrn(JournalKind::Locate, -1, 0, beat_);
         if (as) for (auto& a : as->t) a.reseek = true;
         beat_ = (to >= 0.0) ? to : 0.0;          // NaN lands at zero too
     };
@@ -1581,6 +1636,12 @@ void Engine::drainCommands() {
     auto armTransport = [&]() {
         playing_ = true;
         if (as) for (auto& a : as->t) a.reseek = true;
+        // The take's beat zero (§5.5): the beat the transport actually began
+        // rolling from, which on a stop-and-resume is where the stop left it and
+        // not zero. Every path that starts the clock comes through here -- a
+        // launch, a scene, a take, and Cmd::SetPlaying 1 -- so the pass has
+        // exactly one opening entry however it was started.
+        jrn(JournalKind::TakeStart, -1, 0, beat_);
     };
 
     // Retiring a lane, and the ONE place the arrangement's protocol is not
@@ -1688,12 +1749,18 @@ void Engine::drainCommands() {
                 // marked for a re-seek so that starting again resumes whatever
                 // covers beat_, mid-item.
                 if (as) for (auto& a : as->t) { a.playing = -1; a.prev = -1; a.reseek = true; }
+                // LAST, after every clip on every track has been let go, so the
+                // pass's closing entry is genuinely the last thing in it. The
+                // beat is where the transport stopped, which is what open items
+                // are closed against (§5.5's "unmatched ons closed at TakeEnd").
+                jrn(JournalKind::TakeEnd, -1, 0, stopBeat);
                 evts_.push({Ev::TransportStopped, 0, 0, 0.0});
             } else if (!playing_) {
-                playing_ = true;
                 // beat_ stays: starting resumes the timeline where the stop left
-                // it, which is the other half of "stop does not rewind".
-                if (as) for (auto& a : as->t) a.reseek = true;
+                // it, which is the other half of "stop does not rewind". Through
+                // armTransport rather than beside it, so a take started with the
+                // transport button opens exactly as one started with a launch.
+                armTransport();
             }
             break;
         case Cmd::SetTempo:     tempo_ = clampv(c.x, 20.0, 999.0); break;
@@ -2080,6 +2147,32 @@ void Engine::drainCommands() {
 void Engine::fireDue(f64 atBeat) {
     ArrState* as = arrFind(this);
 
+    // The record journal (§5.3), and the reason this milestone exists: THIS is
+    // where a launch happens, so this is where a launch is written down.
+    //
+    // Every entry below is stamped with `sched` -- the beat the ENGINE decided
+    // the action lands on, computed in drainCommands from quantum_, the clip's
+    // own quantumIdx and beat_ -- and NOT with `atBeat`, the sub-block beat the
+    // splitter happened to notice it on. The two differ by up to a frame's worth
+    // of accumulated float, and the difference is the whole point twice over:
+    //
+    //   * musically, `sched` is the grid line, so a performance recorded at 140
+    //     BPM commits items at 4.0 and 8.0 rather than at 4.0000000001;
+    //   * exactly, `sched` is the number the sub-block splitter is FED. An
+    //     arrangement item at start == sched therefore resolves to the identical
+    //     frame -- `posOrigin + ceil((sched - origin) / bps - kFrameEps)` is the
+    //     same arithmetic on the same inputs -- which is what makes an
+    //     arrangement built from a performance render bit-identically to it.
+    //     A beat inferred from atBeat would round-trip through beat_'s own
+    //     accumulation and only usually come back to the same frame.
+    //
+    // Arrangement item starts are deliberately NOT journalled: a take records
+    // what was PERFORMED, and an item the arrangement is already playing would
+    // otherwise be committed a second time on every pass.
+    auto jrn = [&](JournalKind k, i32 track, i32 a, f64 beat) {
+        journalPush(journal_, journalSeq_, journalDropped, k, track, a, beat);
+    };
+
     // §4.2. THE override is set HERE — at the quantized launch the engine itself
     // computed from quantum_, the clip's own quantumIdx and beat_ — and not in
     // drainCommands when the command arrived, and emphatically not in the GUI
@@ -2130,6 +2223,11 @@ void Engine::fireDue(f64 atBeat) {
         // timer when nothing is, or this launch would eat that queued action.
         if (t.queued == -2) t.fireBeat = followDueBeat(*c, sched);
         evts_.push({Ev::ClipStarted, ti, slot, atBeat});
+        // A record-triggered launch is a launch the engine performed, so it goes
+        // in the journal like any other. It is also the one launch the GUI never
+        // asked for, which is precisely why the record cannot be made of what
+        // the GUI asked for.
+        jrn(JournalKind::ClipOn, ti, slot, sched);
     };
 
     // 1. Recording boundaries. Independent of clip scheduling, but on the same
@@ -2217,16 +2315,28 @@ void Engine::fireDue(f64 atBeat) {
         const f64 sched = t.fireBeat;
 
         if (t.queued == -1) {
+            // The slot that was sounding, read before it is cleared: `a` on a
+            // ClipOff names WHICH clip stopped, so a consumer can pair it with
+            // its own ClipOn instead of guessing from ordering. -1 when a queued
+            // launch was superseded by a stop before it ever fired, which is
+            // still an action the engine performed and still worth recording.
+            const int was = t.playing;
             if (t.voice.active) t.voice.releasing = true;
             t.playing = -1;
             t.fireBeat = kNoFollow;
             evts_.push({Ev::TrackStopped, ti, 0, atBeat});
+            jrn(JournalKind::ClipOff, ti, was, sched);
         } else {
             const RtClip& cl = clips_[ti][t.queued];
             if (!cl.valid) {
+                const int was = t.playing;
                 if (t.voice.active) t.voice.releasing = true;
                 t.playing = -1;
                 t.fireBeat = kNoFollow;
+                // A launch into an empty slot silences the track (the scene rule
+                // in drainCommands sends this shape too), so the journal records
+                // what happened -- a stop -- and not what was asked for.
+                jrn(JournalKind::ClipOff, ti, was, sched);
             } else if (!rollLaunch(cl, ti, t.queued, sched)) {
                 // A failed roll is a no-op, not a stop: whatever is playing
                 // keeps playing. Restart that clip's follow timer from this
@@ -2243,6 +2353,12 @@ void Engine::fireDue(f64 atBeat) {
                 t.playing = t.queued;
                 t.fireBeat = followDueBeat(cl, sched);
                 evts_.push({Ev::ClipStarted, ti, t.queued, atBeat});
+                // The record. A scene launch reaches here once per track it
+                // actually launched a clip on -- which is why JournalKind has no
+                // "scene": a scene is not a thing that sounds, the per-track
+                // launches it resolved into are, and a probability roll or an
+                // empty slot means the two are not the same list.
+                jrn(JournalKind::ClipOn, ti, t.queued, sched);
             }
         }
         t.queued = -2;
@@ -3052,6 +3168,12 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     // in the buffer is the raw input: monitoring is a listening path, the take
     // is the source, and putting the chain between them would bake the devices
     // into the recording.
+    // The record journal (§5.3) once more, for the two things only process()
+    // knows: the loop brace, and the notes an armed track is being played.
+    auto jrn = [&](JournalKind k, i32 track, i32 a, f64 beat) {
+        journalPush(journal_, journalSeq_, journalDropped, k, track, a, beat);
+    };
+
     auto captureRange = [&](int from, int to) {
         for (int ti = 0; ti < kMaxTracks; ++ti) {
             Track& t = tracks_[ti];
@@ -3078,7 +3200,15 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     // stream of messages into clip material. It shares the sub-block loop with
     // the audio path for the same reason: a take must begin and end on the exact
     // frame its grid line falls on, not merely on a block boundary.
-    auto captureMidiRange = [&](int from, int to) {
+    // `origin` is the timeline beat at frame `posOrigin` (see the sub-block loop
+    // below). It is passed in rather than read from beat_ because a loop wrap
+    // moves the block's origin part-way through the block, and beat_ is still the
+    // block's START beat until the loop ends -- so a take stamped against beat_
+    // is a whole lap wrong for the remainder of any block a wrap fell inside.
+    // With no brace, origin == beat_ and posOrigin == 0 and every expression
+    // below is the one it has always been, term for term. (§15's hand-off from
+    // 8b+8c, which named this file's next owner as the one to fold it in.)
+    auto captureMidiRange = [&](int from, int to, f64 origin, int posOrigin) {
         if (midiCount == 0) return;
         const f64 bpf = tempo_ / 60.0 / sr_;
         for (int ti = 0; ti < kMaxTracks; ++ti) {
@@ -3118,7 +3248,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                 if (oc) {
                     at = wrapBeat(t.voice.beatPos - (f64)(to - fr) * bpf, loopLen);
                 } else {
-                    at = beat_ + (f64)fr * bpf - t.recStartBeat;
+                    at = origin + (f64)(fr - posOrigin) * bpf - t.recStartBeat;
                     if (at < 0.0) at = 0.0;
                 }
                 const u8 pitch = (u8)(m.d1 & 0x7F);
@@ -3178,6 +3308,49 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
         }
     };
 
+    // The journal's note half (§5.3, §5.5's MIDI take). Deliberately NOT folded
+    // into captureMidiRange above: that one writes into a GUI-owned buffer lent
+    // for one session take into one slot, and this one records what an armed
+    // track was PLAYED, whether or not any slot is recording. They share the
+    // sub-block loop and nothing else.
+    //
+    // The beat is absolute timeline beats at the message's own frame -- not
+    // clip-relative and not take-relative -- because that is the number the
+    // arrangement is indexed by, and because the journal's whole claim is that
+    // its timestamps are the engine's, taken where the engine already knows the
+    // answer. Armed tracks only, consistent with the live routing: an unarmed
+    // track is not listening, so it has nothing to record either.
+    auto journalMidiRange = [&](int from, int to, f64 origin, int posOrigin) {
+        if (midiCount == 0) return;
+        const f64 bpf = tempo_ / 60.0 / sr_;
+        bool anyArmed = false;
+        for (const auto& t : tracks_) if (t.arm) { anyArmed = true; break; }
+        if (!anyArmed) return;
+        for (int mi = 0; mi < midiCount; ++mi) {
+            const MidiMsg& m = midi[mi];
+            const int fr = clampv((int)m.frame, 0, n - 1);
+            if (fr < from || fr >= to) continue;
+            const u8 hi = (u8)(m.status & 0xF0);
+            if (hi != 0x90 && hi != 0x80) continue;
+            const u8 pitch = (u8)(m.d1 & 0x7F);
+            const u8 vel   = (u8)(m.d2 & 0x7F);
+            // Note-on with velocity 0 is a note-off; every source that bothers
+            // with running status sends them that way, and captureMidiRange
+            // already reads them so.
+            const bool on = (hi == 0x90 && m.d2 > 0);
+            // `a` carries pitch in the low byte and velocity in the next, which
+            // is the one place ArrJournal's single i32 has to hold two numbers
+            // (§5.3 says "slot / pitch / velocity, per kind" of a field that can
+            // only be one of them at a time). Both are 7-bit, so the packing is
+            // lossless and a consumer that only wants the pitch masks with 0x7F.
+            const i32 a = on ? ((i32)pitch | ((i32)vel << 8)) : (i32)pitch;
+            const f64 at = origin + (f64)(fr - posOrigin) * bpf;
+            for (int ti = 0; ti < kMaxTracks; ++ti)
+                if (tracks_[ti].arm)
+                    jrn(on ? JournalKind::NoteOn : JournalKind::NoteOff, ti, a, at);
+        }
+    };
+
     if (playing_) {
         const f64 bps = tempo_ / 60.0 / sr_;
         // The timeline is affine in the frame index only BETWEEN loop wraps, so
@@ -3203,6 +3376,13 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                     if (t.prev.active)  flushOffs(t, t.prev, pos);
                     as->t[ti].reseek = true;
                 }
+                // Stamped with the BRACE and not with curBeat: the wrap is the
+                // brace's own boundary, curBeat is that boundary rounded up to a
+                // frame, and a take that ends at the brace should end at the
+                // number the user drew (§5.5 -- for wave 8 a wrap ends the take
+                // there and commits it, which is honest and defensible; overdub
+                // onto existing material is §11).
+                jrn(JournalKind::LoopWrap, -1, 0, as->loopEnd);
                 origin    = as->loopStart;
                 posOrigin = pos;
                 curBeat   = origin;
@@ -3277,7 +3457,8 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
 
             renderRange(outL, outR, pos, upto);
             captureRange(pos, upto);
-            captureMidiRange(pos, upto);
+            captureMidiRange(pos, upto, origin, posOrigin);
+            journalMidiRange(pos, upto, origin, posOrigin);
             pos = upto;
         }
         beat_ = origin + (f64)(n - posOrigin) * bps;
