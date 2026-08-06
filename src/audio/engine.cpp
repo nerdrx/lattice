@@ -825,11 +825,26 @@ namespace {
 // being republished (a different pointer), the transport stopping (the voice
 // releases and dies). Cmd::SetChain is the one trigger that cannot be derived
 // from the set pointer, and it is handled where it happens, before the swap.
+// Which pass claimed a device-parameter hold (§6.5). One parameter has one
+// storage slot in the plugin, so two containers can claim it and the write-back
+// is owed exactly once — when the last claim goes away.
+constexpr u32 kClaimClip = 1u << 0;
+constexpr u32 kClaimArr  = 1u << 1;
+constexpr u32 kClaimAll  = kClaimClip | kClaimArr;
+
 struct AutoTrack {
-    const RtAutoSet* set = nullptr;
-    u32 inert = 0;
-    struct Hold { i32 devSlot = -1; i32 param = -1; f32 was = 0.f; bool used = false; };
-    Hold hold[kMaxRtAutoLanes];
+    const RtAutoSet*  set    = nullptr;    // the clip envelope set, as before
+    const RtAutoSetN* arrSet = nullptr;    // the track's arrangement lanes, as published
+    const RtAutoSetN* arrApplied = nullptr;// ... and the one actually applying
+    u32 inert    = 0;                      // clip lanes given up on
+    u32 arrInert = 0;                      // arrangement lanes given up on (32 of them)
+    // Keyed by the PARAMETER and not by the lane. The old table was indexed by
+    // lane index, which is ambiguous the moment two containers have lanes: lane
+    // 3 of the clip set and lane 3 of the arrangement set are different lanes
+    // and may name different parameters. `claims` is what turns that into one
+    // entry with two owners.
+    struct Hold { i32 devSlot = -1; i32 param = -1; f32 was = 0.f; u32 claims = 0; };
+    Hold hold[kMaxRtAutoLanes + kMaxRtArrLanes];
     bool anyHold = false;
 };
 
@@ -895,26 +910,44 @@ AutoState* autoAcquire(const Engine* e) {
 // any: a parameter the incoming set marks kAutoOverridden is *dropped* rather
 // than written back, because the user's hand on the knob is the newer statement
 // (§3.6) and the value they are dragging must not be stamped over.
-void autoRestore(AutoTrack& at, const RtChain* chain, const RtAutoSet* fresh) {
+// `mask` says WHICH pass is releasing; the write-back happens only when the last
+// claim on a parameter goes away, because the other pass is still driving it and
+// stamping the pre-automation value over its output would be a jump. `fresh` is
+// the incoming lane array of the releasing pass, as a pointer and a count so
+// that both containers reach the same body.
+void autoRestore(AutoTrack& at, const RtChain* chain, const RtAutoLane* fresh, int freshLanes,
+                 u32 mask) {
     if (!at.anyHold) return;
-    const int freshLanes =
-        fresh ? (fresh->laneCount < kMaxRtAutoLanes ? fresh->laneCount : kMaxRtAutoLanes) : 0;
+    bool any = false;
     for (auto& h : at.hold) {
-        if (!h.used) continue;
+        if (!(h.claims & mask)) { any = any || h.claims != 0; continue; }
+        h.claims &= ~mask;
+        if (h.claims) { any = true; continue; }        // the other pass still has it
         bool overridden = false;
         for (int i = 0; i < freshLanes; ++i) {
-            const RtAutoLane& l = fresh->lanes[i];
+            const RtAutoLane& l = fresh[i];
             if (l.target == (i32)AutoTarget::DeviceParam && l.devSlot == h.devSlot &&
                 l.index == h.param && (l.flags & kAutoOverridden)) { overridden = true; break; }
         }
         if (!overridden && chain && h.devSlot >= 0 && h.devSlot < kMaxChainFx &&
             h.devSlot < chain->count)
             if (PluginInstance* fx = chain->fx[h.devSlot]) fx->setParamRT(h.param, h.was);
-        h.used = false;
         h.devSlot = -1;
         h.param = -1;
     }
-    at.anyHold = false;
+    at.anyHold = any;
+}
+
+// The entry for one (devSlot, param), created on first claim. Bounded by the
+// table's own width — a track whose two containers between them automate more
+// than 48 distinct device parameters simply stops holding the 49th, which costs
+// a restore and never a write out of bounds.
+AutoTrack::Hold* holdFor(AutoTrack& at, i32 devSlot, i32 param) {
+    for (auto& h : at.hold)
+        if (h.claims && h.devSlot == devSlot && h.param == param) return &h;
+    for (auto& h : at.hold)
+        if (!h.claims) { h.devSlot = devSlot; h.param = param; return &h; }
+    return nullptr;
 }
 
 // What one block of class-A automation says about one track. Block-local: it is
@@ -1164,6 +1197,181 @@ void pdcFlush(Pdc& p, int lineIdx, int n) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// the arrangement scheduler (docs/ARRANGEMENT.md §3, §4)
+//
+// The engine's whole arrangement job is to answer, per track, "which clip should
+// be on the primary voice right now, and at what offset". That is a SCHEDULER
+// and not a renderer: an item starting calls the same startVoice a queued
+// session launch calls, at a sub-block boundary computed by the same
+// consider/fireDue loop, against the same RtClip layout. Nothing about voice
+// rendering, warping, grain scheduling, the declick envelope, note-off
+// bookkeeping, the fx chain, delay compensation or the mixdown changes.
+//
+// COST, and it is the whole point: O(1) per block, O(log n) per discontinuity.
+// Per block per track this compares beat_ against two doubles — items[next].start
+// and the end of the item currently playing — and `next` only ever advances. A
+// locate, a loop wrap or a Back to Arrangement re-seeks with a bisection over
+// items[].start, which is legal only because §2.3's overlap invariant holds and
+// is why that invariant is validated at the process boundary (§9.4) rather than
+// assumed.
+//
+// WHERE THE STATE LIVES. In a side table keyed by the Engine's address, exactly
+// as Pdc, PendingEv and AutoState above already do, and for exactly the reason
+// those three give: engine.h is the daemon's contract and does not thaw
+// casually. Claimed in prepare() on the GUI thread; read and written only by the
+// audio thread afterwards.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// §3.5 condition (2). Beats and not frames, so a warped clip continues if and
+// only if its beat map is continuous across the boundary — which is the correct
+// question to ask of a warped clip.
+constexpr f64 kContinuityEps = 1e-9;
+
+struct ArrTrack {
+    const RtArrangement* arr = nullptr;
+    int  next    = 0;      // index of the next item that will start
+    int  playing = -1;     // index the primary voice is on, -1 = none
+    int  prev    = -1;     // index Track::prev is on, -1 = none
+    // §4. Set at the QUANTIZED launch the engine itself computes (fireDue), not
+    // when the command arrives and emphatically not when the user clicks: the
+    // GUI does not own the clock, so it cannot own a flag whose meaning is "as
+    // of a particular beat".
+    bool override_ = false;
+    // A discontinuity is pending: re-bisect this lane against the next beat
+    // fireDue is called with, and resume whatever item covers it, mid-item. Set
+    // by Cmd::Locate, by the loop brace, by transport start, by
+    // Cmd::BackToArrangement and by a republished lane; consumed once.
+    bool reseek = false;
+};
+
+struct ArrState {
+    ArrTrack t[kMaxTracks];
+    // The transport cell (Cmd::SetArrangement with a = -1). Held so the
+    // displaced pointer can be retired exactly as a track's lane is.
+    const RtArrangement* transport = nullptr;
+    f64  loopStart = 0.0, loopEnd = 0.0;
+    bool loopOn  = false;
+    // "Does any track have a lane at all." The per-sub-block fade and boundary
+    // work is skipped wholesale when this is false, which is what keeps a
+    // session-only render taking the arithmetic it takes today.
+    bool anyLane = false;
+
+    // Lanes displaced but not yet safe to free (see arrHolds and the parking
+    // note in drainCommands). Eight is far past what a 6 ms declick tail can
+    // keep outstanding.
+    static constexpr int kParked = 8;
+    const RtArrangement* parked[kParked] = {};
+    i32 parkedAt[kParked] = {};        // the cell each was published to
+
+    // startVoiceAt's third argument, in transit.
+    //
+    // §3.4 names the facility startVoiceAt(Track&, const RtClip&, f64 clipBeat)
+    // and describes it as "the same body with the beat seeded", so that
+    // startVoice(t, c) becomes startVoiceAt(t, c, 0.0) and a session launch stays
+    // bit-identical because it is the same function with the argument the old one
+    // implied. engine.h is FROZEN and Track is a private nested type, so the
+    // third parameter cannot be added to the declaration and the function cannot
+    // be written outside the class. Passing it here — set immediately before the
+    // call, consumed and cleared inside startVoice — keeps the ONE body the
+    // bit-identity argument rests on instead of forking a second copy of it.
+    // Audio thread only, and its lifetime is a single call.
+    f64 seek = 0.0;
+};
+
+struct ArrTable {
+    static constexpr int kSlots = 4;   // app, daemon, renderer, tests: one each
+    std::atomic<const Engine*> owner[kSlots];
+    ArrState* slot[kSlots]  = {};
+    u64       stamp[kSlots] = {};
+    u64       clock = 0;
+    ~ArrTable() { for (auto*& p : slot) { delete p; p = nullptr; } }
+};
+ArrTable gArr;
+
+// Audio thread: a handful of pointer compares. Null => never prepared, which
+// every caller reads as "this engine plays no arrangement".
+ArrState* arrFind(const Engine* e) {
+    for (int i = 0; i < ArrTable::kSlots; ++i)
+        if (gArr.owner[i].load(std::memory_order_acquire) == e) return gArr.slot[i];
+    return nullptr;
+}
+
+// GUI thread, from prepare(). Allocates on first use and reuses the slot on
+// every re-prepare, like pdcAcquire and autoAcquire.
+ArrState* arrAcquire(const Engine* e) {
+    int idx = -1;
+    for (int i = 0; i < ArrTable::kSlots; ++i)
+        if (gArr.owner[i].load(std::memory_order_relaxed) == e) { idx = i; break; }
+    if (idx < 0)
+        for (int i = 0; i < ArrTable::kSlots; ++i)
+            if (!gArr.owner[i].load(std::memory_order_relaxed)) { idx = i; break; }
+    if (idx < 0) {                      // table full: take the oldest slot over
+        idx = 0;
+        for (int i = 1; i < ArrTable::kSlots; ++i)
+            if (gArr.stamp[i] < gArr.stamp[idx]) idx = i;
+        LOGW("arr: no free arrangement slot, taking the oldest (engine %p)", (const void*)e);
+    }
+    if (!gArr.slot[idx]) {
+        gArr.slot[idx] = new (std::nothrow) ArrState();
+        if (!gArr.slot[idx]) return nullptr;
+    }
+    *gArr.slot[idx] = ArrState{};
+    gArr.stamp[idx] = ++gArr.clock;
+    gArr.owner[idx].store(e, std::memory_order_release);
+    return gArr.slot[idx];
+}
+
+inline f64 arrItemEnd(const RtArrItem& it) { return it.start + it.length; }
+
+// First index whose start is past `beat`. THE O(log n) half of the cost claim,
+// and the only place the sortedness §2.3 guarantees is relied on. An unsorted
+// lane yields some index in range rather than a read past the end.
+inline int arrSeekNext(const RtArrangement* a, f64 beat) {
+    int lo = 0, hi = a->itemCount;
+    while (lo < hi) {
+        const int m = (lo + hi) >> 1;
+        if (a->items[m].start <= beat + kEps) lo = m + 1; else hi = m;
+    }
+    return lo;
+}
+
+// The item's fade multiplier at one beat. The shape is applied to the
+// MULTIPLIER, so fadeShape 0 is a linear gain ramp — the same choice
+// AUTOMATION.md §3.2 makes for class-A automation: ramp the derived value, not
+// the stored one. A non-zero fadeShape is reserved and renders linear in this
+// wave, exactly as RtAutoPoint::curve does.
+inline f32 arrFadeAt(const RtArrItem& it, f64 beat) {
+    f32 m = 1.f;
+    if (it.fadeIn > 0.f) {
+        const f64 d = beat - it.start;
+        m = (d <= 0.0) ? 0.f : (d >= (f64)it.fadeIn ? 1.f : (f32)(d / (f64)it.fadeIn));
+    }
+    if (it.fadeOut > 0.f) {
+        const f64 d = arrItemEnd(it) - beat;
+        const f32 o = (d <= 0.0) ? 0.f : (d >= (f64)it.fadeOut ? 1.f : (f32)(d / (f64)it.fadeOut));
+        if (o < m) m = o;
+    }
+    return m;
+}
+
+// Does this lane block own the RtClip a voice is reading? The clips live INSIDE
+// the one allocation, so this is a range test on the block's own clips[] array
+// and nothing else has to be known about it.
+inline bool arrHolds(const RtArrangement* a, const RtClip* c) {
+    return c && a && a->clips && c >= a->clips && c < a->clips + a->clipCount;
+}
+
+void arrRecomputeAnyLane(ArrState& s) {
+    s.anyLane = false;
+    for (const auto& a : s.t)
+        if (a.arr && a.arr->itemCount > 0) { s.anyLane = true; return; }
+}
+
+} // namespace
+
 // Track::fireBeat does double duty, and this is the one place to look for why.
 // While something is queued (Track::queued != -2) it is the beat that queued
 // action fires on, exactly as before. While nothing is queued and a clip is
@@ -1217,6 +1425,14 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
         LOGW("engine: no slot for automation state; clip envelopes will not apply");
     // Warp markers need no slot of their own: they arrive on RtClip and are
     // read from there.
+
+    // The arrangement scheduler, on the same discipline again. Without it the
+    // engine plays no arrangement at all — the session behaviour, which is the
+    // correct degradation and also exactly what every build before wave 8 did.
+    if (!arrAcquire(this))
+        LOGW("engine: no slot for arrangement state; the arrangement will not play");
+    arrOverride.store(0, std::memory_order_relaxed);
+    beat_ = 0.0;
 
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
@@ -1280,12 +1496,136 @@ void Engine::startVoice(Track& t, const RtClip& c) {
         v.readA   = v.srcPos;
         v.readB   = v.srcPos;
     }
+
+    // Arrangement item fades travel with the VOICE and not with the track (see
+    // the note on Voice::fade in engine.h), so a launch has to clear them: the
+    // copy above has just handed the outgoing voice — which may be half way down
+    // a fade-out — to t.prev, where it keeps its own multiplier, and the incoming
+    // voice must not inherit it. The arrangement's per-sub-block pass overwrites
+    // these immediately for an item that has fades; everything else stays 1.0.
+    v.fade   = 1.f;
+    v.fadeTo = 1.f;
+
+    // startVoiceAt(t, c, clipBeat), spelled the only way the frozen header
+    // allows (see ArrState::seek). An item with offset != 0 — every second half
+    // of a split, every item a locate lands in the middle of, and every item a
+    // Back to Arrangement resumes — must start the voice INSIDE the clip.
+    //
+    // The zero case is a guarded branch and not an unconditional assignment
+    // through the same arithmetic, deliberately: a session launch must execute
+    // the code it executed before this existed, character for character, which
+    // is what makes "the same function with the argument the old one implied"
+    // a bit-identity claim rather than an algebraic one.
+    ArrState* as = arrFind(this);
+    if (!as || as->seek == 0.0) return;
+    const f64 clipBeat = as->seek;
+    as->seek = 0.0;
+    if (c.isMidi) {
+        // The note cursor, plus a bisection for the first note at or after it.
+        v.beatPos = clipBeat;
+        int lo = 0, hi = c.notes ? c.noteCount : 0;
+        while (lo < hi) {
+            const int m = (lo + hi) >> 1;
+            if (c.notes[m].beat < clipBeat) lo = m + 1; else hi = m;
+        }
+        v.nextNote = lo;
+    } else if (c.markers && c.markerCount >= 2 && c.warp != (int)Warp::Off) {
+        // The warped path verbatim: the beat is the primary cursor and srcPos is
+        // a function of it, so seeding is one addition and one map evaluation.
+        v.beatPos += clipBeat;
+        v.srcPos   = warpSrcAt(c.markers, c.markerCount, v.beatPos);
+        v.readA    = v.srcPos;
+        v.readB    = v.srcPos;
+    } else if (c.lengthBeats > 0.0) {
+        v.srcPos = (f64)c.loopStart +
+                   clipBeat / c.lengthBeats * (f64)(c.loopEnd - c.loopStart);
+        v.readA  = v.srcPos;
+        v.readB  = v.srcPos;
+    }
 }
 
 void Engine::drainCommands() {
     Command c;
     Pdc* pdc = pdcFind(this);
     AutoState* aut = autoFind(this);
+    ArrState* as = arrFind(this);
+
+    // Every discontinuity in the timeline is these three steps (§3.6), and they
+    // are written once so the loop brace's internal locate, Cmd::Locate, the
+    // second stop and the transport starting cannot drift apart:
+    //
+    //   1. flush offs, on every track, at the frame the discontinuity falls on;
+    //   2. mark every lane for a re-seek, consumed by the next fireDue;
+    //   3. ASSIGN beat_ — never add to it, so sixty-four laps of a four-bar
+    //      brace accumulate exactly zero drift.
+    //
+    // And what it does NOT do: it leaves session voices alone. A session clip is
+    // a loop a performer has launched and is playing; a locate is a statement
+    // about the timeline, not about the performance. Moving the playhead to
+    // check a transition must not silence everything the performer had running.
+    auto locateTo = [&](f64 to) {
+        for (int ti = 0; ti < kMaxTracks; ++ti) {
+            Track& t = tracks_[ti];
+            if (t.voice.active) flushOffs(t, t.voice, 0);
+            if (t.prev.active)  flushOffs(t, t.prev, 0);
+        }
+        if (as) for (auto& a : as->t) a.reseek = true;
+        beat_ = (to >= 0.0) ? to : 0.0;          // NaN lands at zero too
+    };
+
+    // A launch, a scene or a take needs a running clock, and each of them starts
+    // the transport if it is not running. Where they used to rewind to zero as
+    // well they now do not, for the same reason Cmd::SetPlaying 1 does not: with
+    // a timeline, "play" means play from the playhead. On a freshly prepared
+    // engine beat_ is 0, so every session-only path is unchanged.
+    auto armTransport = [&]() {
+        playing_ = true;
+        if (as) for (auto& a : as->t) a.reseek = true;
+    };
+
+    // Retiring a lane, and the ONE place the arrangement's protocol is not
+    // literally the RtNote one.
+    //
+    // A replaced note array can be re-seeked into (reseekNotes) because the CLIP
+    // survives the swap and only its notes moved, so the old pointer is dead the
+    // instant the swap happens. A replaced LANE takes its RtClips with it — they
+    // live inside the one allocation — and a voice handed its 6 ms declick tail
+    // goes on reading one of them for another block or two. Announcing the
+    // pointer immediately would invite the owner to free memory the audio thread
+    // is still inside, which is a use-after-free that only shows up when someone
+    // edits a lane while it plays: the exact case §10.3 gate 8 exists to churn.
+    //
+    // So the displaced pointer is PARKED, and Ev::ArrangementRetired goes out on
+    // the first drain at which no voice on any track still points inside it. It
+    // is bounded (a tail is milliseconds), it is exact (a range test on the
+    // block's own clips[]), and the event still means precisely what §3.7 says
+    // it means: this pointer is now safe to free.
+    auto arrPark = [&](const RtArrangement* old, i32 cell) {
+        if (!old || !as) return;
+        for (int i = 0; i < ArrState::kParked; ++i)
+            if (!as->parked[i]) { as->parked[i] = old; as->parkedAt[i] = cell; return; }
+        // Eight outstanding means the publisher republished eight times inside
+        // one block. Announce it now: a clicked tail is a worse sound and a lost
+        // pointer is a worse bug, and this is the lesser of the two.
+        emitCritical(this, evts_, {Ev::ArrangementRetired, cell, 0, 0.0, (void*)old});
+    };
+    auto arrSweepParked = [&]() {
+        if (!as) return;
+        for (int i = 0; i < ArrState::kParked; ++i) {
+            const RtArrangement* p = as->parked[i];
+            if (!p) continue;
+            bool held = false;
+            for (int ti = 0; ti < kMaxTracks && !held; ++ti) {
+                const Track& t = tracks_[ti];
+                held = (t.voice.active && arrHolds(p, t.voice.clip)) ||
+                       (t.prev.active  && arrHolds(p, t.prev.clip));
+            }
+            if (held) continue;
+            emitCritical(this, evts_,
+                         {Ev::ArrangementRetired, as->parkedAt[i], 0, 0.0, (void*)p});
+            as->parked[i] = nullptr;
+        }
+    };
     // Retires a voice that is losing the clip under it. Note-offs first: the
     // array it reads is about to go away and a release ramp it cannot hear will
     // not deliver them for us. Frame 0 because a GUI edit has no grid line of
@@ -1305,11 +1645,20 @@ void Engine::drainCommands() {
         switch (c.type) {
         case Cmd::SetPlaying:
             if (!c.a) {
-                // Takes close against the beat we stopped on, so grab it before
-                // the transport rewinds.
+                // A SECOND stop rewinds, and a first one does not (§3.6, and the
+                // orchestrator's answer 4). Once there is a timeline, stopping to
+                // fix a fill and resuming where you were is the whole point — but
+                // the muscle memory that expects a rewind still has to find one.
+                //
+                // The double press is STATE, not timing: a stop received while
+                // already stopped locates to zero. There is no window to miss, so
+                // it cannot misfire on a slow hand, and it cannot fire twice on a
+                // fast one either.
+                if (!playing_) { locateTo(0.0); break; }
+                // Takes close against the beat we stopped on.
                 const f64 stopBeat = beat_;
                 playing_ = false;
-                beat_ = 0.0;
+                // beat_ STAYS. This is the line §3.6 is about.
                 for (int ti = 0; ti < kMaxTracks; ++ti) {
                     Track& t = tracks_[ti];
                     if (t.voice.active) t.voice.releasing = true;
@@ -1333,10 +1682,18 @@ void Engine::drainCommands() {
                         else    finishRec(this, ti, t, evts_, stopBeat - t.recStartBeat);
                     } else if (t.recPhase == 1) cancelRec(t);
                 }
+                // The arrangement loses its voices with everything else, but NOT
+                // its override bits: the flag is performance state and a stop is
+                // not a statement about the arrangement (§4.3). The lanes are
+                // marked for a re-seek so that starting again resumes whatever
+                // covers beat_, mid-item.
+                if (as) for (auto& a : as->t) { a.playing = -1; a.prev = -1; a.reseek = true; }
                 evts_.push({Ev::TransportStopped, 0, 0, 0.0});
             } else if (!playing_) {
                 playing_ = true;
-                beat_ = 0.0;
+                // beat_ stays: starting resumes the timeline where the stop left
+                // it, which is the other half of "stop does not rewind".
+                if (as) for (auto& a : as->t) a.reseek = true;
             }
             break;
         case Cmd::SetTempo:     tempo_ = clampv(c.x, 20.0, 999.0); break;
@@ -1347,7 +1704,7 @@ void Engine::drainCommands() {
             if (c.a < 0 || c.a >= kMaxTracks || c.b < 0 || c.b >= kMaxScenes) break;
             const RtClip& cl = clips_[c.a][c.b];
             if (!cl.valid) break;
-            if (!playing_) { playing_ = true; beat_ = 0.0; }
+            if (!playing_) armTransport();
             Track& t = tracks_[c.a];
             t.queued = c.b;
             t.fireBeat = nextQuantum(beat_, cl.quantumIdx);
@@ -1371,7 +1728,7 @@ void Engine::drainCommands() {
         }
         case Cmd::LaunchScene: {
             if (c.a < 0 || c.a >= kMaxScenes) break;
-            if (!playing_) { playing_ = true; beat_ = 0.0; }
+            if (!playing_) armTransport();
             const f64 fire = nextQuantum(beat_, -1);
             for (int ti = 0; ti < kMaxTracks; ++ti) {
                 Track& t = tracks_[ti];
@@ -1442,7 +1799,9 @@ void Engine::drainCommands() {
             // instance a hold names may be one the engine no longer references,
             // and writing the captured value into it would be a write through a
             // pointer the GUI is about to free.
-            if (aut) autoRestore(aut->t[c.a], old, nullptr);
+            // Both passes release: the chain the holds name is going away, so
+            // there is no instance left for either of them to write back into.
+            if (aut) autoRestore(aut->t[c.a], old, nullptr, 0, kClaimAll);
             t.chain = (const RtChain*)c.p;
             // The one place a chain's latency is read. It is const after
             // prepare() per the PluginInstance contract, so the cached copy is
@@ -1532,7 +1891,7 @@ void Engine::drainCommands() {
                 if (!buf || cap <= 0) break;
                 // A take needs a running clock. Arm the transport exactly the
                 // way LaunchClip does so the first grid line is beat 0.
-                if (!playing_) { playing_ = true; beat_ = 0.0; }
+                if (!playing_) armTransport();
                 t.recBuf = buf; t.recCap = cap; t.recLen = 0;
                 t.recSlot = c.b; t.recPhase = 1; t.recMidi = midi;
                 t.recFireBeat = nextQuantum(beat_, -1);
@@ -1562,6 +1921,98 @@ void Engine::drainCommands() {
                     t.pendBuf = buf; t.pendCap = cap;
                     t.pendSlot = c.b; t.pendMidi = midi;
                 }
+            }
+            break;
+        }
+
+        // --- the arrangement ------------------------------------------------
+        //
+        // The RtNote retirement protocol, verbatim: swap the pointer, and push
+        // the DISPLACED one home only when it differs from the incoming one —
+        // "an entry that would never be announced must not be queued", which is
+        // the condition publishNotes documents and publishAutos inherits.
+        // emitCritical, because a lost one leaks GUI memory with no second
+        // channel to notice it by.
+        //
+        // With no side table nothing was ever borrowed, so nothing is stored and
+        // nothing is retired: the engine plays no arrangement and the publisher's
+        // pointer stays exactly where it was, still owned by the publisher.
+        case Cmd::SetArrangement: {
+            if (!as) break;
+            const RtArrangement* fresh = (const RtArrangement*)c.p;
+
+            // a = -1 is the TRANSPORT CELL, not a track — deliberately
+            // Ev::ChainRetired's own addressing, so a reader who knows one knows
+            // the other. It carries no items, only the loop brace.
+            if (c.a == -1) {
+                const RtArrangement* old = as->transport;
+                as->transport = fresh;
+                as->loopStart = fresh ? fresh->loopStart : 0.0;
+                as->loopEnd   = fresh ? fresh->loopEnd   : 0.0;
+                // loopStart >= loopEnd DISABLES the loop rather than being
+                // clamped: a zero-length brace is a request the engine cannot
+                // honour, and clamping it would invent a length the user did not
+                // ask for. The comparison rejects NaN on either end for free.
+                as->loopOn = fresh && fresh->loopOn != 0 && as->loopEnd > as->loopStart;
+                // The transport cell carries no clips, so nothing can be reading
+                // it and the park resolves on this very sweep.
+                if (old && old != fresh) arrPark(old, -1);
+                break;
+            }
+            if (c.a < 0 || c.a >= kMaxTracks) break;
+            ArrTrack& a = as->t[c.a];
+            Track& t = tracks_[c.a];
+            const RtArrangement* old = a.arr;
+            // Voices the OUTGOING lane owns are released before the indices that
+            // name them stop meaning anything. A session voice on this track is
+            // not one of them and is left alone.
+            if (a.playing >= 0 && t.voice.active) { flushOffs(t, t.voice, 0); t.voice.releasing = true; }
+            if (a.prev    >= 0 && t.prev.active)  { flushOffs(t, t.prev,  0); t.prev.releasing  = true; }
+            a.arr = fresh;
+            a.playing = a.prev = -1;
+            a.next = 0;
+            a.reseek = true;                     // resume whatever covers beat_
+            // A lane that no longer exists cannot be overridden (§4.3).
+            if (!fresh) a.override_ = false;
+            arrRecomputeAnyLane(*as);
+            if (old && old != fresh) arrPark(old, c.a);
+            break;
+        }
+
+        // The arrangement's automation lanes (§6.2). Same protocol, different
+        // container: absolute-beat, one lane per address per track, evaluated in
+        // a pass that runs BEFORE the clip envelope pass so the clip's value wins
+        // by overwriting it (§6.4).
+        case Cmd::SetTrackAutos: {
+            if (!aut || c.a < 0 || c.a >= kMaxTracks) break;
+            AutoTrack& at = aut->t[c.a];
+            const RtAutoSetN* old = at.arrSet;
+            at.arrSet = (const RtAutoSetN*)c.p;
+            if (old && old != at.arrSet)
+                emitCritical(this, evts_, {Ev::TrackAutosRetired, c.a, 0, 0.0, (void*)old});
+            break;
+        }
+
+        // a = 0 (reserved), x = the beat to go to.
+        case Cmd::Locate:
+            // The override is KEPT: a locate is a timeline gesture, and a track
+            // the performer put in session mode stays in session mode. The
+            // alternative — a locate is a "reset" — would make scrubbing the
+            // timeline silently undo the performance.
+            locateTo(c.x);
+            break;
+
+        // a = track, or -1 for every track. UNQUANTIZED: it is a corrective
+        // gesture, and a correction that waits a bar is the wrong feel. The
+        // track's cursor re-seeks to beat_ and resumes whatever item covers it
+        // MID-ITEM, which is the third caller of startVoiceAt and the reason
+        // that is a general facility and not a split-specific hack.
+        case Cmd::BackToArrangement: {
+            if (!as || c.a >= kMaxTracks) break;
+            for (int ti = 0; ti < kMaxTracks; ++ti) {
+                if (c.a >= 0 && c.a != ti) continue;
+                as->t[ti].override_ = false;
+                as->t[ti].reseek    = true;
             }
             break;
         }
@@ -1613,6 +2064,11 @@ void Engine::drainCommands() {
         pdc->dirty = false;
     }
 
+    // Parked lanes whose last reader has died. Swept here, after this drain's
+    // own parks, so a lane replaced while nothing was reading it is announced on
+    // the same drain that replaced it.
+    arrSweepParked();
+
     // Last, and after everything above has landed: this counter is what proves
     // to the other side that a command it pushed has been consumed, so it must
     // not be observable before the effects it vouches for. Release for the same
@@ -1622,6 +2078,25 @@ void Engine::drainCommands() {
 }
 
 void Engine::fireDue(f64 atBeat) {
+    ArrState* as = arrFind(this);
+
+    // §4.2. THE override is set HERE — at the quantized launch the engine itself
+    // computed from quantum_, the clip's own quantumIdx and beat_ — and not in
+    // drainCommands when the command arrived, and emphatically not in the GUI
+    // when the user clicked. If the flag were set at click time the arrangement
+    // on that track would go silent up to a whole bar before the session clip
+    // started: an audible hole, in the one gesture a performer makes most.
+    //
+    // Taking the track out of the arrangement also drops the lane's claim on the
+    // voice; the session clip is already on it by the time this runs.
+    auto takeOver = [&](int ti) {
+        if (!as) return;
+        ArrTrack& a = as->t[ti];
+        a.override_ = true;
+        a.playing = -1;
+        a.prev    = -1;
+    };
+
     // A take whose target slot already holds a playable MIDI clip is a looper
     // pass, and a pass needs something to lap over: the record boundary is
     // therefore also that clip's launch boundary. It goes through startVoice()
@@ -1648,6 +2123,7 @@ void Engine::fireDue(f64 atBeat) {
         // voice twice and report two ClipStarted for one launch.
         if (t.queued == slot && t.fireBeat <= atBeat + kEps) return;
         startVoice(t, *c);
+        takeOver(ti);                 // a session clip is sounding on this track
         t.playing = slot;
         // fireBeat is the queued action's beat for as long as something is
         // queued (see the note above prepare()); only claim it for the follow
@@ -1763,12 +2239,142 @@ void Engine::fireDue(f64 atBeat) {
                 continue;
             } else {
                 startVoice(t, cl);
+                takeOver(ti);         // §4.3: a launch takes the track out of the arrangement
                 t.playing = t.queued;
                 t.fireBeat = followDueBeat(cl, sched);
                 evts_.push({Ev::ClipStarted, ti, t.queued, atBeat});
             }
         }
         t.queued = -2;
+    }
+
+    // 4. Arrangement item boundaries (§3.4). Fourth and last, so that a session
+    //    launch landing on this very beat has already set its override and this
+    //    pass sees it — which is what makes the hand-over sample-exact rather
+    //    than a bar early.
+    if (!as || !as->anyLane) return;
+
+    // A voice the arrangement owns, released exactly as a Cmd::StopTrack at a
+    // boundary releases one: offs first (they belong to an array the voice is
+    // about to stop reading), then the existing declick tail.
+    auto arrRelease = [&](ArrTrack& a, Track& t) {
+        if (a.playing >= 0 && t.voice.active) {
+            flushOffs(t, t.voice, 0);
+            t.voice.releasing = true;
+        }
+        a.playing = -1;
+    };
+
+    // An item takes the primary voice, at `clipBeat` into its clip. The outgoing
+    // voice goes to Track::prev the way startVoice already sends it there — so a
+    // crossfade overlap is ALREADY the mechanism that exists — and, when the
+    // outgoing item has not itself ended yet, it keeps sounding under its own
+    // fade instead of taking the 6 ms declick.
+    auto arrStart = [&](ArrTrack& a, int ti, Track& t, int idx, f64 clipBeat) {
+        const RtArrangement* arr = a.arr;
+        const RtArrItem& in = arr->items[idx];
+        if (!arr->clips || in.clip < 0 || in.clip >= arr->clipCount) {
+            arrRelease(a, t);                    // an item with no payload is a gap
+            return;
+        }
+        const int out = a.playing;
+        as->seek = clipBeat;                     // startVoiceAt's argument
+        startVoice(t, arr->clips[in.clip]);
+        as->seek = 0.0;
+        // The arrangement is driving this track now, so a session clip that was
+        // still nominally "playing" on it stops being the UI's answer.
+        if (out < 0 && t.playing >= 0) { t.playing = -1; t.fireBeat = kNoFollow; }
+        a.playing = idx;
+        a.prev    = -1;
+        if (out >= 0 && out != idx && t.prev.active &&
+            atBeat < arrItemEnd(arr->items[out]) - kEps) {
+            t.prev.releasing = false;            // a crossfade, not a declick
+            a.prev = out;
+        }
+    };
+
+    for (int ti = 0; ti < kMaxTracks; ++ti) {
+        ArrTrack& a = as->t[ti];
+        const RtArrangement* arr = a.arr;
+        if (!arr || arr->itemCount <= 0 || !arr->items) { a.playing = a.prev = -1; continue; }
+        Track& t = tracks_[ti];
+
+        // --- a discontinuity: re-bisect, then resume mid-item. O(log n), and
+        //     the only place this is not O(1).
+        if (a.reseek) {
+            a.reseek = false;
+            if (a.playing >= 0 && t.voice.active) { flushOffs(t, t.voice, 0); t.voice.releasing = true; }
+            if (a.prev    >= 0 && t.prev.active)  { flushOffs(t, t.prev,  0); t.prev.releasing  = true; }
+            a.playing = a.prev = -1;
+            a.next = arrSeekNext(arr, atBeat);
+            if (a.override_) continue;
+            const int k = a.next - 1;
+            if (k >= 0 && atBeat < arrItemEnd(arr->items[k]) - kEps)
+                arrStart(a, ti, t, k, arr->items[k].offset + (atBeat - arr->items[k].start));
+            continue;
+        }
+
+        // The outgoing half of a crossfade reaching its own end.
+        if (a.prev >= 0 && atBeat >= arrItemEnd(arr->items[a.prev]) - kEps) {
+            if (t.prev.active) { flushOffs(t, t.prev, 0); t.prev.releasing = true; }
+            a.prev = -1;
+        }
+
+        // `next` advances past every item whose start has passed. Items a locate
+        // skipped over entirely are SKIPPED, not fired; only the last one can
+        // still be covering this beat.
+        int starting = -1;
+        while (a.next < arr->itemCount && arr->items[a.next].start <= atBeat + kEps) {
+            starting = a.next;
+            ++a.next;
+        }
+
+        // §4.4 rule 1: an overridden track fires no item starts, but its cursor
+        // still advances, so a later Back to Arrangement lands where the
+        // timeline is instead of replaying the set from wherever the override
+        // began.
+        if (a.override_) { a.playing = a.prev = -1; continue; }
+
+        const bool ended = a.playing >= 0 &&
+                           atBeat >= arrItemEnd(arr->items[a.playing]) - kEps;
+
+        if (starting >= 0 && atBeat < arrItemEnd(arr->items[starting]) - kEps) {
+            const RtArrItem& in = arr->items[starting];
+            // §3.5 — R3: CONTINUATION, not relaunch. A naive scheduler calls
+            // startVoice here, which resets srcPos, zeroes env (so the voice
+            // re-attacks through its 3 ms declick), resets the grain phase and
+            // hands the old voice to prev: a click and a re-attack in the middle
+            // of a note, sixty-four of them for sixty-four splits. Instead, when
+            // all three conditions hold, `playing` is reassigned and NOTHING
+            // ELSE HAPPENS AT ALL.
+            //
+            //   (1) identity of material — one RtClip, which is exactly what the
+            //       publisher's dedupe (§3.3) exists to make achievable;
+            //   (2) contiguity — the incoming item resumes the source where the
+            //       outgoing one left it, compared in BEATS so a warped clip
+            //       continues iff its beat map is continuous across the boundary;
+            //   (3) intent — a fade is the user saying "put a shape here", and
+            //       honouring it means the two items are two events.
+            //
+            // Because a continuation touches no voice state, the boundary is
+            // unobservable in the output: the sub-block split still happens, and
+            // splitting a block does not change the samples a voice renders —
+            // renderRange is deterministic in (srcPos, phase), both of which
+            // carry across. That is the argument the 64x split gate tests.
+            bool cont = false;
+            if (a.playing >= 0) {
+                const RtArrItem& out = arr->items[a.playing];
+                cont = in.clip == out.clip && in.clip >= 0 && in.clip < arr->clipCount &&
+                       out.fadeOut == 0.f && in.fadeIn == 0.f &&
+                       std::fabs(in.offset - (out.offset + (in.start - out.start)))
+                           <= kContinuityEps &&
+                       arr->clips && t.voice.active && t.voice.clip == &arr->clips[in.clip];
+            }
+            if (cont) a.playing = starting;
+            else      arrStart(a, ti, t, starting, in.offset);
+        } else if (ended) {
+            arrRelease(a, t);
+        }
     }
 }
 
@@ -1952,6 +2558,24 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
         const f64 loopLen = (f64)(c.loopEnd - c.loopStart);
         const f64 loopBeats = wc.loopBeat1 - wc.loopBeat0;
 
+        // The arrangement item fade (docs/ARRANGEMENT.md §3.4), ramped across
+        // this sub-block by the same per-sample increment Voice::env already
+        // uses, and applied at the same place. `fading` false is the ordinary
+        // case — a session clip, an item with no fades, an item past its fade
+        // regions — and leaves the gain expression below LITERALLY the code it
+        // is today, which is the same "the ordinary case must stay free"
+        // discipline the delay compensation states for comp == false and the
+        // automation pass states for a track with no lane.
+        //
+        // The gate is a PERFORMANCE decision and not a correctness one:
+        // multiplying by exactly 1.0f is bit-exact in IEEE-754 for every finite
+        // value, so the gated and ungated paths produce identical samples. That
+        // is what lets the headline gate be BIT-identity rather than a tolerance.
+        const bool fading = (v.fade != 1.f || v.fadeTo != 1.f);
+        const f32 fadeStep = fading ? (v.fadeTo - v.fade) / (f32)(to - from) : 0.f;
+        f32 fadeG = v.fade;
+        v.fade = v.fadeTo;      // hold, for any block the scheduler does not touch
+
         for (int i = from; i < to; ++i) {
             f32 l, r;
             if (granular) {
@@ -2029,7 +2653,8 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
 
             // Pre-fader: clip gain and declick only. Both voices of a track sum
             // into the same scratch, which is what makes the crossfade work.
-            const f32 g = c.gain * v.env;
+            const f32 g = fading ? (c.gain * v.env * fadeG) : (c.gain * v.env);
+            if (fading) fadeG += fadeStep;
             t.fxL[i] += l * g;
             t.fxR[i] += r * g;
         }
@@ -2133,6 +2758,7 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
     // go uncleared and the whole track would be skipped for the block the
     // follow fires in.
     bool live[kMaxTracks];
+    ArrState* as = arrFind(this);
     for (int ti = 0; ti < kMaxTracks; ++ti) {
         Track& t = tracks_[ti];
         // A queued MIDI take into a slot that holds a MIDI clip launches that
@@ -2146,9 +2772,18 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             (t.recPhase == 1 && overdubSlot(clips_[ti], t.recSlot, t.recMidi)) ||
             (t.recPhase == 3 && t.pendBuf &&
              overdubSlot(clips_[ti], t.pendSlot, t.pendMidi));
+        // A track running an arrangement lane is live for the same reason a
+        // queued launch makes one live, and it is the same silent failure: an
+        // item that starts part-way through this block would find its scratch
+        // uncleared and the whole track skipped for the block it started in.
+        // Answering "does it have a lane" rather than "does an item start before
+        // the block ends" is deliberate — the loop brace makes the block's beat
+        // span non-affine, so the cheap question is also the only correct one.
+        const bool arrLive = playing_ && as && as->t[ti].arr &&
+                             as->t[ti].arr->itemCount > 0 && !as->t[ti].override_;
         live[ti] = t.voice.active || t.prev.active || t.queued != -2 || t.arm ||
                    (t.playing >= 0 && t.fireBeat < kNoFollow) || recWillLaunch ||
-                   (t.chain && t.chain->count > 0);
+                   arrLive || (t.chain && t.chain->count > 0);
         if (live[ti]) {
             std::memset(t.fxL, 0, (size_t)n * sizeof(f32));
             std::memset(t.fxR, 0, (size_t)n * sizeof(f32));
@@ -2207,7 +2842,10 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             // condition, one restore, and the inert bitmap resets with it so
             // "once per published set" stays exact.
             if (at.set != set) {
-                autoRestore(at, t.chain, set);
+                autoRestore(at, t.chain, set ? set->lanes : nullptr,
+                            set ? (set->laneCount < kMaxRtAutoLanes ? set->laneCount
+                                                                   : kMaxRtAutoLanes) : 0,
+                            kClaimClip);
                 at.set = set;
                 at.inert = 0;
             }
@@ -2274,14 +2912,14 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                     // takes a copy of what it is destroying. getParam() is a
                     // plain load in every backend in the tree, which is what
                     // makes this safe here.
-                    AutoTrack::Hold& h = at.hold[li];
-                    if (!h.used) {
-                        h.devSlot = l.devSlot;
-                        h.param   = l.index;
-                        h.was     = fx->getParam(l.index);
-                        h.used    = true;
-                        at.anyHold = true;
-                    }
+                    AutoTrack::Hold* hp = holdFor(at, l.devSlot, l.index);
+                    if (!hp) break;                  // table full: no hold, no apply
+                    AutoTrack::Hold& h = *hp;
+                    // Captured only when NOBODY held it, so the value stored is
+                    // the user's and never the other pass's output (§6.5).
+                    if (h.claims == 0) h.was = fx->getParam(l.index);
+                    h.claims |= kClaimClip;
+                    at.anyHold = true;
 
                     const f32 v = autoValueAt(*set, l, b0, 0.f);
                     if (!fx->setParamRT(l.index, v)) {
@@ -2292,7 +2930,8 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                         // The hold is dropped without a write-back: nothing was
                         // ever applied, so there is nothing to undo.
                         at.inert |= 1u << li;
-                        h.used = false; h.devSlot = -1; h.param = -1;
+                        h.claims &= ~kClaimClip;
+                        if (!h.claims) { h.devSlot = -1; h.param = -1; }
                         emitCritical(this, evts_,
                                      {Ev::AutoLaneInert, ti, t.playing, (f64)li});
                     }
@@ -2303,6 +2942,108 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
             }
         }
     };
+    // The ARRANGEMENT automation pass (§6.4), and it runs FIRST — before the
+    // clip envelope pass, because that is the entire implementation of the
+    // precedence rule: the clip envelope wins, purely by pass ordering. No
+    // priority field, no per-lane arbitration, no merge. Class A is a pair of
+    // floats per target in autoA[ti] and a second store is a complete overwrite;
+    // class B is a setParamRT call and the clip pass's is the later one in the
+    // same block. The clip envelope is attached to the MATERIAL — it travels
+    // when the clip is dragged and it was drawn while the user was looking at
+    // that clip — and when two statements about one value disagree, the more
+    // local one wins.
+    //
+    // NOT gated on a voice, and that is the difference from a clip envelope: an
+    // arrangement lane says what the fader does at bar 33 whether or not
+    // anything happens to be sounding there. Gated on playing_ and on
+    // !override_ (§4.4), which is the second thing the override buys and the
+    // evidence the flag is in the right place — the pass runs on the audio
+    // thread once per block and needs a per-track answer to "is the arrangement
+    // in charge here". Had the flag lived in the GUI it would have to cross the
+    // ring every block to be usable here.
+    auto arrAutoPass = [&]() {
+        if (!aut) return;
+        const f64 bps = playing_ ? (tempo_ / 60.0 / sr_) : 0.0;
+        for (int ti = 0; ti < kMaxTracks; ++ti) {
+            Track& t = tracks_[ti];
+            AutoTrack& at = aut->t[ti];
+            const bool on = playing_ && !(as && as->t[ti].override_);
+            const RtAutoSetN* set =
+                (on && at.arrSet && at.arrSet->laneCount > 0 && at.arrSet->lanes) ? at.arrSet
+                                                                                  : nullptr;
+            if (at.arrApplied != set) {
+                autoRestore(at, t.chain, set ? set->lanes : nullptr,
+                            set ? (set->laneCount < kMaxRtArrLanes ? set->laneCount
+                                                                   : kMaxRtArrLanes) : 0,
+                            kClaimArr);
+                at.arrApplied = set;
+                at.arrInert = 0;
+            }
+            if (!set) continue;                  // the ordinary case, and free
+
+            // ABSOLUTE beats, and no wrap: an arrangement lane is a statement
+            // about the timeline, so its window is simply this block of it.
+            const f64 b0 = beat_;
+            const f64 b1 = beat_ + (f64)n * bps;
+
+            AutoBlock& ab = autoA[ti];
+            const int lanes = set->laneCount < kMaxRtArrLanes ? set->laneCount : kMaxRtArrLanes;
+            for (int li = 0; li < lanes; ++li) {
+                const RtAutoLane& l = set->lanes[li];
+                if (l.flags & (kAutoOverridden | kAutoInert)) continue;
+                if (at.arrInert & (1u << li)) continue;
+                if (l.count <= 0) continue;
+
+                switch ((AutoTarget)l.target) {
+                case AutoTarget::TrackVol: {
+                    const f32 v0 = autoValueAt(*set, l, b0, 0.f);
+                    const f32 v1 = autoValueAt(*set, l, b1, 0.f);
+                    ab.vol0 = busGain((f64)(l.xform == (i32)AutoXform::Fader ? faderToGain(v0) : v0));
+                    ab.vol1 = busGain((f64)(l.xform == (i32)AutoXform::Fader ? faderToGain(v1) : v1));
+                    ab.hasVol = ab.any = true;
+                    break;
+                }
+                case AutoTarget::TrackPan:
+                    ab.pan0 = autoPan(autoValueAt(*set, l, b0, 0.f));
+                    ab.pan1 = autoPan(autoValueAt(*set, l, b1, 0.f));
+                    ab.hasPan = ab.any = true;
+                    break;
+                case AutoTarget::TrackSend: {
+                    if (l.index < 0 || l.index >= kMaxReturns) break;
+                    ab.snd0[l.index] = busGain((f64)autoValueAt(*set, l, b0, 0.f));
+                    ab.snd1[l.index] = busGain((f64)autoValueAt(*set, l, b1, 0.f));
+                    ab.sendMask |= 1u << l.index;
+                    ab.any = true;
+                    break;
+                }
+                case AutoTarget::DeviceParam: {
+                    if (!t.chain || l.devSlot < 0 || l.devSlot >= kMaxChainFx ||
+                        l.devSlot >= t.chain->count) break;
+                    PluginInstance* fx = t.chain->fx[l.devSlot];
+                    if (!fx || l.index < 0 || l.index >= fx->paramCount()) break;
+
+                    AutoTrack::Hold* hp = holdFor(at, l.devSlot, l.index);
+                    if (!hp) break;
+                    if (hp->claims == 0) hp->was = fx->getParam(l.index);
+                    hp->claims |= kClaimArr;
+                    at.anyHold = true;
+
+                    if (!fx->setParamRT(l.index, autoValueAt(*set, l, b0, 0.f))) {
+                        at.arrInert |= 1u << li;
+                        hp->claims &= ~kClaimArr;
+                        if (!hp->claims) { hp->devSlot = -1; hp->param = -1; }
+                        // b = -1: an arrangement lane belongs to the track, not
+                        // to a slot, so there is no clip to name.
+                        emitCritical(this, evts_, {Ev::AutoLaneInert, ti, -1, (f64)li});
+                    }
+                    break;
+                }
+                default: break;
+                }
+            }
+        }
+    };
+    arrAutoPass();
     autoPass(false);
 
     // Appends [from, to) of the capture input to every take in progress. This
@@ -2439,14 +3180,40 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
 
     if (playing_) {
         const f64 bps = tempo_ / 60.0 / sr_;
-        const f64 blockEnd = beat_ + (f64)n * bps;
+        // The timeline is affine in the frame index only BETWEEN loop wraps, so
+        // the block carries an origin: `origin` is the timeline beat at frame
+        // `posOrigin`. With no brace they stay beat_ and 0 and every expression
+        // below is arithmetically the one it has always been, term for term.
+        f64 origin = beat_;
+        int posOrigin = 0;
+        f64 blockEnd = origin + (f64)(n - posOrigin) * bps;
         int pos = 0;
         while (pos < n) {
-            const f64 curBeat = beat_ + (f64)pos * bps;
+            f64 curBeat = origin + (f64)(pos - posOrigin) * bps;
+
+            // The loop brace (§3.6): a sub-block boundary plus an INTERNAL
+            // LOCATE. Not "wrap the cursors" — wrapping cursors while a voice
+            // keeps reading would leave that voice playing past its item's end
+            // for the rest of the lap. The locate ASSIGNS, so sixty-four laps
+            // accumulate exactly zero drift.
+            if (as && as->loopOn && curBeat >= as->loopEnd - kEps) {
+                for (int ti = 0; ti < kMaxTracks; ++ti) {
+                    Track& t = tracks_[ti];
+                    if (t.voice.active) flushOffs(t, t.voice, pos);
+                    if (t.prev.active)  flushOffs(t, t.prev, pos);
+                    as->t[ti].reseek = true;
+                }
+                origin    = as->loopStart;
+                posOrigin = pos;
+                curBeat   = origin;
+                blockEnd  = origin + (f64)(n - posOrigin) * bps;
+            }
+
             fireDue(curBeat);
 
             // Next scheduled boundary inside this block, if any: a queued
-            // launch or stop, a due follow action, or a record start/stop.
+            // launch or stop, a due follow action, a record start/stop — and
+            // now an arrangement item start or end, and the brace.
             f64 nextB = blockEnd;
             auto consider = [&](f64 b) { if (b > curBeat && b < nextB) nextB = b; };
             for (const auto& t : tracks_) {
@@ -2454,15 +3221,66 @@ void Engine::process(const f32* inL, const f32* inR, f32* outL, f32* outR, int n
                 else if (t.playing >= 0 && t.fireBeat < kNoFollow) consider(t.fireBeat);
                 if (t.recPhase == 1 || t.recPhase == 3) consider(t.recFireBeat);
             }
+            // Two doubles per track, and `next` only ever advances: this is the
+            // O(1)-per-block half of §3.4's cost claim. An item boundary joins
+            // the same splitter a clip launch uses, so it lands on its exact
+            // frame the same way a launch does.
+            if (as && as->anyLane) {
+                for (int ti = 0; ti < kMaxTracks; ++ti) {
+                    const ArrTrack& a = as->t[ti];
+                    if (!a.arr || a.override_) continue;
+                    if (a.next < a.arr->itemCount) consider(a.arr->items[a.next].start);
+                    if (a.playing >= 0) consider(arrItemEnd(a.arr->items[a.playing]));
+                    if (a.prev    >= 0) consider(arrItemEnd(a.arr->items[a.prev]));
+                }
+            }
+            if (as && as->loopOn) consider(as->loopEnd);
 
-            int upto = (int)std::ceil((nextB - beat_) / bps);
+            // The frame the boundary falls on. kFrameEps is subtracted for the
+            // same reason nextQuantum subtracts kEps before its own ceil: beat_
+            // is accumulated one block at a time, so a boundary that is
+            // mathematically on frame 123000 arrives here as 123000 plus or
+            // minus a few ulps, and a bare ceil turns the plus into 123001. The
+            // sign of that error depends on how many times beat_ has been added
+            // to, which is to say on the BUFFER SIZE — so without this an item
+            // lands a frame later at 64 frames per block than at 8192, which is
+            // exactly the property §10.3 gate 4 forbids. A millionth of a frame
+            // is twenty picoseconds and cannot move a boundary that was not
+            // already on one.
+            constexpr f64 kFrameEps = 1e-6;
+            int upto = posOrigin + (int)std::ceil((nextB - origin) / bps - kFrameEps);
             upto = clampv(upto, pos + 1, n);
+
+            // Item fades for this sub-block, against its end beat (§3.4).
+            // `fadeTo` is computed once per sub-block from the item's fade
+            // regions; the ramp between them happens per sample in renderRange.
+            // Only a track with a lane is touched, so every other voice keeps
+            // fade == fadeTo == 1.0 and takes the arithmetic it takes today.
+            if (as && as->anyLane) {
+                const f64 subEnd = origin + (f64)(upto - posOrigin) * bps;
+                for (int ti = 0; ti < kMaxTracks; ++ti) {
+                    const ArrTrack& a = as->t[ti];
+                    if (!a.arr) continue;
+                    Track& t = tracks_[ti];
+                    if (a.playing >= 0) {
+                        const RtArrItem& it = a.arr->items[a.playing];
+                        t.voice.fade   = arrFadeAt(it, curBeat);
+                        t.voice.fadeTo = arrFadeAt(it, subEnd);
+                    }
+                    if (a.prev >= 0) {
+                        const RtArrItem& it = a.arr->items[a.prev];
+                        t.prev.fade   = arrFadeAt(it, curBeat);
+                        t.prev.fadeTo = arrFadeAt(it, subEnd);
+                    }
+                }
+            }
+
             renderRange(outL, outR, pos, upto);
             captureRange(pos, upto);
             captureMidiRange(pos, upto);
             pos = upto;
         }
-        beat_ += (f64)n * bps;
+        beat_ = origin + (f64)(n - posOrigin) * bps;
     } else {
         // Voices still get a release tail so stopping never clicks.
         bool anyTail = false;
@@ -2791,6 +3609,16 @@ void Engine::publish() {
     if (const Pdc* p = pdcFind(this))
         latencyFrames.store(p->maxTrackLat + p->maxRetLat + p->masterLat,
                             std::memory_order_relaxed);
+
+    // Bit i set == track i is overridden. For the UI only: the Back to
+    // Arrangement button lights when it is non-zero, and an overridden lane is
+    // drawn desaturated. kMaxTracks is 32, so the mask is exactly wide enough.
+    if (const ArrState* as = arrFind(this)) {
+        u32 mask = 0;
+        for (int ti = 0; ti < kMaxTracks; ++ti)
+            if (as->t[ti].override_) mask |= 1u << ti;
+        arrOverride.store(mask, std::memory_order_relaxed);
+    }
 }
 
 } // namespace lat

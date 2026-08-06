@@ -2440,3 +2440,97 @@ buffer. The shape that fits the existing design is a pending-publish set drained
 across frames, exactly as the automation publisher's `pendingArrPubs_` already
 does for a failed push. Queued as its own item; it is not arrangement work and
 should not ride a milestone.
+
+---
+
+## 15. 8b + 8c shipped
+
+The arrangement plays. `ArrState` and its `Engine*`-keyed side table, the fourth
+`fireDue` step, the continuation rule, the fade ramp, `startVoiceAt`,
+`Cmd::SetArrangement` and its retirement, `beat_` as the timeline,
+stop-no-rewind, `Cmd::Locate`, the loop brace and its internal locate,
+`arrOverride` and `Cmd::BackToArrangement`, and the §6.4 arrangement automation
+pass with §6.5's merged hold table. 562 engine checks (497 before, all still
+green), the four demo renders `cmp`-identical, ASan+UBSan clean, `make test`
+green, and 8g's daemon arrangement section — which fails six checks against a
+HEAD engine — passes in full.
+
+The gates, as measured:
+
+- **R3, the headline.** A clip split 64 times at irregular beats renders
+  **bit-identically** to the same clip unsplit. Both negative controls hold: a
+  1/64-beat fade on one of the sixty-four is *not* identical, and neither is a
+  discontiguous offset, so conditions (3) and (2) of §3.5 are demonstrably
+  consulted rather than merely written down.
+- **The empty case.** An item with no fades renders bit-identically to the same
+  clip launched in the session, and a lane that names no clips renders
+  bit-identically to a session-only render.
+- **Boundary exactness**, at 64 and 8192 frames per block, on irrational beats.
+
+Five things §3 did not say, each discovered by contact with the code:
+
+1. **`startVoiceAt` cannot be a function.** `engine.h` is frozen and `Track` is a
+   private nested type, so the third parameter cannot be added to the
+   declaration and the body cannot be written outside the class. It travels in
+   `ArrState::seek` instead — set immediately before `startVoice`, consumed and
+   cleared inside it — which keeps the ONE body the bit-identity argument rests
+   on. §3.4's "the same function with the argument the old one implied" is
+   preserved exactly; only the spelling of the argument moved.
+
+2. **A displaced lane is not safe to free when it is replaced.** The RtClips a
+   voice reads live *inside* the block, and a voice on its 6 ms declick tail goes
+   on reading one for another block or two. §3.7 calls the protocol "the RtNote
+   protocol verbatim", and this is the one place it cannot be: a replaced note
+   array can be re-seeked into (`reseekNotes`) because the *clip* survives the
+   swap, while a replaced lane takes its clips with it and there is nowhere to
+   re-seek a voice to. So the pointer is **parked** and `Ev::ArrangementRetired`
+   goes out on the first drain at which no voice on any track points inside it —
+   bounded (eight slots against a millisecond-scale tail), exact (a range test on
+   the block's own `clips[]`), and the event still means precisely what §3.7 says
+   it means. ASan found the use-after-free in the §10.3 gate-8 churn test, which
+   is exactly what that gate is for.
+
+3. **The sub-block splitter needed an epsilon.** `beat_` is accumulated one block
+   at a time, so a boundary mathematically on frame 123000 arrives at the `ceil`
+   as 123000 plus or minus a few ulps — and the *sign* of that error depends on
+   how many times `beat_` has been added to, which is to say on the buffer size.
+   Without a `kFrameEps` subtraction (a millionth of a frame, twenty picoseconds)
+   an item lands a frame later at 64 frames per block than at 8192, which is the
+   property §10.3 gate 4 forbids. Same convention `nextQuantum` already uses. The
+   four demo renders are `cmp`-identical with it.
+
+4. **A crossfade needs the outgoing voice not to be `releasing`.** §3.4 says the
+   outgoing voice goes to `Track::prev` "the way `startVoice` already does — so a
+   crossfade overlap is *already* the mechanism that exists", but `startVoice`
+   marks `prev` releasing, which is a 6 ms declick and not a four-beat crossfade.
+   When the outgoing item has not itself ended, `releasing` is cleared and
+   `ArrTrack::prev` remembers which item it is on, so the outgoing voice keeps
+   sounding under its own `fadeOut` until its item's end — which is a fifth
+   boundary in `consider()`. `ArrTrack::prev` earns its place there and nowhere
+   else.
+
+5. **`Cmd::SetPlaying 1` had to stop rewinding too**, along with the three
+   `if (!playing_) { playing_ = true; beat_ = 0.0; }` sites in `LaunchClip`,
+   `LaunchScene` and `Record*Slot`. §3.6 only names `SetPlaying 0`, but if a
+   *start* rewinds then stop-then-start rewinds and the rule buys nothing. A
+   start now marks every lane for a re-seek instead, so play resumes the
+   arrangement from the playhead, mid-item. On a freshly prepared engine
+   `beat_` is 0, so every session-only path is unchanged — which is why 497
+   existing checks did not move.
+
+Three notes for the milestones after this one:
+
+- **The publisher must round the point array up to `alignof(RtAutoPoint)`.**
+  `RtAutoLane` is 4-aligned and `RtAutoPoint` leads with an `f64`, so an odd lane
+  count leaves `[RtAutoSetN][RtAutoLane[n]][RtAutoPoint[m]]` with the points on a
+  4-byte boundary. UBSan says so; a strict-alignment target would fault. The
+  same applies to `RtAutoSet`, and to any block 8g lays out in shared memory.
+  Owner: 8d's `buildArrangeAutos`, and 8g's region layout.
+- **`Ev::AutoLaneInert` from an arrangement lane carries `b = -1`**, because an
+  arrangement lane belongs to the track and there is no slot to name. 8e's
+  handler has to tell the two apart by that.
+- **The metronome and the MIDI-take stamp still read `beat_` as the block's
+  start beat**, so both are wrong for the remainder of a block a loop wrap fell
+  inside. Neither is arrangement work: the metronome is cosmetic and the take
+  stamp belongs to 8f, which owns `engine.cpp` after this and should fold the
+  sub-block origin into `captureMidiRange` when it does.

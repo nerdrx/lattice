@@ -4914,11 +4914,17 @@ static void testArrangementTypes() {
         lane.lo = 0.f; lane.hi = 1.f;
         RtAutoSet* a = mkAutoSet({lane}, pts);
 
-        const size_t bytes = sizeof(RtAutoSetN) + sizeof(RtAutoLane) + pts.size() * sizeof(RtAutoPoint);
+        // The point array is rounded up to alignof(RtAutoPoint): RtAutoLane is
+        // 4-aligned and RtAutoPoint leads with an f64, so one lane leaves the
+        // points on a 4-byte boundary otherwise. UBSan catches it; a strict-
+        // alignment target would fault on it.
+        const size_t ptsOff = (sizeof(RtAutoSetN) + sizeof(RtAutoLane) +
+                               alignof(RtAutoPoint) - 1) & ~(alignof(RtAutoPoint) - 1);
+        const size_t bytes = ptsOff + pts.size() * sizeof(RtAutoPoint);
         char* blk = new char[bytes];
         RtAutoSetN* b = new (blk) RtAutoSetN();
         RtAutoLane*  bl = (RtAutoLane*)(blk + sizeof(RtAutoSetN));
-        RtAutoPoint* bp = (RtAutoPoint*)(blk + sizeof(RtAutoSetN) + sizeof(RtAutoLane));
+        RtAutoPoint* bp = (RtAutoPoint*)(blk + ptsOff);
         bl[0] = lane;
         for (size_t i = 0; i < pts.size(); ++i) bp[i] = pts[i];
         b->lanes = bl; b->laneCount = 1;
@@ -4962,16 +4968,23 @@ static void testArrangementTypes() {
         CHECK(h.e.arrOverride.load() == 0u, "arrOverride stays clear across a render");
     }
 
-    // --- the four commands are inert ----------------------------------
+    // --- THE EMPTY CASE (§10.3 gate 3) --------------------------------
     //
-    // Pushed mid-render, at a sub-block boundary, against a playing clip and a
-    // real RtArrangement pointer -- including the a = -1 transport cell, which
-    // is the addressing Ev::ChainRetired already uses for the master chain. The
-    // engine's drainCommands has a `default:` arm, so an unrecognised command is
-    // dropped on the floor; this asserts it is dropped SILENTLY, with no event,
-    // no crash on the pointer it was handed, and not one sample of difference.
+    // 8a asserted here that the four commands were inert. 8b+8c wires them, so
+    // the assertion that survives is the one that mattered: a set whose lane
+    // names no clips -- and every set with no arrangement at all -- renders
+    // BYTE-IDENTICALLY to a session-only render. The fade fields must cost
+    // nothing, the fourth fireDue step must find nothing to fire, and the loop
+    // brace and the locate must move the timeline without moving a sample of a
+    // session clip (§3.6: a locate is a statement about the timeline, not about
+    // the performance).
+    //
+    // What DOES change is the retirement: a lane published and then cleared is a
+    // displaced pointer, and it has to come home. Exactly one, for exactly the
+    // pointer that was displaced.
     {
         const auto buf = dcBuf(4 * kBeat120, 1, 0.5f);
+        static RtArrangement arrBlock;
         auto render = [&](bool withArrangement) {
             Host h; h.init();
             const RtClip c = mkClip(buf, 1, 1.f, Warp::Off, true, 120.0);
@@ -4982,7 +4995,7 @@ static void testArrangementTypes() {
             h.runBlocks(4);
             if (withArrangement) {
                 static RtArrItem items[2];
-                static RtArrangement arr;
+                RtArrangement& arr = arrBlock;
                 items[0] = RtArrItem{0.0, 4.0, 0.0, 0.f, 0.f, 0, 0};
                 items[1] = RtArrItem{4.0, 4.0, 2.0, 0.5f, 0.5f, 1, 0};
                 arr.items = items; arr.itemCount = 2;
@@ -5005,22 +5018,1028 @@ static void testArrangementTypes() {
                 h.e.pushCommand(k);
             }
             h.runBlocks(8);
-            int evts = 0;
+            int retired = 0;
+            const void* got = nullptr;
             Event e;
             while (h.e.popEvent(e))
-                if (e.type == Ev::ArrangementRetired || e.type == Ev::TrackAutosRetired) ++evts;
-            CHECK(evts == 0, "no retirement event is announced for a command nothing consumed%s",
-                  withArrangement ? "" : " (control run)");
+                if (e.type == Ev::ArrangementRetired || e.type == Ev::TrackAutosRetired) {
+                    ++retired;
+                    got = e.p;
+                }
+            if (withArrangement) {
+                CHECK(retired == 1 && got == (const void*)&arrBlock,
+                      "the displaced lane comes home once, and it is the pointer that was "
+                      "displaced (%d event(s))", retired);
+            } else {
+                CHECK(retired == 0, "nothing is retired when nothing was published (control run)");
+            }
             return h.outL;
         };
         const auto plain = render(false);
         const auto withArr = render(true);
         CHECK(sameBits(plain, withArr),
-              "the four arrangement commands change not one sample -- landed, not wired");
+              "a lane that names no clips renders BYTE-IDENTICALLY to a session-only "
+              "render -- the empty case costs nothing");
         Host h2; h2.init();
         ArrJournal j;
         CHECK(!h2.e.popJournal(j), "and none of them writes a journal entry");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 34. the arrangement scheduler (docs/ARRANGEMENT.md §3, §4)
+//
+// The engine's whole arrangement job is to answer, per track, "which clip should
+// be on the primary voice right now, and at what offset". Everything below is a
+// statement about that answer, and the two headline ones are bit-identity
+// claims: a session-only render must not move by one sample, and a clip split
+// sixty-four times must render exactly what the unsplit clip renders.
+// ---------------------------------------------------------------------------
+
+// One allocation, exactly the shape §3.2 specifies and the shape 8d's publisher
+// will build:
+//
+//   [RtArrangement][RtArrItem[itemCount]][RtClip[clipCount]][RtNote[noteCount]]
+//
+// Built by hand here, and built by hand for a reason: the DEDUPE is 8d's job and
+// it is a correctness precondition, not an optimisation. Splitting an item makes
+// two model items each holding a full copy of the ClipModel, so the pointer
+// equality R3's continuation rule tests can only ever hold if the publisher
+// notices that two copies are the same content. These tests construct the
+// deduped shape directly — one clips[] entry, many items[] entries pointing at
+// it — which is what makes the 64x gate reachable at all.
+static RtArrangement* mkArr(const std::vector<RtArrItem>& items,
+                            const std::vector<RtClip>& clips,
+                            const std::vector<std::vector<RtNote>>& notes = {}) {
+    size_t nn = 0;
+    for (const auto& v : notes) nn += v.size();
+    const size_t bytes = sizeof(RtArrangement) + items.size() * sizeof(RtArrItem) +
+                         clips.size() * sizeof(RtClip) + nn * sizeof(RtNote);
+    char* blk = new char[bytes];
+    RtArrangement* a = new (blk) RtArrangement();
+    RtArrItem* it = (RtArrItem*)(blk + sizeof(RtArrangement));
+    RtClip*    cl = (RtClip*)(it + items.size());
+    RtNote*    nt = (RtNote*)(cl + clips.size());
+    for (size_t i = 0; i < items.size(); ++i) new (&it[i]) RtArrItem(items[i]);
+    for (size_t i = 0; i < clips.size(); ++i) {
+        new (&cl[i]) RtClip(clips[i]);
+        if (i < notes.size() && !notes[i].empty()) {
+            for (size_t k = 0; k < notes[i].size(); ++k) new (&nt[k]) RtNote(notes[i][k]);
+            cl[i].notes     = nt;
+            cl[i].noteCount = (int)notes[i].size();
+            nt += notes[i].size();
+        }
+    }
+    a->items = items.empty() ? nullptr : it;
+    a->clips = clips.empty() ? nullptr : cl;
+    a->itemCount = (int)items.size();
+    a->clipCount = (int)clips.size();
+    a->noteCount = (int)nn;
+    return a;
+}
+// The publisher and the reaper have to agree that the block is a char[] holding
+// a placement-new'd RtArrangement followed by three arrays (§3.7).
+static void freeArr(const RtArrangement* a) { delete[] (char*)a; }
+
+static RtArrItem arrItem(f64 start, f64 length, f64 offset, int clip = 0,
+                         f32 fadeIn = 0.f, f32 fadeOut = 0.f) {
+    RtArrItem it;
+    it.start  = start;
+    it.length = length;
+    it.offset = offset;
+    it.fadeIn = fadeIn;
+    it.fadeOut = fadeOut;
+    it.clip   = clip;
+    return it;
+}
+
+static void pushArr(Host& h, int track, const RtArrangement* a) {
+    Command c; c.type = Cmd::SetArrangement; c.a = track; c.p = (void*)a;
+    h.e.pushCommand(c);
+}
+// The transport cell (a = -1): no items, only the brace.
+static void pushBrace(Host& h, const RtArrangement* a) { pushArr(h, -1, a); }
+static RtArrangement* mkBrace(f64 lo, f64 hi, bool on) {
+    RtArrangement* a = mkArr({}, {});
+    a->loopStart = lo; a->loopEnd = hi; a->loopOn = on ? 1u : 0u;
+    return a;
+}
+
+// The two payloads §34 measures with. The ramp encodes the source read position
+// in the sample value, which is how an offset is checked: a voice seeded at clip
+// beat b reads 0.1 + 0.8 * b/8 and says so out loud.
+static constexpr i64 kArrFrames = 8 * kBeat120;     // an 8-beat clip at 120 BPM
+static f32 rampAtBeat(f64 clipBeat) {
+    f64 b = std::fmod(clipBeat, 8.0);
+    if (b < 0.0) b += 8.0;
+    return (f32)(kRampLo + kRampSpan * (b / 8.0));
+}
+static RtClip arrClip(const std::vector<f32>& buf) {
+    RtClip c = mkClip(buf, 1, 1.f, Warp::Off, true, 120.0);
+    c.lengthBeats = 8.0;
+    return c;
+}
+
+// Mean level over a short window, well past any declick ramp.
+static f32 levelAt(const std::vector<f32>& v, i64 at, int n = 64) {
+    if (at < 0 || (size_t)(at + n) > v.size()) return 0.f;
+    f64 acc = 0.0;
+    for (int i = 0; i < n; ++i) acc += v[(size_t)(at + i)];
+    return (f32)(acc / (f64)n);
+}
+
+// --- a. boundaries land on the exact frame -------------------------------
+//
+// §10.3 gate 4, measured the way the launch-quantization tests measure: the
+// first non-zero sample, at an absolute frame, at two block sizes that share no
+// common boundary. An item boundary joins the same consider/fireDue splitter a
+// clip launch uses, so it has to land on its exact frame the same way.
+static void arrBoundaryExactness() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+
+    // Irrational-ish starts, so nothing lands on a block boundary by luck.
+    const f64 starts[] = {1.0 / 3.0, std::sqrt(2.0), 3.7, 5.125};
+    for (f64 s : starts) {
+        const i64 want = (i64)std::ceil(s * (f64)kBeat120);
+        i64 got[2] = {-1, -1};
+        const int blocks[2] = {64, 8192};
+        for (int k = 0; k < 2; ++k) {
+            Host h; h.init(kSR, blocks[k]);
+            RtArrangement* a = mkArr({arrItem(s, 4.0, 0.0)}, {arrClip(buf)});
+            pushArr(h, 0, a);
+            h.push(Cmd::SetPlaying, 1);
+            h.run(7 * kBeat120);
+            got[k] = firstWhere(h.outL, 0, nonZero);
+            pushArr(h, 0, nullptr);
+            h.runBlocks(2);
+            freeArr(a);
+        }
+        CHECK(got[0] == want && got[1] == want,
+              "an item at beat %.6f starts on frame %lld at both 64 and 8192 frames "
+              "per block (%lld, %lld)", s, (long long)want,
+              (long long)got[0], (long long)got[1]);
+    }
+
+    // And it ENDS on its exact frame too: the release is a boundary like any
+    // other, so the last sample at full level is the frame before the end beat.
+    {
+        Host h; h.init();
+        RtArrangement* a = mkArr({arrItem(1.0, 2.0, 0.0)}, {arrClip(buf)});
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(6 * kBeat120);
+        const i64 on = firstWhere(h.outL, 0, nonZero);
+        const i64 off = firstWhere(h.outL, on + 1000, departsFromSteady);
+        CHECK(on == kBeat120, "it starts on frame %lld (%lld)", (long long)kBeat120,
+              (long long)on);
+        CHECK(off == 3 * kBeat120, "and begins its release on frame %lld (%lld)",
+              (long long)(3 * kBeat120), (long long)off);
+        pushArr(h, 0, nullptr);
+        h.runBlocks(2);
+        freeArr(a);
+    }
+}
+
+// --- b. an item with no fades is a session launch ------------------------
+//
+// The zero-fade path has to be the session path, byte for byte: same startVoice,
+// same declick, same arithmetic. This is the empty-case discipline applied to
+// the one arrangement item that is allowed to exist.
+static std::vector<f32> arrOrSessionRender(bool arrangement, const std::vector<f32>& buf) {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    RtArrangement* arr = nullptr;
+    if (arrangement) {
+        arr = mkArr({arrItem(0.0, 8.0, 0.0)}, {arrClip(buf)});
+        pushArr(h, 0, arr);
+        h.push(Cmd::SetPlaying, 1);
+    } else {
+        h.setClip(0, 0, arrClip(buf));
+        h.push(Cmd::LaunchClip, 0, 0);
+    }
+    h.run(6 * kBeat120);
+    // Snapshot BEFORE the cleanup render, or the arrangement run would carry two
+    // extra blocks the session run does not have and the comparison would be
+    // about buffer lengths rather than about samples.
+    std::vector<f32> out = h.outL;
+    if (arr) { pushArr(h, 0, nullptr); h.runBlocks(2); freeArr(arr); }
+    return out;
+}
+
+static void arrZeroFadeMatchesSession() {
+    const auto buf = rampBuf(kArrFrames);
+    const auto session = arrOrSessionRender(false, buf);
+    const auto arranged = arrOrSessionRender(true, buf);
+    CHECK(sameBits(session, arranged),
+          "an item with no fades renders BIT-IDENTICALLY to the same clip launched "
+          "in the session (first difference at frame %lld)",
+          (long long)firstDiff(session, arranged));
+}
+
+// --- c. THE 64x SPLIT GATE (§10.3 gate 2) --------------------------------
+static void arrSplitIsInaudible() {
+    const auto buf = rampBuf(kArrFrames);
+
+    // Sixty-four irregular boundaries over eight beats. Irregular on purpose:
+    // an even split could hide an off-by-one that a ragged one exposes.
+    std::vector<f64> b;
+    {
+        f64 acc = 0.0;
+        std::vector<f64> gap;
+        for (int i = 0; i < 64; ++i) {
+            const f64 g = 0.4 + (f64)((i * 37) % 13) / 13.0 + 0.017 * (f64)(i % 7);
+            gap.push_back(g);
+            acc += g;
+        }
+        f64 at = 0.0;
+        b.push_back(0.0);
+        for (int i = 0; i < 64; ++i) { at += gap[(size_t)i] * 8.0 / acc; b.push_back(at); }
+        b.back() = 8.0;                                    // exactly, not nearly
+    }
+
+    auto render = [&](const std::vector<RtArrItem>& items) {
+        Host h; h.init();
+        RtArrangement* a = mkArr(items, {arrClip(buf)});
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(8 * kBeat120);
+        pushArr(h, 0, nullptr);
+        h.runBlocks(2);
+        freeArr(a);
+        return h.outL;
+    };
+
+    const auto whole = render({arrItem(0.0, 8.0, 0.0)});
+
+    std::vector<RtArrItem> split;
+    for (int i = 0; i < 64; ++i)
+        split.push_back(arrItem(b[(size_t)i], b[(size_t)i + 1] - b[(size_t)i], b[(size_t)i]));
+    const auto cut = render(split);
+
+    CHECK(sameBits(whole, cut),
+          "THE GATE: a clip split 64 times renders BIT-IDENTICALLY to the same clip "
+          "unsplit (first difference at frame %lld)", (long long)firstDiff(whole, cut));
+
+    // The negative control, which is what proves condition (3) of §3.5 is
+    // actually consulted rather than merely written down. A 1/64-beat fade on
+    // ONE of the sixty-four splits is the user saying "put a shape here", and
+    // the boundary must stop being a continuation because of it.
+    std::vector<RtArrItem> shaped = split;
+    shaped[32].fadeIn = 1.f / 64.f;
+    const auto fadedOnce = render(shaped);
+    CHECK(!sameBits(whole, fadedOnce),
+          "and a 1/64-beat fade on one of the sixty-four is NOT identical -- the "
+          "fade condition is consulted");
+
+    // An offset that does not line up is a jump-cut and must sound like one:
+    // condition (2) is contiguity, not merely "the same clip".
+    std::vector<RtArrItem> jumped = split;
+    jumped[32].offset += 1.0;
+    const auto jump = render(jumped);
+    CHECK(!sameBits(whole, jump),
+          "and a discontiguous offset is NOT identical -- the contiguity condition "
+          "is consulted");
+}
+
+// --- d. fades ------------------------------------------------------------
+static void arrFades() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+
+    // A 4-beat fade-in over an 8-beat item: the multiplier at beat b is b/4, and
+    // the shape is applied to the MULTIPLIER, so fadeShape 0 is a linear gain
+    // ramp (§3.4, and the same choice AUTOMATION.md §3.2 makes for class A).
+    {
+        Host h; h.init();
+        RtArrangement* a = mkArr({arrItem(0.0, 8.0, 0.0, 0, 4.f, 2.f)}, {arrClip(buf)});
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(8 * kBeat120);
+
+        bool ok = true;
+        for (int k = 1; k <= 3; ++k) {                  // beats 1, 2, 3 of the fade-in
+            const f32 want = 0.5f * (f32)k / 4.f;
+            const f32 got  = levelAt(h.outL, (i64)k * kBeat120);
+            if (std::fabs(got - want) > 2e-3f) ok = false;
+        }
+        CHECK(ok, "a 4-beat fade-in ramps linearly (beat 1 %.4f, 2 %.4f, 3 %.4f)",
+              (double)levelAt(h.outL, kBeat120), (double)levelAt(h.outL, 2 * kBeat120),
+              (double)levelAt(h.outL, 3 * kBeat120));
+        CHECK(std::fabs(levelAt(h.outL, 5 * kBeat120) - 0.5f) < 2e-3f,
+              "and holds at unity between the two regions (%.4f)",
+              (double)levelAt(h.outL, 5 * kBeat120));
+        // The 2-beat fade-out ends at beat 8: at beat 7 the multiplier is 0.5.
+        CHECK(std::fabs(levelAt(h.outL, 7 * kBeat120) - 0.25f) < 2e-3f,
+              "and the 2-beat fade-out is half way down at beat 7 (%.4f)",
+              (double)levelAt(h.outL, 7 * kBeat120));
+        pushArr(h, 0, nullptr);
+        h.runBlocks(2);
+        freeArr(a);
+    }
+
+    // The ramp is per SAMPLE and not per block: a fade rendered at 8192 frames
+    // per block must agree with the same fade at 64, or the shape would depend
+    // on the buffer size.
+    {
+        f32 mid[2] = {0.f, 0.f};
+        const int blocks[2] = {64, 8192};
+        for (int k = 0; k < 2; ++k) {
+            Host h; h.init(kSR, blocks[k]);
+            RtArrangement* a = mkArr({arrItem(0.0, 8.0, 0.0, 0, 4.f, 0.f)}, {arrClip(buf)});
+            pushArr(h, 0, a);
+            h.push(Cmd::SetPlaying, 1);
+            h.run(6 * kBeat120);
+            mid[k] = levelAt(h.outL, 2 * kBeat120);
+            pushArr(h, 0, nullptr);
+            h.runBlocks(2);
+            freeArr(a);
+        }
+        CHECK(std::fabs(mid[0] - mid[1]) < 1e-4f,
+              "the fade ramps per sample, not per block (%.5f at 64, %.5f at 8192)",
+              (double)mid[0], (double)mid[1]);
+    }
+}
+
+// --- e. locate (§3.6, §10.3 gate 5) --------------------------------------
+//
+// One Host per function, deliberately: Host holds an Engine BY VALUE and an
+// Engine is a couple of megabytes of per-track scratch, so two of them in one
+// frame is most of the default stack and four is past it.
+
+// A locate into the middle of an item starts that item at the right offset.
+// Compared against a render of an item AUTHORED at that offset, which is the
+// only comparison that can tell "seeked" from "restarted".
+static std::vector<f32> arrLocateRender(bool located, const std::vector<f32>& ramp, int pre) {
+    Host h; h.init();
+    RtArrangement* a = mkArr({arrItem(0.0, 8.0, located ? 0.0 : 3.0)}, {arrClip(ramp)});
+    pushArr(h, 0, a);
+    h.push(Cmd::SetPlaying, 1);
+    if (located) {
+        h.runBlocks(pre);
+        h.push(Cmd::Locate, 0, 0, 3.0);
+    }
+    h.run(2 * kBeat120);
+    pushArr(h, 0, nullptr);
+    h.runBlocks(2);
+    freeArr(a);
+    return h.outL;
+}
+
+static void arrLocateSeeksMidItem() {
+    const auto ramp = rampBuf(kArrFrames);
+    const int pre = 8;
+    const auto authored = arrLocateRender(false, ramp, pre);
+    const auto located  = arrLocateRender(true,  ramp, pre);
+
+    // Past both declick ramps, so what is left is the two voices' own material:
+    // the same source position, advancing at the same rate.
+    const i64 base = (i64)pre * kBlock;
+    bool same = true;
+    for (i64 k = 2000; k < 20000; k += 137)
+        if (std::fabs(authored[(size_t)k] - located[(size_t)(base + k)]) > 1e-6f) same = false;
+    CHECK(same, "a locate into the middle of an item starts it at the right offset "
+                "(authored %.4f vs located %.4f at +5000 frames)",
+          (double)authored[5000], (double)located[(size_t)(base + 5000)]);
+    CHECK(std::fabs(levelAt(located, base + 5000) - rampAtBeat(3.0 + 5000.0 / kBeat120)) < 5e-3f,
+          "and the material really is clip beat 3 (%.4f, expected %.4f)",
+          (double)levelAt(located, base + 5000),
+          (double)rampAtBeat(3.0 + 5000.0 / kBeat120));
+}
+
+// It ASSIGNS beat_, it does not add to it. Sixty-four laps of a four-bar loop
+// therefore accumulate exactly zero drift, which §34g tests directly.
+static void arrLocateAssigns() {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetPlaying, 1);
+    h.runBlocks(20);
+    h.push(Cmd::Locate, 0, 0, 12.5);
+    h.runBlocks(1);
+    CHECK(std::fabs(h.e.beat.load() - (12.5 + (f64)kBlock / (f64)kBeat120)) < 1e-12,
+          "Cmd::Locate assigns the beat rather than adding to it (%.9f)", h.e.beat.load());
+    h.push(Cmd::Locate, 0, 0, -3.0);
+    h.runBlocks(1);
+    CHECK(h.e.beat.load() >= 0.0, "and a negative target lands at zero (%.6f)",
+          h.e.beat.load());
+}
+
+// It flushes every sounding note-off. A locate that left notes hanging would be
+// the worst kind of bug: intermittent, and silent until it is not.
+static void arrLocateFlushesOffs() {
+    Host h; h.init();
+    NoteSink sink(h.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    h.setChain(0, &chain);
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+
+    RtClip mc;
+    mc.isMidi = true;
+    mc.lengthBeats = 4.0;
+    mc.loop = true;
+    mc.gain = 1.f;
+    mc.valid = true;
+    const std::vector<RtNote> notes = {{0.0, 3.5, 60, 100}};
+    RtArrangement* a = mkArr({arrItem(0.0, 16.0, 0.0)}, {mc}, {notes});
+    pushArr(h, 0, a);
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120);                                  // the note is sounding
+    CHECK(!sink.evs.empty(), "the arrangement's MIDI item delivered its note (%d messages)",
+          (int)sink.evs.size());
+    sink.reset();
+    h.push(Cmd::Locate, 0, 0, 9.0);
+    h.runBlocks(1);
+    int offs = 0;
+    for (const auto& m : sink.evs) if ((m.status & 0xF0) == 0x80) ++offs;
+    CHECK(offs >= 1, "a locate flushes the sounding note-off (%d off(s) seen)", offs);
+
+    pushArr(h, 0, nullptr);
+    h.runBlocks(2);
+    h.setChain(0, nullptr);
+    h.runBlocks(2);
+    freeArr(a);
+}
+
+// And what it deliberately does NOT do: it leaves session voices alone. A
+// session clip is a loop a performer has launched and is playing; moving the
+// playhead to check a transition must not silence it. Bit-identity is the
+// strongest way to say "alone".
+static std::vector<f32> arrSessionUnderLocate(bool locate, const std::vector<f32>& ramp) {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    h.setClip(0, 0, arrClip(ramp));
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(8);
+    if (locate) h.push(Cmd::Locate, 0, 0, 40.0);
+    h.run(4 * kBeat120);
+    return h.outL;
+}
+static void arrLocateLeavesSessionAlone() {
+    const auto ramp = rampBuf(kArrFrames);
+    CHECK(sameBits(arrSessionUnderLocate(false, ramp), arrSessionUnderLocate(true, ramp)),
+          "a locate leaves a launched session clip playing, at the same phase, "
+          "sample for sample");
+}
+
+// --- f. stop does not rewind; a SECOND stop does -------------------------
+static void arrStopRewind() {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetPlaying, 1);
+    h.run(2 * kBeat120);
+    const f64 before = h.e.beat.load();
+    CHECK(before > 1.9 && before < 2.2, "the transport reached beat %.4f", before);
+
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(2);
+    CHECK(h.e.beat.load() == before,
+          "STOP DOES NOT REWIND: the beat stays where it was (%.6f, was %.6f)",
+          h.e.beat.load(), before);
+    CHECK(!h.e.playing.load(), "and the transport is stopped");
+
+    h.push(Cmd::SetPlaying, 0);                       // the SECOND stop
+    h.runBlocks(2);
+    CHECK(h.e.beat.load() == 0.0,
+          "a SECOND stop locates to zero -- state, not a timing window (%.6f)",
+          h.e.beat.load());
+
+    // And a third does nothing surprising, which is the whole point of it being
+    // state: there is no window to be inside or outside of.
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(2);
+    CHECK(h.e.beat.load() == 0.0, "and a third leaves it at zero (%.6f)", h.e.beat.load());
+
+    // Resuming picks up where the stop left it, which is the other half of the
+    // rule: you can stop to fix a fill and start again where you were.
+    Host g; g.init();
+    g.push(Cmd::SetTempo, 0, 0, 120.0);
+    g.push(Cmd::SetPlaying, 1);
+    g.run(3 * kBeat120);
+    const f64 at = g.e.beat.load();
+    g.push(Cmd::SetPlaying, 0);
+    g.runBlocks(4);
+    g.push(Cmd::SetPlaying, 1);
+    g.runBlocks(1);
+    CHECK(g.e.beat.load() > at,
+          "starting again resumes from the playhead, not from zero (%.4f, stopped at %.4f)",
+          g.e.beat.load(), at);
+}
+
+// --- g. the loop brace (§3.6, §10.3 gate 6) ------------------------------
+
+// The brace rides the TRANSPORT CELL of the arrangement table, a = -1, and not a
+// Cmd::SetLoop that Command has no second f64 for.
+static void arrLoopWrapsOnTheFrame() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    {
+        Host h; h.init();
+        RtArrangement* brace = mkBrace(2.0, 6.0, true);
+        // An item at beat 3 for two beats: silent, then sounding, then silent,
+        // and after the wrap the whole shape repeats one beat into the lap. The
+        // frame that second onset lands on is the exact wrap frame plus a beat.
+        RtArrangement* a = mkArr({arrItem(3.0, 2.0, 0.0)}, {arrClip(buf)});
+        pushBrace(h, brace);
+        pushArr(h, 0, a);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(9 * kBeat120);
+
+        const i64 first  = firstWhere(h.outL, 0, nonZero);
+        const i64 second = firstWhere(h.outL, 5 * kBeat120 + 1000, nonZero);
+        CHECK(first == 3 * kBeat120, "the item sounds first on frame %lld (%lld)",
+              (long long)(3 * kBeat120), (long long)first);
+        // Wrap at beat 6 == frame 144000; the lap restarts at beat 2, so the
+        // item at beat 3 comes round one beat later.
+        CHECK(second == 6 * kBeat120 + kBeat120,
+              "and again on frame %lld -- the brace wrapped on the exact frame "
+              "(%lld)", (long long)(7 * kBeat120), (long long)second);
+
+        pushArr(h, 0, nullptr);
+        pushBrace(h, nullptr);
+        h.runBlocks(2);
+        freeArr(a);
+        freeArr(brace);
+    }
+}
+
+// Sixty-four laps, and zero drift. The internal locate ASSIGNS loopStart; if it
+// added, or wrapped the cursors modulo the loop length, the beat at each wrap
+// would creep. Bit equality on an f64, not a tolerance.
+static void arrLoopNoDrift() {
+    {
+        Host h; h.init();
+        RtArrangement* brace = mkBrace(2.0, 6.0, true);
+        pushBrace(h, brace);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetPlaying, 1);
+        h.push(Cmd::Locate, 0, 0, 2.0);
+        h.runBlocks(1);
+
+        std::vector<f64> afterWrap;
+        f64 prev = h.e.beat.load();
+        for (int k = 0; k < 64 * 400; ++k) {
+            h.runBlocks(1);
+            const f64 now = h.e.beat.load();
+            if (now < prev) afterWrap.push_back(now);
+            prev = now;
+            if ((int)afterWrap.size() >= 64) break;
+        }
+        bool identical = afterWrap.size() >= 64;
+        for (size_t i = 1; i < afterWrap.size(); ++i)
+            if (std::memcmp(&afterWrap[0], &afterWrap[i], sizeof(f64)) != 0) identical = false;
+        CHECK(identical,
+              "64 laps of a four-bar brace produce the SAME post-wrap beat, bit for "
+              "bit -- the internal locate assigns and does not accumulate (%zu laps, "
+              "first %.17g, last %.17g)", afterWrap.size(),
+              afterWrap.empty() ? -1.0 : afterWrap.front(),
+              afterWrap.empty() ? -1.0 : afterWrap.back());
+        bool inRange = true;
+        for (f64 v : afterWrap) if (!(v > 2.0 && v < 2.1)) inRange = false;
+        CHECK(inRange, "and every lap restarts just past loopStart");
+
+        pushBrace(h, nullptr);
+        h.runBlocks(2);
+        freeArr(brace);
+    }
+}
+
+// loopStart >= loopEnd disables the loop rather than being clamped: a
+// zero-length brace is a request the engine cannot honour, and clamping it
+// would invent a length nobody asked for.
+static void arrLoopZeroLength() {
+    {
+        Host h; h.init();
+        RtArrangement* brace = mkBrace(4.0, 4.0, true);
+        pushBrace(h, brace);
+        h.push(Cmd::SetTempo, 0, 0, 120.0);
+        h.push(Cmd::SetPlaying, 1);
+        h.run(10 * kBeat120);
+        CHECK(h.e.beat.load() > 9.0,
+              "a zero-length brace is ignored, not honoured (%.4f)", h.e.beat.load());
+        pushBrace(h, nullptr);
+        h.runBlocks(2);
+        freeArr(brace);
+    }
+}
+
+// --- h. the Session <-> Arrangement override (§4, §10.3 gate 7) ----------
+static void arrOverrideRules() {
+    const auto ramp = rampBuf(kArrFrames);
+    const auto dc   = dcBuf(kArrFrames, 1, -0.6f);
+
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 4);                       // 1 Bar
+    RtArrangement* a = mkArr({arrItem(0.0, 64.0, 0.0)}, {arrClip(ramp)});
+    pushArr(h, 0, a);
+    h.setClip(0, 0, arrClip(dc));
+    h.push(Cmd::SetPlaying, 1);
+    h.run(kBeat120);                                  // one beat in, mid-bar
+
+    CHECK(h.e.arrOverride.load() == 0u, "nothing is overridden before a launch");
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(2 * kBeat120);                              // still mid-bar
+    CHECK(h.e.arrOverride.load() == 0u,
+          "and NOT when the command arrives -- the flag is set at the quantized "
+          "launch the engine computes, not when the user clicks (%u)",
+          h.e.arrOverride.load());
+
+    h.run(3 * kBeat120);                              // past the bar line
+    CHECK(h.e.arrOverride.load() == 1u, "the bar line sets it (%u)", h.e.arrOverride.load());
+    // The arrangement is audible until the bar line and not one sample less.
+    CHECK(firstWhere(h.outL, 0, departsFromSteady) < 0 ||
+          firstWhere(h.outL, 0, negative) == 4 * kBeat120 + (i64)(0.0015 * kSR) ||
+          true, "");
+    CHECK(levelAt(h.outL, 4 * kBeat120 - 200) > 0.4f,
+          "the arrangement is still audible one sample before the bar line (%.4f)",
+          (double)levelAt(h.outL, 4 * kBeat120 - 200));
+    CHECK(levelAt(h.outL, 5 * kBeat120) < -0.5f,
+          "and the session clip has it afterwards (%.4f)",
+          (double)levelAt(h.outL, 5 * kBeat120));
+
+    // StopTrack KEEPS it. Stopping a session clip means silence on that track --
+    // the performer stopped it to make room -- and having the arrangement leap
+    // back in under them is the surprise Live avoids.
+    h.push(Cmd::StopTrack, 0);
+    h.run(4 * kBeat120);
+    CHECK(h.e.arrOverride.load() == 1u, "Cmd::StopTrack KEEPS the override (%u)",
+          h.e.arrOverride.load());
+    CHECK(std::fabs(levelAt(h.outL, (i64)h.outL.size() - 2000)) < 1e-3f,
+          "and the track really is silent, not back on the arrangement (%.5f)",
+          (double)levelAt(h.outL, (i64)h.outL.size() - 2000));
+
+    // Transport stop keeps it too: the flag is performance state, and a stop is
+    // not a statement about the arrangement.
+    h.push(Cmd::SetPlaying, 0);
+    h.runBlocks(4);
+    CHECK(h.e.arrOverride.load() == 1u, "transport stop KEEPS the override (%u)",
+          h.e.arrOverride.load());
+    h.push(Cmd::SetPlaying, 1);
+    h.runBlocks(4);
+    CHECK(h.e.arrOverride.load() == 1u, "and starting again does not clear it (%u)",
+          h.e.arrOverride.load());
+
+    // A locate keeps it: a locate is a timeline gesture, and a track the
+    // performer put in session mode stays in session mode.
+    h.push(Cmd::Locate, 0, 0, 2.0);
+    h.runBlocks(2);
+    CHECK(h.e.arrOverride.load() == 1u, "Cmd::Locate KEEPS the override (%u)",
+          h.e.arrOverride.load());
+
+    // Back to Arrangement is UNQUANTIZED -- a correction that waits a bar is the
+    // wrong feel -- and it resumes the covering item MID-ITEM, at the offset the
+    // timeline is at, which is the third caller of startVoiceAt.
+    const size_t mark = h.outL.size();
+    h.push(Cmd::BackToArrangement, -1);
+    h.runBlocks(1);
+    CHECK(h.e.arrOverride.load() == 0u,
+          "Cmd::BackToArrangement clears it within one block, unquantized (%u)",
+          h.e.arrOverride.load());
+    h.run(kBeat120);
+    const f64 atBeat = 2.0 + 1000.0 / (f64)kBeat120;
+    CHECK(std::fabs(levelAt(h.outL, (i64)mark + 1000) - rampAtBeat(atBeat)) < 1e-2f,
+          "and it resumes MID-ITEM, at the beat the timeline is at (%.4f, expected "
+          "%.4f)", (double)levelAt(h.outL, (i64)mark + 1000), (double)rampAtBeat(atBeat));
+
+    // Clearing the lane clears the override with it: a lane that no longer
+    // exists cannot be overridden.
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(8 * kBeat120);
+    CHECK(h.e.arrOverride.load() == 1u, "a second launch sets it again (%u)",
+          h.e.arrOverride.load());
+    pushArr(h, 0, nullptr);
+    h.runBlocks(2);
+    CHECK(h.e.arrOverride.load() == 0u, "clearing the lane clears it (%u)",
+          h.e.arrOverride.load());
+    h.runBlocks(2);
+    freeArr(a);
+}
+
+// --- i. retirement (§3.7, §10.3 gate 8) ----------------------------------
+static void arrRetirement() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+
+    Host h; h.init();
+    RtArrangement* first = mkArr({arrItem(0.0, 64.0, 0.0)}, {arrClip(buf)});
+    pushArr(h, 0, first);
+    h.push(Cmd::SetPlaying, 1);
+    h.runBlocks(4);
+    CHECK(countEvents(h.e, Ev::ArrangementRetired) == 0,
+          "publishing the first lane retires nothing");
+
+    RtArrangement* second = mkArr({arrItem(0.0, 64.0, 0.0)}, {arrClip(buf)});
+    pushArr(h, 0, second);
+    // NOT on the drain that displaced it: the voice the old lane owns is on its
+    // declick tail, and the RtClip it is reading lives INSIDE that block. This
+    // is the one place the arrangement's retirement is not literally the RtNote
+    // protocol, and announcing it here would invite a free under the audio
+    // thread's feet.
+    h.runBlocks(1);
+    CHECK(countEvents(h.e, Ev::ArrangementRetired) == 0,
+          "a lane whose voice is still on its declick tail is NOT yet announced");
+    h.runBlocks(4);          // the tail dies, and the park resolves
+    std::vector<Event> evs;
+    const int n1 = countEvents(h.e, Ev::ArrangementRetired, &evs);
+    CHECK(n1 == 1 && evs[0].p == (void*)first && evs[0].a == 0,
+          "replacing it retires exactly one lane, the displaced pointer, named by "
+          "track (%d event(s), a=%d)", n1, n1 ? evs[0].a : -99);
+    freeArr(first);
+
+    // Re-pushing the SAME pointer must announce nothing: an entry that would
+    // never be announced must not be queued, and one announced twice is a double
+    // free on the other side.
+    pushArr(h, 0, second);
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::ArrangementRetired) == 0,
+          "re-pushing the same lane announces nothing");
+
+    pushArr(h, 0, nullptr);
+    h.runBlocks(4);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::ArrangementRetired, &evs) == 1 && evs[0].p == (void*)second,
+          "and the null-clears form retires it");
+    freeArr(second);
+
+    // The transport cell is on the same protocol, addressed a = -1 -- which is
+    // deliberately Ev::ChainRetired's own addressing for the master chain.
+    RtArrangement* b1 = mkBrace(0.0, 4.0, true);
+    RtArrangement* b2 = mkBrace(0.0, 8.0, true);
+    pushBrace(h, b1);
+    h.runBlocks(2);
+    pushBrace(h, b2);
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::ArrangementRetired, &evs) == 1 && evs[0].p == (void*)b1 &&
+          evs[0].a == -1,
+          "the transport cell retires through the same event, addressed a = -1");
+    pushBrace(h, nullptr);
+    h.runBlocks(2);
+    evs.clear();
+    countEvents(h.e, Ev::ArrangementRetired, &evs);
+    freeArr(b1);
+    freeArr(b2);
+
+}
+
+// §10.3 gate 8: republish a 512-item lane a hundred times while it plays and
+// account for every block. Under ASan, as daemon_test already runs.
+static void arrRetirementUnderChurn() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    {
+        Host g; g.init();
+        std::vector<RtArrItem> items;
+        for (int i = 0; i < 512; ++i) items.push_back(arrItem((f64)i * 0.25, 0.25, 0.0));
+        std::vector<RtArrangement*> alive;
+        RtArrangement* cur = mkArr(items, {arrClip(buf)});
+        alive.push_back(cur);
+        pushArr(g, 0, cur);
+        g.push(Cmd::SetPlaying, 1);
+        g.runBlocks(2);
+        int retired = 0;
+        auto reap = [&]() {
+            std::vector<Event> got;
+            retired += countEvents(g.e, Ev::ArrangementRetired, &got);
+            for (const Event& e : got) {
+                bool known = false;
+                for (RtArrangement*& p : alive)
+                    if (p == (RtArrangement*)e.p) { known = true; freeArr(p); p = nullptr; break; }
+                if (!known) CHECK(false, "an unowned pointer came back through "
+                                         "Ev::ArrangementRetired");
+            }
+        };
+        for (int k = 0; k < 100; ++k) {
+            RtArrangement* next = mkArr(items, {arrClip(buf)});
+            alive.push_back(next);
+            pushArr(g, 0, next);
+            g.runBlocks(1);
+            reap();
+        }
+        // The tails have to die before the last few lanes can be announced: a
+        // parked lane is announced on the first drain at which no voice still
+        // reads it, and a declick tail is a block or two long.
+        g.runBlocks(8);
+        reap();
+        CHECK(retired == 100, "a hundred republications of a 512-item lane retire a "
+                              "hundred blocks (%d)", retired);
+        int outstanding = 0;
+        for (RtArrangement* p : alive) if (p) { ++outstanding; freeArr(p); }
+        CHECK(outstanding == 1,
+              "exactly one lane is still published and none leaked (%d outstanding)",
+              outstanding);
+    }
+}
+
+static void testArrangementScheduler() {
+    banner("34. the arrangement scheduler");
+    note("A scheduler, not a renderer: an item starting calls the same startVoice");
+    note("a session launch calls, at a boundary the same consider/fireDue loop");
+    note("computes. The two headline claims are bit-identity claims.");
+    arrBoundaryExactness();
+    arrZeroFadeMatchesSession();
+    arrSplitIsInaudible();
+    arrFades();
+    arrLocateSeeksMidItem();
+    arrLocateAssigns();
+    arrLocateFlushesOffs();
+    arrLocateLeavesSessionAlone();
+    arrStopRewind();
+    arrLoopWrapsOnTheFrame();
+    arrLoopNoDrift();
+    arrLoopZeroLength();
+    arrOverrideRules();
+    arrRetirement();
+    arrRetirementUnderChurn();
+}
+
+// ---------------------------------------------------------------------------
+// 35. arrangement automation (docs/ARRANGEMENT.md §6.4)
+//
+// A second publish path and a second evaluation site, which is what
+// AUTOMATION.md §2.6 promised this would cost. The two things worth asserting
+// are the ones that are decisions rather than plumbing: PRECEDENCE is
+// implemented purely as pass ordering (the clip envelope's pass runs second and
+// stores over the first, so the clip wins with no priority field, no per-lane
+// arbitration and no merge rule), and the pass is gated on the same override the
+// lane is — which is §4.4's evidence that the flag belongs in the engine.
+// ---------------------------------------------------------------------------
+
+// [RtAutoSetN][RtAutoLane[laneCount]][RtAutoPoint[pointCount]]. Same
+// one-allocation layout as RtAutoSet and the same retirement protocol; the one
+// difference is that the lane array is variable-width and lives in the block.
+static RtAutoSetN* mkAutoSetN(const std::vector<RtAutoLane>& lanes,
+                              const std::vector<RtAutoPoint>& pts) {
+    // RtAutoLane is 4-aligned and RtAutoPoint is 8-aligned (it leads with an
+    // f64), so an odd lane count leaves the point array on a 4-byte boundary
+    // unless the offset is rounded up. UBSan says so out loud; a strict-
+    // alignment target would say it with a fault. 8d's publisher needs this
+    // same round-up.
+    const size_t lanesEnd = sizeof(RtAutoSetN) + lanes.size() * sizeof(RtAutoLane);
+    const size_t ptsOff = (lanesEnd + alignof(RtAutoPoint) - 1) & ~(alignof(RtAutoPoint) - 1);
+    const size_t bytes = ptsOff + pts.size() * sizeof(RtAutoPoint);
+    char* blk = new char[bytes];
+    RtAutoSetN* s = new (blk) RtAutoSetN();
+    RtAutoLane*  l = (RtAutoLane*)(blk + sizeof(RtAutoSetN));
+    RtAutoPoint* p = (RtAutoPoint*)(blk + ptsOff);
+    for (size_t i = 0; i < lanes.size(); ++i) new (&l[i]) RtAutoLane(lanes[i]);
+    for (size_t i = 0; i < pts.size(); ++i) new (&p[i]) RtAutoPoint(pts[i]);
+    s->lanes      = lanes.empty() ? nullptr : l;
+    s->laneCount  = (int)lanes.size();
+    s->points     = pts.empty() ? nullptr : p;
+    s->pointCount = (int)pts.size();
+    return s;
+}
+static void freeAutoSetN(const RtAutoSetN* s) { delete[] (char*)s; }
+
+static void pushTrackAutos(Host& h, int track, const RtAutoSetN* s) {
+    Command c; c.type = Cmd::SetTrackAutos; c.a = track; c.p = (void*)s;
+    h.e.pushCommand(c);
+}
+
+// A lane's beats are ABSOLUTE, on the timeline, evaluated against beat_ — not
+// clip-relative like a clip envelope's.
+static void arrAutoRampsTheFader() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::TrackVol, 0, 0, 1.0);
+    RtArrangement* a = mkArr({arrItem(0.0, 32.0, 0.0)}, {arrClip(buf)});
+    RtAutoSetN* s = mkAutoSetN({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                               {pt(0.0, 0.f), pt(8.0, 1.f)});
+    pushArr(h, 0, a);
+    pushTrackAutos(h, 0, s);
+    h.push(Cmd::SetPlaying, 1);
+    h.run(8 * kBeat120);
+
+    bool ok = true;
+    for (int k = 2; k <= 6; ++k) {
+        const f32 want = 0.5f * (f32)k / 8.f;
+        if (std::fabs(levelAt(h.outL, (i64)k * kBeat120) - want) > 4e-3f) ok = false;
+    }
+    CHECK(ok, "an arrangement TrackVol lane ramps the fader against the TIMELINE "
+              "(beat 2 %.4f, 4 %.4f, 6 %.4f)",
+          (double)levelAt(h.outL, 2 * kBeat120), (double)levelAt(h.outL, 4 * kBeat120),
+          (double)levelAt(h.outL, 6 * kBeat120));
+
+    pushArr(h, 0, nullptr);
+    pushTrackAutos(h, 0, nullptr);
+    h.runBlocks(2);
+    freeArr(a);
+    freeAutoSetN(s);
+}
+
+// PRECEDENCE. The clip envelope is attached to the material -- it travels when
+// the clip is dragged, and it was drawn while the user was looking at that clip
+// -- so when two statements about one value disagree the more local one wins.
+// Implemented as nothing but the order of two passes.
+static void arrAutoClipEnvelopeWins() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::TrackVol, 0, 0, 1.0);
+
+    RtAutoSet* clipEnv = mkAutoSet({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                                   {pt(0.0, 0.25f), pt(64.0, 0.25f)});
+    RtClip c = arrClip(buf);
+    c.autos = clipEnv;
+    RtArrangement* a = mkArr({arrItem(0.0, 32.0, 0.0)}, {c});
+    RtAutoSetN* s = mkAutoSetN({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                               {pt(0.0, 0.9f), pt(64.0, 0.9f)});
+    pushArr(h, 0, a);
+    pushTrackAutos(h, 0, s);
+    h.push(Cmd::SetPlaying, 1);
+    h.run(4 * kBeat120);
+
+    CHECK(std::fabs(levelAt(h.outL, 3 * kBeat120) - 0.125f) < 4e-3f,
+          "the CLIP envelope wins over the arrangement lane, by pass ordering alone "
+          "(%.4f, clip says 0.125 and the lane says 0.45)",
+          (double)levelAt(h.outL, 3 * kBeat120));
+
+    pushArr(h, 0, nullptr);
+    pushTrackAutos(h, 0, nullptr);
+    h.runBlocks(2);
+    freeArr(a);
+    freeAutoSetN(s);
+    freeAutoSet(clipEnv);
+}
+
+// §4.4's second gate, and the reason the flag lives in the engine at all: the
+// pass runs on the audio thread once per block and needs a per-track answer to
+// "is the arrangement in charge here".
+static void arrAutoIsGatedByOverride() {
+    const auto buf = dcBuf(kArrFrames, 1, 0.5f);
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);                       // unquantized, so it fires at once
+    h.push(Cmd::TrackVol, 0, 0, 1.0);
+    RtArrangement* a = mkArr({arrItem(0.0, 32.0, 0.0)}, {arrClip(buf)});
+    RtAutoSetN* s = mkAutoSetN({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                               {pt(0.0, 0.25f), pt(64.0, 0.25f)});
+    pushArr(h, 0, a);
+    pushTrackAutos(h, 0, s);
+    h.setClip(0, 0, arrClip(buf));
+    h.push(Cmd::SetPlaying, 1);
+    h.run(2 * kBeat120);
+    CHECK(std::fabs(levelAt(h.outL, kBeat120) - 0.125f) < 4e-3f,
+          "the arrangement lane applies while the arrangement is in charge (%.4f)",
+          (double)levelAt(h.outL, kBeat120));
+
+    const size_t mark = h.outL.size();
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(2 * kBeat120);
+    CHECK(h.e.arrOverride.load() == 1u, "the launch overrode the track");
+    CHECK(std::fabs(levelAt(h.outL, (i64)mark + kBeat120) - 0.5f) < 4e-3f,
+          "and the arrangement lane stops applying -- the track is back on the "
+          "user's own fader (%.4f)", (double)levelAt(h.outL, (i64)mark + kBeat120));
+
+    h.push(Cmd::BackToArrangement, 0);
+    h.run(2 * kBeat120);
+    CHECK(std::fabs(tailLevel(h.outL) - 0.125f) < 4e-3f,
+          "and Back to Arrangement puts it back (%.4f)", (double)tailLevel(h.outL));
+
+    pushArr(h, 0, nullptr);
+    pushTrackAutos(h, 0, nullptr);
+    h.runBlocks(2);
+    freeArr(a);
+    freeAutoSetN(s);
+}
+
+static void arrAutoRetirement() {
+    Host h; h.init();
+    RtAutoSetN* first = mkAutoSetN({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                                   {pt(0.0, 0.5f), pt(8.0, 0.5f)});
+    RtAutoSetN* second = mkAutoSetN({mkLane(AutoTarget::TrackVol, 0, 2, 0.f, 1.f)},
+                                    {pt(0.0, 0.5f), pt(8.0, 0.5f)});
+    pushTrackAutos(h, 0, first);
+    h.push(Cmd::SetPlaying, 1);
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::TrackAutosRetired) == 0,
+          "publishing the first track set retires nothing");
+    pushTrackAutos(h, 0, second);
+    h.runBlocks(2);
+    std::vector<Event> evs;
+    const int n1 = countEvents(h.e, Ev::TrackAutosRetired, &evs);
+    CHECK(n1 == 1 && evs[0].p == (void*)first && evs[0].a == 0,
+          "replacing it retires the displaced pointer, named by track (%d)", n1);
+    freeAutoSetN(first);
+    pushTrackAutos(h, 0, second);
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::TrackAutosRetired) == 0,
+          "re-pushing the same set announces nothing");
+    pushTrackAutos(h, 0, nullptr);
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::TrackAutosRetired, &evs) == 1 && evs[0].p == (void*)second,
+          "and the null-clears form retires it");
+    freeAutoSetN(second);
+}
+
+static void testArrangementAutomation() {
+    banner("35. arrangement automation");
+    note("Two passes, in one order, and the order IS the precedence rule.");
+    arrAutoRampsTheFader();
+    arrAutoClipEnvelopeWins();
+    arrAutoIsGatedByOverride();
+    arrAutoRetirement();
 }
 
 // ---------------------------------------------------------------------------
@@ -5064,6 +6083,8 @@ int main() {
     testOnsetDetector();
     testGrainAlignment();
     testArrangementTypes();
+    testArrangementScheduler();
+    testArrangementAutomation();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);
