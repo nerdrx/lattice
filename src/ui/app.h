@@ -751,6 +751,147 @@ private:
     u64  ctlInert_   = 0;               // hits whose address resolved to nothing
     f64  ctlFlashAt_ = 0.0;             // last apply, for the status chip's blink
     // === end remote-control block ==========================================
+
+    // =======================================================================
+    // ARRANGEMENT: the two publishers and their reapers  (wave 8d)
+    //   docs/ARRANGEMENT.md §3.2, §3.3, §3.6, §3.7, §6.2, §6.6
+    //
+    // One block, appended whole, so it can be moved or merged in one piece.
+    // Everything here is GUI thread, and every definition lives in the one file
+    // this milestone owns, src/ui/app_arrange.cpp — publishers and reapers next
+    // to each other, exactly as buildAutos and its reaper sit together in
+    // app_engine.cpp.
+    //
+    // Nothing in here is a new lifetime protocol. It is the RtNote protocol for
+    // the fifth and sixth time (chains, note arrays, envelopes, warp maps, now
+    // lanes and track lanes): the GUI allocates, the engine borrows, a displaced
+    // pointer is announced back before it may be freed, and a pointer we have no
+    // record of owning is LEAKED rather than freed.
+    // =======================================================================
+public:
+    // --- the item lane (§3.2, §3.3) ----------------------------------------
+    // Builds the ONE allocation §3.2 specifies, from ses_.tracks[track].arrange:
+    //
+    //   [RtArrangement][RtArrItem[itemCount]][RtClip[clipCount]][RtNote[noteCount]]
+    //
+    // `items`, `clips` and every RtClip::notes inside it address memory in this
+    // same block, so the whole lane is one new[] and one delete[] and the
+    // retirement protocol has exactly ONE pointer to talk about. Null for a track
+    // with no placeable item, which is the ordinary case and is what clears the
+    // engine's cell.
+    const RtArrangement* buildArrangement(int track);
+    // Undoes buildArrangement when the command that would have carried the lane
+    // never reached the engine, so nothing ever borrowed it.
+    void dropArrangement(const RtArrangement* arr);
+    // §3.7 verbatim: build, push, park, retire the displaced pointer. Every edit
+    // to a track's arrangement ends here, and nothing else sends
+    // Cmd::SetArrangement for a track.
+    void publishArrangement(int track);
+    // The TRANSPORT CELL (§3.6): Cmd::SetArrangement with a = -1, whose
+    // RtArrangement carries no items at all — only loopStart / loopEnd / loopOn,
+    // read from ses_. A separate publish path with no item, clip or note tail,
+    // because a loop brace is two numbers and a flag and `Command` has one f64.
+    void publishTransportCell();
+
+    // --- the automation lane (§6.2, §6.6) ----------------------------------
+    // ses_.tracks[track].arrangeAutos, resolved and flattened into its own one
+    // allocation:
+    //
+    //   [RtAutoSetN][RtAutoLane[laneCount]][RtAutoPoint[pointCount]]
+    //
+    // buildAutos with three differences (§6.6): it reads arrangeAutos, it
+    // resolves against the track itself, and the lane array is variable-width
+    // and lives inside the block. Address resolution is resolveAutoLane, the
+    // SAME function the clip envelopes use — there is deliberately no second
+    // resolver, because two would be two things to keep agreeing.
+    const RtAutoSetN* buildArrangeAutos(int track);
+    void dropArrangeAutos(const RtAutoSetN* set);
+    void publishArrangeAutos(int track);
+
+    // Republishes the whole feature for one track — the lane and its automation
+    // — which is what every structural edit and every chain republish owes
+    // (§6.6's blunt rule). One call so a file this milestone does not own needs
+    // one line rather than three.
+    void publishArrangementFor(int track);
+    // Every track, plus the transport cell. The pushAll() half of the feature;
+    // called from a file this milestone does not own (see the report).
+    void publishArrangementAll();
+
+    // THE REAPER for both retirement events. Returns true when it consumed `e`,
+    // so the one line it needs inside pumpEngineEvents() — a file this milestone
+    // does not own — is `if (reapArrangementEvent(e)) continue;`. Refuses to free
+    // a pointer it has no record of owning, with the same LOGW and for the same
+    // reason as every other reaper here: a bad free is a use-after-free in
+    // whoever does own it, which is strictly worse than the leak taken instead.
+    bool reapArrangementEvent(const Event& e);
+
+private:
+    // The published lane per cell, and the ones displaced and not yet announced.
+    // ONE MORE CELL THAN THERE ARE TRACKS: index kMaxTracks is the transport
+    // cell, which the wire addresses as a = -1 (engine.h, and deliberately
+    // Ev::ChainRetired's own addressing). arrCell() is the only place that
+    // mapping is written down.
+    //
+    // The destructor is the AutoBlocks / WarpMaps argument verbatim: App is
+    // destroyed after shutdown() has joined the audio thread, so this is the same
+    // moment shutdown() frees the note arrays — and a destructor cannot be
+    // forgotten by a later edit to shutdown(), which is a file this milestone
+    // does not own. What it frees is what the engine still held when the process
+    // ended, plus anything whose retirement event was never drained.
+    struct ArrPubs {
+        const RtArrangement* published[kMaxTracks + 1] = {};
+        std::vector<const RtArrangement*> retiring;
+        ArrPubs() = default;
+        ArrPubs(const ArrPubs&) = delete;
+        ArrPubs& operator=(const ArrPubs&) = delete;
+        ~ArrPubs();
+    };
+    ArrPubs arr_;
+    // a = -1 (the transport cell) -> kMaxTracks; a track -> itself; anything
+    // else -> -1, which every caller treats as "not a cell we published to".
+    static int arrCell(int a) {
+        if (a == -1) return kMaxTracks;
+        return (a >= 0 && a < kMaxTracks) ? a : -1;
+    }
+
+    // The same, for the arrangement's automation. A separate table because it is
+    // a separate command, a separate event and a separate allocation; sharing one
+    // would mean a retirement that has to guess which kind of pointer it holds.
+    struct ArrAutoPubs {
+        const RtAutoSetN* published[kMaxTracks] = {};
+        std::vector<const RtAutoSetN*> retiring;
+        ArrAutoPubs() = default;
+        ArrAutoPubs(const ArrAutoPubs&) = delete;
+        ArrAutoPubs& operator=(const ArrAutoPubs&) = delete;
+        ~ArrAutoPubs();
+    };
+    ArrAutoPubs arrAutos_;
+
+    // One item's clip envelopes, published as their own RtAutoSet exactly as a
+    // session clip's are (§3.2) — NOT folded into the lane block, because
+    // dragging one breakpoint would then republish up to 1.6 MB of notes.
+    //
+    // Keyed by uid and not by index because inserting an item renumbers every
+    // index after it. The uid recorded is that of the FIRST item whose payload
+    // produced the set: §3.3's dedupe collapses identical payloads into one
+    // RtClip, and an RtClip has one `autos` pointer, so a set belongs to a
+    // payload rather than to an item. See the note in app_arrange.cpp — this is
+    // the one place §3.2's wording and §3.3's dedupe have to be reconciled.
+    struct ArrAutoPub { u64 itemUid = 0; const RtAutoSet* set = nullptr; };
+    std::vector<ArrAutoPub> publishedArrAutos_[kMaxTracks];
+    // The envelope table buildArrangement() has just built and that nothing has
+    // adopted yet. It exists so that the two halves of §3.7 stay the two halves
+    // §3.7 describes: buildArrangement allocates and publishArrangement decides,
+    // and a lane the command ring refused must leave the track's envelope table
+    // exactly as it found it. publishArrangement adopts this; dropArrangement
+    // discards it.
+    std::vector<ArrAutoPub> pendingArrPubs_;
+    // Builds one item's envelopes into the shared autoBlocks_ pool, so that
+    // dropAutos() and the existing Ev::AutosRetired reaper free them with no
+    // change at all. buildAutos's body against an arbitrary ClipModel rather
+    // than against a slot — see the report for why the two are not one function.
+    const RtAutoSet* buildAutosFor(int track, const ClipModel& m);
+    // === end arrangement block =============================================
 };
 
 } // namespace lat

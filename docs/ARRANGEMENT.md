@@ -2320,3 +2320,123 @@ Two corrections to this document, from contact with the code:
   §2.5 places it. That file is 8d's and does not exist yet, and 8a had to both
   ship and test the function. It is a pure vector transform; moving it later
   changes which file it is in and nothing else.
+
+---
+
+## 15. 8d shipped — the GUI-side publishers
+
+`src/ui/app_arrange.cpp` is in, reached through an append-only block in
+`app.h`. Both publishers, both reapers, and the two destructors that free what
+the engine still held when the process ended.
+
+**The lane block.** `buildArrangement(track)` builds §3.2's one allocation —
+`[RtArrangement][RtArrItem[]][RtClip[]][RtNote[]]`, one `new char[]`, one
+`delete[]` — in three passes: decide the shape (which items survive, which
+distinct payloads they collapse onto, how many notes the tail holds), build the
+per-payload envelope sets, then allocate and fill. Each array's offset is
+`alignUp`'d rather than left to today's sizes happening to divide, and the
+free is `delete[] (char*)` with a `static_assert` per type that nothing in
+either block has a destructor to run. `publishArrangement` is §3.7 verbatim;
+`publishTransportCell` is the `a = -1` cell, whose `RtArrangement` carries no
+items, no clips and no notes, and whose inverted brace (`loopStart >= loopEnd`)
+is published unchanged rather than clamped.
+
+**The dedupe decides identity on the MODEL, not on the built `RtClip`.** §3.3
+lists "the published `autos` pointer" among the fields compared and §3.2 keys the
+item-envelope table by item uid; taken literally those two are circular, because
+an envelope set built per item gives the two halves of a split two different
+`autos` pointers, and then the clips never collapse and R3 fails for every clip
+that carries an envelope — precisely the case the dedupe exists to serve. So the
+comparison runs over the `ClipModel`s (bit-exact, every field that reaches the
+wire, including the note vector, the marker vector and the envelope vector's
+text and points, behind §3.3's cheap `(sample.get(), noteCount, lengthBeats)`
+pre-filter), and ONE `RtAutoSet` is built per DISTINCT PAYLOAD. The published
+`autos` pointers are then equal exactly when the envelopes are, so §3.3's rule
+holds by construction and is strictly stronger than comparing pointers built
+after the fact. `publishedArrAutos_` still records a uid — §3.2's reason,
+indices renumber and uids do not — and records the uid of the first item whose
+payload produced the set.
+
+**Arrangement automation** publishes `RtAutoSetN` through `Cmd::SetTrackAutos`
+with its own one allocation, `[RtAutoSetN][RtAutoLane[]][RtAutoPoint[]]`. The
+`alignUp` on the point offset is load-bearing and not defensive: `RtAutoLane` is
+36 bytes, so an odd lane count leaves the points on a 4-byte boundary and
+`RtAutoPoint` begins with an `f64`. Address resolution is `resolveAutoLane`,
+unchanged and unduplicated — §6.6's "resolves against the track itself" is what
+that function already does, since its scope check is `p.scopeUid == track.uid`.
+
+Three things a later milestone owns, recorded here because a note in a finished
+agent's report is not a place work survives:
+
+- **§6.5's merged hold table is engine-side and is NOT in this milestone.** A
+  track lane and a clip envelope can claim one `(devSlot, param)`, and
+  `AutoTrack::Hold hold[kMaxRtAutoLanes]` indexed by lane index is ambiguous the
+  moment `RtAutoSetN` exists. The keyed-by-parameter table with the two-bit
+  `claims` mask, the capture-only-when-`claims == 0` rule, and `autoRestore`'s
+  mask argument all live in `engine.cpp`, which 8d does not own. **Owed by
+  whoever lands arrangement-automation evaluation** (the 8b+8c bracket, per
+  §10.1). The publisher's side is only to publish lanes correctly, which it
+  does; nothing about precedence is encoded in the data, because §6.4 and
+  answer 5 make precedence pass ordering and nothing else.
+- **`pumpEngineEvents()` needs one line.** `Ev::ArrangementRetired` and
+  `Ev::TrackAutosRetired` are reaped by `App::reapArrangementEvent(e)`, which
+  returns true when it consumed the event, so the call site is
+  `if (reapArrangementEvent(e)) continue;` in `app_engine.cpp` — a file 8d does
+  not own. Until it is added both events fall through to the "reserved for undo
+  hooks" tail and every replaced lane leaks until shutdown (safe, and freed by
+  the destructors, but a leak).
+- **Nothing calls the publishers yet.** `publishArrangementFor(track)` and
+  `publishArrangementAll()` exist so that `pushAll()` and every arrangement edit
+  need one line each rather than three. Owner: 8e.
+
+And two gaps, both deliberate and both stated rather than discovered:
+
+- **Warp markers are not published for arrangement items.** A per-item marker
+  array is a fifth allocation with a retirement of its own, and §3.2 names a
+  table for the item envelopes and none for the item markers. `RtClip::markers`
+  is left null, so an arranged clip warps at its single `clipBpm` ratio — a
+  working clip, not a broken one. The dedupe already compares the marker
+  vectors, so the day the table exists nothing about identity changes.
+- **The item envelopes' retirement ORDER is the engine's to honour.** §3.7
+  requires an item's `RtAutoSet` to come home *after* the lane that named it,
+  since the lane's `RtClip::autos` points into it. The publisher queues each
+  displaced set into `retiringAutos_`, where the existing `Ev::AutosRetired`
+  reaper frees it with no change at all; the engine must announce them after it
+  has released the lane.
+
+Verified: every touched TU compiles at zero warnings with the wave flags,
+`make -j` links, headless boot is clean and the undo self-test's 769
+`command ring full` warnings are byte-for-byte what a binary built from HEAD's
+`engine.cpp` produces. A scratchpad harness (not in the repo) drives the real
+`App` members under ASan and LeakSanitizer: **3652 checks, 0 failures, no leaks**
+— the block layout re-derived from the header's own counts and every pointer
+asserted to land on it, 26 dedupe cases (2 that must share, 22 single-field
+mutations that must not, 2 that must share despite differing — clip uid and clip
+name), a 64-way split of a 10 000-note clip yielding exactly one `RtClip` and
+10 000 notes rather than 640 000, 100 republishes of each kind with retirement,
+the refusal of an unknown pointer, the ring-full rollback, the transport cell's
+round trip, and a lane-count sweep from 1 to 33 that reads the last point back
+through `autoValueAt` — which is the check that catches a missing `alignUp`.
+
+### A latent bug 8d's verification surfaced — pushAll can outrun the command ring
+
+The undo self-test emits 769 `command ring full` warnings, identically on a
+binary built from HEAD, so it is neither 8d's nor 8b+8c's. The immediate cause
+is a test artifact: the self-test performs its edits, undos and redos in one
+synchronous loop inside a single frame, so the audio thread never gets a chance
+to drain between pushes.
+
+But it points at something real. `pushAll()` sends roughly
+`3 + tracks*5 + tracks*scenes` commands in one burst, and the ring holds 1024.
+A full session — 32 tracks by 32 scenes — is about 1200 commands, so a project
+load or an undo restore on a large set overflows it **in ordinary use**. The
+failure mode is the bad kind: `pushClip` logs and gives up, so the engine keeps
+playing the previous clip for that slot while the model believes otherwise, and
+the two disagree until something happens to republish.
+
+Neither retrying nor enlarging the ring is obviously right — the ring is a
+realtime structure and a burst that large wants flow control, not a bigger
+buffer. The shape that fits the existing design is a pending-publish set drained
+across frames, exactly as the automation publisher's `pendingArrPubs_` already
+does for a failed push. Queued as its own item; it is not arrangement work and
+should not ride a milestone.
