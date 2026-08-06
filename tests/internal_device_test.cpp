@@ -368,7 +368,8 @@ static void testPulse(PluginRegistry& reg) {
 // The devices under test are the stock effects: stereo in, stereo out, no MIDI.
 static const char* kEffectUris[] = {
     "nxtakt:saturator", "nxtakt:eq3", "nxtakt:compressor",
-    "nxtakt:delay", "nxtakt:reverb",
+    "nxtakt:delay", "nxtakt:reverb", "nxtakt:autofilter", "nxtakt:chorus",
+    "nxtakt:limiter", "nxtakt:utility",
 };
 
 // Runs a steady sine through the device and returns the output/input magnitude
@@ -1235,6 +1236,877 @@ static void testReverb(PluginRegistry& reg) {
 }
 
 // ---------------------------------------------------------------------------
+// Block-size invariance
+//
+// A device whose output depends on the buffer size it was handed is a device
+// whose render depends on the audio interface it was made on. Both new devices
+// that run anything at control rate -- the Auto Filter's coefficient tick and
+// the Limiter's moving-average rebuild -- carry their counters ACROSS process()
+// calls precisely so this holds, and this is the test that says whether they
+// really do.
+//
+// Bit-identical is the bar, not "close". The chunk sizes are chosen to break
+// anything block-aligned: 1 (every call a single sample), 7 (coprime with the
+// 16-sample control tick), 300 (bigger than the prepared block size).
+//
+// The parameters are set once and left alone, which is the honest scope of the
+// claim: every device in the file reads its parameters once per block, so a
+// knob MOVING mid-render lands on a block boundary and always will. What is
+// being tested is that nothing else does.
+// ---------------------------------------------------------------------------
+
+// Feeds `in` through `p` in blocks of `chunk`, IN PLACE, which is how the
+// engine calls a device on a track.
+static void renderChunked(PluginInstance& p, const std::vector<f32>& inL,
+                          const std::vector<f32>& inR, int chunk,
+                          std::vector<f32>& oL, std::vector<f32>& oR) {
+    const int frames = (int)inL.size();
+    oL.assign((size_t)frames, 0.f);
+    oR.assign((size_t)frames, 0.f);
+    std::vector<f32> bl((size_t)chunk, 0.f), br((size_t)chunk, 0.f);
+    for (int i = 0; i < frames; i += chunk) {
+        const int k = (frames - i) < chunk ? (frames - i) : chunk;
+        for (int j = 0; j < k; ++j) {
+            bl[(size_t)j] = inL[(size_t)(i + j)];
+            br[(size_t)j] = inR[(size_t)(i + j)];
+        }
+        const f32* cin[2]  = { bl.data(), br.data() };
+        f32*       cout[2] = { bl.data(), br.data() };
+        p.process(cin, cout, 2, k);
+        for (int j = 0; j < k; ++j) {
+            oL[(size_t)(i + j)] = bl[(size_t)j];
+            oR[(size_t)(i + j)] = br[(size_t)j];
+        }
+    }
+}
+
+static void testBlockInvariance(PluginRegistry& reg) {
+    banner("new devices: the output does not depend on the block size");
+
+    const int kFrames = 6000;
+    std::vector<f32> inL((size_t)kFrames), inR((size_t)kFrames);
+    Noise ns;
+    for (int i = 0; i < kFrames; ++i) {
+        inL[(size_t)i] = 0.3f * ns.next();
+        inR[(size_t)i] = 0.3f * ns.next();
+    }
+
+    for (const char* uri : { "nxtakt:autofilter", "nxtakt:chorus",
+                             "nxtakt:limiter", "nxtakt:utility" }) {
+        const PluginDesc* d = reg.find(uri);
+        CHECK(d != nullptr, "%s: in the registry", uri);
+        if (!d) continue;
+
+        // Settings that make every control path actually move: a modulated
+        // filter, a modulated delay with feedback, a limiter that is limiting,
+        // a utility that is off its identity path.
+        const std::string u = uri;
+        auto build = [&]() -> std::unique_ptr<PluginInstance> {
+            auto p = reg.instantiate(*d, kSR, kBlock);
+            if (!p) return p;
+            if (u == "nxtakt:autofilter") {
+                p->setParam(paramIndex(*p, "Cutoff"), 800.f);
+                p->setParam(paramIndex(*p, "Resonance"), 0.6f);
+                p->setParam(paramIndex(*p, "LFO Amount"), 3.f);
+                p->setParam(paramIndex(*p, "LFO Sync"), 0.f);
+                p->setParam(paramIndex(*p, "LFO Rate"), 7.f);
+                p->setParam(paramIndex(*p, "LFO Phase"), 90.f);
+                p->setParam(paramIndex(*p, "Env Amount"), 2.f);
+            } else if (u == "nxtakt:chorus") {
+                p->setParam(paramIndex(*p, "Feedback"), 0.6f);
+                p->setParam(paramIndex(*p, "Voices"), 4.f);
+                p->setParam(paramIndex(*p, "Rate"), 3.f);
+            } else if (u == "nxtakt:limiter") {
+                p->setParam(paramIndex(*p, "Input"), 12.f);
+                p->setParam(paramIndex(*p, "Ceiling"), -6.f);
+                p->setParam(paramIndex(*p, "Release"), 40.f);
+            } else {
+                p->setParam(paramIndex(*p, "Gain"), -3.f);
+                p->setParam(paramIndex(*p, "Width"), 1.7f);
+                p->setParam(paramIndex(*p, "DC Block"), 1.f);
+                p->setParam(paramIndex(*p, "Invert R"), 1.f);
+            }
+            return p;
+        };
+
+        std::vector<f32> refL, refR, altL, altR;
+        auto ref = build();
+        if (!ref) continue;
+        renderChunked(*ref, inL, inR, kBlock, refL, refR);
+
+        f32 worst = 0.f;
+        for (int chunk : { 1, 7, 300 }) {
+            auto alt = build();
+            if (!alt) break;
+            renderChunked(*alt, inL, inR, chunk, altL, altR);
+            f32 diff = 0.f;
+            for (int i = 0; i < kFrames; ++i) {
+                diff = std::fmax(diff, std::fabs(refL[(size_t)i] - altL[(size_t)i]));
+                diff = std::fmax(diff, std::fabs(refR[(size_t)i] - altR[(size_t)i]));
+            }
+            CHECK(diff == 0.f, "%s: blocks of %d are bit-identical to blocks of %d (max diff %.9f)",
+                  uri, chunk, kBlock, (double)diff);
+            worst = std::fmax(worst, diff);
+        }
+
+        // The 300-frame pass was larger than the prepared block size, so this
+        // also says the device PROCESSES an oversized block rather than
+        // degrading to passthrough the way Pulse and the Rack must.
+        CHECK(worst == 0.f, "%s: an oversized block is processed, not degraded", uri);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto Filter
+// ---------------------------------------------------------------------------
+
+static void testAutoFilter(PluginRegistry& reg) {
+    banner("Auto Filter");
+
+    const PluginDesc* d = reg.find("nxtakt:autofilter");
+    CHECK(d != nullptr, "registry finds nxtakt:autofilter");
+    if (!d) return;
+
+    auto make = [&](int type, f32 cutoff, f32 res) {
+        auto f = reg.instantiate(*d, kSR, kBlock);
+        if (!f) return f;
+        f->setParam(paramIndex(*f, "Type"), (f32)type);
+        f->setParam(paramIndex(*f, "Cutoff"), cutoff);
+        f->setParam(paramIndex(*f, "Resonance"), res);
+        f->setParam(paramIndex(*f, "LFO Amount"), 0.f);
+        f->setParam(paramIndex(*f, "Env Amount"), 0.f);
+        return f;
+    };
+
+    // The tempo wart, stated in the test as well as in the source, because a
+    // test is where someone looks to find out what a device promises.
+    {
+        auto probe = reg.instantiate(*d, kSR, kBlock);
+        CHECK(probe != nullptr, "instantiate + prepare");
+        if (!probe) return;
+        CHECK(paramIndex(*probe, "Tempo") >= 0,
+              "the device carries its own Tempo parameter, like the Delay");
+        note("PluginInstance still has no transport channel, so the synced LFO runs "
+             "off a device parameter (120 BPM default) -- the same wart, the same "
+             "shape, and the same one-line host.h fix documented on class Delay.");
+        const int ps = paramIndex(*probe, "LFO Sync");
+        const int pd = paramIndex(*probe, "LFO Division");
+        const int pt = paramIndex(*probe, "Type");
+        CHECK(ps >= 0 && probe->paramInfo(ps).isBool, "LFO Sync is flagged as a switch");
+        CHECK(pd >= 0 && probe->paramInfo(pd).isInt, "LFO Division is flagged as stepped");
+        CHECK(pt >= 0 && probe->paramInfo(pt).isInt, "Type is flagged as stepped");
+
+        // Defaults: cutoff parked at the top of its range, so dropping the
+        // device on a channel is very nearly a wire. Measured rather than
+        // asserted by eye -- a 2-pole at 18 kHz is what it is at 1 kHz.
+        const f64 g1k = probeGainDb(*probe, 1000.0, 0.25f, 40);
+        CHECK(std::fabs(g1k) < 0.5, "at its defaults it is within %.2f dB of unity at 1 kHz", g1k);
+    }
+
+    // 1. Lowpass: flat a decade below, 12 dB/oct above.
+    {
+        auto f = make(0, 1000.f, 0.f);
+        if (!f) return;
+        const f64 lo = probeGainDb(*f, 100.0, 0.25f, 40);
+        const f64 hi = probeGainDb(*f, 4000.0, 0.25f, 80);
+        CHECK(std::fabs(lo) < 0.6, "LP: 100 Hz passes at %.2f dB (cutoff 1 kHz)", lo);
+        CHECK(hi < -18.0 && hi > -32.0,
+              "LP: two octaves up is %.1f dB, i.e. the 12 dB/oct a 2-pole owes", hi);
+    }
+
+    // 2. Highpass: the mirror image.
+    {
+        auto f = make(2, 1000.f, 0.f);
+        if (!f) return;
+        const f64 lo = probeGainDb(*f, 250.0, 0.25f, 40);
+        const f64 hi = probeGainDb(*f, 8000.0, 0.25f, 80);
+        CHECK(lo < -18.0 && lo > -32.0, "HP: two octaves down is %.1f dB", lo);
+        CHECK(std::fabs(hi) < 0.6, "HP: 8 kHz passes at %.2f dB", hi);
+    }
+
+    // 3. Bandpass, normalised: unity at the cutoff whatever the resonance, and
+    //    down on both sides. The normalisation is the point -- a raw SVF band
+    //    tap has a peak gain of Q, so this would read +26 dB at resonance 1.
+    {
+        for (f32 res : { 0.2f, 1.0f }) {
+            auto f = make(1, 1000.f, res);
+            if (!f) continue;
+            const f64 at   = probeGainDb(*f, 1000.0, 0.25f, 60);
+            const f64 down = probeGainDb(*f, 125.0, 0.25f, 20);
+            CHECK(std::fabs(at) < 1.0,
+                  "BP: unity at the cutoff at resonance %.1f (%.2f dB)", (double)res, at);
+            CHECK(down < -12.0, "BP: three octaves down is %.1f dB at resonance %.1f",
+                  down, (double)res);
+        }
+    }
+
+    // 4. Resonance does what its name says, at the cutoff.
+    {
+        auto flat = make(0, 1000.f, 0.f);
+        auto ring = make(0, 1000.f, 1.f);
+        if (!flat || !ring) return;
+        const f64 a = probeGainDb(*flat, 1000.0, 0.05f, 60);
+        const f64 b = probeGainDb(*ring, 1000.0, 0.05f, 60);
+        CHECK(b - a > 20.0, "LP: resonance 1 peaks %.1f dB above resonance 0 at the cutoff",
+              b - a);
+        CHECK(b < 40.0, "and does not run away (%.1f dB)", b);
+    }
+
+    // 5. The synced LFO and the free LFO are the SAME LFO.
+    //
+    // A 1/4 at 120 BPM is one cycle every 0.5 s, i.e. 2 Hz. If the division
+    // maths is right, a synced filter and a free-running one at 2 Hz must
+    // produce bit-identical output from the same input -- which tests the
+    // conversion far more sharply than measuring a wobble could, and is the
+    // part of the tempo story that does NOT depend on where the BPM came from.
+    {
+        const int kFrames = 4096;
+        std::vector<f32> inL((size_t)kFrames), inR((size_t)kFrames);
+        Noise ns;
+        for (int i = 0; i < kFrames; ++i) inL[(size_t)i] = inR[(size_t)i] = 0.3f * ns.next();
+
+        auto sync = reg.instantiate(*d, kSR, kBlock);
+        auto freeRun = reg.instantiate(*d, kSR, kBlock);
+        if (!sync || !freeRun) return;
+        for (PluginInstance* p : { sync.get(), freeRun.get() }) {
+            p->setParam(paramIndex(*p, "Cutoff"), 600.f);
+            p->setParam(paramIndex(*p, "LFO Amount"), 3.f);
+        }
+        sync->setParam(paramIndex(*sync, "LFO Sync"), 1.f);
+        sync->setParam(paramIndex(*sync, "LFO Division"), 5.f);      // 1/4
+        sync->setParam(paramIndex(*sync, "Tempo"), 120.f);
+        freeRun->setParam(paramIndex(*freeRun, "LFO Sync"), 0.f);
+        freeRun->setParam(paramIndex(*freeRun, "LFO Rate"), 2.f);
+
+        std::vector<f32> aL, aR, bL, bR;
+        renderChunked(*sync, inL, inR, kBlock, aL, aR);
+        renderChunked(*freeRun, inL, inR, kBlock, bL, bR);
+        f32 diff = 0.f;
+        for (int i = 0; i < kFrames; ++i)
+            diff = std::fmax(diff, std::fabs(aL[(size_t)i] - bL[(size_t)i]));
+        CHECK(diff == 0.f, "1/4 at 120 BPM is exactly 2 Hz (max diff %.9f)", (double)diff);
+
+        // ...and the tempo really is the divisor.
+        auto half = reg.instantiate(*d, kSR, kBlock);
+        auto slow = reg.instantiate(*d, kSR, kBlock);
+        if (!half || !slow) return;
+        for (PluginInstance* p : { half.get(), slow.get() }) {
+            p->setParam(paramIndex(*p, "Cutoff"), 600.f);
+            p->setParam(paramIndex(*p, "LFO Amount"), 3.f);
+        }
+        half->setParam(paramIndex(*half, "LFO Sync"), 1.f);
+        half->setParam(paramIndex(*half, "LFO Division"), 5.f);
+        half->setParam(paramIndex(*half, "Tempo"), 60.f);
+        slow->setParam(paramIndex(*slow, "LFO Sync"), 0.f);
+        slow->setParam(paramIndex(*slow, "LFO Rate"), 1.f);
+        renderChunked(*half, inL, inR, kBlock, aL, aR);
+        renderChunked(*slow, inL, inR, kBlock, bL, bR);
+        diff = 0.f;
+        for (int i = 0; i < kFrames; ++i)
+            diff = std::fmax(diff, std::fabs(aL[(size_t)i] - bL[(size_t)i]));
+        CHECK(diff == 0.f, "the same division at 60 BPM is exactly 1 Hz (max diff %.9f)",
+              (double)diff);
+    }
+
+    // 6. The LFO's stereo phase: 0 means the two channels are the same filter,
+    //    which is what a mono-compatible setting has to mean.
+    {
+        Buf in, out;
+        Noise ns;
+        for (int i = 0; i < kBlock; ++i) in.l[(size_t)i] = in.r[(size_t)i] = 0.3f * ns.next();
+
+        auto same = reg.instantiate(*d, kSR, kBlock);
+        if (!same) return;
+        same->setParam(paramIndex(*same, "Cutoff"), 700.f);
+        same->setParam(paramIndex(*same, "LFO Amount"), 3.f);
+        same->setParam(paramIndex(*same, "LFO Phase"), 0.f);
+        f32 lr = 0.f;
+        for (int b = 0; b < 8; ++b) {
+            out.clear();
+            same->process(in.p, out.p, 2, kBlock);
+            for (int i = 0; i < kBlock; ++i)
+                lr = std::fmax(lr, std::fabs(out.l[(size_t)i] - out.r[(size_t)i]));
+        }
+        CHECK(lr == 0.f, "LFO phase 0: the two channels are bit-identical (%.9f)", (double)lr);
+
+        auto wide = reg.instantiate(*d, kSR, kBlock);
+        if (!wide) return;
+        wide->setParam(paramIndex(*wide, "Cutoff"), 700.f);
+        wide->setParam(paramIndex(*wide, "LFO Amount"), 3.f);
+        wide->setParam(paramIndex(*wide, "LFO Phase"), 180.f);
+        f32 spread = 0.f;
+        for (int b = 0; b < 8; ++b) {
+            out.clear();
+            wide->process(in.p, out.p, 2, kBlock);
+            for (int i = 0; i < kBlock; ++i)
+                spread = std::fmax(spread, std::fabs(out.l[(size_t)i] - out.r[(size_t)i]));
+        }
+        CHECK(spread > 0.01f, "LFO phase 180: the channels move apart (%.4f)", (double)spread);
+    }
+
+    // 7. The envelope follower opens the filter, and only when there is
+    //    something to open it with. Same device, same settings, two input
+    //    levels: the loud one has to let far more 2 kHz through.
+    {
+        auto f = make(0, 200.f, 0.f);
+        if (!f) return;
+        f->setParam(paramIndex(*f, "Env Amount"), 4.f);
+        f->setParam(paramIndex(*f, "Env Attack"), 1.f);
+        f->setParam(paramIndex(*f, "Env Release"), 50.f);
+        const f64 quiet = probeGainDb(*f, 2000.0, 0.002f, 60);
+        const f64 loud  = probeGainDb(*f, 2000.0, 0.5f,   60);
+        CHECK(loud - quiet > 15.0,
+              "env amount +4 oct: a loud input passes 2 kHz %.1f dB better than a quiet one",
+              loud - quiet);
+
+        // Negative amount closes it instead, which is the other half of a
+        // bipolar control being bipolar.
+        auto g = make(0, 4000.f, 0.f);
+        if (!g) return;
+        g->setParam(paramIndex(*g, "Env Amount"), -4.f);
+        const f64 q2 = probeGainDb(*g, 2000.0, 0.002f, 60);
+        const f64 l2 = probeGainDb(*g, 2000.0, 0.5f,   60);
+        CHECK(q2 - l2 > 15.0, "env amount -4 oct: a loud input passes %.1f dB LESS", q2 - l2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chorus
+// ---------------------------------------------------------------------------
+
+static void testChorus(PluginRegistry& reg) {
+    banner("Chorus");
+
+    const PluginDesc* d = reg.find("nxtakt:chorus");
+    CHECK(d != nullptr, "registry finds nxtakt:chorus");
+    if (!d) return;
+
+    // 1. Fully dry is bit-exact, like the Delay's. Same reason: a modulation
+    //    device at zero has to be safe to leave in a chain.
+    {
+        auto ch = reg.instantiate(*d, kSR, kBlock);
+        CHECK(ch != nullptr, "instantiate + prepare");
+        if (!ch) return;
+        ch->setParam(paramIndex(*ch, "Dry/Wet"), 0.f);
+        Buf in, out;
+        f32 err = 0.f;
+        Noise ns;
+        for (int b = 0; b < 12; ++b) {
+            for (int i = 0; i < kBlock; ++i) in.l[(size_t)i] = in.r[(size_t)i] = 0.3f * ns.next();
+            out.clear();
+            ch->process(in.p, out.p, 2, kBlock);
+            for (int i = 0; i < kBlock; ++i)
+                err = std::fmax(err, std::fabs(out.l[(size_t)i] - in.l[(size_t)i]));
+        }
+        CHECK(err == 0.f, "dry/wet at 0 is a bit-exact copy (%.9f)", (double)err);
+    }
+
+    // 2. The wet path is a delay of about the time it was asked for. One voice,
+    //    no depth, so the tap is stationary and an impulse says exactly where.
+    {
+        auto ch = reg.instantiate(*d, kSR, kBlock);
+        if (!ch) return;
+        ch->setParam(paramIndex(*ch, "Voices"), 1.f);
+        ch->setParam(paramIndex(*ch, "Depth"), 0.f);
+        ch->setParam(paramIndex(*ch, "Delay"), 10.f);            // ms
+        ch->setParam(paramIndex(*ch, "Feedback"), 0.f);
+        ch->setParam(paramIndex(*ch, "Dry/Wet"), 1.f);
+        std::vector<f32> l, r;
+        impulseResponse(*ch, 4800, l, r);
+        int at = 0;
+        f32 best = 0.f;
+        for (int i = 8; i < 4800; ++i)
+            if (std::fabs(l[(size_t)i]) > best) { best = std::fabs(l[(size_t)i]); at = i; }
+        const int expect = (int)(0.010 * kSR);                   // 480
+        CHECK(std::abs(at - expect) <= 1,
+              "a 10 ms tap lands at sample %d (expected %d)", at, expect);
+    }
+
+    // 3. Modulation is what makes it a chorus rather than a short delay: with
+    //    depth up the tap moves, so a steady sine comes back with a varying
+    //    delay -- audible as a swing in the level of the summed output.
+    {
+        auto ch = reg.instantiate(*d, kSR, kBlock);
+        if (!ch) return;
+        ch->setParam(paramIndex(*ch, "Voices"), 1.f);
+        ch->setParam(paramIndex(*ch, "Depth"), 8.f);
+        ch->setParam(paramIndex(*ch, "Rate"), 4.f);
+        ch->setParam(paramIndex(*ch, "Dry/Wet"), 0.5f);
+        Buf in, out;
+        f32 lo = 1e9f, hi = 0.f;
+        for (int b = 0; b < 120; ++b) {
+            for (int i = 0; i < kBlock; ++i)
+                in.l[(size_t)i] = in.r[(size_t)i] =
+                    0.5f * (f32)std::sin(6.2831853 * 500.0 * (b * kBlock + i) / kSR);
+            out.clear();
+            ch->process(in.p, out.p, 2, kBlock);
+            if (b < 20) continue;                                // let the line fill
+            const f32 pk = out.peak();
+            lo = std::fmin(lo, pk);
+            hi = std::fmax(hi, pk);
+        }
+        CHECK(hi > lo * 1.2f, "the comb moves: block peak swings %.3f .. %.3f",
+              (double)lo, (double)hi);
+    }
+
+    // 4. Stereo. The two channels read the same line in quadrature, so a MONO
+    //    input comes out decorrelated -- and Width 0 folds that back to
+    //    identical, exactly.
+    {
+        Buf in, out;
+        for (int i = 0; i < kBlock; ++i)
+            in.l[(size_t)i] = in.r[(size_t)i] =
+                0.4f * (f32)std::sin(6.2831853 * 300.0 * i / kSR);
+
+        auto wide = reg.instantiate(*d, kSR, kBlock);
+        if (!wide) return;
+        wide->setParam(paramIndex(*wide, "Width"), 1.f);
+        wide->setParam(paramIndex(*wide, "Dry/Wet"), 1.f);
+        f32 spread = 0.f;
+        for (int b = 0; b < 40; ++b) {
+            out.clear();
+            wide->process(in.p, out.p, 2, kBlock);
+            if (b > 20)
+                for (int i = 0; i < kBlock; ++i)
+                    spread = std::fmax(spread, std::fabs(out.l[(size_t)i] - out.r[(size_t)i]));
+        }
+        CHECK(spread > 0.01f, "width 1: a mono input comes out stereo (%.4f)", (double)spread);
+
+        auto narrow = reg.instantiate(*d, kSR, kBlock);
+        if (!narrow) return;
+        narrow->setParam(paramIndex(*narrow, "Width"), 0.f);
+        narrow->setParam(paramIndex(*narrow, "Dry/Wet"), 1.f);
+        f32 same = 0.f;
+        for (int b = 0; b < 40; ++b) {
+            out.clear();
+            narrow->process(in.p, out.p, 2, kBlock);
+            for (int i = 0; i < kBlock; ++i)
+                same = std::fmax(same, std::fabs(out.l[(size_t)i] - out.r[(size_t)i]));
+        }
+        CHECK(same == 0.f, "width 0: the wet folds to mono exactly (%.9f)", (double)same);
+    }
+
+    // 5. Every voice count works, and full feedback in both polarities stays
+    //    bounded -- a modulated delay with feedback is a flanger, and a flanger
+    //    is the classic way to build a device that explodes.
+    {
+        for (f32 v = 1.f; v <= 4.f; v += 1.f) {
+            for (f32 fb : { -0.9f, 0.9f }) {
+                auto ch = reg.instantiate(*d, kSR, kBlock);
+                if (!ch) continue;
+                ch->setParam(paramIndex(*ch, "Voices"), v);
+                ch->setParam(paramIndex(*ch, "Feedback"), fb);
+                ch->setParam(paramIndex(*ch, "Depth"), 6.f);
+                ch->setParam(paramIndex(*ch, "Rate"), 2.f);
+                ch->setParam(paramIndex(*ch, "Dry/Wet"), 1.f);
+                Buf in, out;
+                Noise ns;
+                f32 peak = 0.f;
+                bool fin = true;
+                for (int b = 0; b < 200; ++b) {
+                    for (int i = 0; i < kBlock; ++i)
+                        in.l[(size_t)i] = in.r[(size_t)i] = 0.25f * ns.next();
+                    out.clear();
+                    ch->process(in.p, out.p, 2, kBlock);
+                    if (!out.finite()) { fin = false; break; }
+                    peak = std::fmax(peak, out.peak());
+                }
+                CHECK(fin && peak < 8.f,
+                      "%d voice(s) at %+.1f feedback stay finite and bounded (peak %.3f)",
+                      (int)v, (double)fb, (double)peak);
+            }
+        }
+    }
+
+    // 6. And it decays to true silence rather than to denormals grinding round
+    //    the feedback line, which is the failure this device is most exposed to.
+    //
+    // Feedback 0.5 rather than 0.9, so the arithmetic of the test is honest:
+    // 0.5 per 12 ms round trip is 6 dB per repeat, so 300 dB of decay takes
+    // about 0.6 s and the 3.2 s below is not a race. At 0.9 the same decay
+    // takes six seconds and a passing test would only mean the loop was long.
+    {
+        auto ch = reg.instantiate(*d, kSR, kBlock);
+        if (!ch) return;
+        ch->setParam(paramIndex(*ch, "Feedback"), 0.5f);
+        ch->setParam(paramIndex(*ch, "Dry/Wet"), 1.f);
+        Buf in, out;
+        for (int i = 0; i < kBlock; ++i)
+            in.l[(size_t)i] = in.r[(size_t)i] = 0.5f * (f32)std::sin(6.2831853 * 220.0 * i / kSR);
+        for (int b = 0; b < 8; ++b) { out.clear(); ch->process(in.p, out.p, 2, kBlock); }
+        in.clear();
+        f32 tail = 1.f;
+        for (int b = 0; b < 600; ++b) {
+            out.clear();
+            ch->process(in.p, out.p, 2, kBlock);
+            tail = out.peak();
+        }
+        CHECK(tail == 0.f, "the tail reaches exact zero, not a denormal floor (%.3e)",
+              (double)tail);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Limiter
+//
+// The interesting device, and the reason is one number. It is the only internal
+// device with latency; the engine caches what it reports when a chain is
+// published (docs/RACKS.md §1) and aligns every parallel path in the project
+// against that figure. So the tests below are not "does it limit" -- they are
+// "is the number it reports the number of samples it actually delays", and then
+// "is the ceiling a ceiling".
+// ---------------------------------------------------------------------------
+
+static void testLimiter(PluginRegistry& reg) {
+    banner("Limiter");
+
+    const PluginDesc* d = reg.find("nxtakt:limiter");
+    CHECK(d != nullptr, "registry finds nxtakt:limiter");
+    if (!d) return;
+
+    auto lim = reg.instantiate(*d, kSR, kBlock);
+    CHECK(lim != nullptr, "instantiate + prepare");
+    if (!lim) return;
+
+    // 1. It reports latency at all, and reports the right amount: 5 ms.
+    const int lat  = lim->latencyFrames();
+    const int want = (int)(0.005 * kSR + 0.5);
+    CHECK(lat == want, "reports %d frames at %.0f Hz (5 ms; expected %d)", lat, kSR, want);
+    CHECK(lat == 240, "which at 48 kHz is 240 frames -- the figure LSP's limiter also reports");
+
+    // Constant after prepare, across a re-prepare, across a second instance and
+    // across actually running: the four ways a latency figure goes stale.
+    CHECK(lim->prepare(kSR, kBlock) && lim->latencyFrames() == lat,
+          "stable across a re-prepare (%d)", lim->latencyFrames());
+    auto other = reg.instantiate(*d, kSR, kBlock);
+    CHECK(other && other->latencyFrames() == lat, "a second instance agrees (%d)",
+          other ? other->latencyFrames() : -1);
+    {
+        Buf in, out;
+        for (int b = 0; b < 8; ++b) { out.clear(); lim->process(in.p, out.p, 2, kBlock); }
+        CHECK(lim->latencyFrames() == lat, "unchanged after processing (%d)", lim->latencyFrames());
+    }
+
+    // It scales with the sample rate, because five milliseconds does. A figure
+    // that did not would be wrong at every rate but one.
+    {
+        auto at441 = reg.instantiate(*d, 44100.0, 64);
+        const int w441 = (int)(0.005 * 44100.0 + 0.5);
+        CHECK(at441 && at441->latencyFrames() == w441,
+              "at 44.1 kHz / 64 frames it reports %d (expected %d)",
+              at441 ? at441->latencyFrames() : -1, w441);
+    }
+
+    // 2. THE HONESTY TEST: the reported latency IS the measured latency.
+    //
+    // A unit impulse against a 0 dB ceiling needs no gain reduction at all, so
+    // the output is the input delayed and nothing else. If the peak does not
+    // land on exactly `lat`, the engine's compensation is wrong by the
+    // difference and every parallel path in the set is smeared by it.
+    {
+        auto p = reg.instantiate(*d, kSR, kBlock);
+        if (!p) return;
+        p->setParam(paramIndex(*p, "Ceiling"), 0.f);
+        std::vector<f32> l, r;
+        impulseResponse(*p, 2048, l, r);
+        int at = -1;
+        for (int i = 0; i < 2048; ++i) if (l[(size_t)i] != 0.f) { at = i; break; }
+        CHECK(at == lat, "an impulse comes out at sample %d, exactly the %d it reports", at, lat);
+        CHECK(at >= 0 && std::fabs(l[(size_t)at] - 1.f) < 1e-6f,
+              "and at full amplitude (%.6f), so nothing else happened to it",
+              at >= 0 ? (double)l[(size_t)at] : 0.0);
+    }
+
+    // 3. Below the ceiling it is a BIT-EXACT wire plus that delay, which is what
+    //    makes it safe on a master bus that is not being pushed.
+    {
+        auto p = reg.instantiate(*d, kSR, kBlock);
+        if (!p) return;
+        p->setParam(paramIndex(*p, "Ceiling"), 0.f);
+        const int kFrames = 4096;
+        std::vector<f32> inL((size_t)kFrames), inR((size_t)kFrames), oL, oR;
+        Noise ns;
+        for (int i = 0; i < kFrames; ++i) {
+            inL[(size_t)i] = 0.2f * ns.next();
+            inR[(size_t)i] = 0.2f * ns.next();
+        }
+        renderChunked(*p, inL, inR, kBlock, oL, oR);
+        f32 err = 0.f;
+        for (int i = 0; i + lat < kFrames; ++i) {
+            err = std::fmax(err, std::fabs(oL[(size_t)(i + lat)] - inL[(size_t)i]));
+            err = std::fmax(err, std::fabs(oR[(size_t)(i + lat)] - inR[(size_t)i]));
+        }
+        CHECK(err == 0.f, "under the ceiling it is bit-identical, %d frames late (%.9f)",
+              lat, (double)err);
+    }
+
+    // 4. THE CEILING IS A CEILING. Five signals chosen to break a limiter that
+    //    smooths its gain in the wrong place: a steady sine (the easy case), an
+    //    impulse train (nothing but transients), white noise (a peak somewhere
+    //    in every window), a step from silence to full scale (the classic
+    //    overshoot), and DC (a detector that assumes zero mean).
+    {
+        struct Sig { const char* name; int kind; };
+        static const Sig kSigs[] = {
+            { "a 200 Hz sine", 0 }, { "an impulse train", 1 }, { "white noise", 2 },
+            { "a step to full scale", 3 }, { "DC", 4 },
+        };
+        for (const Sig& s : kSigs) {
+            for (f32 ceilDb : { -0.3f, -6.f, -24.f }) {
+                auto p = reg.instantiate(*d, kSR, kBlock);
+                if (!p) continue;
+                p->setParam(paramIndex(*p, "Input"), 12.f);      // hit it hard
+                p->setParam(paramIndex(*p, "Ceiling"), ceilDb);
+                p->setParam(paramIndex(*p, "Release"), 1.f);     // the fastest, i.e. the worst
+                Buf in, out;
+                Noise ns;
+                f32 peak = 0.f;
+                for (int b = 0; b < 80; ++b) {
+                    for (int i = 0; i < kBlock; ++i) {
+                        const int n = b * kBlock + i;
+                        f32 v = 0.f;
+                        switch (s.kind) {
+                            case 0: v = 0.9f * (f32)std::sin(6.2831853 * 200.0 * n / kSR); break;
+                            case 1: v = (n % 977) == 0 ? 1.f : 0.f; break;
+                            case 2: v = 0.9f * ns.next(); break;
+                            case 3: v = n > 20000 ? 1.f : 0.f; break;
+                            default: v = 1.f; break;
+                        }
+                        in.l[(size_t)i] = v;
+                        in.r[(size_t)i] = -v;                    // and not correlated
+                    }
+                    out.clear();
+                    p->process(in.p, out.p, 2, kBlock);
+                    peak = std::fmax(peak, out.peak());
+                }
+                const f32 ceil = dbToGain(ceilDb);
+                CHECK(peak <= ceil * 1.0001f,
+                      "%s at +12 dB never exceeds a %.1f dB ceiling (peak %.6f vs %.6f)",
+                      s.name, (double)ceilDb, (double)peak, (double)ceil);
+            }
+        }
+    }
+
+    // 5. The gain reduction readout says what it is doing.
+    {
+        auto p = reg.instantiate(*d, kSR, kBlock);
+        if (!p) return;
+        const int pGr = paramIndex(*p, "Gain Reduction");
+        p->setParam(paramIndex(*p, "Ceiling"), -12.f);
+        Buf in, out;
+        for (int i = 0; i < kBlock; ++i) in.l[(size_t)i] = in.r[(size_t)i] = 0.9f;
+        for (int b = 0; b < 20; ++b) { out.clear(); p->process(in.p, out.p, 2, kBlock); }
+        const f32 gr = p->getParam(pGr);
+        // 0.9 is -0.92 dBFS; held against a -12 dB ceiling, that is 11.1 dB down.
+        CHECK(std::fabs(gr - 11.1f) < 1.f,
+              "the readout shows %.2f dB of reduction (expected ~11.1)", (double)gr);
+        in.clear();
+        for (int b = 0; b < 400; ++b) { out.clear(); p->process(in.p, out.p, 2, kBlock); }
+        CHECK(p->getParam(pGr) == 0.f, "and returns to 0 when the signal goes away (%.4f)",
+              (double)p->getParam(pGr));
+    }
+
+    // 6. Release: the gain comes back, and sooner with a fast release than a
+    //    slow one.
+    {
+        auto run = [&](f32 relMs) {
+            auto p = reg.instantiate(*d, kSR, kBlock);
+            if (!p) return 999;
+            p->setParam(paramIndex(*p, "Ceiling"), -12.f);
+            p->setParam(paramIndex(*p, "Release"), relMs);
+            Buf in, out;
+            for (int i = 0; i < kBlock; ++i) in.l[(size_t)i] = in.r[(size_t)i] = 0.95f;
+            for (int b = 0; b < 8; ++b) { out.clear(); p->process(in.p, out.p, 2, kBlock); }
+            // Now a quiet signal, well under the ceiling: count the blocks until
+            // the gain is back at unity.
+            for (int i = 0; i < kBlock; ++i) in.l[(size_t)i] = in.r[(size_t)i] = 0.05f;
+            int blocks = 0;
+            for (; blocks < 400; ++blocks) {
+                out.clear();
+                p->process(in.p, out.p, 2, kBlock);
+                if (blocks > 2 && std::fabs(out.peak() - 0.05f) < 1e-7f) break;
+            }
+            return blocks;
+        };
+        const int fast = run(5.f);
+        const int lazy = run(800.f);
+        CHECK(fast < lazy, "a 5 ms release recovers in %d blocks, an 800 ms one in %d",
+              fast, lazy);
+        CHECK(lazy < 400, "and the slow one does recover rather than hanging (%d blocks)", lazy);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+static void testUtility(PluginRegistry& reg) {
+    banner("Utility");
+
+    const PluginDesc* d = reg.find("nxtakt:utility");
+    CHECK(d != nullptr, "registry finds nxtakt:utility");
+    if (!d) return;
+
+    // Deterministic, decorrelated stereo: a signal where every one of the
+    // operations below has something to bite on.
+    const int kFrames = 2048;
+    std::vector<f32> inL((size_t)kFrames), inR((size_t)kFrames);
+    {
+        Noise ns;
+        for (int i = 0; i < kFrames; ++i) {
+            inL[(size_t)i] = 0.3f * ns.next();
+            inR[(size_t)i] = 0.3f * ns.next();
+        }
+    }
+
+    std::vector<f32> oL, oR;
+    auto run = [&](std::vector<std::pair<const char*, f32>> set,
+                   std::vector<f32>& l, std::vector<f32>& r) {
+        auto u = reg.instantiate(*d, kSR, kBlock);
+        if (!u) return false;
+        for (const auto& kv : set) u->setParam(paramIndex(*u, kv.first), kv.second);
+        renderChunked(*u, inL, inR, kBlock, l, r);
+        return true;
+    };
+
+    // 1. THE PROPERTY: at its defaults it is a bit-exact wire. Not nearly.
+    {
+        CHECK(run({}, oL, oR), "instantiate + prepare");
+        f32 err = 0.f;
+        for (int i = 0; i < kFrames; ++i) {
+            err = std::fmax(err, std::fabs(oL[(size_t)i] - inL[(size_t)i]));
+            err = std::fmax(err, std::fabs(oR[(size_t)i] - inR[(size_t)i]));
+        }
+        CHECK(err == 0.f, "defaults are a bit-exact wire (%.9f)", (double)err);
+    }
+
+    // 2. Gain is exact too, because Width 1 never enters the mid/side path.
+    {
+        run({ { "Gain", -6.f } }, oL, oR);
+        const f32 g = dbToGain(-6.f);
+        f32 err = 0.f;
+        for (int i = 0; i < kFrames; ++i)
+            err = std::fmax(err, std::fabs(oL[(size_t)i] - inL[(size_t)i] * g));
+        CHECK(err == 0.f, "-6 dB is exactly the input times %.6f (%.9f)", (double)g, (double)err);
+
+        run({ { "Gain", -70.f } }, oL, oR);
+        f32 pk = 0.f;
+        for (int i = 0; i < kFrames; ++i) pk = std::fmax(pk, std::fabs(oL[(size_t)i]));
+        CHECK(pk == 0.f, "the bottom of the Gain range is true silence, not -70 dB of hiss");
+    }
+
+    // 3. Width. 0 folds to mono, 2 doubles the side, and both are the M/S
+    //    arithmetic the comment claims rather than something adjacent to it.
+    {
+        run({ { "Width", 0.f } }, oL, oR);
+        f32 diff = 0.f, err = 0.f;
+        for (int i = 0; i < kFrames; ++i) {
+            diff = std::fmax(diff, std::fabs(oL[(size_t)i] - oR[(size_t)i]));
+            const f32 mid = 0.5f * (inL[(size_t)i] + inR[(size_t)i]);
+            err = std::fmax(err, std::fabs(oL[(size_t)i] - mid));
+        }
+        CHECK(diff == 0.f, "width 0: the channels are identical (%.9f)", (double)diff);
+        CHECK(err == 0.f, "width 0: and equal to the mid exactly (%.9f)", (double)err);
+
+        run({ { "Width", 2.f } }, oL, oR);
+        err = 0.f;
+        for (int i = 0; i < kFrames; ++i) {
+            const f32 mid = 0.5f * (inL[(size_t)i] + inR[(size_t)i]);
+            const f32 sid = 0.5f * (inL[(size_t)i] - inR[(size_t)i]) * 2.f;
+            err = std::fmax(err, std::fabs(oL[(size_t)i] - (mid + sid)));
+            err = std::fmax(err, std::fabs(oR[(size_t)i] - (mid - sid)));
+        }
+        CHECK(err == 0.f, "width 2: mid + 2*side, exactly (%.9f)", (double)err);
+    }
+
+    // 4. Mono is Width 0 by another name, and says so by producing the same
+    //    samples.
+    {
+        std::vector<f32> aL, aR;
+        run({ { "Mono", 1.f } }, aL, aR);
+        run({ { "Width", 0.f } }, oL, oR);
+        f32 err = 0.f;
+        for (int i = 0; i < kFrames; ++i)
+            err = std::fmax(err, std::fabs(aL[(size_t)i] - oL[(size_t)i]));
+        CHECK(err == 0.f, "Mono and Width 0 are the same device (%.9f)", (double)err);
+    }
+
+    // 5. Polarity, and the reason it is applied before the width control: an
+    //    inverted channel folded to mono has to CANCEL. That is what someone
+    //    flipping a polarity switch is listening for.
+    {
+        run({ { "Invert L", 1.f } }, oL, oR);
+        f32 err = 0.f;
+        for (int i = 0; i < kFrames; ++i)
+            err = std::fmax(err, std::fabs(oL[(size_t)i] + inL[(size_t)i]));
+        CHECK(err == 0.f, "Invert L is exactly the negated input (%.9f)", (double)err);
+
+        auto u = reg.instantiate(*d, kSR, kBlock);
+        if (!u) return;
+        u->setParam(paramIndex(*u, "Invert L"), 1.f);
+        u->setParam(paramIndex(*u, "Mono"), 1.f);
+        Buf in, out;
+        for (int i = 0; i < kBlock; ++i)
+            in.l[(size_t)i] = in.r[(size_t)i] = 0.4f * (f32)std::sin(6.2831853 * 440.0 * i / kSR);
+        f32 pk = 0.f;
+        for (int b = 0; b < 8; ++b) {
+            out.clear();
+            u->process(in.p, out.p, 2, kBlock);
+            pk = std::fmax(pk, out.peak());
+        }
+        CHECK(pk == 0.f, "inverted on one side and folded to mono, a correlated pair cancels (%.9f)",
+              (double)pk);
+    }
+
+    // 6. The DC blocker removes an offset without eating the bass, and does
+    //    nothing at all when it is switched off.
+    {
+        auto off = reg.instantiate(*d, kSR, kBlock);
+        auto on  = reg.instantiate(*d, kSR, kBlock);
+        if (!off || !on) return;
+        on->setParam(paramIndex(*on, "DC Block"), 1.f);
+        Buf in, out;
+        for (int i = 0; i < kBlock; ++i)
+            // 750 Hz has a period of exactly 64 samples at 48 kHz, so a
+            // 256-frame block holds four whole cycles and the block mean of the
+            // music is exactly zero -- which is what lets the mean below be a
+            // measurement of the DC offset alone.
+            in.l[(size_t)i] = in.r[(size_t)i] =
+                0.5f + 0.2f * (f32)std::sin(6.2831853 * 750.0 * i / kSR);
+
+        f32 meanOff = 0.f, meanOn = 0.f;
+        for (int b = 0; b < 200; ++b) {
+            out.clear();
+            off->process(in.p, out.p, 2, kBlock);
+            f64 s = 0.0;
+            for (int i = 0; i < kBlock; ++i) s += (f64)out.l[(size_t)i];
+            meanOff = (f32)(s / kBlock);
+        }
+        for (int b = 0; b < 200; ++b) {
+            out.clear();
+            on->process(in.p, out.p, 2, kBlock);
+            f64 s = 0.0;
+            for (int i = 0; i < kBlock; ++i) s += (f64)out.l[(size_t)i];
+            meanOn = (f32)(s / kBlock);
+        }
+        CHECK(std::fabs(meanOff - 0.5f) < 0.01f, "switched off, the offset survives (%.4f)",
+              (double)meanOff);
+        CHECK(std::fabs(meanOn) < 0.005f, "switched on, the offset is gone (%.5f)", (double)meanOn);
+
+        // ...and the music is still there: 750 Hz passes at unity, and so does
+        // 40 Hz, which is the check that says this is a DC blocker and not a
+        // high-pass filter that ate the bottom of the mix.
+        auto probe = reg.instantiate(*d, kSR, kBlock);
+        if (!probe) return;
+        probe->setParam(paramIndex(*probe, "DC Block"), 1.f);
+        const f64 g = probeGainDb(*probe, 750.0, 0.25f, 50);
+        CHECK(std::fabs(g) < 0.1, "and 750 Hz passes at %.3f dB", g);
+        const f64 gLow = probeGainDb(*probe, 40.0, 0.25f, 20);
+        CHECK(std::fabs(gLow) < 0.3, "and 40 Hz at %.3f dB -- a DC blocker, not a high-pass", gLow);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hosted-instrument smoke test: proves the backend's note path (LV2 atom
 // sequences, CLAP note events) against whatever real plugin is installed.
 // ---------------------------------------------------------------------------
@@ -1319,11 +2191,15 @@ static void testHostedInstrument(PluginRegistry& reg, PluginFormat fmt, const ch
 static void testInternalLatency(PluginRegistry& reg) {
     banner("latency: internal devices");
 
+    // Every internal device EXCEPT the Limiter, which has a lookahead and says
+    // so -- see testLimiter, which measures that its figure is the truth.
+    //
     // The rack is in the list because an EMPTY rack is zero-latency like the
     // rest of them. What it reports when it has something in it is the chain
     // sum, and that is testRackLatency's business.
     for (const char* uri : { "nxtakt:saturator", "nxtakt:pulse", "nxtakt:eq3",
                              "nxtakt:compressor", "nxtakt:delay", "nxtakt:reverb",
+                             "nxtakt:autofilter", "nxtakt:chorus", "nxtakt:utility",
                              "nxtakt:rack" }) {
         const PluginDesc* d = reg.find(uri);
         CHECK(d != nullptr, "%s: in the registry", uri);
@@ -1992,12 +2868,17 @@ static void testRack(PluginRegistry& reg) {
 // ---------------------------------------------------------------------------
 // Rack latency: the chain sum.
 //
-// The internal devices are all zero-latency by construction, so a rack made of
-// them can only ever prove that 0 + 0 = 0. The real claim -- that the rack ADDS
-// -- needs a device that actually delays, and the only ones on a Linux box are
-// third-party. So the witness is discovered at runtime exactly the way
-// testLv2Latency finds one, and if the machine has none the section says so and
-// passes.
+// The real claim -- that the rack ADDS rather than reporting max(), or first(),
+// or 0 -- needs a device that actually delays. When this section was written
+// there was no such device in the stock set, so the witness had to be whatever
+// latent LV2 plugin the machine happened to have, and on a machine with none
+// the claim went unverified.
+//
+// The Limiter changed that: it is a stock device with a real 5 ms lookahead, so
+// the arithmetic is now checked everywhere, on every run, with no dependency on
+// what is installed. The LV2 witness is kept anyway, because "the rack sums a
+// THIRD-PARTY plugin's figure" is a different statement from "the rack sums its
+// own", and the first one is the one that gets a real project wrong.
 // ---------------------------------------------------------------------------
 
 static void testRackLatency(PluginRegistry& reg) {
@@ -2006,8 +2887,8 @@ static void testRackLatency(PluginRegistry& reg) {
     const PluginDesc* rd = reg.find("nxtakt:rack");
     if (!rd) { note("no rack in the registry; skipping"); return; }
 
-    // Internal-only first: the sum of six zeroes is a zero, and a rack that
-    // reported anything else would be inventing delay compensation.
+    // Internal, zero-latency only: the sum of three zeroes is a zero, and a
+    // rack that reported anything else would be inventing delay compensation.
     {
         auto rack = makeRack(reg, { "nxtakt:eq3", "nxtakt:compressor", "nxtakt:saturator" });
         CHECK(rack != nullptr, "built a three internal-device rack");
@@ -2016,8 +2897,61 @@ static void testRackLatency(PluginRegistry& reg) {
                   "a rack of zero-latency devices reports 0 (%d)", rack->latencyFrames());
     }
 
-    // Now a real latent plugin. Same discovery as testLv2Latency: no URI is
-    // hard-coded, because the point is to work on whatever is installed.
+    // Internal, with the stock latent device. No discovery, no skipping: this
+    // runs on every machine.
+    {
+        const PluginDesc* ld = reg.find("nxtakt:limiter");
+        auto probe = ld ? reg.instantiate(*ld, kSR, kBlock) : nullptr;
+        const int lim = probe ? probe->latencyFrames() : 0;
+        probe.reset();
+        CHECK(lim > 0, "the stock Limiter reports %d frames, so it can be the witness", lim);
+
+        auto rack = reg.instantiate(*rd, kSR, kBlock);
+        RackControl* r = asRack(rack.get());
+        CHECK(rack && r && ld, "built an empty rack");
+        if (rack && r && ld && lim > 0) {
+            CHECK(rack->latencyFrames() == 0, "empty: 0 frames");
+            CHECK(r->addDevice(*ld), "Limiter added");
+            CHECK(rack->latencyFrames() == lim, "one Limiter: %d frames (%d)",
+                  lim, rack->latencyFrames());
+
+            const PluginDesc* eq = reg.find("nxtakt:eq3");
+            CHECK(eq && r->addDevice(*eq), "EQ Three added between them");
+            CHECK(rack->latencyFrames() == lim,
+                  "a zero-latency device leaves the sum at %d (%d)", lim, rack->latencyFrames());
+
+            CHECK(r->addDevice(*ld), "a second Limiter added");
+            CHECK(rack->latencyFrames() == 2 * lim,
+                  "two Limiters sum to %d (%d) -- not %d, not 0",
+                  2 * lim, rack->latencyFrames(), lim);
+
+            // A rack inside a rack: the sum has to nest, because engine.cpp
+            // reads only the outermost figure.
+            auto outer = reg.instantiate(*rd, kSR, kBlock);
+            RackControl* o = asRack(outer.get());
+            if (outer && o) {
+                CHECK(o->addDevice(*rd), "an inner rack added to an outer one");
+                RackControl* inner = asRack(o->device(0));
+                CHECK(inner != nullptr, "and it is a rack");
+                if (inner) {
+                    CHECK(inner->addDevice(*ld), "Limiter added INSIDE the inner rack");
+                    CHECK(outer->latencyFrames() == lim,
+                          "the outer rack reports the nested %d frames (%d)",
+                          lim, outer->latencyFrames());
+                }
+            }
+
+            CHECK(r->removeDevice(2), "removed the second Limiter");
+            CHECK(rack->latencyFrames() == lim, "the sum came back down to %d (%d)",
+                  lim, rack->latencyFrames());
+            CHECK(rack->prepare(kSR, kBlock) && rack->latencyFrames() == lim,
+                  "re-prepare leaves the sum at %d (%d)", lim, rack->latencyFrames());
+        }
+    }
+
+    // Now a real third-party latent plugin. Same discovery as testLv2Latency:
+    // no URI is hard-coded, because the point is to work on whatever is
+    // installed.
     static const char* kHints[] = {
         "limiter", "lookahead", "look-ahead", "dpl", "linear phase", "linearphase",
         "convol", "oversampl",
@@ -2103,7 +3037,7 @@ int main() {
         if (reg.plugins()[i].format == PluginFormat::Internal) ++internals;
         else if (firstNonInternal < 0) firstNonInternal = (int)i;
     }
-    CHECK(internals == 7, "scan lists every internal device (%d)", internals);
+    CHECK(internals == 11, "scan lists every internal device (%d)", internals);
     CHECK(firstNonInternal < 0 || firstNonInternal == internals,
           "internal devices sort to the front of the list");
 
@@ -2115,6 +3049,11 @@ int main() {
     testCompressor(reg);
     testDelay(reg);
     testReverb(reg);
+    testAutoFilter(reg);
+    testChorus(reg);
+    testLimiter(reg);
+    testUtility(reg);
+    testBlockInvariance(reg);
     testRack(reg);
     testInternalLatency(reg);
     testLv2Latency(reg);

@@ -66,6 +66,19 @@ against a real plugin: LSP Limiter Mono reports 240 frames; the rack reports 240
 for one, 240 with a zero-latency EQ Three added, **480 for two**, 240 after a
 removal.
 
+That first proof depended on a third-party plugin happening to be installed,
+which made it a claim that could only be checked on some machines. The stock
+`nxtakt:limiter` reports 240 frames at 48 kHz for the same reason — 5 ms of
+lookahead — so the chain-sum property is now testable in-tree, on any machine,
+with no plugins installed at all.
+
+**A bug this section did not survive first contact with.** `latencyFrames()`
+originally cached the chain sum into the published layout. A rack *nested*
+inside a rack could then gain a latent device and republish its own layout while
+the outer rack — the only figure the engine ever reads — stayed at 0. The sum is
+computed on demand now: one acquire load and at most eight virtual calls per
+level, at most four levels, which is realtime-safe and cannot go stale.
+
 But `engine.cpp` caches the figure when a chain is published, which is correct
 per the contract as written. So:
 

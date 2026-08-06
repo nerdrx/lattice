@@ -65,10 +65,37 @@ constexpr const char* kCompressorUri = "nxtakt:compressor";
 constexpr const char* kDelayUri      = "nxtakt:delay";
 constexpr const char* kReverbUri     = "nxtakt:reverb";
 constexpr const char* kRackUri       = "nxtakt:rack";
+constexpr const char* kAutoFilterUri = "nxtakt:autofilter";
+constexpr const char* kChorusUri     = "nxtakt:chorus";
+constexpr const char* kLimiterUri    = "nxtakt:limiter";
+constexpr const char* kUtilityUri    = "nxtakt:utility";
 
 // Pre-rename spellings. Append-only; an entry may never be removed.
 constexpr const char* kSaturatorUriLegacy = "lattice:saturator";
 constexpr const char* kPulseUriLegacy     = "lattice:pulse";
+
+// Musical divisions, in beats. 1/32 up to one bar. Triplets and dotted values
+// are included because a delay without a dotted eighth is a delay nobody uses.
+// "1 bar" is four beats: the time signature is not on the plugin contract
+// either, and 4/4 is the honest default rather than a guess we could get wrong.
+//
+// Shared by every device with a Sync switch -- the Delay and the Auto Filter
+// today. One table, so a division added later cannot mean 1/16 on one device
+// and a dotted eighth on another; and because the INDEX is what a project file
+// stores, the table is APPEND-ONLY. Reordering it would silently retune every
+// saved delay in the world.
+constexpr int kDivCount = 9;
+constexpr f32 kDivBeats[kDivCount] = {
+    0.125f,      // 1/32
+    0.25f,       // 1/16
+    1.f / 3.f,   // 1/8 triplet
+    0.5f,        // 1/8
+    0.75f,       // 1/8 dotted
+    1.f,         // 1/4
+    1.5f,        // 1/4 dotted
+    2.f,         // 1/2
+    4.f,         // 1 bar
+};
 
 // Denormals cost hundreds of cycles per operation on x86 when they leak into a
 // feedback path (the one-pole filter state, a decaying envelope). We do not
@@ -116,18 +143,23 @@ public:
     // property of the devices and not an accident of what the base class
     // happens to return today.
     //
-    // It is true by construction for all six. The Saturator is a memoryless
-    // waveshaper (out[i] depends only on in[i]); Pulse is a generator whose
-    // first sample of a voice lands on the frame the note-on asked for; EQ Three
-    // and the Compressor are recursive but causal, so their first output sample
-    // responds to their first input sample; the Delay and the Reverb are
-    // parallel wet paths whose dry component is untouched, and their delay is
-    // the effect rather than a processing cost. None has a lookahead buffer, an
-    // FFT window or an oversampling filter, which are the three things that
-    // produce latency. Any future internal device that does acquire one must
-    // override this again with its real figure -- the engine's delay
-    // compensation trusts it, so reporting 0 while actually delaying would
-    // smear transients across every parallel path.
+    // It is true by construction for all of them but one. The Saturator is a
+    // memoryless waveshaper (out[i] depends only on in[i]); Pulse is a
+    // generator whose first sample of a voice lands on the frame the note-on
+    // asked for; EQ Three, the Compressor and the Auto Filter are recursive but
+    // causal, so their first output sample responds to their first input
+    // sample; the Delay, the Chorus and the Reverb are parallel wet paths whose
+    // dry component is untouched, and their delay is the effect rather than a
+    // processing cost; the Utility is a per-sample gain. None of those has a
+    // lookahead buffer, an FFT window or an oversampling filter, which are the
+    // three things that produce latency.
+    //
+    // THE EXCEPTION IS THE LIMITER, which overrides this with the real figure
+    // because it genuinely delays its output — see the comment on the device.
+    // Any other internal device that acquires a lookahead must do the same: the
+    // engine's delay compensation trusts what it is told and caches it when the
+    // chain is published, so reporting 0 while actually delaying would smear
+    // transients across every parallel path in the set.
     int latencyFrames() const override      { return 0; }
 
     void setBypassed(bool b) override       { bypassed_ = b; }
@@ -965,23 +997,6 @@ private:
     static constexpr int kCh = 2;
     static constexpr f64 kMaxDelaySec = 4.0;
 
-    // 1/32 .. 1 bar, in beats. Triplets and dotted values are included because
-    // a delay without a dotted eighth is a delay nobody uses. "1 bar" is four
-    // beats: the time signature is not on the plugin contract either, and 4/4
-    // is the honest default rather than a guess we could get wrong.
-    static constexpr int kDivCount = 9;
-    static constexpr f32 kDivBeats[kDivCount] = {
-        0.125f,      // 1/32
-        0.25f,       // 1/16
-        1.f / 3.f,   // 1/8 triplet
-        0.5f,        // 1/8
-        0.75f,       // 1/8 dotted
-        1.f,         // 1/4
-        1.5f,        // 1/4 dotted
-        2.f,         // 1/2
-        4.f,         // 1 bar
-    };
-
     int pSync_ = 0, pDiv_ = 0, pTime_ = 0, pTempo_ = 0, pFb_ = 0, pTone_ = 0,
         pPing_ = 0, pMix_ = 0;
 
@@ -1267,6 +1282,689 @@ private:
     bool first_ = true;
 };
 
+// --- Auto Filter -----------------------------------------------------------
+// Resonant multimode filter (12 dB/oct lowpass, bandpass or highpass) with an
+// LFO and an envelope follower on its cutoff.
+//
+// THE TEMPO SITUATION AGAIN, and the same answer as the Delay's, on purpose:
+// PluginInstance carries no transport, so a tempo-synced LFO cannot know the
+// session's BPM. The division table, the beats-to-hertz conversion and the Sync
+// switch are all implemented; the number they multiply comes from a `Tempo`
+// PARAMETER defaulting to 120, exactly as the Delay's does, and the user (or an
+// automation lane) has to keep it in agreement with the transport. Everything
+// except the source of that one number is done.
+//
+// The contract addition that would retire the wart on both devices at once is
+// written out in full in the Delay's header, and adding it is a change to
+// host.h and to engine.cpp's process loop rather than to this file.
+//
+// Three decisions worth stating:
+//
+//   * TPT state-variable filter, not a biquad. The cutoff moves continuously —
+//     that is the device — and a direct-form section swept fast can leave the
+//     stability triangle between two samples because its state stops meaning
+//     anything once the coefficients have moved. The TPT form's state IS the
+//     two integrator outputs, which survive a coefficient change. See
+//     internal_dsp.h.
+//   * The modulators run at CONTROL RATE (kCtrl = 16 samples, 0.33 ms at
+//     48 kHz) and the coefficients are ramped linearly to the new target over
+//     the following 16 samples. An LFO at its fastest (20 Hz over 4 octaves)
+//     moves the cutoff by 0.03 octaves in one tick, which no ear resolves, and
+//     the ramp is what stops that step from being a step. The alternative — a
+//     tan() and an exp2() per sample per channel — buys nothing audible for
+//     roughly ten times the cost.
+//   * The envelope follower is stereo-LINKED and reads the peak, for the same
+//     reason the Compressor's detector does: two independent followers pull the
+//     stereo image around every time one side is louder.
+//
+// Defaults: lowpass, cutoff at the top of its range, no LFO and no envelope. A
+// filter that reshapes the sound the moment it is dropped on a channel is a
+// filter people delete; this one is a wire until a knob moves, like EQ Three.
+class AutoFilter final : public InternalInstance {
+public:
+    explicit AutoFilter(const PluginDesc& d) : InternalInstance(d) {
+        pType_   = addIntParam ("Type", 0, 2, 0);            // 0 LP, 1 BP, 2 HP
+        pCut_    = addParam("Cutoff",       "Hz",  20.f,  18000.f, 18000.f, true);
+        pRes_    = addParam("Resonance",    "",    0.f,   1.f,     0.1f);
+        pLfoAmt_ = addParam("LFO Amount",   "oct", 0.f,   4.f,     0.f);
+        pRate_   = addParam("LFO Rate",     "Hz",  0.01f, 20.f,    1.f,     true);
+        pSync_   = addBoolParam("LFO Sync", true);
+        pDiv_    = addIntParam ("LFO Division", 0, kDivCount - 1, 5);   // 1/4
+        pTempo_  = addParam("Tempo",        "BPM", 20.f,  999.f,   120.f);
+        pShape_  = addIntParam ("LFO Shape", 0, 3, 0);       // sine/tri/saw/square
+        pPhase_  = addParam("LFO Phase",    "deg", 0.f,   180.f,   0.f);
+        pEnvAmt_ = addParam("Env Amount",   "oct", -4.f,  4.f,     0.f);
+        pEnvA_   = addParam("Env Attack",   "ms",  0.1f,  100.f,   5.f,     true);
+        pEnvR_   = addParam("Env Release",  "ms",  1.f,   1000.f,  100.f,   true);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+        for (int c = 0; c < kCh; ++c) sv_[c].reset();
+        lfo_.reset();
+        env_ = 0.f;
+        envNorm_ = 0.f;
+        ctrl_ = 0;
+        first_ = true;                  // snap the coefficients on the first block
+        return true;                    // recursive but causal: zero latency
+    }
+
+    // REALTIME. No per-block buffer of any kind, so an nframes larger than the
+    // one we were prepared for is processed rather than degraded -- the control
+    // loop below is written in terms of nframes alone.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in) { passthrough(in, out, channels, nframes); return; }
+
+        const int type  = (int)clampv(p(pType_) + 0.5f, 0.f, 2.f);
+        const int shape = (int)clampv(p(pShape_) + 0.5f, 0.f, 3.f);
+        const f32 base  = clampv(p(pCut_), 20.f, 18000.f);
+        // Resonance 0..1 -> Q 0.5..20, geometrically: a linear map spends most
+        // of its travel below the point where resonance becomes audible.
+        const f32 q     = 0.5f * std::pow(40.f, clampv(p(pRes_), 0.f, 1.f));
+        const f32 lfoA  = clampv(p(pLfoAmt_), 0.f, 4.f);
+        const f32 envA  = clampv(p(pEnvAmt_), -4.f, 4.f);
+        const f32 phOff = clampv(p(pPhase_), 0.f, 180.f) * (1.f / 360.f);
+
+        if (p(pSync_) >= 0.5f) {
+            const int div = (int)clampv(p(pDiv_) + 0.5f, 0.f, (f32)(kDivCount - 1));
+            const f32 bpm = clampv(p(pTempo_), 20.f, 999.f);
+            // One cycle per division: a 1/4 at 120 BPM is 0.5 s, i.e. 2 Hz.
+            lfo_.setRate(sr_, bpm / (60.f * kDivBeats[div]));
+        } else {
+            lfo_.setRate(sr_, clampv(p(pRate_), 0.01f, 20.f));
+        }
+
+        const f32 att   = dsp::poleCoef(sr_, clampv(p(pEnvA_), 0.1f, 100.f) * 1e-3f);
+        const f32 rel   = dsp::poleCoef(sr_, clampv(p(pEnvR_), 1.f, 1000.f) * 1e-3f);
+        const f32 fcMax = (f32)(sr_ * 0.45);
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        int i = 0;
+        while (i < nframes) {
+            // --- control tick: where the modulation becomes a coefficient set.
+            //
+            // `ctrl_` counts down across process() calls rather than restarting
+            // at every block boundary, so a tick lands every 16 samples of
+            // ABSOLUTE time whatever block sizes the host hands us. That is what
+            // makes the device block-size invariant -- at a fixed parameter
+            // setting, the same audio in blocks of 1, of 256 and of 300 comes
+            // out bit-identical -- and it is not a nicety: a render at one block
+            // size and the same render at another must be the same file.
+            //
+            // (Parameters themselves are still read once per block, like every
+            // other device here, so a knob MOVING lands on a block boundary.
+            // That is the one block-size dependence the whole file shares, and
+            // it is the same one every plugin format has.)
+            if (ctrl_ <= 0) {
+                // The log lives here rather than in the sample loop: the cutoff
+                // is only rebuilt at the tick, so a per-sample dB conversion
+                // would be sixteen logarithms for one number that gets used.
+                envNorm_ = clampv((20.f * std::log10(std::fmax(env_, 1e-7f)) + 60.f) * (1.f / 60.f),
+                                  0.f, 1.f);
+                const f32 eo = envA * envNorm_;
+
+                // The two channels differ only by the LFO's stereo phase offset,
+                // so at phase 0 they are bit-identical and the device is exactly
+                // mono-compatible -- which is the property a stereo LFO has to
+                // be able to give back.
+                dsp::SvfCoeffs tgt[kCh];
+                for (int c = 0; c < kCh; ++c) {
+                    const f32 m = lfoA * dsp::Lfo::shape(shape, lfo_.phase + (c ? phOff : 0.f));
+                    tgt[c] = dsp::svfCoeffs(sr_, clampv(base * std::exp2(m + eo), 20.f, fcMax), q);
+                }
+                // The first block after prepare() establishes the coefficients
+                // rather than gliding towards them, for the reason
+                // Smoother::settle gives: a project load writes every parameter
+                // AFTER instantiate().
+                if (first_) { cur_[0] = tgt[0]; cur_[1] = tgt[1]; first_ = false; }
+
+                const f32 invk = 1.f / (f32)kCtrl;
+                for (int c = 0; c < kCh; ++c) inc_[c] = dsp::svfSlope(cur_[c], tgt[c], invk);
+                ctrl_ = kCtrl;
+            }
+
+            const int k = (nframes - i) < ctrl_ ? (nframes - i) : ctrl_;
+            for (int j = 0; j < k; ++j) {
+                const int n = i + j;
+                const f32 l = src[0] ? src[0][n] : 0.f;
+                const f32 r = (nc > 1 && src[1]) ? src[1][n] : l;
+
+                // Envelope follower: stereo-linked peak through a one-pole with
+                // separate attack and release. Per sample, because the whole
+                // point of a follower is to catch a transient.
+                const f32 det = std::fmax(std::fabs(l), std::fabs(r));
+                env_ = flushDenormal(env_ + (det - env_) * (det > env_ ? att : rel));
+
+                for (int c = 0; c < nc; ++c) {
+                    if (!dst[c]) continue;
+                    const dsp::SvfOut o = dsp::svfTick(cur_[c], sv_[c], c == 0 ? l : r);
+                    // The bandpass is normalised by k = 1/Q so its peak stays at
+                    // unity: an SVF's raw bandpass tap has a peak gain of Q, and
+                    // a band filter that gets 26 dB louder as the resonance knob
+                    // turns is a hazard rather than a feature. The lowpass and
+                    // highpass keep their resonant peak, which is the whole
+                    // point of the knob on those.
+                    dst[c][n] = type == 0 ? o.lp : (type == 1 ? o.bp * cur_[c].k : o.hp);
+                }
+                for (int c = 0; c < kCh; ++c) dsp::svfStep(cur_[c], inc_[c]);
+                lfo_.tick();
+            }
+
+            ctrl_ -= k;
+            i += k;
+        }
+
+        for (int c = 0; c < kCh; ++c) sv_[c].check();
+        if (!dsp::sane(env_)) { env_ = 0.f; envNorm_ = 0.f; }
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh   = 2;
+    // 16 samples: 0.33 ms at 48 kHz, 0.36 ms at 44.1. Small enough that the
+    // fastest modulation this device can produce moves the cutoff by a
+    // hundredth of an octave between ticks.
+    static constexpr int kCtrl = 16;
+
+    int pType_ = 0, pCut_ = 0, pRes_ = 0, pLfoAmt_ = 0, pRate_ = 0, pSync_ = 0,
+        pDiv_ = 0, pTempo_ = 0, pShape_ = 0, pPhase_ = 0, pEnvAmt_ = 0,
+        pEnvA_ = 0, pEnvR_ = 0;
+
+    dsp::SvfCoeffs cur_[kCh], inc_[kCh];
+    dsp::SvfState  sv_[kCh];
+    dsp::Lfo       lfo_;
+    f32  env_ = 0.f;                   // linear peak follower
+    f32  envNorm_ = 0.f;               // that peak as 0..1 over the top 60 dB
+    int  ctrl_ = 0;                    // samples until the next control tick
+    bool first_ = true;
+};
+
+// --- Chorus ----------------------------------------------------------------
+// Modulated multi-tap delay: up to four voices per channel, each reading the
+// same line at a different point on one LFO's cycle.
+//
+// Decisions:
+//
+//   * ONE oscillator, read at N angles. Every voice is the same rotating unit
+//     vector (dsp::Quad) read at a fixed offset, because sin(t + a) is
+//     s*cos a + c*sin a and the offsets are constants for the block. N
+//     independent LFOs would cost N sines per sample and would drift apart at
+//     the same time -- the offsets are the whole point of an ensemble.
+//   * The two channels are in QUADRATURE, always: right reads the same
+//     oscillator a quarter cycle ahead of left. That fixed offset, not a
+//     parameter, is what makes the device stereo out of a mono source.
+//   * Width is therefore a mid/side control on the WET signal, per sample and
+//     smoothed, rather than a phase offset. A phase offset can only change at
+//     block boundaries -- it is baked into the per-voice constants -- and a
+//     delay time that steps once per block is a click.
+//   * Feedback is taken from the summed wet signal and clamped before it
+//     re-enters the line, so a NaN arriving from upstream cannot become
+//     permanent state in a loop. Negative feedback is allowed and is what turns
+//     a slow chorus into a flanger.
+//
+// Defaults: 3 voices, 12 ms, 3 ms of depth at 0.6 Hz, no feedback, 50% wet.
+// Audible on the first play, which is the point of the device -- unlike a
+// filter or an EQ, a chorus that does nothing by default is just latency.
+class Chorus final : public InternalInstance {
+public:
+    explicit Chorus(const PluginDesc& d) : InternalInstance(d) {
+        pRate_   = addParam("Rate",     "Hz",  0.01f, 10.f, 0.6f, true);
+        pDepth_  = addParam("Depth",    "ms",  0.f,   10.f, 3.f);
+        pDelay_  = addParam("Delay",    "ms",  1.f,   30.f, 12.f);
+        pVoices_ = addIntParam("Voices", 1, kMaxVoices, 3);
+        pFb_     = addParam("Feedback", "",   -0.9f,  0.9f, 0.f);
+        pWidth_  = addParam("Width",    "",    0.f,   1.f,  1.f);
+        pMix_    = addParam("Dry/Wet",  "",    0.f,   1.f,  0.5f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        // GUI thread: the only allocation in the device. 50 ms covers the
+        // longest tap the parameters can ask for (30 ms delay + 10 ms depth)
+        // with room for the interpolator to read past it.
+        const int n = (int)(kMaxSec * sr_) + 8;
+        lineL_.resize(n);
+        lineR_.resize(n);
+        lineL_.reset();
+        lineR_.reset();
+
+        delay_.setTime(sr_, 0.05f);     // a time change bends, it does not click
+        depth_.setTime(sr_, 0.05f);
+        fb_.setTime(sr_, 0.02f);
+        width_.setTime(sr_, 0.02f);
+        mix_.setTime(sr_, 0.02f);
+        lfo_.reset();
+        voices_ = 0;                    // forces the angle table to be rebuilt
+        renorm_ = 0;
+        first_ = true;
+        return true;
+    }
+
+    // REALTIME.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in || lineL_.buf.empty()) { passthrough(in, out, channels, nframes); return; }
+
+        const int v = (int)clampv(p(pVoices_) + 0.5f, 1.f, (f32)kMaxVoices);
+        if (v != voices_) setVoices(v);
+
+        lfo_.setRate(sr_, clampv(p(pRate_), 0.01f, 10.f));
+        delay_.set(clampv(p(pDelay_), 1.f, 30.f) * 1e-3f * (f32)sr_);
+        depth_.set(clampv(p(pDepth_), 0.f, 10.f) * 1e-3f * (f32)sr_);
+        fb_.set(clampv(p(pFb_), -0.9f, 0.9f));
+        width_.set(clampv(p(pWidth_), 0.f, 1.f));
+        mix_.set(clampv(p(pMix_), 0.f, 1.f));
+        if (first_) {
+            delay_.settle(); depth_.settle(); fb_.settle(); width_.settle(); mix_.settle();
+            first_ = false;
+        }
+
+        const f32 maxD = (f32)lineL_.capacity() - 2.f;
+        const f32 inv  = 1.f / (f32)voices_;
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        for (int i = 0; i < nframes; ++i) {
+            const f32 xl = src[0] ? src[0][i] : 0.f;
+            const f32 xr = (nc > 1 && src[1]) ? src[1][i] : xl;
+
+            // Renormalising the oscillator on a fixed sample period rather than
+            // once per block is what keeps the device block-size invariant: the
+            // correction changes the vector slightly, so applying it at buffer
+            // boundaries would make the output depend on the buffer size.
+            if (renorm_ <= 0) { lfo_.renorm(); renorm_ = kRenorm; }
+            --renorm_;
+
+            lfo_.tick();
+            const f32 s = lfo_.s, c = lfo_.c;
+            const f32 d0 = delay_.next();
+            const f32 dp = depth_.next() * 0.5f;
+
+            // Read then push, which is what makes the tap an exact delay.
+            f32 wl = 0.f, wr = 0.f;
+            for (int k = 0; k < voices_; ++k) {
+                const f32 ml = s * cosA_[k] + c * sinA_[k];   // sin(t + a)
+                const f32 mr = c * cosA_[k] - s * sinA_[k];   // sin(t + a + 90 deg)
+                wl += lineL_.tapLerp(clampv(d0 + dp * (1.f + ml), 1.f, maxD));
+                wr += lineR_.tapLerp(clampv(d0 + dp * (1.f + mr), 1.f, maxD));
+            }
+            wl *= inv;
+            wr *= inv;
+
+            const f32 fb = fb_.next();
+            lineL_.push(flushDenormal(clampv(xl + wl * fb, -32.f, 32.f)));
+            lineR_.push(flushDenormal(clampv(xr + wr * fb, -32.f, 32.f)));
+
+            const f32 w   = width_.next();
+            const f32 mid = 0.5f * (wl + wr);
+            const f32 sid = 0.5f * (wl - wr) * w;
+            const f32 mix = mix_.next();
+
+            if (dst[0]) dst[0][i] = xl * (1.f - mix) + (mid + sid) * mix;
+            if (nc > 1 && dst[1]) dst[1][i] = xr * (1.f - mix) + (mid - sid) * mix;
+        }
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh        = 2;
+    static constexpr int kMaxVoices = 4;
+    static constexpr f64 kMaxSec    = 0.05;
+    // The quadrature vector drifts by O(k^2) per sample; at the fastest rate
+    // this device allows that is a part in 10^7 per sample, so 1024 samples
+    // between corrections is three orders of magnitude of headroom.
+    static constexpr int kRenorm    = 1024;
+
+    // Voice angles, evenly spaced around the cycle. Rebuilt only when the voice
+    // count changes: they are constants of the topology, not of the signal.
+    void setVoices(int v) {
+        voices_ = clampv(v, 1, kMaxVoices);
+        for (int k = 0; k < voices_; ++k) {
+            const f32 a = dsp::kTwoPi * (f32)k / (f32)voices_;
+            cosA_[k] = std::cos(a);
+            sinA_[k] = std::sin(a);
+        }
+    }
+
+    int pRate_ = 0, pDepth_ = 0, pDelay_ = 0, pVoices_ = 0, pFb_ = 0, pWidth_ = 0,
+        pMix_ = 0;
+
+    dsp::DelayLine lineL_, lineR_;
+    dsp::Quad      lfo_;
+    dsp::Smoother  delay_, depth_, fb_, width_, mix_;
+    f32  cosA_[kMaxVoices] = { 1.f, 1.f, 1.f, 1.f };
+    f32  sinA_[kMaxVoices] = { 0.f, 0.f, 0.f, 0.f };
+    int  voices_ = 0;
+    int  renorm_ = 0;
+    bool first_ = true;
+};
+
+// --- Limiter ---------------------------------------------------------------
+// Lookahead brickwall limiter. The one internal device with latency, and the
+// reason the base class's latencyFrames() comment names an exception.
+//
+// THE LATENCY, first, because it is the part the rest of the program depends
+// on. The lookahead is five milliseconds, FIXED AT PREPARE TIME -- 240 frames
+// at 48 kHz, 221 at 44.1 -- and latencyFrames() reports exactly that. It is not
+// a parameter and must never become one:
+//
+//   * host.h says latency is constant after prepare();
+//   * engine.cpp reads it ONCE, when a chain is published, and caches it beside
+//     the pointer (see docs/RACKS.md §1);
+//   * so a knob that changed the figure would leave every parallel path in the
+//     project compensated by a number that is no longer true, silently, with no
+//     way for the engine to find out.
+//
+// A device that under-reports smears the whole set; a device that over-reports
+// does the same in the other direction. The number here is not an estimate --
+// the output IS the input delayed by exactly `look_` samples (the test measures
+// it by impulse), so the engine's compensation is exact rather than close.
+//
+// THE GAIN COMPUTER, and why this shape is brickwall rather than nearly:
+//
+//   1. level[n]   = 20*log10(peak of the stereo pair, after input gain)
+//   2. rel[n]     = max(level[n], rel[n-1] released towards it)   -- release
+//   3. m[n]       = max over rel[n-L .. n]                        -- lookahead
+//   4. a[n]       = mean of m[n-L .. n]                           -- smoothing
+//   5. gain[n]    = 10^(-max(0, a[n] - ceiling)/20), applied to input[n-L]
+//
+// Each stage is monotone upward in the level it reports, and the proof that the
+// output cannot exceed the ceiling is three lines:
+//   * rel[n] >= level[n], because step 2 only ever holds the level UP;
+//   * every term of the mean in step 4 is m[n-j] for j <= L, and each of those
+//     is a maximum over a window that CONTAINS index n-L (that is exactly what
+//     makes L the right window length in both steps 3 and 4), so every term is
+//     >= rel[n-L] >= level[n-L];
+//   * therefore a[n] >= level[n-L], the attenuation applied to sample n-L is at
+//     least what that sample needed, and |output| <= ceiling. No overshoot, at
+//     any release time, for any signal.
+//
+// Release BEFORE the maximum, not after, is what makes that proof work and is
+// the one ordering in the chain that is not free to move: smoothing after the
+// maximum would let the gain arrive late.
+//
+// The attack is not a parameter either, because it is not a free variable: it
+// is the mean in step 4, i.e. a linear ramp exactly `look_` samples long that
+// finishes precisely when the peak arrives. That is what lookahead buys.
+//
+// Inter-sample peaks are NOT limited: this is a sample-peak limiter, and a
+// signal that reads -0.1 dBFS here can still reconstruct above 0 dBFS in a
+// converter. Saying so is cheaper than an oversampled detector nobody asked
+// for, and the default ceiling of -0.3 dB is the usual allowance.
+class Limiter final : public InternalInstance {
+public:
+    explicit Limiter(const PluginDesc& d) : InternalInstance(d) {
+        pIn_   = addParam("Input",   "dB", -12.f, 24.f,   0.f);
+        pCeil_ = addParam("Ceiling", "dB", -24.f, 0.f,    -0.3f);
+        pRel_  = addParam("Release", "ms", 1.f,   1000.f, 100.f, true);
+        // Output-only. See InternalInstance::setReadout for the wart.
+        pGr_   = addParam("Gain Reduction", "dB", 0.f, 60.f, 0.f);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        look_ = (int)(kLookaheadSec * sr_ + 0.5);
+        if (look_ < 1) look_ = 1;
+        const int w = look_ + 1;        // see the proof: both windows are L+1
+
+        // GUI thread: every allocation in the device, sized from the sample
+        // rate alone. Nothing here depends on the block size, which is why
+        // process() has no nframes limit.
+        lineL_.resize(look_ + 8);
+        lineR_.resize(look_ + 8);
+        lineL_.reset();
+        lineR_.reset();
+        max_.resize(w);
+        box_.resize(w);
+        in_.setTime(sr_, 0.02f);
+        in_.snap(dbToGain(clampv(p(pIn_), -12.f, 24.f)));
+        rel_ = kFloorDb;
+        resum_ = 0;
+        setReadout(pGr_, 0.f);
+        first_ = true;
+        return true;
+    }
+
+    // Constant after prepare(), audio-thread-safe to read, and true: the
+    // measured delay through this device is this number.
+    int latencyFrames() const override { return look_; }
+
+    // REALTIME. No per-block buffer, so any nframes is processed rather than
+    // degraded -- which matters more here than elsewhere, since a limiter that
+    // fell back to passthrough on a long block would pass a peak it exists to
+    // stop.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in || lineL_.buf.empty()) { passthrough(in, out, channels, nframes); return; }
+
+        in_.set(dbToGain(clampv(p(pIn_), -12.f, 24.f)));
+        if (first_) { in_.settle(); first_ = false; }
+        const f32 ceil = clampv(p(pCeil_), -24.f, 0.f);
+        const f32 rel  = dsp::poleCoef(sr_, clampv(p(pRel_), 1.f, 1000.f) * 1e-3f);
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        f32 peakGr = 0.f;
+        for (int i = 0; i < nframes; ++i) {
+            // Rebuild the moving-average sum exactly, every kResum samples of
+            // ABSOLUTE time rather than once per block. Both halves matter: the
+            // rebuild keeps the gain a function of the last L samples instead of
+            // of every sample since prepare(), and doing it on a fixed sample
+            // period rather than at block boundaries is what keeps the device
+            // block-size invariant -- the same audio in blocks of 1 and of 256
+            // comes out bit-identical, so a render cannot depend on the buffer
+            // size it happened to be made at.
+            if (resum_ <= 0) { box_.resum(); resum_ = kResum; }
+            --resum_;
+
+            // The input gain is applied ONCE, on the way into the line, so the
+            // detector and the delayed audio can never disagree about it --
+            // which they would if the gain were smoothed and applied at the
+            // output, where it would be `look_` samples out of step.
+            const f32 g  = in_.next();
+            const f32 xl = (src[0] ? src[0][i] : 0.f) * g;
+            const f32 xr = (nc > 1 && src[1]) ? src[1][i] * g : xl;
+
+            const f32 dl = lineL_.tap(look_);     // read then push: exact delay
+            const f32 dr = lineR_.tap(look_);
+            lineL_.push(xl);
+            lineR_.push(xr);
+
+            // Detector: stereo-LINKED peak, so one gain moves both channels and
+            // the image does not swing towards the quieter side on every hit.
+            const f32 pk  = std::fmax(std::fabs(xl), std::fabs(xr));
+            const f32 lvl = 20.f * std::log10(std::fmax(pk, kFloorLin));
+            rel_ = lvl > rel_ ? lvl : rel_ + (lvl - rel_) * rel;
+
+            const f32 a   = box_.push(max_.push(rel_));
+            const f32 att = a > ceil ? a - ceil : 0.f;
+            if (att > peakGr) peakGr = att;
+
+            // The branch is not an optimisation: it makes a limiter that is not
+            // limiting a BIT-EXACT wire (plus its delay), rather than a wire
+            // multiplied by whatever pow(10, -0.0) returns.
+            const f32 gg = att > 0.f ? dbToGain(-att) : 1.f;
+            if (dst[0]) dst[0][i] = dl * gg;
+            if (nc > 1 && dst[1]) dst[1][i] = dr * gg;
+        }
+
+        if (!dsp::sane(rel_)) rel_ = kFloorDb;
+        // One value per block: the worst reduction in the block, which is the
+        // number an engineer wants to see.
+        setReadout(pGr_, peakGr);
+
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh = 2;
+    // Five milliseconds. Long enough that the attack ramp is inaudible on
+    // programme material, short enough to keep the reported latency small; and
+    // it happens to be the same 240 frames at 48 kHz that LSP's limiter
+    // reports, which is the figure docs/RACKS.md §1 already measures against.
+    static constexpr f64 kLookaheadSec = 0.005;
+    static constexpr f32 kFloorLin = 1e-7f;      // -140 dB
+    static constexpr f32 kFloorDb  = -140.f;
+    static constexpr int kResum    = 1024;
+
+    int pIn_ = 0, pCeil_ = 0, pRel_ = 0, pGr_ = 0;
+
+    dsp::DelayLine  lineL_, lineR_;
+    dsp::SlidingMax max_;
+    dsp::Boxcar     box_;
+    dsp::Smoother   in_;
+    f32  rel_   = kFloorDb;
+    int  look_  = 1;
+    int  resum_ = 0;
+    bool first_ = true;
+};
+
+// --- Utility ---------------------------------------------------------------
+// Gain, stereo width, mono fold, polarity and a DC blocker. The device with no
+// sound of its own, and the one that ends up on the most channels.
+//
+// THE PROPERTY THAT MATTERS: at its defaults it is a BIT-EXACT WIRE. Not
+// "transparent", not "within a fraction of a dB" -- the samples that come out
+// are the samples that went in. That is what makes it safe to leave on every
+// channel, and it is a claim that has to be engineered rather than hoped for,
+// because the obvious implementation destroys it:
+//
+//     mid = (L+R)/2;  side = (L-R)/2;  out = mid + side
+//
+// is NOT L in floating point. So Width == 1 is a BRANCH, not a computation, and
+// the same reasoning puts a branch on the limiter's unity gain. Everything else
+// on the identity path is a multiply by exactly 1.0f, which is exact.
+//
+// Order of operations, and why: DC block, then polarity, then width, then gain.
+//   * The DC blocker is first so it sees the signal as it arrived, before a
+//     polarity flip has changed the sign of the offset it is tracking.
+//   * Polarity is before width, so inverting one side and folding to mono
+//     cancels -- which is exactly what someone flipping a polarity switch is
+//     listening for.
+//   * Gain is last, so the knob is a true output level whatever the rest does.
+//
+// Mono is Width 0 with a switch of its own, because folding to mono is the one
+// width setting people reach for by name. It moves the same smoother, so the
+// switch glides rather than clicks.
+//
+// Polarity is smoothed too, over 20 ms. Flipping it therefore dips through zero
+// rather than stepping, which is the lesser of two artefacts: a true crossfade
+// would need the un-inverted copy kept alive in a second buffer for the sake of
+// a switch nobody automates at audio rate.
+class Utility final : public InternalInstance {
+public:
+    explicit Utility(const PluginDesc& d) : InternalInstance(d) {
+        // The bottom of the range is -70 dB because that is where dbToGain()
+        // returns exactly zero: a Gain control that cannot actually mute is one
+        // people work around.
+        pGain_  = addParam("Gain",  "dB", -70.f, 24.f, 0.f);
+        pWidth_ = addParam("Width", "",   0.f,   2.f,  1.f);
+        pMono_  = addBoolParam("Mono",     false);
+        pInvL_  = addBoolParam("Invert L", false);
+        pInvR_  = addBoolParam("Invert R", false);
+        pDc_    = addBoolParam("DC Block", false);
+    }
+
+    bool prepare(f64 sampleRate, int maxBlock) override {
+        sr_ = sampleRate > 0.0 ? sampleRate : 48000.0;
+        maxBlock_ = maxBlock > 0 ? maxBlock : kMaxBlock;
+
+        gain_.setTime(sr_, 0.02f);
+        width_.setTime(sr_, 0.02f);
+        sgnL_.setTime(sr_, 0.02f);
+        sgnR_.setTime(sr_, 0.02f);
+        gain_.snap(dbToGain(clampv(p(pGain_), -70.f, 24.f)));
+        width_.snap(p(pMono_) >= 0.5f ? 0.f : clampv(p(pWidth_), 0.f, 2.f));
+        sgnL_.snap(p(pInvL_) >= 0.5f ? -1.f : 1.f);
+        sgnR_.snap(p(pInvR_) >= 0.5f ? -1.f : 1.f);
+        // 5 Hz: below anything a listener would call bass, and still settles a
+        // hard offset in a fraction of a second.
+        dcL_.setCutoff(sr_, 5.f);
+        dcR_.setCutoff(sr_, 5.f);
+        dcL_.reset();
+        dcR_.reset();
+        first_ = true;
+        return true;
+    }
+
+    // REALTIME. Per-sample and per-channel only; any nframes is legal.
+    void process(const f32* const* in, f32* const* out, int channels, int nframes) override {
+        if (channels <= 0 || nframes <= 0 || !out) return;
+        if (bypassed_ || !in) { passthrough(in, out, channels, nframes); return; }
+
+        const bool dc = p(pDc_) >= 0.5f;
+        gain_.set(dbToGain(clampv(p(pGain_), -70.f, 24.f)));
+        width_.set(p(pMono_) >= 0.5f ? 0.f : clampv(p(pWidth_), 0.f, 2.f));
+        sgnL_.set(p(pInvL_) >= 0.5f ? -1.f : 1.f);
+        sgnR_.set(p(pInvR_) >= 0.5f ? -1.f : 1.f);
+        if (first_) { gain_.settle(); width_.settle(); sgnL_.settle(); sgnR_.settle(); first_ = false; }
+        // Switched off, the blocker holds no state: re-enabling it starts from
+        // the signal rather than from whatever it last saw.
+        if (!dc) { dcL_.reset(); dcR_.reset(); }
+
+        const int nc = channels < kCh ? channels : kCh;
+        const f32* src[kCh] = { nullptr, nullptr };
+        f32*       dst[kCh] = { nullptr, nullptr };
+        for (int c = 0; c < nc; ++c) { src[c] = in[c]; dst[c] = out[c]; }
+
+        for (int i = 0; i < nframes; ++i) {
+            f32 l = src[0] ? src[0][i] : 0.f;
+            f32 r = (nc > 1 && src[1]) ? src[1][i] : l;
+
+            if (dc) { l = dcL_.process(l); r = dcR_.process(r); }
+
+            // Every smoother is advanced on every sample whatever the branches
+            // below do, so the glide is a function of time and not of settings.
+            l *= sgnL_.next();
+            r *= sgnR_.next();
+
+            const f32 w = width_.next();
+            f32 ol, orr;
+            if (w == 1.f) { ol = l; orr = r; }          // the bit-exact path
+            else {
+                const f32 mid = 0.5f * (l + r);
+                const f32 sid = 0.5f * (l - r) * w;
+                ol  = mid + sid;
+                orr = mid - sid;
+            }
+
+            const f32 g = gain_.next();
+            if (dst[0]) dst[0][i] = ol * g;
+            if (nc > 1 && dst[1]) dst[1][i] = orr * g;
+        }
+
+        dcL_.check();
+        dcR_.check();
+        copyExtra(in, out, nc, channels, nframes);
+    }
+
+private:
+    static constexpr int kCh = 2;
+
+    int pGain_ = 0, pWidth_ = 0, pMono_ = 0, pInvL_ = 0, pInvR_ = 0, pDc_ = 0;
+
+    dsp::Smoother gain_, width_, sgnL_, sgnR_;
+    dsp::DcBlock  dcL_, dcR_;
+    bool first_ = true;
+};
+
 // --- Rack ------------------------------------------------------------------
 // Up to eight devices in series behind eight macro knobs.
 //
@@ -1274,9 +1972,11 @@ private:
 // therefore has to honour every clause of the contract in host.h *and forward
 // it*, which is where all the interesting decisions are:
 //
-//   * latencyFrames() is the SUM of the chain. Reporting 0 would be a lie the
-//     engine acts on -- it compensates with the number we give it, so a rack
-//     containing a lookahead limiter would smear every parallel path in the
+//   * latencyFrames() is the SUM of the chain, and is summed ON DEMAND rather
+//     than cached, so that a rack nested inside this one can gain a latent
+//     device without this rack's figure going stale. Reporting 0 would be a lie
+//     the engine acts on -- it compensates with the number we give it, so a
+//     rack containing the stock Limiter would smear every parallel path in the
 //     project by exactly the amount we failed to declare.
 //   * midi() is forwarded to sub-devices that declare a note input, so a rack
 //     can contain an instrument.
@@ -1417,15 +2117,40 @@ public:
         return applyMacro(i, true);
     }
 
-    // The chain sum, published with the topology so it can never disagree with
-    // it. NOTE the contract friction, stated where it will be read: host.h says
-    // latency is constant after prepare(), and the engine caches it when the
-    // chain is published. Editing a live rack changes this number. The caller
-    // must republish the track's chain after a rack edit for the engine's
-    // compensation to follow -- see the report.
+    // The chain sum, computed from the published topology when it is asked for
+    // rather than cached alongside it.
+    //
+    // It used to be cached in the Layout, computed in republish(). That was
+    // wrong in exactly one case, and the case is not exotic: a rack INSIDE a
+    // rack. Adding a latent device to the inner rack republishes the inner
+    // rack's layout, but the outer rack has no way to know that happened, so
+    // its cached sum stayed at whatever the inner rack reported when it was
+    // added -- zero, since a rack is empty when you drop it in. The outer
+    // figure is the only one the engine ever reads, so the whole project's
+    // delay compensation was silently short by the inner rack's latency.
+    //
+    // Summing on demand fixes it with no new plumbing: each entry answers for
+    // itself, and a nested rack answers by doing the same thing one level down.
+    // It is realtime-safe -- one acquire load, at most kRackMaxDevices virtual
+    // calls, bounded by kRackMaxDepth levels, no allocation and no lock -- and
+    // it costs nothing per block, because the engine reads latency once when a
+    // chain is published (docs/RACKS.md §1) and not per callback.
+    //
+    // The contract friction that remains is the one already documented: host.h
+    // says latency is constant after prepare(), and a rack's is not. THE CALLER
+    // MUST STILL REPUBLISH THE TRACK'S CHAIN AFTER A RACK EDIT for the engine's
+    // compensation to follow. What is fixed here is that when it does, the
+    // number it reads is now right at any nesting depth.
     int latencyFrames() const override {
         const Layout* L = live_.load(std::memory_order_acquire);
-        return L ? L->lat : 0;
+        if (!L) return 0;
+        int lat = 0;
+        for (int i = 0; i < L->n; ++i) {
+            if (!L->dev[i]) continue;
+            const int l = L->dev[i]->latencyFrames();
+            if (l > 0) lat += l;                    // a negative figure is a bug, not a credit
+        }
+        return lat;
     }
 
     // --- RackControl (GUI thread) ------------------------------------------
@@ -1588,9 +2313,11 @@ private:
     };
 
     // Everything the audio thread reads, in one immutable-once-published block.
+    //
+    // The latency sum is deliberately NOT in here: see latencyFrames(). A
+    // cached figure cannot see an edit made to a rack nested inside this one.
     struct Layout {
         int             n   = 0;
-        int             lat = 0;                    // chain sum, frames
         PluginInstance* dev[kRackMaxDevices]  = {};
         bool            midi[kRackMaxDevices] = {};
         int             nMaps = 0;
@@ -1608,14 +2335,11 @@ private:
     // swaps it in with one release store.
     void republish() {
         Layout& L = ring_[next_];
-        L.n   = 0;
-        L.lat = 0;
+        L.n = 0;
         for (PluginInstance* d : chain_) {
             if (L.n >= kRackMaxDevices) break;
             L.dev[L.n]  = d;
             L.midi[L.n] = d->desc().hasMidiIn;
-            const int l = d->latencyFrames();
-            L.lat += l > 0 ? l : 0;                 // a negative figure is a bug, not a credit
             ++L.n;
         }
 
@@ -1824,23 +2548,34 @@ PluginDesc rackDesc() {
     return d;
 }
 
-PluginDesc eq3Desc()        { return effectDesc(kEq3Uri,        "EQ Three",   "EQ",      7); }
+PluginDesc eq3Desc()        { return effectDesc(kEq3Uri,        "EQ Three",   "EQ",       7); }
 PluginDesc compressorDesc() { return effectDesc(kCompressorUri, "Compressor", "Dynamics", 7); }
 PluginDesc delayDesc()      { return effectDesc(kDelayUri,      "Delay",      "Delay",    8); }
 PluginDesc reverbDesc()     { return effectDesc(kReverbUri,     "Reverb",     "Reverb",   6); }
+PluginDesc autoFilterDesc() { return effectDesc(kAutoFilterUri, "Auto Filter", "Filter",     13); }
+PluginDesc chorusDesc()     { return effectDesc(kChorusUri,     "Chorus",      "Modulation", 7); }
+PluginDesc limiterDesc()    { return effectDesc(kLimiterUri,    "Limiter",     "Dynamics",   4); }
+PluginDesc utilityDesc()    { return effectDesc(kUtilityUri,    "Utility",     "Utility",    6); }
 
 } // namespace
 
 // --- entry points ----------------------------------------------------------
 void scanInternal(std::vector<PluginDesc>& out) {
+    const size_t before = out.size();
     out.push_back(saturatorDesc());
     out.push_back(pulseDesc());
     out.push_back(eq3Desc());
     out.push_back(compressorDesc());
     out.push_back(delayDesc());
     out.push_back(reverbDesc());
+    out.push_back(autoFilterDesc());
+    out.push_back(chorusDesc());
+    out.push_back(limiterDesc());
+    out.push_back(utilityDesc());
     out.push_back(rackDesc());
-    LOGI("internal: 7 devices");
+    // Counted rather than spelled out: a device added without touching this
+    // line would otherwise make the log quietly wrong.
+    LOGI("internal: %zu devices", out.size() - before);
 }
 
 std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
@@ -1862,6 +2597,14 @@ std::unique_ptr<PluginInstance> instantiateInternal(const PluginDesc& d,
         inst = std::make_unique<Delay>(delayDesc());
     else if (d.uri == kReverbUri)
         inst = std::make_unique<Reverb>(reverbDesc());
+    else if (d.uri == kAutoFilterUri)
+        inst = std::make_unique<AutoFilter>(autoFilterDesc());
+    else if (d.uri == kChorusUri)
+        inst = std::make_unique<Chorus>(chorusDesc());
+    else if (d.uri == kLimiterUri)
+        inst = std::make_unique<Limiter>(limiterDesc());
+    else if (d.uri == kUtilityUri)
+        inst = std::make_unique<Utility>(utilityDesc());
     else if (d.uri == kRackUri)
         // The one device that is handed the registry: it has to be able to
         // instantiate the devices it contains, and PluginRegistry::instantiate
