@@ -9,6 +9,14 @@
 //                       src/core/common.cpp -o engine_test
 #include "../src/audio/engine.h"
 #include "../src/plugin/host.h"
+// The onset detector (§31) lives in sample.cpp, which the Makefile's
+// build/engine_test rule does not list — and that rule is not this change's to
+// edit. Including the translation unit is the whole of the workaround: it needs
+// only sndfile and libsamplerate, both of which TOOL_LIBS already links for this
+// binary. Caveat for whoever touches it next: the rule has no dependency on
+// sample.cpp either, so `touch tests/engine_test.cpp` after editing the detector,
+// or `make -B build/engine_test`.
+#include "../src/audio/sample.cpp"
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -4151,6 +4159,687 @@ static void autosRetirementUnderChurn() {
 }
 
 // ---------------------------------------------------------------------------
+// 27. the warp map evaluator
+//
+// warpSrcAt / warpSlopeAt / warpBeatAt / warpMapValid are the ONE
+// implementation the engine and the UI both call, exactly as autoValueAt is for
+// envelopes: the warp line a user drags and the frames the engine reads cannot
+// be allowed to disagree. Everything here is a pure-function check with no
+// engine in it — §28 onwards is where the same functions have to move audio.
+// ---------------------------------------------------------------------------
+
+static std::vector<WarpMarker> mkMap(std::initializer_list<std::pair<i64, f64>> pts) {
+    std::vector<WarpMarker> v;
+    for (const auto& p : pts) { WarpMarker m; m.srcFrame = p.first; m.beat = p.second; v.push_back(m); }
+    return v;
+}
+static f64 srcAt(const std::vector<WarpMarker>& m, f64 beat) {
+    return warpSrcAt(m.data(), (int)m.size(), beat);
+}
+static f64 slopeAt(const std::vector<WarpMarker>& m, f64 beat) {
+    return warpSlopeAt(m.data(), (int)m.size(), beat);
+}
+static f64 beatAt(const std::vector<WarpMarker>& m, f64 src) {
+    return warpBeatAt(m.data(), (int)m.size(), src);
+}
+static bool mapValid(const std::vector<WarpMarker>& m) {
+    return warpMapValid(m.data(), (int)m.size());
+}
+
+static void testWarpEvaluator() {
+    banner("27. the warp map evaluator");
+
+    // Three segments with deliberately different slopes: 12000, 48000 and 6000
+    // source frames per beat. Nothing here is a round ratio of anything else, so
+    // an off-by-one segment shows up as a wrong number rather than a lucky one.
+    const auto m = mkMap({{0, 0.0}, {24000, 2.0}, {120000, 4.0}, {138000, 7.0}});
+    CHECK(mapValid(m), "the fixture map is valid");
+
+    // --- bracketing: every marker is ON the curve, both ways ---------------
+    bool onCurve = true, inverseOnCurve = true;
+    for (const WarpMarker& k : m) {
+        if (std::fabs(srcAt(m, k.beat) - (f64)k.srcFrame) > 1e-9) onCurve = false;
+        if (std::fabs(beatAt(m, (f64)k.srcFrame) - k.beat) > 1e-12) inverseOnCurve = false;
+    }
+    CHECK(onCurve, "warpSrcAt reproduces every marker's frame exactly");
+    CHECK(inverseOnCurve, "warpBeatAt reproduces every marker's beat exactly");
+
+    // Interior points are the straight line between the bracketing pair, which
+    // is what "piecewise LINEAR" has to mean if a dragged marker is to move the
+    // playback the user expects.
+    CHECK(std::fabs(srcAt(m, 1.0) - 12000.0) < 1e-9,
+          "midway through segment 0: %.4f (expected 12000)", srcAt(m, 1.0));
+    CHECK(std::fabs(srcAt(m, 3.0) - 72000.0) < 1e-9,
+          "midway through segment 1: %.4f (expected 72000)", srcAt(m, 3.0));
+    CHECK(std::fabs(srcAt(m, 5.5) - 129000.0) < 1e-9,
+          "midway through segment 2: %.4f (expected 129000)", srcAt(m, 5.5));
+
+    // --- slope: the local rate, per segment -------------------------------
+    CHECK(std::fabs(slopeAt(m, 0.5)  - 12000.0) < 1e-9, "slope in segment 0 (%.1f)", slopeAt(m, 0.5));
+    CHECK(std::fabs(slopeAt(m, 3.0)  - 48000.0) < 1e-9, "slope in segment 1 (%.1f)", slopeAt(m, 3.0));
+    CHECK(std::fabs(slopeAt(m, 6.0)  -  6000.0) < 1e-9, "slope in segment 2 (%.1f)", slopeAt(m, 6.0));
+    // Exactly on a marker the LATER segment wins, because the bracket is
+    // "last index whose key is <= x". That is a choice, not an accident, and a
+    // test says so rather than leaving the next reader to find out.
+    CHECK(std::fabs(slopeAt(m, 2.0) - 48000.0) < 1e-9,
+          "on a marker the following segment's slope is reported (%.1f)", slopeAt(m, 2.0));
+
+    // --- monotonicity ------------------------------------------------------
+    // The single invariant everything else rests on: strictly increasing in,
+    // strictly increasing out. Swept finely enough to catch a bracket that
+    // picks the wrong pair for one step rather than for a whole segment.
+    bool srcMono = true, beatMono = true, slopePos = true;
+    f64 prevSrc = -1e18, prevBeat = -1e18;
+    for (int i = 0; i <= 9000; ++i) {
+        const f64 b = -2.0 + (f64)i * (12.0 / 9000.0);   // past both ends
+        const f64 s = srcAt(m, b);
+        if (!(s > prevSrc)) srcMono = false;
+        if (!(slopeAt(m, b) > 0.0)) slopePos = false;
+        prevSrc = s;
+        const f64 sf = -20000.0 + (f64)i * (200000.0 / 9000.0);
+        const f64 bb = beatAt(m, sf);
+        if (!(bb > prevBeat)) beatMono = false;
+        prevBeat = bb;
+    }
+    CHECK(srcMono, "warpSrcAt is strictly increasing over 9000 steps, ends included");
+    CHECK(beatMono, "warpBeatAt is strictly increasing over 9000 steps, ends included");
+    CHECK(slopePos, "the local rate is positive everywhere, so nothing ever divides by it wrongly");
+
+    // --- extrapolation before the first and after the last marker ----------
+    // What lets a user pin two transients in the middle of a clip and have the
+    // rest of it follow, instead of the clip stopping dead outside the marks.
+    CHECK(std::fabs(srcAt(m, -1.0) - (-12000.0)) < 1e-9,
+          "before the first marker the first segment's slope extrapolates: %.1f (expected -12000)",
+          srcAt(m, -1.0));
+    CHECK(std::fabs(srcAt(m, 9.0) - 150000.0) < 1e-9,
+          "after the last marker the last segment's slope extrapolates: %.1f (expected 150000)",
+          srcAt(m, 9.0));
+    CHECK(std::fabs(slopeAt(m, -5.0) - 12000.0) < 1e-9 &&
+          std::fabs(slopeAt(m, 99.0) -  6000.0) < 1e-9,
+          "and the reported slope outside the span is the adjacent segment's");
+    CHECK(std::fabs(beatAt(m, -12000.0) - (-1.0)) < 1e-9 &&
+          std::fabs(beatAt(m, 150000.0) - 9.0) < 1e-9,
+          "the inverse extrapolates on the same two segments");
+
+    // --- the inverse really is the inverse ---------------------------------
+    // Round-tripping is the property that makes marker snapping and the
+    // loop-region conversion in warpCtxFor trustworthy.
+    f64 worstFwd = 0.0, worstBack = 0.0;
+    for (int i = 0; i <= 4000; ++i) {
+        const f64 b = -3.0 + (f64)i * (14.0 / 4000.0);
+        worstFwd = std::max(worstFwd, std::fabs(beatAt(m, srcAt(m, b)) - b));
+        const f64 s = -30000.0 + (f64)i * (220000.0 / 4000.0);
+        worstBack = std::max(worstBack, std::fabs(srcAt(m, beatAt(m, s)) - s));
+    }
+    CHECK(worstFwd < 1e-9, "beat -> src -> beat is the identity (worst %.3g beats)", worstFwd);
+    CHECK(worstBack < 1e-6, "src -> beat -> src is the identity (worst %.3g frames)", worstBack);
+
+    // --- degenerate maps ---------------------------------------------------
+    const std::vector<WarpMarker> none;
+    CHECK(warpSrcAt(nullptr, 0, 3.5) == 3.5 && srcAt(none, 3.5) == 3.5,
+          "n == 0 has no opinion: warpSrcAt returns the beat unchanged");
+    CHECK(warpSlopeAt(nullptr, 0, 3.5) == 0.0,
+          "n == 0 reports no slope");
+    CHECK(warpBeatAt(nullptr, 0, 777.0) == 777.0,
+          "n == 0 has no opinion: warpBeatAt returns the frame unchanged");
+    CHECK(!mapValid(none) && !warpMapValid(nullptr, 5),
+          "an empty map and a null pointer are both invalid");
+
+    const auto one = mkMap({{9000, 3.0}});
+    CHECK(srcAt(one, 0.0) == 9000.0 && srcAt(one, 1e6) == 9000.0,
+          "n == 1 pins, it does not tilt: every beat maps to that one frame");
+    CHECK(slopeAt(one, 3.0) == 0.0, "n == 1 reports no slope");
+    CHECK(beatAt(one, 0.0) == 3.0 && beatAt(one, 1e9) == 3.0,
+          "n == 1 inverts to that one beat");
+    CHECK(!mapValid(one), "n == 1 is not a publishable map");
+
+    // --- validity ----------------------------------------------------------
+    CHECK(!mapValid(mkMap({{0, 0.0}, {0, 1.0}})), "equal source frames are rejected");
+    CHECK(!mapValid(mkMap({{24000, 0.0}, {0, 1.0}})), "decreasing source frames are rejected");
+    CHECK(!mapValid(mkMap({{0, 1.0}, {24000, 1.0}})), "equal beats are rejected");
+    CHECK(!mapValid(mkMap({{0, 2.0}, {24000, 1.0}})), "decreasing beats are rejected");
+    CHECK(!mapValid(mkMap({{-1, 0.0}, {24000, 1.0}})), "a negative source frame is rejected");
+    const f64 nan = std::nan("");
+    CHECK(!mapValid(mkMap({{0, 0.0}, {24000, nan}})), "a NaN beat is rejected");
+    CHECK(!mapValid(mkMap({{0, nan}, {24000, 1.0}})), "a NaN first beat is rejected");
+    CHECK(mapValid(mkMap({{0, 0.0}, {1, 1e-9}})),
+          "a legal map with tiny steps is accepted (the gate tests order, not size)");
+
+    // A map that slipped past the gate must still produce a defined point on
+    // itself rather than a division by zero or a read past the end: the
+    // evaluators are the last line of defence and the audio thread only checks
+    // n >= 2.
+    const auto broken = mkMap({{0, 5.0}, {24000, 5.0}, {48000, 1.0}});
+    bool finite = true;
+    for (int i = -100; i <= 100; ++i) {
+        const f64 b = (f64)i * 0.25;
+        if (!std::isfinite(srcAt(broken, b)) || !std::isfinite(slopeAt(broken, b))) finite = false;
+        if (!std::isfinite(beatAt(broken, (f64)i * 1000.0))) finite = false;
+    }
+    CHECK(finite, "a non-monotone map still evaluates finitely everywhere");
+    CHECK(std::isfinite(srcAt(m, nan)) && std::isfinite(beatAt(m, nan)) &&
+          std::isfinite(slopeAt(m, nan)),
+          "NaN in, a real number out");
+}
+
+// ---------------------------------------------------------------------------
+// 28. a single-segment map is BIT-IDENTICAL to the no-marker path
+//
+// The whole marker feature is a regression risk to every render this engine has
+// ever produced, so the flat path keeps its original arithmetic and the marker
+// path is new arithmetic that only runs when markers exist. This is the seam
+// tested from the outside: a map that describes exactly what the flat path
+// already does must produce exactly the same samples — not close, the same.
+//
+// The numbers are chosen so both paths are EXACT in binary and the comparison
+// is therefore meaningful rather than lucky:
+//
+//   tempo 87.890625 at 48 kHz  ->  bps = tempo/60/sr = 2^-15 exactly
+//   clipBpm 175.78125          ->  flatRate = tempo/clipBpm = 0.5 exactly
+//   one segment, 16384 frames per beat -> local rate = 16384 * 2^-15 = 0.5
+//
+// so the flat path's accumulation (srcPos += 0.5) and the marker path's
+// re-evaluation (srcPos = beatPos * 16384, beatPos = k * 2^-15) are the same
+// real number AND the same double. If the map's arithmetic is ever changed in a
+// way that rounds differently, this fails.
+// ---------------------------------------------------------------------------
+
+static constexpr f64 kExactTempo   = 87.890625;    // bps == 2^-15
+static constexpr f64 kExactClipBpm = 175.78125;    // rate == 0.5
+
+// Renders one clip and returns the output. `map` may be empty, which is the
+// no-marker path.
+static std::vector<f32> renderWarped(const std::vector<f32>& buf, Warp w,
+                                     const std::vector<WarpMarker>& map,
+                                     i64 frames, f64 tempo, f64 clipBpm,
+                                     const std::vector<i64>* transients = nullptr) {
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, tempo);
+    h.push(Cmd::SetQuantum, 0);
+    RtClip c = mkClip(buf, 1, 1.0f, w, /*loop*/false, clipBpm);
+    if (map.size() >= 2) { c.markers = map.data(); c.markerCount = (int)map.size(); }
+    if (transients) {
+        c.transients     = transients->data();
+        c.transientCount = (int)transients->size();
+    }
+    h.setClip(0, 0, c);
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(frames);
+    return h.outL;
+}
+
+// Bit equality, not tolerance: the buffers must be the same bytes.
+static bool sameBits(const std::vector<f32>& a, const std::vector<f32>& b) {
+    if (a.size() != b.size()) return false;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(f32)) == 0;
+}
+static i64 firstDiff(const std::vector<f32>& a, const std::vector<f32>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i)
+        if (std::memcmp(&a[i], &b[i], sizeof(f32)) != 0) return (i64)i;
+    return -1;
+}
+
+static void testWarpSingleSegment() {
+    banner("28. a single-segment map is bit-identical to the no-marker path");
+    note("The flat rate keeps its original expression and the map is arithmetic");
+    note("that only runs when markers exist; this is that promise, asserted.");
+
+    const i64 N = 480000;                    // long enough that nothing loops
+    const auto ramp = rampBuf(N);
+    // 16384 source frames per beat: with bps = 2^-15 that is a rate of exactly
+    // 0.5, which is exactly tempo/clipBpm.
+    const auto flatMap = mkMap({{0, 0.0}, {16384, 1.0}});
+    CHECK(mapValid(flatMap), "the single-segment map is valid");
+    CHECK(warpSlopeAt(flatMap.data(), 2, 0.0) * (kExactTempo / 60.0 / kSR) == 0.5,
+          "the map's local rate is exactly the flat rate (%.17g)",
+          warpSlopeAt(flatMap.data(), 2, 0.0) * (kExactTempo / 60.0 / kSR));
+
+    for (int mode = 0; mode < 2; ++mode) {
+        const Warp w = mode == 0 ? Warp::Repitch : Warp::Beats;
+        const char* nm = mode == 0 ? "Repitch" : "Beats";
+        const auto without = renderWarped(ramp, w, {},      96000, kExactTempo, kExactClipBpm);
+        const auto with    = renderWarped(ramp, w, flatMap, 96000, kExactTempo, kExactClipBpm);
+        CHECK(!without.empty() && tailLevel(without) > 0.05f,
+              "%s: the no-marker render actually produced audio (%.4f)",
+              nm, (double)tailLevel(without));
+        CHECK(sameBits(without, with),
+              "%s: %zu frames are bit-identical with and without the map (first diff %lld)",
+              nm, without.size(), (long long)firstDiff(without, with));
+    }
+
+    // The negative control. Without it the test above would still pass if the
+    // marker path were silently never taken, which is the failure it exists to
+    // catch: shift one marker and the samples must move.
+    const auto tilted = mkMap({{0, 0.0}, {20480, 1.0}});   // rate 0.625, not 0.5
+    const auto base   = renderWarped(ramp, Warp::Repitch, {},     96000, kExactTempo, kExactClipBpm);
+    const auto moved  = renderWarped(ramp, Warp::Repitch, tilted, 96000, kExactTempo, kExactClipBpm);
+    CHECK(!sameBits(base, moved),
+          "a map with a different slope does NOT match, so the map is really being read");
+}
+
+// ---------------------------------------------------------------------------
+// 29. a two-segment map plays its halves at different rates
+// ---------------------------------------------------------------------------
+
+static void testWarpTwoSegments() {
+    banner("29. a two-segment map plays the halves at different measured rates");
+    note("Ramp buffer, so the output level IS the source read position (§4).");
+
+    const i64 N = 480000;
+    const auto ramp = rampBuf(N);
+    // At 120 BPM a beat is 24000 output frames. Segment 0 covers beats 0..4 in
+    // 48000 source frames (12000/beat -> rate 0.5); segment 1 covers beats 4..8
+    // in 144000 (36000/beat -> rate 1.5). So the first 96000 output frames read
+    // at half speed and the next 96000 at one and a half.
+    const auto m = mkMap({{0, 0.0}, {48000, 4.0}, {192000, 8.0}});
+    CHECK(mapValid(m), "the two-segment map is valid");
+
+    Host h; h.init();
+    h.push(Cmd::SetTempo, 0, 0, 120.0);
+    h.push(Cmd::SetQuantum, 0);
+    RtClip c = mkClip(ramp, 1, 1.0f, Warp::Repitch, /*loop*/false, 120.0);
+    c.markers = m.data(); c.markerCount = (int)m.size();
+    h.setClip(0, 0, c);
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.run(200000);
+
+    const f64 a0 = srcPosAt(h.outL, 20000, N), a1 = srcPosAt(h.outL, 40000, N);
+    const f64 b0 = srcPosAt(h.outL, 120000, N), b1 = srcPosAt(h.outL, 140000, N);
+    const f64 rA = (a1 - a0) / 20000.0;
+    const f64 rB = (b1 - b0) / 20000.0;
+    CHECK(std::fabs(rA - 0.5) < 0.01,
+          "the first half reads at the first segment's rate: %.4f (expected 0.5)", rA);
+    CHECK(std::fabs(rB - 1.5) < 0.01,
+          "the second half reads at the second segment's rate: %.4f (expected 1.5)", rB);
+    CHECK(rB > rA * 2.5, "and the two really are different rates (%.4f vs %.4f)", rA, rB);
+
+    // The absolute positions matter as much as the rates: a map that got the
+    // slopes right and the origin wrong would still put the downbeat in the
+    // wrong place. Beat 4 is output frame 96000 and must be source frame 48000.
+    const f64 atSeam = srcPosAt(h.outL, 96000, N);
+    CHECK(std::fabs(atSeam - 48000.0) < 400.0,
+          "the segment boundary lands on its marker: source %.0f at beat 4 (expected 48000)",
+          atSeam);
+    const f64 atEnd = srcPosAt(h.outL, 191000, N);
+    CHECK(std::fabs(atEnd - 190500.0) < 800.0,
+          "and the far end tracks the map: source %.0f near beat 8 (expected ~190500)", atEnd);
+
+    // Continuity: a piecewise-linear map is continuous by construction, so the
+    // read position must never jump. A jump at a marker would be an audible
+    // click on every warped clip.
+    f64 worstJump = 0.0;
+    for (size_t i = 90000; i < 102000; ++i) {
+        const f64 d = srcPosAt(h.outL, i, N) - srcPosAt(h.outL, i - 1, N);
+        worstJump = std::max(worstJump, std::fabs(d));
+    }
+    CHECK(worstJump < 8.0,
+          "the read position is continuous across the marker (worst step %.2f frames)", worstJump);
+}
+
+// ---------------------------------------------------------------------------
+// 30. a displaced warp map comes home
+// ---------------------------------------------------------------------------
+
+static WarpMarker* mkHeapMap(const std::vector<WarpMarker>& src) {
+    WarpMarker* p = new WarpMarker[src.size()];
+    for (size_t i = 0; i < src.size(); ++i) p[i] = src[i];
+    return p;
+}
+
+static void testWarpRetirement() {
+    banner("30. a warp map replaced under a playing clip comes home");
+    note("Fourth instance of the RtChain / RtNote / RtAutoSet protocol: the");
+    note("audio thread never frees GUI memory, so a displaced map rides");
+    note("Ev::WarpRetired back and only then may be released.");
+
+    const auto proto = mkMap({{0, 0.0}, {24000, 1.0}});
+    const auto buf = dcBuf(480000, 1, 1.0f);
+
+    Host h; h.init();
+    tempoNoQuantum(h);
+    auto push = [&](WarpMarker* map) {
+        RtClip c = mkClip(buf, 1, 0.5f, Warp::Beats, true, 120.0);
+        if (map) { c.markers = map; c.markerCount = 2; }
+        h.setClip(0, 0, c);
+    };
+
+    WarpMarker* first = mkHeapMap(proto);
+    push(first);
+    h.push(Cmd::LaunchClip, 0, 0);
+    h.runBlocks(4);
+    CHECK(countEvents(h.e, Ev::WarpRetired) == 0, "publishing the first map retires nothing");
+
+    WarpMarker* second = mkHeapMap(proto);
+    push(second);
+    h.runBlocks(2);
+    std::vector<Event> evs;
+    const int n1 = countEvents(h.e, Ev::WarpRetired, &evs);
+    CHECK(n1 == 1, "replacing it retires exactly one map (%d)", n1);
+    CHECK(n1 == 1 && evs[0].p == (void*)first, "and it is the displaced pointer");
+    CHECK(n1 == 1 && evs[0].a == 0 && evs[0].b == 0,
+          "named by track and slot (a=%d b=%d)", n1 ? evs[0].a : -1, n1 ? evs[0].b : -1);
+    delete[] first;
+
+    // Re-pushing the SAME pointer must announce nothing: one announced twice
+    // would be a double free on the other side.
+    push(second);
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::WarpRetired) == 0, "re-pushing the same map announces nothing");
+
+    // A clip with no map at all pushed over one that had a map still has to
+    // hand the old one back — the case a naive "only when both exist" check
+    // would leak.
+    push(nullptr);
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::WarpRetired, &evs) == 1 && evs[0].p == (void*)second,
+          "publishing a clip with no map retires the one that was there");
+    delete[] second;
+
+    // And clearing the slot.
+    WarpMarker* third = mkHeapMap(proto);
+    push(third);
+    h.runBlocks(2);
+    CHECK(countEvents(h.e, Ev::WarpRetired) == 0, "(re-arming: nothing retired)");
+    Command cc; cc.type = Cmd::ClearClip; cc.a = 0; cc.b = 0;
+    h.e.pushCommand(cc);
+    h.runBlocks(2);
+    evs.clear();
+    CHECK(countEvents(h.e, Ev::WarpRetired, &evs) == 1 && evs[0].p == (void*)third,
+          "clearing the clip retires the map it carried");
+    delete[] third;
+}
+
+// Churn: a hundred republications under a playing clip must account for a
+// hundred maps and leave exactly one outstanding. Its own function because a
+// Host carries an Engine (~2.4 MB) by value and three of them do not fit on a
+// default stack — the reason autosRetirementUnderChurn is split out too.
+static void warpRetirementUnderChurn() {
+    const auto proto = mkMap({{0, 0.0}, {24000, 1.0}});
+    const auto buf = dcBuf(480000, 1, 1.0f);
+    Host g; g.init();
+    tempoNoQuantum(g);
+    std::vector<WarpMarker*> live;
+    WarpMarker* cur = mkHeapMap(proto);
+    live.push_back(cur);
+    {
+        RtClip c = mkClip(buf, 1, 0.5f, Warp::Beats, true, 120.0);
+        c.markers = cur; c.markerCount = 2;
+        g.setClip(0, 0, c);
+    }
+    g.push(Cmd::LaunchClip, 0, 0);
+    g.runBlocks(2);
+    int retired = 0;
+    for (int k = 0; k < 100; ++k) {
+        WarpMarker* next = mkHeapMap(proto);
+        live.push_back(next);
+        RtClip c = mkClip(buf, 1, 0.5f, Warp::Beats, true, 120.0);
+        c.markers = next; c.markerCount = 2;
+        g.setClip(0, 0, c);
+        g.runBlocks(1);
+        std::vector<Event> got;
+        retired += countEvents(g.e, Ev::WarpRetired, &got);
+        for (const Event& e : got) {
+            bool known = false;
+            for (WarpMarker*& p : live)
+                if (p == (WarpMarker*)e.p) { known = true; delete[] p; p = nullptr; break; }
+            if (!known) CHECK(false, "an unowned pointer came back through WarpRetired");
+        }
+    }
+    CHECK(retired == 100, "a hundred republications retire a hundred maps (%d)", retired);
+    int leaked = 0;
+    for (WarpMarker* p : live) if (p) { ++leaked; delete[] p; }
+    CHECK(leaked == 1, "exactly one map is still published and none leaked (%d outstanding)",
+          leaked);
+}
+
+// A MIDI clip's beatPos is its NOTE cursor. A map that reached one anyway — the
+// GUI refuses to publish one, but the engine is handed RtClips by three
+// publishers — must not seed it, or the pattern starts somewhere other than its
+// beginning. Asserted through the notes, which is where it would show.
+static void warpOnMidiClip() {
+    Host k; k.init();
+    NoteSink sink(k.block);
+    RtChain chain; chain.fx[0] = &sink; chain.count = 1;
+    auto notes = twoNoteClip();
+    WarpMarker* stray = mkHeapMap(mkMap({{0, 4.0}, {24000, 5.0}}));   // starts at beat 4
+    k.push(Cmd::SetTempo, 0, 0, 120.0);
+    k.push(Cmd::SetQuantum, 0);
+    k.setChain(0, &chain);
+    RtClip mc = mkMidiClip(notes, 1.0, /*loop*/true);
+    mc.markers = stray; mc.markerCount = 2;
+    k.setClip(0, 0, mc);
+    k.push(Cmd::LaunchClip, 0, 0);
+    k.run(kBeat120);
+    // The first lap, frame for frame: on/off at 0 and 6000, on/off at 12000 and
+    // 18000 — identical to midiClipTiming's first lap (§14a), which is the
+    // whole assertion. run() is block-aligned, so a fifth message (the next
+    // lap's downbeat, at 24000) may or may not be in the buffer.
+    const i64 wantFrame[4] = {0, 6000, 12000, 18000};
+    const u8  wantPitch[4] = {60, 60, 64, 64};
+    bool laneOk = sink.evs.size() >= 4;
+    for (int i = 0; i < 4 && laneOk; ++i)
+        if (std::llabs((long long)(sink.evs[(size_t)i].frame - wantFrame[i])) > 1 ||
+            sink.evs[(size_t)i].pitch != wantPitch[i]) laneOk = false;
+    CHECK(laneOk,
+          "a map on a MIDI clip does not move its note cursor (%zu messages, first at %lld)",
+          sink.evs.size(), sink.evs.empty() ? -1 : (long long)sink.evs[0].frame);
+    Command cl; cl.type = Cmd::ClearClip; cl.a = 0; cl.b = 0;
+    k.e.pushCommand(cl);
+    k.runBlocks(2);
+    std::vector<Event> strayEv;
+    CHECK(countEvents(k.e, Ev::WarpRetired, &strayEv) == 1 &&
+          strayEv[0].p == (void*)stray,
+          "and it is still retired properly when the slot is cleared");
+    delete[] stray;
+}
+
+// ---------------------------------------------------------------------------
+// 31. the onset detector
+//
+// A warp marker is a source frame pinned to a beat, and the frames worth
+// pinning are the ones a listener hears as an event. So this asserts POSITIONS,
+// not counts: a detector that returns the right number of onsets in the wrong
+// places is a detector that puts every auto-warp marker in the wrong place.
+//
+// The two signals are the demo loops verbatim (tools/gen_demo.cpp): a
+// four-on-the-floor kick with the 110 -> 45 Hz pitch sweep that makes a kick a
+// kick, and an eighth-note hat pattern. Both are two bars of 4/4 at 120 BPM.
+// ---------------------------------------------------------------------------
+
+static constexpr i64 kDemoBeat   = 24000;             // one beat at 120 BPM, 48 kHz
+static constexpr i64 kDemoFrames = 8 * kDemoBeat;     // two bars
+
+// tools/gen_demo.cpp makeKick(), value for value.
+static std::vector<f32> demoKick() {
+    std::vector<f32> v((size_t)kDemoFrames, 0.f);
+    for (int b = 0; b < 8; ++b) {
+        const i64 start = (i64)b * kDemoBeat;
+        const int len = (int)(kSR * 0.35);
+        for (int i = 0; i < len && start + i < kDemoFrames; ++i) {
+            const f64 t = (f64)i / kSR;
+            const f64 f = 45.0 + 65.0 * std::exp(-t * 38.0);
+            const f64 env = std::exp(-t * 9.0);
+            v[(size_t)(start + i)] += (f32)(std::sin(2 * 3.14159265358979323846 * f * t) * env * 0.9);
+        }
+    }
+    return v;
+}
+
+// tools/gen_demo.cpp makeHats(): sixteen eighth notes, alternating accents.
+// The noise is a fixed LCG rather than <random> so the fixture cannot move
+// under a libstdc++ change; the detector does not care what the noise is, only
+// that a burst starts where one is supposed to.
+static std::vector<f32> demoHats() {
+    std::vector<f32> v((size_t)kDemoFrames, 0.f);
+    u32 st = 12345u;
+    auto noise = [&]() {
+        st = st * 1664525u + 1013904223u;
+        return (f32)((f64)(st >> 8) / 8388608.0 - 1.0);      // [-1, 1)
+    };
+    const i64 step = kDemoBeat / 2;
+    for (int s = 0; s * step < kDemoFrames; ++s) {
+        const i64 start = (i64)s * step;
+        const bool accent = (s % 2) == 1;
+        const int len = (int)(kSR * (accent ? 0.06 : 0.03));
+        f32 hp = 0.f;
+        for (int i = 0; i < len && start + i < kDemoFrames; ++i) {
+            const f64 env = std::exp(-((f64)i / kSR) * (accent ? 70.0 : 130.0));
+            const f32 n = noise();
+            hp = 0.85f * (hp + n - (i ? noise() : 0.f));
+            v[(size_t)(start + i)] += (f32)(hp * env * (accent ? 0.28 : 0.16));
+        }
+    }
+    return v;
+}
+
+// Worst |detected - expected| in milliseconds, or -1 if the counts disagree or
+// any expected onset has no detection within `tolMs`.
+static f64 onsetError(const std::vector<i64>& got, const std::vector<i64>& want, f64 tolMs) {
+    if (got.size() != want.size()) return -1.0;
+    f64 worst = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const f64 ms = std::fabs((f64)(got[i] - want[i])) / kSR * 1000.0;
+        if (ms > tolMs) return -1.0;
+        worst = std::max(worst, ms);
+    }
+    return worst;
+}
+
+static void testOnsetDetector() {
+    banner("31. the onset detector finds the beats and nothing else");
+
+    std::vector<i64> beats, eighths;
+    for (int b = 0; b < 8; ++b) beats.push_back((i64)b * kDemoBeat);
+    for (int s = 0; s < 16; ++s) eighths.push_back((i64)s * (kDemoBeat / 2));
+
+    std::vector<i64> got;
+    detectTransients(demoKick().data(), kDemoFrames, 1, kSR, got);
+    const f64 kickErr = onsetError(got, beats, 5.0);
+    CHECK(got.size() == 8,
+          "a synthesized four-on-the-floor yields 8 onsets, not 22 (%zu)", got.size());
+    CHECK(kickErr >= 0.0,
+          "and every one of them is a kick, within 5 ms (worst %.2f ms)", kickErr);
+
+    detectTransients(demoHats().data(), kDemoFrames, 1, kSR, got);
+    const f64 hatErr = onsetError(got, eighths, 5.0);
+    CHECK(got.size() == 16, "an eighth-note hat pattern yields 16 onsets (%zu)", got.size());
+    CHECK(hatErr >= 0.0, "each within 5 ms of its eighth (worst %.2f ms)", hatErr);
+
+    // Strictly increasing is not a nicety: the engine binary-searches this list
+    // and warpGrainOrigin assumes both ends of a bracket are distinct.
+    bool sorted = true;
+    for (size_t i = 1; i < got.size(); ++i) if (!(got[i] > got[i - 1])) sorted = false;
+    CHECK(sorted, "the list comes back strictly increasing");
+
+    // Scale invariance. The thresholds are relative by construction, so a clip
+    // recorded 26 dB down must detect exactly the same frames — otherwise every
+    // quiet clip in a set warps differently from every loud one.
+    std::vector<f32> quiet = demoKick();
+    for (f32& s : quiet) s *= 0.05f;
+    std::vector<i64> quietGot;
+    detectTransients(quiet.data(), kDemoFrames, 1, kSR, quietGot);
+    detectTransients(demoKick().data(), kDemoFrames, 1, kSR, got);
+    CHECK(quietGot == got, "a 26 dB quieter copy detects the identical frames (%zu vs %zu)",
+          quietGot.size(), got.size());
+
+    // Determinism: same samples, same answer, every time. A marker that moved
+    // because the detector ran twice would be a corrupt edit.
+    std::vector<i64> again;
+    detectTransients(demoKick().data(), kDemoFrames, 1, kSR, again);
+    CHECK(again == got, "running it twice gives the identical list");
+
+    // A sustained pad has no onsets to find; the old detector reported 42 on
+    // the demo chord. Nothing but the start of the swell is a defensible
+    // answer, and the level-rise gate rejects even that.
+    std::vector<f32> pad((size_t)kDemoFrames);
+    for (i64 i = 0; i < kDemoFrames; ++i) {
+        const f64 t = (f64)i / kSR;
+        const f64 env = (1.0 - std::exp(-t * 1.6)) * std::exp(-t * 0.28);
+        f64 s = 0.0;
+        for (f64 fq : {220.0, 261.63, 329.63, 493.88}) {
+            s += std::sin(2 * 3.14159265358979323846 * fq * t);
+            s += 0.5 * std::sin(2 * 3.14159265358979323846 * fq * 1.003 * t);
+        }
+        pad[(size_t)i] = (f32)(s / 12.0 * env * 0.7);
+    }
+    std::vector<i64> padGot;
+    detectTransients(pad.data(), kDemoFrames, 1, kSR, padGot);
+    CHECK(padGot.size() <= 1, "a beating pad yields at most one onset, not 42 (%zu)",
+          padGot.size());
+
+    // Degenerate inputs return an empty list rather than a made-up one.
+    std::vector<i64> edge{1, 2, 3};
+    detectTransients(nullptr, 1000, 1, kSR, edge);
+    CHECK(edge.empty(), "a null buffer clears the list and adds nothing");
+    std::vector<f32> tiny(64, 0.5f);
+    detectTransients(tiny.data(), 64, 1, kSR, edge);
+    CHECK(edge.empty(), "a clip shorter than one analysis window gets no list");
+    std::vector<f32> silence((size_t)kDemoFrames, 0.f);
+    detectTransients(silence.data(), kDemoFrames, 1, kSR, edge);
+    CHECK(edge.empty(), "silence has no onsets");
+    detectTransients(demoKick().data(), kDemoFrames, 1, 0.0, edge);
+    CHECK(edge.empty(), "a zero sample rate is refused");
+}
+
+// ---------------------------------------------------------------------------
+// 32. beats-mode grain alignment
+//
+// With transients known, a grain starts on an attack instead of on the fixed
+// hop. The gate that matters for every render that came before: a clip whose
+// sample has NO transients must grain exactly as it always did.
+// ---------------------------------------------------------------------------
+
+static void testGrainAlignment() {
+    banner("32. grain alignment is a no-op when there are no transients");
+
+    const i64 N = 480000;
+    const auto ramp = rampBuf(N);
+    // An empty vector: `.data()` may be null or not, and either way the count
+    // is zero, which is the shape a SampleBuffer whose material has no onsets
+    // publishes. Both halves of the gate (`!w.tr` and `w.trN <= 0`) are
+    // exercised by it.
+    const std::vector<i64> empty;
+
+    const auto plain = renderWarped(ramp, Warp::Beats, {}, 96000,
+                                    kExactTempo, kExactClipBpm);
+    const auto withNull = renderWarped(ramp, Warp::Beats, {}, 96000,
+                                       kExactTempo, kExactClipBpm, &empty);
+    CHECK(!plain.empty() && tailLevel(plain) > 0.05f,
+          "the granular render actually produced audio (%.4f)", (double)tailLevel(plain));
+    CHECK(sameBits(plain, withNull),
+          "an empty transient list renders bit-identically (first diff %lld)",
+          (long long)firstDiff(plain, withNull));
+
+    // And with a real list the grains DO move, which is what stops the check
+    // above from being vacuous. The onsets sit well inside the snap window of a
+    // 1/16-note grain (a grain advance here is 0.5 * hop source frames), so a
+    // gate that was accidentally left off would be caught by the check above
+    // and one that was accidentally left ON is caught by this one.
+    std::vector<i64> onsets;
+    for (i64 f = 1000; f < 200000; f += 3000) onsets.push_back(f);
+    const auto snapped = renderWarped(ramp, Warp::Beats, {}, 96000,
+                                      kExactTempo, kExactClipBpm, &onsets);
+    CHECK(!sameBits(plain, snapped),
+          "a real transient list moves the grain origins, so the alignment is live");
+    bool finite = true;
+    f32 peak = 0.f;
+    for (f32 s : snapped) {
+        if (!std::isfinite(s)) finite = false;
+        peak = std::max(peak, std::fabs(s));
+    }
+    CHECK(finite && peak <= 1.0f + 1e-6f,
+          "and the snapped render stays finite and in range (peak %.4f)", (double)peak);
+
+    // The same gate through the other door: a map with transients but no
+    // markers must still match the no-marker path frame for frame in the parts
+    // the snap does not touch — asserted here as "the render is still a legal
+    // signal", since the snap deliberately changes samples.
+    CHECK(snapped.size() == plain.size(), "the snapped render is the same length");
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -4182,6 +4871,14 @@ int main() {
     testAutomationClassB();
     testAutosRetirement();
     autosRetirementUnderChurn();
+    testWarpEvaluator();
+    testWarpSingleSegment();
+    testWarpTwoSegments();
+    testWarpRetirement();
+    warpRetirementUnderChurn();
+    warpOnMidiClip();
+    testOnsetDetector();
+    testGrainAlignment();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

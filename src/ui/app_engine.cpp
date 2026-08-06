@@ -52,6 +52,97 @@ void App::publishNotes(int track, int slot, const RtNote* fresh) {
 }
 
 // ---------------------------------------------------------------------------
+// warp marker arrays
+//
+// The fourth instance of the RtChain / RtNote / RtAutoSet retirement protocol,
+// and deliberately the same one line for line: pushClip() allocates a fresh
+// WarpMarker[] for the clip it publishes, parks the pointer in `published`, and
+// moves whatever it displaced into `retiring`. An entry is freed when its
+// Ev::WarpRetired arrives and on no other path while the audio thread runs — a
+// clip's warp map can be dragged while that clip is playing.
+//
+// WHERE THIS STATE LIVES. These two belong on App, beside publishedNotes_ and
+// retiringNotes_, and that is exactly the shape they have here — a
+// [kMaxTracks][kMaxScenes] array of published pointers and a vector of displaced
+// ones. They sit in this translation unit because app.h is not this change's to
+// edit; moving them to App is a change to their declaration and to nothing else,
+// since publishWarp() below is the only writer and pumpEngineEvents the only
+// other reader.
+//
+// The leftovers are freed by a destructor rather than by a line in shutdown(),
+// which is the reasoning AutoBlocks already uses in app.h: static destruction
+// runs after main() returns, therefore after App::shutdown() has stopped the
+// audio thread, therefore after the last possible borrow — and a destructor
+// cannot be forgotten by a later edit to shutdown(). What it frees is what the
+// engine still held when the process ended plus anything whose retirement event
+// was never drained, which is the same set shutdown() frees for note arrays.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct WarpPublisher {
+    // The single App main.cpp creates. Recorded rather than assumed: two Apps
+    // sharing this table would retire each other's arrays, so the invariant is
+    // checked instead of documented.
+    const App* owner = nullptr;
+    const WarpMarker* published[kMaxTracks][kMaxScenes] = {};
+    std::vector<const WarpMarker*> retiring;
+
+    WarpPublisher() = default;
+    WarpPublisher(const WarpPublisher&) = delete;
+    WarpPublisher& operator=(const WarpPublisher&) = delete;
+    ~WarpPublisher() {
+        for (auto& row : published)
+            for (const WarpMarker*& m : row) { delete[] m; m = nullptr; }
+        for (const WarpMarker* m : retiring) delete[] m;
+        retiring.clear();
+    }
+};
+WarpPublisher gWarp;
+
+// publishNotes verbatim, with the ownership check the members cannot carry.
+void publishWarp(const App* self, int track, int slot, const WarpMarker* fresh) {
+    if (track < 0 || track >= kMaxTracks || slot < 0 || slot >= kMaxScenes) return;
+    if (!gWarp.owner) gWarp.owner = self;
+    else if (gWarp.owner != self) {
+        LOGW("warp: a second App is publishing markers; refusing to share the "
+             "retirement table with it");
+        return;
+    }
+    const WarpMarker* old = gWarp.published[track][slot];
+    gWarp.published[track][slot] = fresh;
+    // The engine only announces a *replaced* array, and only when it differs
+    // from the incoming one; an entry that would never be announced must not be
+    // queued for a retirement that will never arrive.
+    if (old && old != fresh) gWarp.retiring.push_back(old);
+}
+
+// The GUI-side gate, run once here so the audio thread never pays for it. A map
+// that is empty, or that has a single marker (a point pins, it does not tilt),
+// or that breaks strict monotonicity is simply not published: the clip then
+// warps at its single clipBpm/tempo ratio, which is a working clip and not a
+// broken one. Returns null for all three.
+WarpMarker* buildWarpMarkers(const ClipModel& m, int track, int slot) {
+    const size_t n = m.markers.size();
+    if (n < 2) {
+        if (n == 1) LOGW("warp: slot %d/%d has a single marker, which pins "
+                         "nothing - not published", track, slot);
+        return nullptr;
+    }
+    if (!warpMapValid(m.markers.data(), (int)n)) {
+        LOGW("warp: slot %d/%d has a non-monotone map (%zu markers) - not published",
+             track, slot, n);
+        return nullptr;
+    }
+    WarpMarker* fresh = new (std::nothrow) WarpMarker[n];
+    if (!fresh) return nullptr;
+    for (size_t i = 0; i < n; ++i) fresh[i] = m.markers[i];
+    return fresh;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // automation: address resolution and publishing   (docs/AUTOMATION.md §4, §2.5)
 //
 // The model keeps a lane's address as TEXT and nothing else. Resolution to the
@@ -291,17 +382,25 @@ void App::pushClip(int track, int slot) {
     // publishable lane, which is the ordinary case.
     const RtAutoSet* autos = buildAutos(track, slot);
 
+    // And the warp map, on the same timing and for the same reason. Null for a
+    // clip with no usable map, which is also the ordinary case. Only audio
+    // clips can carry one: a MIDI clip is already in beats and has nothing to
+    // warp, so a stray map on one is not published rather than ignored later.
+    WarpMarker* warp = (m.valid() && !midi) ? buildWarpMarkers(m, track, slot) : nullptr;
+
     if (!m.valid()) {
         c.type = Cmd::ClearClip;
         if (!engine_.pushCommand(c)) {
             LOGW("command ring full - slot %d/%d not cleared", track, slot);
             dropAutos(autos);
+            delete[] warp;                 // null here, but the rule is the rule
             return;
         }
         // A cleared MIDI slot retires its notes exactly like a replaced one, and
-        // its envelopes with them.
+        // its envelopes and its warp map with them.
         publishNotes(track, slot, nullptr);
         publishAutos(track, slot, nullptr);
+        publishWarp(this, track, slot, nullptr);
         clipLive_[track][slot] = false;
         return;
     }
@@ -319,6 +418,21 @@ void App::pushClip(int track, int slot) {
         rc.loopEnd    = m.loopEnd > m.loopStart ? m.loopEnd : m.sample->frames;
         rc.clipBpm    = m.clipBpm;
         rc.warp       = (int)m.warp;
+        // The warp map: GUI-owned, retired through Ev::WarpRetired. Null unless
+        // buildWarpMarkers accepted one, and then always >= 2 entries.
+        rc.markers      = warp;
+        rc.markerCount  = warp ? (int)m.markers.size() : 0;
+        // The transient list: BORROWED from the SampleBuffer and never retired.
+        // SampleBuffer::transients is built once in loadSample and never
+        // rebuilt, and the clip holds a SampleRef, so the pointer outlives every
+        // RtClip that names it exactly as `data` does — which is the whole
+        // reason it needs no retirement event. Beats-mode grain scheduling
+        // aligns to these; a sample with none (the demo pad detects none at all)
+        // grains on the fixed hop exactly as before.
+        if (!m.sample->transients.empty()) {
+            rc.transients     = m.sample->transients.data();
+            rc.transientCount = (int)m.sample->transients.size();
+        }
     }
     rc.lengthBeats  = m.lengthBeats;
     rc.gain         = m.gain;
@@ -333,17 +447,20 @@ void App::pushClip(int track, int slot) {
     rc.valid        = true;
     c.clip = rc;
     if (!engine_.pushCommand(c)) {
-        // The engine never saw either allocation, so both are still solely ours
-        // and the slot keeps whatever it was already playing.
+        // The engine never saw any of the three allocations, so all three are
+        // still solely ours and the slot keeps whatever it was already playing.
         LOGW("command ring full - slot %d/%d not updated", track, slot);
         delete[] fresh;
         dropAutos(autos);
+        delete[] warp;
         return;
     }
     // Unconditional, not only for MIDI clips: a slot that just turned into an
-    // audio clip still has an old note array to hand back.
+    // audio clip still has an old note array to hand back — and one that just
+    // turned into a MIDI clip still has an old warp map to hand back.
     publishNotes(track, slot, fresh);
     publishAutos(track, slot, autos);
+    publishWarp(this, track, slot, warp);
     clipLive_[track][slot] = true;
 }
 
@@ -389,7 +506,8 @@ void App::releaseStaleSlots() {
     for (int t = 0; t < kMaxTracks; ++t) {
         for (int s = 0; s < kMaxScenes; ++s) {
             if (t < nt && s < ns) continue;
-            if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s]) continue;
+            if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s] &&
+                !gWarp.published[t][s]) continue;
             Command c;
             c.type = Cmd::ClearClip;
             c.a = t; c.b = s;
@@ -402,6 +520,7 @@ void App::releaseStaleSlots() {
             clipLive_[t][s] = false;
             publishNotes(t, s, nullptr);
             publishAutos(t, s, nullptr);
+            publishWarp(this, t, s, nullptr);
         }
     }
 }
@@ -499,6 +618,25 @@ void App::pumpEngineEvents() {
             }
             retiringAutos_.erase(it);
             dropAutos(old);
+            continue;
+        }
+        if (e.type == Ev::WarpRetired) {
+            // The audio thread has stopped reading this map. Fourth instance of
+            // the same handshake (chains, note arrays, envelopes, now warp maps)
+            // and the same refusal to free a pointer we have no record of
+            // owning: a bad free here would be a use-after-free in whoever does
+            // own it, which is strictly worse than the leak this takes instead.
+            const WarpMarker* old = (const WarpMarker*)e.p;
+            if (!old) continue;
+            auto it = gWarp.retiring.begin();
+            for (; it != gWarp.retiring.end(); ++it) if (*it == old) break;
+            if (it == gWarp.retiring.end()) {
+                LOGW("WarpRetired for an unknown map %p - leaking it rather than "
+                     "freeing a pointer we do not own", (const void*)old);
+                continue;
+            }
+            delete[] *it;
+            gWarp.retiring.erase(it);
             continue;
         }
         if (e.type == Ev::AutoLaneInert) {

@@ -1,4 +1,10 @@
 #include "engine.h"
+// For the definition of WarpMarker, which RtClip names as an incomplete type.
+// It lives in sample.h because that is where markers are DERIVED (from the
+// transients the onset detector finds); see the "warp map" section below and
+// the note in sample.h. Header include only — nxtaktd links engine.cpp and
+// deliberately does NOT link sample.cpp, so nothing here may call into it.
+#include "sample.h"
 #include "../plugin/host.h"
 #include <algorithm>
 #include <chrono>
@@ -439,6 +445,273 @@ static inline void fetch(const RtClip& c, f64 pos, f32& outL, f32& outR) {
         outL = outR = p0[0] + (p1[0] - p0[0]) * fr;
     }
 }
+
+// ---------------------------------------------------------------------------
+// warp map
+//
+// THE MODEL. A warp marker pins one source frame to one musical beat. A clip's
+// markers are a sorted array; the invariant is that BOTH sequences are strictly
+// increasing. That single invariant buys everything else:
+//
+//   * beat -> source is a bijection, so the inverse (source -> beat) exists and
+//     is the same binary search on the other key;
+//   * every segment has a finite, positive slope, so the LOCAL RATE — source
+//     frames per beat — is well defined everywhere and never divides by zero;
+//   * the map is piecewise linear and continuous, so a voice's read position is
+//     a continuous function of the transport beat. No warp edit can make a
+//     playing clip jump.
+//
+// Evaluating it is a bisection for the bracketing pair and one linear
+// interpolation, exactly as autoValueAt does for envelopes, and for the same
+// reason: it is called from the audio thread and from the UI (drawing the warp
+// line, snapping a dragged marker) and the two must not be able to disagree.
+// Before the first marker and after the last, the adjacent segment's slope is
+// extrapolated — that is what lets a user pin two transients in the middle of a
+// clip and have the rest of it follow sensibly, instead of the clip stopping
+// dead outside the marked region.
+//
+// THE NO-MARKER CASE. A clip without markers is not a different code path, it
+// is a map with one implicit segment: origin at loopStart, slope the clip's own
+// tempo ratio. Conceptually. Arithmetically it IS given its own branch, and on
+// purpose: `tempo_ / c.clipBpm` is the scalar every render this engine has ever
+// produced was built on, and recomputing the same number as
+// (60*sr/clipBpm) * (tempo/60/sr) is equal to it in algebra and not in doubles.
+// The demo renders are the regression gate for this whole change, so the flat
+// path keeps the original expression, character for character, and the marker
+// path is new arithmetic that only runs when markers exist. WarpCtx::flatRate
+// is that scalar and nothing else computes it.
+//
+// HOW A MAP REACHES THE ENGINE. On RtClip, and nowhere else (engine.h):
+//
+//     const WarpMarker* markers = nullptr;    // GUI-owned, sorted, immutable
+//     int markerCount = 0;                    // 0 or >= 2; 1 is meaningless
+//     const i64* transients = nullptr;        // sorted, SampleBuffer-owned
+//     int transientCount = 0;
+//
+// `markers` rides the ONE-POINTER RETIREMENT RULE the notes and envelope arrays
+// already follow (engine.h's RtNote comment, docs/AUTOMATION.md): the GUI
+// heap-allocates one array per clip, ships it whole inside RtClip via
+// Cmd::SetClip, never mutates it after publication, and may free a displaced
+// array only after the engine hands the old pointer back in Ev::WarpRetired —
+// pushed from the same place in drainCommands() that pushes Ev::NotesRetired,
+// and only when the incoming pointer differs from the outgoing one, because
+// re-pushing the same array must announce nothing. Cmd::ClearClip retires it
+// too, and so does replacing the clip with one that carries no markers.
+//
+// `transients` deliberately has NO retirement event: they belong to the SAMPLE,
+// not to the clip (two clips over one sample share one array), and
+// SampleBuffer::transients is built once at load and never rebuilt (sample.cpp),
+// so the pointer is stable for the life of the session exactly as RtClip::data
+// already is. If that ever stops being true it takes the same protocol as
+// `markers`.
+//
+// VALIDITY. warpMapValid() is the GUI-side gate and is O(n), so it runs once
+// where the map is built and never on the audio thread; the realtime path checks
+// only `markerCount >= 2`. That split is safe because the evaluators below are
+// individually robust against a bad map — they return a point ON the map rather
+// than reading out of bounds — so a map that slipped through costs a wrong read
+// position and never a crash.
+// ---------------------------------------------------------------------------
+
+// Last index whose key is <= x, over a strictly increasing array. The same
+// bisection autoValueAt uses; unsorted input yields some index in range rather
+// than a read past the end.
+static inline int warpBracket(const WarpMarker* m, int n, f64 x, bool byBeat) {
+    int a = 0, b = n - 1;
+    while (b - a > 1) {
+        const int mid = (a + b) >> 1;
+        const f64 k = byBeat ? m[mid].beat : (f64)m[mid].srcFrame;
+        if (k <= x) a = mid; else b = mid;
+    }
+    return a;
+}
+
+f64 warpSrcAt(const WarpMarker* m, int n, f64 beat) {
+    if (!m || n <= 0) return beat;              // no opinion
+    if (beat != beat) return (f64)m[0].srcFrame;   // NaN in, a real frame out
+    if (n == 1) return (f64)m[0].srcFrame;      // a point pins, it does not tilt
+
+    // Outside the marked span the adjacent segment is extrapolated: `i` is
+    // simply clamped to a real segment and the interpolation below runs with a
+    // parameter outside [0,1], which is the extrapolation.
+    int i;
+    if (beat <= m[0].beat)            i = 0;
+    else if (beat >= m[n - 1].beat)   i = n - 2;
+    else                              i = warpBracket(m, n, beat, true);
+
+    const f64 db = m[i + 1].beat - m[i].beat;
+    const f64 ds = (f64)(m[i + 1].srcFrame - m[i].srcFrame);
+    if (!(db > 0.0)) return (f64)m[i].srcFrame;    // broken map: defined, if ugly
+    return (f64)m[i].srcFrame + (beat - m[i].beat) * (ds / db);
+}
+
+f64 warpSlopeAt(const WarpMarker* m, int n, f64 beat) {
+    // A map with fewer than two markers has no slope to report. The caller
+    // decides what that means; the engine never asks (it uses flatRate).
+    if (!m || n < 2) return 0.0;
+    if (beat != beat) return 0.0;
+    int i;
+    if (beat <= m[0].beat)            i = 0;
+    else if (beat >= m[n - 1].beat)   i = n - 2;
+    else                              i = warpBracket(m, n, beat, true);
+    const f64 db = m[i + 1].beat - m[i].beat;
+    if (!(db > 0.0)) return 0.0;
+    return (f64)(m[i + 1].srcFrame - m[i].srcFrame) / db;
+}
+
+f64 warpBeatAt(const WarpMarker* m, int n, f64 srcFrame) {
+    if (!m || n <= 0) return srcFrame;
+    if (srcFrame != srcFrame) return m[0].beat;
+    if (n == 1) return m[0].beat;
+    int i;
+    if (srcFrame <= (f64)m[0].srcFrame)             i = 0;
+    else if (srcFrame >= (f64)m[n - 1].srcFrame)    i = n - 2;
+    else                                            i = warpBracket(m, n, srcFrame, false);
+    const f64 ds = (f64)(m[i + 1].srcFrame - m[i].srcFrame);
+    const f64 db = m[i + 1].beat - m[i].beat;
+    if (!(ds > 0.0)) return m[i].beat;
+    return m[i].beat + (srcFrame - (f64)m[i].srcFrame) * (db / ds);
+}
+
+// The publication gate. O(n) and therefore NOT on the audio thread: a map is
+// checked once, where it is handed over, and the realtime path afterwards
+// checks only `n >= 2`. That split is deliberate — the evaluators above are
+// individually safe against a bad map (they return a point ON the map rather
+// than reading out of bounds), so a check that slipped through costs a wrong
+// read position and never a crash.
+bool warpMapValid(const WarpMarker* m, int n) {
+    if (!m || n < 2) return false;
+    if (m[0].srcFrame < 0) return false;
+    if (m[0].beat != m[0].beat) return false;
+    for (int i = 1; i < n; ++i) {
+        if (!(m[i].srcFrame > m[i - 1].srcFrame)) return false;
+        if (!(m[i].beat > m[i - 1].beat)) return false;      // NaN fails here too
+    }
+    return true;
+}
+
+namespace {
+
+// What one voice needs to know about warping for one block. Block-local, built
+// once per voice per sub-block, and the single place the flat/piecewise
+// decision is made.
+struct WarpCtx {
+    const WarpMarker* m = nullptr;
+    int  n = 0;
+    const i64* tr = nullptr;      // transients, sorted, SampleBuffer-owned
+    int  trN = 0;
+    bool piecewise = false;
+    // Source frames per OUTPUT frame for the flat case. Bit-for-bit the scalar
+    // the pre-marker engine used; see the section comment.
+    f64  flatRate = 1.0;
+    f64  bps = 0.0;               // beats per output frame
+    f64  loopBeat0 = 0.0;         // the loop region, in clip beats
+    f64  loopBeat1 = 0.0;
+};
+
+// Grain hop, in OUTPUT frames: one sixteenth note of the CURRENT tempo.
+//
+// The output hop is musical and stays musical whatever the local rate does —
+// that is the half of the stretcher that must not follow the map. What follows
+// the map is the grain ORIGIN, which advances by rate*hop source frames per
+// grain while the two read heads run at natural speed, so pitch is preserved
+// and the grain's source span tracks the local slope for free.
+//
+// Re-derived at every grain boundary rather than frozen at launch, so a tempo
+// change re-musicalises the hop instead of leaving the clip granulating against
+// the tempo it was launched at. At a constant tempo this returns the identical
+// int startVoice() computed, which is why it costs the demo renders nothing.
+inline int warpHop(f64 tempo, f64 sr) {
+    const f64 sixteenth = (60.0 / tempo) * 0.25 * sr;
+    return (int)clampv(sixteenth, 512.0, 16384.0);
+}
+
+// Where the next grain starts reading.
+//
+// Beats mode with transients known is Live's beat-repeat character, and this
+// is the whole of it: instead of starting every grain at the ideal origin, snap
+// to the nearest transient — so a grain plays an attack from its true start and
+// the kick keeps its click instead of being windowed in halfway through.
+//
+// The window is HALF a grain advance, and that number is the design rather than
+// a taste setting. Origins are `adv` source frames apart, so a window of adv/2
+// is the largest for which two consecutive grains can never claim the same
+// transient: [p-adv/2, p+adv/2] and [p+adv/2, p+3adv/2] share one point. The
+// grain sequence therefore stays monotone, which is exactly what a naive
+// "nearest transient" snap loses — there, a slow passage re-triggers one attack
+// over and over and the beat repeat becomes a machine gun. Capped at 50 ms so a
+// near-stalled rate cannot let the window wander across a whole bar.
+//
+// With no transients this returns `ideal` unchanged, by value and by bit — the
+// property the regression gate rests on. A clip whose sample has no onset list
+// (or whose material has no onsets at all: the demo pad detects none) grains on
+// the fixed hop exactly as it always did, and the four demo renders prove it.
+inline f64 warpGrainOrigin(const WarpCtx& w, f64 ideal, f64 adv, f64 sr) {
+    if (!w.tr || w.trN <= 0) return ideal;
+    f64 win = 0.5 * std::fabs(adv);
+    const f64 cap = 0.05 * sr;
+    if (win > cap) win = cap;
+    if (!(win > 0.0)) return ideal;
+    // The cast below is the only place this function can be made to misbehave
+    // by its input rather than by its data, so it is guarded here: NaN and a
+    // magnitude no sample count can reach both leave with no opinion.
+    if (!(ideal > -1e15 && ideal < 1e15)) return ideal;
+
+    const i64 target = (i64)ideal;
+    if (w.tr[0] > target) {
+        const f64 d = (f64)w.tr[0] - ideal;
+        return (d <= win) ? (f64)w.tr[0] : ideal;
+    }
+    int lo = 0, hi = w.trN - 1;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) >> 1;
+        if (w.tr[mid] <= target) lo = mid; else hi = mid;
+    }
+    if (w.tr[hi] <= target) lo = hi;
+
+    f64 best = ideal, bestD = win;
+    const f64 d0 = ideal - (f64)w.tr[lo];
+    if (d0 <= bestD) { bestD = d0; best = (f64)w.tr[lo]; }
+    if (lo + 1 < w.trN) {
+        const f64 d1 = (f64)w.tr[lo + 1] - ideal;
+        if (d1 < bestD) { best = (f64)w.tr[lo + 1]; }
+    }
+    return best;
+}
+
+// The one place the flat/piecewise decision is made, per voice per sub-block.
+// Everything it needs is on the RtClip the voice already holds; there is no
+// side table and no lookup.
+//
+// Warp::Off refuses markers outright: Off means "play this at its recorded
+// speed and ignore the grid", and a map is nothing but an opinion about the
+// grid. Only the transient list survives, because it describes the material and
+// not the tempo — though nothing reads it in Off either, since Off is never
+// granular.
+inline WarpCtx warpCtxFor(const RtClip& c, f64 tempo, f64 sr) {
+    WarpCtx w;
+    // Character for character the pre-marker engine's `rate`. Do not fold this
+    // into the map's arithmetic; see the section comment.
+    w.flatRate = (c.warp == (int)Warp::Off) ? 1.0 : (tempo / c.clipBpm);
+    w.bps      = tempo / 60.0 / sr;
+    w.tr       = (c.transientCount > 0) ? c.transients : nullptr;
+    w.trN      = (c.transientCount > 0 && c.transients) ? c.transientCount : 0;
+    // markerCount >= 2 only. Validity was established by the publisher; the
+    // audio thread re-checks the one thing that would index out of bounds.
+    if (c.markers && c.markerCount >= 2 && c.warp != (int)Warp::Off) {
+        w.m = c.markers;
+        w.n = c.markerCount;
+        w.piecewise = true;
+        // The loop region, expressed in the map's own units. Both ends go
+        // through the inverse map so a loop that was set in source frames
+        // still wraps on the musical position the map assigns it.
+        w.loopBeat0 = warpBeatAt(w.m, w.n, (f64)c.loopStart);
+        w.loopBeat1 = warpBeatAt(w.m, w.n, (f64)c.loopEnd);
+    }
+    return w;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // automation (docs/AUTOMATION.md §3)
@@ -940,6 +1213,8 @@ void Engine::prepare(f64 sampleRate, int /*maxBlock*/) {
     // is the un-automated one rather than a crash or a stuck parameter.
     if (!autoAcquire(this))
         LOGW("engine: no slot for automation state; clip envelopes will not apply");
+    // Warp markers need no slot of their own: they arrive on RtClip and are
+    // read from there.
 
     LOGI("engine prepared @ %.0f Hz", sr_);
 }
@@ -982,9 +1257,27 @@ void Engine::startVoice(Track& t, const RtClip& c) {
     v.nextNote = 0;
     for (auto& o : v.offs) o.used = false;
     // Grain hop of one 1/16 note keeps transients intact, which is what makes
-    // Beats-mode warping sound like a beat repeat rather than a smear.
-    const f64 sixteenth = (60.0 / tempo_) * 0.25 * sr_;
-    v.hop = (int)clampv(sixteenth, 512.0, 16384.0);
+    // Beats-mode warping sound like a beat repeat rather than a smear. One
+    // function with renderVoice's per-grain re-derivation, so the hop a clip
+    // launches with and the hop it keeps cannot drift apart.
+    v.hop = warpHop(tempo_, sr_);
+
+    // With markers the beat is the primary cursor and srcPos is a function of
+    // it, so a launch seeds the beat the loop start maps to rather than zero.
+    // Without markers this does nothing at all and the voice starts exactly
+    // where it always did — the reason it is written as a guarded branch and
+    // not as an unconditional assignment through the map.
+    //
+    // `!c.isMidi` is not paranoia about a case the GUI already refuses: a MIDI
+    // voice's beatPos is its NOTE cursor, and seeding it from a warp map would
+    // start the pattern somewhere other than its beginning. The engine is
+    // handed RtClips by three publishers and trusts none of them that far.
+    if (!c.isMidi && c.markers && c.markerCount >= 2 && c.warp != (int)Warp::Off) {
+        v.beatPos = warpBeatAt(c.markers, c.markerCount, (f64)c.loopStart);
+        v.srcPos  = warpSrcAt(c.markers, c.markerCount, v.beatPos);
+        v.readA   = v.srcPos;
+        v.readB   = v.srcPos;
+    }
 }
 
 void Engine::drainCommands() {
@@ -1115,6 +1408,12 @@ void Engine::drainCommands() {
                 // second channel to notice it by.
                 const RtAutoSet* oldAutos = dst.autos;
                 const bool autosChanged = oldAutos && oldAutos != c.clip.autos;
+                // And the warp map, third of three on the one-pointer rule. The
+                // transient list is NOT here on purpose: it belongs to the
+                // SampleBuffer, outlives every clip over it, and has no
+                // retirement event to miss.
+                const WarpMarker* oldWarp = dst.markers;
+                const bool warpChanged = oldWarp && oldWarp != c.clip.markers;
                 if (changed) {
                     if (t.voice.clip == &dst && t.voice.active) flushOffs(t, t.voice, 0);
                     if (t.prev.clip  == &dst && t.prev.active)  flushOffs(t, t.prev,  0);
@@ -1125,6 +1424,8 @@ void Engine::drainCommands() {
                 if (changed) emitCritical(this, evts_, {Ev::NotesRetired, c.a, c.b, 0.0, (void*)old});
                 if (autosChanged)
                     emitCritical(this, evts_, {Ev::AutosRetired, c.a, c.b, 0.0, (void*)oldAutos});
+                if (warpChanged)
+                    emitCritical(this, evts_, {Ev::WarpRetired, c.a, c.b, 0.0, (void*)oldWarp});
             }
             break;
         // A pointer swap and nothing else. The audio thread must never free a
@@ -1188,6 +1489,7 @@ void Engine::drainCommands() {
                 RtClip& dst = clips_[c.a][c.b];
                 const RtNote* old = dst.notes;
                 const RtAutoSet* oldAutos = dst.autos;
+                const WarpMarker* oldWarp = dst.markers;
                 if (t.playing == c.b) { t.voice.releasing = true; t.playing = -1;
                                         t.fireBeat = kNoFollow; }
                 if (t.queued  == c.b) { t.queued = -2; t.fireBeat = kNoFollow; }
@@ -1202,6 +1504,8 @@ void Engine::drainCommands() {
                 // the incoming one" is simply "there was one".
                 if (oldAutos)
                     emitCritical(this, evts_, {Ev::AutosRetired, c.a, c.b, 0.0, (void*)oldAutos});
+                if (oldWarp)
+                    emitCritical(this, evts_, {Ev::WarpRetired, c.a, c.b, 0.0, (void*)oldWarp});
             }
             break;
 
@@ -1626,12 +1930,25 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
 
         const RtClip& c = *v.clip;
 
+        // The clip's warp map for this block. Flat (one implicit segment at the
+        // clip's tempo ratio) unless the clip carries markers; see the warp map
+        // section for why the flat rate keeps its original expression.
+        const WarpCtx wc = warpCtxFor(c, tempo_, sr_);
+
         // Fitting material recorded at clipBpm onto a grid running at tempo_
         // means consuming source frames at tempo_/clipBpm: a 120 BPM loop in a
-        // 240 BPM set has to be read twice as fast to cover the same bar.
-        const f64 rate = (c.warp == (int)Warp::Off) ? 1.0 : (tempo_ / c.clipBpm);
-        const bool granular = (c.warp == (int)Warp::Beats) && std::fabs(rate - 1.0) > 1e-4;
+        // 240 BPM set has to be read twice as fast to cover the same bar. With
+        // markers that ratio is no longer one number — it is the slope of
+        // whichever segment the clip beat is in — so `rate` below is the flat
+        // case only and the piecewise case reads its rate off the map.
+        const f64 rate = wc.flatRate;
+        // A marked clip is always granular in Beats mode: some segment will
+        // have a slope of one, and switching the stretcher off and on again as
+        // the read position crossed it would click at every marker.
+        const bool granular = (c.warp == (int)Warp::Beats) &&
+                              (wc.piecewise || std::fabs(rate - 1.0) > 1e-4);
         const f64 loopLen = (f64)(c.loopEnd - c.loopStart);
+        const f64 loopBeats = wc.loopBeat1 - wc.loopBeat0;
 
         for (int i = from; i < to; ++i) {
             f32 l, r;
@@ -1647,19 +1964,60 @@ void Engine::renderRange(f32* outL, f32* outR, int from, int to) {
                 r = aR * (1.f - w) + bR * w;
                 v.readA += 1.0;
                 v.readB += 1.0;
-                if (++v.phase >= v.hop) { v.readA = v.readB; v.readB = v.srcPos; v.phase = 0; }
+                if (++v.phase >= v.hop) {
+                    // A new grain: re-musicalise the hop against the current
+                    // tempo, then place the origin. `adv` is how far origins
+                    // move per grain at the LOCAL rate, which is what sizes the
+                    // transient snap window and what makes the grain's source
+                    // span follow the map's slope.
+                    v.hop = warpHop(tempo_, sr_);
+                    const f64 local = wc.piecewise
+                                          ? warpSlopeAt(wc.m, wc.n, v.beatPos) * wc.bps
+                                          : rate;
+                    v.readA = v.readB;
+                    v.readB = warpGrainOrigin(wc, v.srcPos, local * (f64)v.hop, sr_);
+                    v.phase = 0;
+                }
             } else {
                 fetch(c, v.srcPos, l, r);
             }
 
             // Advance the musical position.
-            v.srcPos += rate;
-            if (v.srcPos >= (f64)c.loopEnd) {
-                if (c.loop && loopLen > 0.0) {
-                    v.srcPos = (f64)c.loopStart + std::fmod(v.srcPos - (f64)c.loopStart, loopLen);
-                    if (!granular) { v.readA = v.srcPos; v.readB = v.srcPos; v.phase = 0; }
-                } else {
-                    v.releasing = true;
+            if (wc.piecewise) {
+                // Markers make the beat the primary cursor and the source
+                // position a function of it, rather than the other way round.
+                // Re-evaluating the map every frame instead of accumulating a
+                // rate is what makes this sample-accurate: an accumulated
+                // varying rate drifts away from the map, and a clip that drifts
+                // is a clip whose downbeat is in the wrong place by the end of
+                // the bar. The loop wrap happens in BEATS, so a warped loop
+                // repeats the same musical span however uneven the map is.
+                v.beatPos += wc.bps;
+                if (v.beatPos >= wc.loopBeat1) {
+                    if (c.loop && loopBeats > 0.0) {
+                        v.beatPos = wc.loopBeat0 +
+                                    std::fmod(v.beatPos - wc.loopBeat0, loopBeats);
+                    } else {
+                        v.releasing = true;
+                    }
+                }
+                const f64 prev = v.srcPos;
+                v.srcPos = warpSrcAt(wc.m, wc.n, v.beatPos);
+                // A wrap moves the read heads with it when the stretcher is off,
+                // exactly as the flat path does; `prev` catches it without a
+                // second wrap test.
+                if (!granular && v.srcPos < prev) {
+                    v.readA = v.srcPos; v.readB = v.srcPos; v.phase = 0;
+                }
+            } else {
+                v.srcPos += rate;
+                if (v.srcPos >= (f64)c.loopEnd) {
+                    if (c.loop && loopLen > 0.0) {
+                        v.srcPos = (f64)c.loopStart + std::fmod(v.srcPos - (f64)c.loopStart, loopLen);
+                        if (!granular) { v.readA = v.srcPos; v.readB = v.srcPos; v.phase = 0; }
+                    } else {
+                        v.releasing = true;
+                    }
                 }
             }
 

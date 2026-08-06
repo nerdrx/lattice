@@ -65,6 +65,18 @@ struct ClipModel {
     ClipKind kind = ClipKind::Audio;
     std::vector<NoteModel> notes;      // Midi clips only; kept sorted by beat
     std::vector<AutoLane>  envelopes;  // clip automation; audio and MIDI alike
+    // The clip's warp map: a piecewise-linear beat -> source frame curve, one
+    // marker per pinned point. Sorted, and BOTH sequences strictly increasing —
+    // warpMapValid() in audio/sample.h is the gate, and pushClip refuses a map
+    // it rejects rather than handing the engine one it cannot invert.
+    //
+    // EMPTY IS THE ORDINARY CASE and is not a degenerate map: a clip with no
+    // markers warps at the single clipBpm/tempo ratio, exactly as every clip did
+    // before markers existed. A one-marker map is meaningless (a point pins, it
+    // does not tilt) and is likewise not published. pushClip snapshots this into
+    // a heap WarpMarker array for the engine; the displaced array comes back via
+    // Ev::WarpRetired before it is freed, the same lifetime `notes` has.
+    std::vector<WarpMarker> markers;
     SampleRef sample;
     std::string name;
     // Source file. Authoritative for save/load: it survives a missing sample,
