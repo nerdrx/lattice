@@ -46,7 +46,10 @@
 #include "../audio/backend.h"
 #include "../audio/engine.h"
 #include "../audio/midi_in.h"
+#include "../plugin/host.h"      // PluginDesc, and PluginInstance as an identity
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace lat {
 
@@ -63,6 +66,27 @@ static_assert(kEsReturns == kMaxReturns,
 // travel was to get engine internals *out* of the view TUs, and swapping an
 // Engine for an EngineClient there would have undone it.
 struct RemoteEngine;
+
+// What the daemon made of one device the GUI published. Pure data, no ipc: a
+// caller that wants to draw "loading…", a reject reason or the real latency
+// asks for this rather than for a DeviceMirror.
+//
+// Keyed by the GUI's own PluginInstance*, because that is the identity the
+// model already has. §5 step 4 asks for a `DeviceModel { u64 uid; u32 deviceId;
+// ... }` instead, which is the right end state and is a change to
+// src/ui/session.h — see the note on publishChain() below for why this wave
+// could not make it.
+struct RemoteDevice {
+    u32  id         = 0;        // the daemon's device id
+    u32  generation = 0;        // its slot generation, the param-write guard
+    bool live       = false;    // EvDeviceAdded has landed
+    bool failed     = false;    // EvDeviceFailed did; `error` says why
+    i32  latencyFrames = 0;     // the DAEMON's figure, which is the one that sounds
+    u32  paramsMapped   = 0;    // GUI controls matched to a daemon control by id
+    u32  paramsUnmapped = 0;    // GUI controls with no counterpart over there
+    u32  paramsTruncated = 0;   // controls past ipc::kMaxDevParams (64)
+    std::string uri, name, error;
+};
 
 class EngineHandle {
 public:
@@ -177,6 +201,91 @@ public:
     bool midiRunning() const;
     int  midiClientId() const;
     u64  midiReceived() const;
+
+    // --- devices (§5 step 4) ------------------------------------------------
+    //
+    // THERE IS NO addDevice() HERE, AND THAT IS THE DESIGN OF THIS STEP.
+    //
+    // §5 step 4 describes rewriting App's device code around device ids:
+    // `DeviceModel::inst` deleted, `addDevice()` becoming "send CmdAddDevice and
+    // wait for the event", the knobs reading a DeviceMirror. That is the right
+    // end state and it is unreachable from these files — it edits
+    // src/ui/session.h and src/ui/app_devices.cpp, and it would delete the
+    // in-process path that §8 says stays supported through step 6.
+    //
+    // So the seam is put one level lower, at the one call every chain edit
+    // already funnels through: App::publishChain() builds an RtChain and hands
+    // it to pushCommand(). An RtChain cannot cross a process boundary — but
+    // everything the daemon needs in order to BUILD ITS OWN is readable off it
+    // through PluginInstance's virtuals: desc().uri, paramInfo(i).id,
+    // getParam(i), bypassed(). So the remote path reads the chain the GUI
+    // declared and reconciles the daemon toward it with AddDevice /
+    // RemoveDevice / MoveDevice / SetBypass, then mirrors params every frame.
+    //
+    // Two consequences worth stating rather than discovering:
+    //
+    //   * The GUI's PluginInstance is not silent-and-pointless in daemon mode,
+    //     it is the MODEL. It holds the parameter values, the bypass flag and
+    //     the rack contents; it just never renders audio, because there is no
+    //     in-process engine to call process(). That is exactly §4's split — the
+    //     GUI is the authority on what exists, the engine on what sounds.
+    //   * Instantiation is asynchronous, and the GUI does not currently know
+    //     that. A device appears in the model at once and starts sounding a
+    //     frame or several later (or, on the very first one, after the daemon's
+    //     plugin scan). devicesPending() is how a status line says so.
+    //
+    // Params are addressed by ParamInfo::id, per docs/PARAM-ADDRESS.md: the GUI
+    // and the daemon load the same plugin build, so the ids match, but the
+    // INDEX ordering is not something either side promises the other. A control
+    // whose id has no counterpart is counted, never guessed at.
+
+    // What the daemon made of a device the GUI published, or null if this is
+    // not the daemon path or the instance is not in any published chain.
+    const RemoteDevice* remoteDevice(const PluginInstance* gui) const;
+    // Devices asked for whose answer has not arrived. Also in EngineState.
+    u32 devicesPending() const;
+    u64 devicesAdded() const;
+    u64 devicesFailed() const;
+
+    // --- the plugin catalog (§5 step 5) -------------------------------------
+    //
+    // What the DAEMON can instantiate, which is not in general what this
+    // process can find: a different LV2_PATH, a different user, a bundle that
+    // crashes lilv here and not there. A browser drawn from the local
+    // PluginRegistry can therefore offer a row whose double-click can only ever
+    // fail, which is the whole reason §3 asked for a catalog table.
+    //
+    // Empty in local mode — there the local registry IS the daemon's — and
+    // empty in daemon mode until the scan completes. Ask with requestScan();
+    // scanRunning() drives the spinner.
+    const std::vector<PluginDesc>& catalog() const;
+    // Plugins the daemon found that did not fit the table. Non-zero must be
+    // drawn: "…and N more this build cannot list" beats a silently short list.
+    u32  catalogTruncated() const;
+    bool catalogReady() const;
+    bool scanRunning() const;
+    bool requestScan();
+
+    // --- lifecycle (§6) -----------------------------------------------------
+    EngineLink link() const;
+    // The engine's process id, or -1 when there is no daemon. Status-bar
+    // material, and the only handle on the daemon a test has.
+    i32 enginePid() const;
+
+    // §6's recovery, and the ONLY thing that may run it is a user click or a
+    // provably dead engine — never a stale heartbeat (§4.4). Reaps the orphan
+    // region, respawns, re-attaches (which re-announces the pool), republishes
+    // every clip cell from the client's shadow — a memcpy, no decode, no offset
+    // changes — replays the mixer scalars and the tempo, and re-issues
+    // AddDevice for every device on every chain, because device ids do not
+    // survive an engine (§11.4).
+    //
+    // The transport deliberately comes back STOPPED, per §4.4's honest default.
+    //
+    // False if nothing could be started; the handle is then Detached and the
+    // set is still editable and saveable.
+    bool restartEngine();
+    u64  resyncs() const;      // completed restartEngine()s
 
     // --- daemon-mode diagnostics -------------------------------------------
     //

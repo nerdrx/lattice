@@ -982,13 +982,30 @@ static void testArrangementClassifiers() {
           (unsigned long long)ipc::arrangementBytes(2, 1));
     CHECK(ipc::kMaxArrLanes == kMaxRtArrLanes,
           "the wire lane bound and the engine's agree (%d)", (int)ipc::kMaxArrLanes);
-    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 6,
+    CHECK(ipc::kProtocolVersion == 6 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 6,
           "protocol v%u, pool v%u, shm v%u", ipc::kProtocolVersion, ipc::kPoolVersion,
           ipc::kShmVersion);
     CHECK(ipc::control::kJournal > ipc::control::kParams &&
-          ipc::control::kBytes == ipc::control::kJournal + ipc::JournalRing::bytes(),
-          "the journal is the ninth section, appended at %zu of %zu B",
-          ipc::control::kJournal, ipc::control::kBytes);
+          ipc::control::kCatalog >= ipc::control::kJournal + ipc::JournalRing::bytes(),
+          "the journal is the ninth section, appended at %zu",
+          ipc::control::kJournal);
+    // v6's tenth section. The property that matters is not where it is but that
+    // it went on the END: every offset below it is unchanged, so the only
+    // reason a v5 and a v6 binary refuse each other is the hash and the
+    // version, and not a section that quietly moved under a peer.
+    CHECK(ipc::control::kCatalog > ipc::control::kJournal &&
+          ipc::control::kBytes == ipc::control::kCatalog + ipc::kCatalogTableBytes,
+          "the catalog is the tenth section, appended at %zu of %zu B",
+          ipc::control::kCatalog, ipc::control::kBytes);
+    CHECK(sizeof(ipc::WirePluginDesc) == 512 && ipc::kMaxCatalog == 2048 &&
+          ipc::kCatalogTableBytes == 512ull * 2048ull,
+          "WirePluginDesc is %zu B x %u = %zu B", sizeof(ipc::WirePluginDesc),
+          (u32)ipc::kMaxCatalog, ipc::kCatalogTableBytes);
+    // The row must be able to hold the longest URI the pool's string blobs can
+    // carry, or the catalog could advertise a plugin AddDevice cannot name.
+    CHECK(sizeof(ipc::WirePluginDesc::uri) >= sizeof(ipc::WireDeviceInfo::uri),
+          "a catalog URI (%zu B) is at least as wide as a device URI (%zu B)",
+          sizeof(ipc::WirePluginDesc::uri), sizeof(ipc::WireDeviceInfo::uri));
 }
 
 // ---------------------------------------------------------------------------

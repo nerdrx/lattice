@@ -33,6 +33,50 @@ namespace lat {
 // the duplication cannot drift without failing a build.
 inline constexpr int kEsReturns = 4;
 
+// docs/GUI-ON-DAEMON.md §6's state machine, as the UI sees it. It is in the
+// snapshot rather than behind an accessor for the same reason everything else
+// here is: a banner is drawn from a frame, and a frame should be one sample.
+//
+// LOCAL MODE ONLY EVER ANSWERS Live OR Detached, and that is not a degradation
+// — an in-process engine cannot be stale (it is this process) and cannot be
+// lost (it dies with us). Detached is §8's degraded mode: no engine at all, the
+// set still loads, edits and saves.
+enum class EngineLink : u32 {
+    Detached = 0,   // nothing is open. Every send() is a no-op.
+    Starting,       // spawned/attached, no heartbeat yet
+    Live,           // answering
+    Stale,          // attached, process alive, heartbeat older than the tolerance
+    Lost,           // the process is gone, or it published the shutdown flag
+    Stopping,       // EvEngineStopping: a clean shutdown has begun
+};
+
+// The banner text §6's table specifies, or null when there is nothing to say.
+// A function rather than a string in the struct because EngineState is pure
+// data and copied once a frame, and because the rule this encodes is worth
+// having in one place: the UI shows the state, it never acts on it. §4.4 —
+// never respawn automatically on a stale heartbeat. A laptop resuming from
+// suspend and a JACK restart both look exactly like a wedged engine for a few
+// hundred milliseconds, and a second daemon under a live one is the worst
+// available outcome. Only a *dead* engine or a user click may restart.
+inline const char* engineLinkBanner(EngineLink l) {
+    switch (l) {
+        case EngineLink::Detached: return "No audio engine. The set can still be edited and saved.";
+        case EngineLink::Starting: return "Starting the audio engine…";
+        case EngineLink::Live:     return nullptr;
+        case EngineLink::Stale:    return "The audio engine is not responding.";
+        case EngineLink::Lost:     return "The audio engine stopped. Your set is intact.";
+        case EngineLink::Stopping: return "The audio engine is shutting down.";
+    }
+    return nullptr;
+}
+
+// True when the banner should offer a "Restart engine" button. Deliberately
+// includes Stale — the user may act on a wedged engine even though the GUI may
+// not — and excludes Starting and Stopping, which are transitions that finish.
+inline bool engineLinkOffersRestart(EngineLink l) {
+    return l == EngineLink::Stale || l == EngineLink::Lost || l == EngineLink::Detached;
+}
+
 struct EngineState {
     // --- transport -----------------------------------------------------
     f64 beat       = 0.0;      // absolute beats since transport start
@@ -90,6 +134,20 @@ struct EngineState {
     // told rather than infer it.
     u32 arrOverride    = 0;
     u32 journalDropped = 0;    // engine-side refused journal pushes
+
+    // --- the link (§6) ---------------------------------------------------
+    // Sampled once a frame like everything else here, so the banner cannot
+    // flicker between two draws inside one frame.
+    EngineLink link = EngineLink::Detached;
+    // How long the daemon has been silent, in milliseconds, 0 when it is not.
+    // §6's table distinguishes "not responding" from "not responding, and it
+    // has been five seconds", which is the difference between a JACK restart
+    // and something a user should act on.
+    u32 linkSilentMs = 0;
+    // Devices the daemon has been asked for whose EvDeviceAdded/Failed has not
+    // arrived. Non-zero means a chain on screen is not yet the chain that
+    // sounds — §5 step 4's "project load becomes asynchronous too".
+    u32 devicesPending = 0;
 
     EngineState() {
         for (int i = 0; i < kMaxTracks; ++i) {

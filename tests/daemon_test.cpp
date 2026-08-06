@@ -1606,6 +1606,76 @@ static void testDevices(ipc::EngineClient& c) {
     CHECK(c.scanState() == ipc::ScanDone, "scanState is Done (%u)", c.scanState());
     CHECK(scanEv.a >= 2, "the catalog has at least the two stock devices (%d)", scanEv.a);
 
+    // -- 11b. the catalog table (v6, GUI-ON-DAEMON.md §3 option B) -----------
+    //
+    // Until this table existed the catalog was reachable one URI at a time, so
+    // a GUI browser could only list what its OWN process found. Every check
+    // here fails if publishCatalog() is removed from registryReady(), and the
+    // last one is the one that says what the table is FOR: a row the browser
+    // can show is a row AddDevice can load.
+    std::vector<ipc::CatalogEntry> cat;
+    const int nCat = c.readCatalog(cat);
+    CHECK(nCat > 0, "the catalog table carries %d rows", nCat);
+    // Not a plausible zero on either side: catalogCount reads 0 if the daemon
+    // never wrote it, and `parsed == count` fails if the per-row release store
+    // of `state` were dropped, because readCatalogEntry refuses a Free row.
+    CHECK((u32)nCat == c.catalogCount(),
+          "every row the header claims parses Live (%d of %u)", nCat, c.catalogCount());
+    // catalogTruncated is 0 on any sane machine, so asserting it equals 0 would
+    // pass against a daemon that never stored it. The SUM is what discriminates:
+    // it can only equal scanPlugins if both halves were written.
+    CHECK(c.catalogCount() + c.catalogTruncated() == c.scanPluginCount(),
+          "carried %u + dropped %u == the %u the scan found",
+          c.catalogCount(), c.catalogTruncated(), c.scanPluginCount());
+    CHECK(c.scanPluginCount() == (u32)scanEv.a,
+          "and EvScanComplete agreed about the count (%d)", scanEv.a);
+
+    bool haveSat = false, havePulse = false, allNamed = true;
+    for (const ipc::CatalogEntry& e : cat) {
+        if (e.uri.empty() || e.name.empty()) allNamed = false;
+        if (e.uri == "nxtakt:saturator") haveSat = true;
+        if (e.uri == "nxtakt:pulse")     havePulse = true;
+    }
+    CHECK(haveSat && havePulse,
+          "the stock devices are in it by canonical uri (saturator %d, pulse %d)",
+          (int)haveSat, (int)havePulse);
+    CHECK(allNamed, "and every row has a uri and a name");
+    // The internal devices report their real shape, so a browser can draw the
+    // instrument/effect split without loading anything. The two numbers are
+    // spelled out because this file deliberately does not link src/plugin:
+    // PluginKind::Effect == 0, PluginFormat::Internal == 3 (src/plugin/host.h).
+    for (const ipc::CatalogEntry& e : cat)
+        if (e.uri == "nxtakt:saturator")
+            CHECK(e.kind == 0u && e.format == 3u && e.paramCount == 3u,
+                  "Saturator: kind %u (Effect), format %u (Internal), %u params",
+                  e.kind, e.format, e.paramCount);
+
+    // THE POINT OF THE TABLE. Take a uri the browser would have shown and load
+    // it. If the catalog could ever list something the daemon cannot
+    // instantiate, this is where it shows — as RejectUnknownUri on a row a user
+    // just double-clicked.
+    u32 fromCat = 0;
+    // Guarded, because this section is meant to be watchable in the red: the
+    // removal tests above leave `cat` empty, and a suite that segfaults there
+    // proves nothing about the check it was supposed to be running.
+    if (cat.empty()) { CHECK(false, "no catalog row to load from"); drainEvents(c); }
+    else {
+    const bool catLoads = addDeviceAndWait(c, ipc::DevTargetReturn, 3, -1,
+                                           cat.front().uri.c_str(), fromCat, 5000);
+    CHECK(catLoads, "a device loaded straight off catalog row 0 ('%s') -> id %u",
+          cat.front().uri.c_str(), fromCat);
+    if (catLoads) {
+        ipc::DeviceMirror cd;
+        CHECK(c.readDevice(fromCat, cd) && cd.uri == cat.front().uri,
+              "and the device table agrees about its uri");
+        CHECK(c.removeDevice(fromCat), "removed again, leaving the section as it found it");
+        ipc::WireEvent rm{};
+        CHECK(waitEvent(c, ipc::EvDeviceRemoved, rm, 2000) && (u32)rm.ref == fromCat,
+              "EvDeviceRemoved for %u", fromCat);
+    }
+    }
+    drainEvents(c);
+
     // The "pump kept beating through the scan" property only has teeth when the
     // scan was actually slow. On a box with hundreds of LV2 bundles it takes
     // seconds; on a plugin-less runner (CI, LV2_PATH empty) it finishes in a

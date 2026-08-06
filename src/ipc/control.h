@@ -70,7 +70,14 @@ namespace lat::ipc {
 //        deliberate incompatibility on a shipped protocol: a v3 binary and a v5
 //        binary refuse each other at attach() with a specific message, which is
 //        the mechanism working as designed.
-inline constexpr u32 kProtocolVersion = 5;
+//   v6 — the plugin catalog (GUI-ON-DAEMON.md §3, option B). A TENTH section:
+//        WirePluginDesc[kMaxCatalog], written once by the daemon when its scan
+//        completes and read once by a client on EvScanComplete. Until this
+//        existed the catalog was reachable one URI at a time, so a GUI browser
+//        could only list what its OWN process found — which is the thing phase
+//        3 removed the GUI's plugin layer to stop being true. ControlHeader
+//        gains catalogCount/catalogTruncated out of its reserved words.
+inline constexpr u32 kProtocolVersion = 6;
 
 // Daemon-generated wire events start here, well clear of lat::Ev. The event
 // ring carries a superset of Ev: the boundary itself has things to report
@@ -713,6 +720,61 @@ static_assert(std::atomic<f32>::is_always_lock_free,
               "a param table of non-lock-free atomics would put a futex in the pump");
 
 // ---------------------------------------------------------------------------
+// The plugin catalog: one more table, same direction as the device table
+// ---------------------------------------------------------------------------
+//
+// docs/GUI-ON-DAEMON.md §3 sizes three ways to get the browser its list and
+// picks this one. The argument in one line: the registry lives in the daemon
+// now, so a GUI that browses its OWN PluginRegistry is browsing a different
+// machine's answer — a different LV2_PATH, a different user, a different set of
+// bundles that crash lilv — and a double-click on a row it can see but the
+// daemon cannot ends in EvDeviceFailed(RejectUnknownUri) with no way to have
+// known. The catalog is therefore what the DAEMON can instantiate, published
+// where a client can read it.
+//
+// Same discipline as WireDeviceInfo and for the same reason: `state` is stored
+// LAST with release, so a reader that sees a row Live has seen every byte of
+// it. Unlike the device table this one is written exactly once per scan, from
+// the pump thread, before scanState goes to ScanDone — so a client that walks
+// [0, catalogCount) after seeing ScanDone (or EvScanComplete) is reading a
+// table nobody will touch again.
+//
+// §3 option C — the AF_UNIX socket — is strictly better and three or four times
+// the work, and this is deliberately NOT a detour on the way to it: when the
+// socket lands the catalog moves onto it and this table is deleted.
+enum : u32 {
+    CatalogSlotFree = 0,
+    CatalogSlotLive = 1,
+};
+
+// PluginDesc with its four std::strings truncated to fixed widths. `category`
+// is carried even though nothing draws it yet, because the browser will want to
+// group by it and adding a field later costs another version bump.
+struct WirePluginDesc {
+    std::atomic<u32> state;        // CatalogSlot*, stored LAST with release
+    u32 format;                    // lat::PluginFormat
+    u32 kind;                      // lat::PluginKind
+    u32 audioIn, audioOut;
+    u32 hasMidiIn;
+    u32 paramCount;                // what the SCANNER found, not kMaxDevParams
+    u32 reserved;
+    char uri[256];                 // LV2 URIs are long; 256 is the pool's own limit
+    char name[96];
+    char vendor[64];
+    char category[64];
+};
+static_assert(std::is_trivially_copyable_v<WirePluginDesc>);
+static_assert(sizeof(WirePluginDesc) == 512, "WirePluginDesc is part of the region layout");
+
+// 2048 x 512 B = 1 MiB, one page of it resident until a scan writes into it.
+// The machine this was developed on has 410 plugins; a heavily populated LV2
+// install is a few hundred more. A catalog larger than this reports the first
+// kMaxCatalog and says how many it could not carry in
+// ControlHeader::catalogTruncated, which the browser draws — a visible,
+// testable degradation, never a silently short list.
+inline constexpr u32 kMaxCatalog = 2048;
+
+// ---------------------------------------------------------------------------
 // Command policy
 // ---------------------------------------------------------------------------
 //
@@ -962,7 +1024,22 @@ struct ControlHeader {
     std::atomic<u64> poolEpoch;         // client: +1 per published pool, 0 = none
     std::atomic<u64> poolAttachedEpoch; // daemon: the epoch it has mapped, 0 = none
     std::atomic<u64> poolAttachFailures;// daemon: attaches that did not work
-    u32  reserved[8];
+
+    // --- the plugin catalog (v6) --------------------------------------------
+    //
+    // Taken out of the reserved words rather than appended, so ControlHeader
+    // keeps its size and every section offset above kCatalog stays where it
+    // was. `scanPlugins` already says how many the scan FOUND; these two say
+    // how many made it into the table and how many did not fit. They are
+    // different numbers exactly when a machine has more than kMaxCatalog
+    // plugins, and a browser that drew the first without the second would be
+    // silently short.
+    //
+    // Written before scanState goes to ScanDone, with that release store as
+    // the publication edge for the whole table.
+    std::atomic<u32> catalogCount;      // rows published, <= kMaxCatalog
+    std::atomic<u32> catalogTruncated;  // plugins beyond kMaxCatalog, 0 normally
+    u32  reserved[6];
 
     // Creator only, before publishReady().
     void init(i32 pid, bool nullDriver, const char* driver) {
@@ -991,6 +1068,8 @@ struct ControlHeader {
         chainsRetired.store(0, std::memory_order_relaxed);
         scanState.store(ScanIdle, std::memory_order_relaxed);
         scanPlugins.store(0, std::memory_order_relaxed);
+        catalogCount.store(0, std::memory_order_relaxed);
+        catalogTruncated.store(0, std::memory_order_relaxed);
         engineDrains.store(0, std::memory_order_relaxed);
         drainsExact.store(0, std::memory_order_relaxed);
         reserved1.store(0, std::memory_order_relaxed);
@@ -1050,6 +1129,13 @@ inline constexpr size_t kClipTableBytes = sizeof(WireClip) * kMaxTracks * kMaxSc
 inline constexpr size_t kDeviceTableBytes = sizeof(WireDeviceInfo)   * kMaxDevices;
 inline constexpr size_t kParamTableBytes  = sizeof(WireDeviceParams) * kMaxDevices;
 
+// 1 MiB, and — like every table here — one resident page until a scan fills it.
+// It is the largest single section in the region and it is still a fifth of
+// what the pool's own header costs, which is the sizing argument §3 option B
+// makes: a fixed budget for the catalog is affordable precisely because the
+// catalog is small compared with audio.
+inline constexpr size_t kCatalogTableBytes = sizeof(WirePluginDesc) * kMaxCatalog;
+
 namespace control {
 
 inline constexpr size_t kHeader  = 0;
@@ -1065,22 +1151,29 @@ inline constexpr size_t kParams  = alignUp(kDevices + kDeviceTableBytes,      kC
 // other is the hash and the version — which is the mechanism, not an accident
 // of layout churn.
 inline constexpr size_t kJournal = alignUp(kParams  + kParamTableBytes,       kCacheLine);
-inline constexpr size_t kBytes   = kJournal + JournalRing::bytes();
+// The tenth section (v6). Appended for the same reason the ninth was: every
+// offset above it is unchanged, so nothing that already worked can be moved out
+// from under a peer by this — the only reason a v5 binary and a v6 binary
+// refuse each other is the hash and the version, which is the mechanism rather
+// than an accident of layout churn.
+inline constexpr size_t kCatalog = alignUp(kJournal + JournalRing::bytes(),   kCacheLine);
+inline constexpr size_t kBytes   = kCatalog + kCatalogTableBytes;
 
 // Everything that could move an offset out from under a peer goes into the
 // hash: the total size, every section offset, every message size, the ring
 // capacities and the protocol version.
 inline constexpr u32 kHash =
-    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
-        fnv1a("nxtakt.control.v5"),   // reseeded per protocol: see pool::kHash
+    hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(hashMix(
+        fnv1a("nxtakt.control.v6"),   // reseeded per protocol: see pool::kHash
         (u64)kBytes), (u64)kState), (u64)kCmds), (u64)kEvts), (u64)kMidi), (u64)kClips),
-        (u64)kDevices), (u64)kParams), (u64)kJournal),
+        (u64)kDevices), (u64)kParams), (u64)kJournal), (u64)kCatalog),
         (u64)(sizeof(WireCommand) * 65536 + sizeof(WireEvent) * 256 + sizeof(WireMidi))),
         (u64)(sizeof(WireJournal) * 65536ull + JournalRing::capacity()) ^
         (u64)(sizeof(WireArrHeader) * 65536ull + sizeof(WireArrItem))),
         (u64)(CommandRing::capacity() * 65536ull + EventRing::capacity()) ^
         (u64)(kProtocolVersion * 65536u + (u32)sizeof(WireClip)) ^
-        (u64)(sizeof(WireDeviceInfo) * 65536ull + sizeof(WireDeviceParams)));
+        (u64)(sizeof(WireDeviceInfo) * 65536ull + sizeof(WireDeviceParams)) ^
+        (u64)(sizeof(WirePluginDesc) * 65536ull + kMaxCatalog));
 
 } // namespace control
 
@@ -1109,9 +1202,18 @@ struct ControlMap {
     WireDeviceInfo*   devices = nullptr;   // [kMaxDevices], daemon -> client
     WireDeviceParams* params  = nullptr;   // [kMaxDevices], client -> daemon
     JournalRing*      journal = nullptr;   // daemon pump -> client, §9.6
+    WirePluginDesc*   catalog = nullptr;   // [kMaxCatalog], daemon -> client, v6
 
     bool valid() const {
-        return hdr && state && cmds && evts && midi && clips && devices && params && journal;
+        return hdr && state && cmds && evts && midi && clips && devices && params &&
+               journal && catalog;
+    }
+
+    WirePluginDesc* catalogRow(u32 i) {
+        return (catalog && i < kMaxCatalog) ? catalog + i : nullptr;
+    }
+    const WirePluginDesc* catalogRow(u32 i) const {
+        return const_cast<ControlMap*>(this)->catalogRow(i);
     }
 
     WireDeviceInfo* device(u32 id) {
@@ -1184,6 +1286,10 @@ private:
         if (params && !r.at<WireDeviceParams>(control::kParams + kParamTableBytes -
                                               sizeof(WireDeviceParams)))
             params = nullptr;
+        catalog = r.at<WirePluginDesc>(control::kCatalog);
+        if (catalog && !r.at<WirePluginDesc>(control::kCatalog + kCatalogTableBytes -
+                                             sizeof(WirePluginDesc)))
+            catalog = nullptr;
     }
 };
 

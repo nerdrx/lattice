@@ -1103,3 +1103,274 @@ provably gone.
   built, so it is the cheapest remaining feature by some distance.
 * **Hardware MIDI**, §1.3 option 1: move `MidiInput` into `nxtaktd`. It cannot
   be done from this side — `MidiInput::start()` takes an `Engine&`.
+
+---
+
+## 12. Steps 4, 5 and 6 shipped
+
+`NXTAKT_ENGINE=daemon` now loads plugins. A device the user adds instantiates in
+`nxtaktd`, renders there, follows its knobs, follows its bypass, comes back after
+an engine restart, and is refused *with a reason* when the engine has never heard
+of it. The browser lists what the daemon can load rather than what the GUI's own
+process happened to find, and the link between the two has a state machine with a
+number on it.
+
+### 12.1 The seam moved down one level, and no App file was touched
+
+§5 step 4 describes rewriting `App` around device ids: `DeviceModel::inst`
+deleted, `addDevice()` becoming "send and wait for the event", the knobs reading
+a `DeviceMirror`. **That is not what shipped, and the deviation is deliberate.**
+It edits `src/ui/session.h` and `src/ui/app_devices.cpp`, both owned by other
+agents this wave; more importantly it *deletes the in-process path*, which §8
+says stays supported through step 6 and which `tools/render.cpp`,
+`tools/gen_demo.cpp` and `engine_test` all still go through.
+
+So the seam went one level lower, at the single call every chain edit already
+funnels through:
+
+```
+App::publishChain(owner)
+  -> builds an RtChain* full of PluginInstance*
+  -> eng_.pushCommand({SetChain, owner, p = chain})
+       -> [daemon]  RemoteEngine::setChain(): read the chain's DESCRIPTION off
+                    those instances, reconcile the daemon toward it
+       -> [local]   Engine::pushCommand(), exactly as before
+```
+
+An `RtChain` cannot cross a process boundary. But **everything the daemon needs
+in order to build its own is readable off one through `PluginInstance`'s
+virtuals** — `desc().uri`, `paramInfo(i).id`, `getParam(i)`, `bypassed()` — and
+those four are the entire input. The GUI's instance stops being a thing that
+renders audio and becomes exactly what §4 says it should be: the model. The GUI
+is the authority on what exists; the engine on what sounds.
+
+Three consequences worth stating rather than discovering:
+
+1. **`Cmd::SetChain` now answers `true`.** §11.2's rule is unchanged and this is
+   not an exception to it — the command is *consumed and acted on*, not
+   swallowed. It has to answer true because `App::addDevice()` compares
+   `*co.published` before and after and **rolls the device back out of the
+   model** on a refusal ("Engine busy — device not added"). A `false` here was
+   the whole of the visible-and-silent bug.
+2. **The displaced chain is retired by a synthesised `Ev::ChainRetired`**, the
+   same stand-in §11.3 built for notes and for the same reason: there is no
+   engine on this path to send one, and without it `App::retiring_` grows for
+   the life of the session and every removed plugin leaks.
+3. **Parameters are POLLED, not hooked.** A knob drag calls
+   `PluginInstance::setParam()` on the GUI's own instance and there is no
+   command anywhere to hang a hook on. `syncParams()` compares the model against
+   what it last wrote, once a frame, and pushes the difference. One virtual
+   `getParam()` per mapped control per frame: ten devices of twenty controls is
+   200 calls, two orders of magnitude below a single draw call. It carries the
+   knobs, a project load's restored parameters, an undo, and a rack macro
+   driving its targets — none of which have a command of their own.
+
+Bypass is **not** on that path: it is `Cmd::SetBypass`, because it has to order
+against the chain edits around it (§3.7). That is the one-line change §1.6 warns
+is easy to get wrong by reflex.
+
+### 12.2 The reconciler, and the one invariant it rests on
+
+`live[chain]` is what the daemon's chain **will be** once everything already sent
+has been applied — placeholders for un-answered adds included. Because the daemon
+dequeues device commands strictly in the order it took them off the ring, a
+position computed against `live` is the position the daemon will use, even for
+commands whose answers have not come back. That is what lets a project load fire
+every `AddDevice` for a chain in one pass instead of one per frame.
+
+Order within a pass: **removals first** (so every position below is a position in
+the chain as it will be), then moves, then adds at their target positions. A
+chain with an unanswered add is skipped entirely for one frame, because its
+`live` holds an entry with no device id and a removal or a move could not name
+it.
+
+Failures are **tombstoned**, not retried: an `AddDevice` the daemon refuses would
+otherwise be re-sent sixty times a second for the life of the session. The
+tombstone is dropped the moment the GUI stops asking for that instance, so
+removing a device that would not load and adding it again genuinely retries.
+
+`docs/RACKS.md` §1 — a rack's `latencyFrames()` is its chain's sum and is not
+constant after `prepare()` — needs nothing special here: the daemon owns the
+instances, so it recomputes and republishes its own chain on every add, remove
+and move, and `WireDeviceInfo::latencyFrames` is its figure rather than ours.
+Republication is free because a chain is a *declaration*: publish it again and
+the reconciler works out the difference.
+
+**Parameters are addressed by `ParamInfo::id`, per `docs/PARAM-ADDRESS.md`**, and
+never by index. The two sides load the same plugin build so the ids match, but
+neither promises the other an index *ordering*, and a positional guess that was
+wrong would move the wrong knob silently — the worst failure this corner of the
+system has. A control with no counterpart is counted in
+`RemoteDevice::paramsUnmapped` and logged, never guessed at.
+
+### 12.3 What a rack does, and it is not good
+
+`RACKS.md` §4: a rack's descriptor is static and does not describe its contents,
+and there is no wire field that could carry them. So the daemon instantiates
+`nxtakt:rack` and gets an **empty** one — eight macros driving nothing — and the
+rack sounds as a passthrough while the GUI draws its contents. The macros
+themselves cross (they are ordinary `ParamInfo` knobs) and drive nothing.
+
+Logged once per chain rather than left silent, because "my rack went quiet" is
+otherwise unattributable. The fix is a `PoolKindRackState` blob carrying
+`rackStateToString()`'s output and an `AddDevice` that can name one — the string
+already exists, is already one line of printable ASCII, and is already
+version-tagged. It is the cheapest remaining device feature.
+
+### 12.4 The catalog: `kProtocolVersion` 6, a tenth section
+
+§3 option B, as specified. `WirePluginDesc[2048]` at 512 B each — 1 MiB,
+one resident page until a scan fills it — written once by the daemon's
+`publishCatalog()` from the pump thread *before* the `scanState = ScanDone`
+release store, which is the publication edge for the whole table. Read once by
+the client on `EvScanComplete`, or on attach if the scan is already done (a GUI
+that attaches to somebody else's daemon will never see the event).
+
+Same release discipline as `WireDeviceInfo`: `state` stored last, so a reader
+that sees a row `Live` has seen every byte. `catalogCount`/`catalogTruncated`
+came out of `ControlHeader::reserved`, so the header keeps its size and every
+section offset below `kCatalog` is unchanged — the only reason a v5 and a v6
+binary refuse each other is the hash and the version.
+
+A plugin whose URI does not fit 256 bytes is **dropped rather than truncated**: a
+truncated URI is not a shorter name for the same plugin, it is a different string
+that `AddDevice` would answer `RejectUnknownUri` for, and a browser row that
+cannot be loaded is worse than a row that is not there. Dropped rows are counted
+in `catalogTruncated`, which a browser must draw.
+
+The measured cost on this machine: 415 plugins, ~210 KiB of the table used, one
+memcpy-shaped pass at the end of a scan that already took 4 s.
+
+### 12.5 Lifecycle, and a bug that only a GUI could have found
+
+`EngineLink` (`src/ui/engine_state.h`) is §6's state machine, carried in the
+frame snapshot so a banner cannot flicker between two draws inside one frame.
+`engineLinkBanner()` and `engineLinkOffersRestart()` are §6's table, in the
+header, so the view has no policy in it.
+
+**`processAlive()` is not enough when the daemon is your own child.** A daemon we
+spawned is our child; a child nobody waits for is a **zombie**; a zombie still
+has a `/proc` entry with the same start ticks. So a GUI that started its own
+engine would watch it be SIGKILLed and go on reporting it alive for the rest of
+the session — and "the process is gone" is precisely the one state §4.4 permits
+acting on automatically. `RemoteEngine::reapChild()` does a `WNOHANG` `waitpid`
+from `poll()`. The bug is invisible to a client that merely *attached* (no child,
+no zombie), which is why 546 daemon_test checks never saw it.
+
+Stale and Lost are now distinguishable and both are tested against a real daemon:
+`SIGSTOP` gives Stale with a measured silence and provokes nothing; `SIGKILL`
+gives Lost, and only then is a restart offered.
+
+**`restartEngine()`** is §6's recovery and the only things that may call it are a
+user click and a provably dead engine. It reaps, respawns, re-attaches (which
+re-announces the pool — `attach()` calls `publishPool()`), republishes every clip
+cell from the client's shadow, replays the scalars, and re-issues `AddDevice` for
+every device on every chain because ids do not survive an engine (§11.4). The
+transport comes back **stopped**.
+
+The scalar replay is new and is what makes the restart complete without App
+knowing anything happened: the handle keeps a `(type, a, b) -> Command` shadow of
+every **state-bearing** scalar it forwarded — tempo, quantum, metronome, the
+mixer, sends, return levels, clip gain/warp/loop. Actions are deliberately not in
+it. Replaying a `LaunchScene` after a crash would be the GUI inventing a
+performance the user did not give, and §4.4's honest default is a stopped
+transport. Clips are republished first and scalars second, so a `Cmd::ClipGain`
+moved after the cell was published wins over the cell's own copy.
+
+### 12.6 Evidence
+
+`tests/handle_test.cpp` is 28 checks -> **84**, all against a real spawned
+`nxtaktd`. The ones that matter:
+
+* **A plugin added in daemon mode makes sound from the daemon.** A DC 0.5 clip
+  meters 0.5000 dry; publish a chain holding one device and it meters 0.4621,
+  which is `tanh(0.5)` — the Saturator's own shaper, computed in another process.
+* **A knob turned on the GUI's own instance changes what the daemon renders.**
+  `sat.setParam(kOutput, -12.f)` — exactly what `drawDeviceStrip()` does, with
+  nothing sent — takes it 0.4621 -> 0.1161, the ×0.251 that −12 dB is.
+  `setBypassed(true)` takes it back to the dry 0.5000 and un-bypassing restores
+  0.4621.
+* Removing the device retires the displaced chain by pointer, and the track
+  meters 0.5000 again.
+* An unknown URI is answered `EvDeviceFailed` with a reason, once — the failure
+  count is unchanged over sixty further frames.
+* The catalog carries 415 plugins with their real shape (Pulse is an instrument
+  and takes MIDI), and `daemon_test` §11b loads a device straight off catalog
+  row 0, which is the property the table exists for.
+* `SIGSTOP` -> Stale, 504 ms of measured silence, nothing restarted itself;
+  `SIGCONT` -> Live; `SIGKILL` -> Lost; `restartEngine()` -> a different pid, the
+  chain rebuilt, the clip sounding again with no decode at the 0.5 master the
+  scalar shadow put back.
+
+**Removal tests, run and watched go red** (the discipline §11.6 established):
+
+| removed | red |
+|---|---|
+| `publishCatalog()` from `registryReady()` | daemon_test ×3 |
+| the per-row `state.store(CatalogSlotLive)` | daemon_test ×3, incl. "every row the header claims parses Live (0 of 415)" |
+| `out.link` (daemon branch) | handle_test ×4 |
+| `out.link` (local branch) | handle_test ×1 |
+| `out.linkSilentMs` | handle_test ×1 |
+| `out.devicesPending` | handle_test ×1 |
+| `reapChild()` | handle_test ×1 — the zombie bug |
+| `syncParams()` | handle_test ×2 |
+
+`catalogTruncated` reads 0 on any sane machine, so asserting it *equals* 0 would
+pass against a daemon that never stored it. The discriminating check is the sum:
+`catalogCount + catalogTruncated == scanPlugins` can only hold if both halves
+were written. Same trick as §7d's poisoning, one step sideways.
+
+### 12.7 Owed, and what step 7 still has to do
+
+**Diffs to files this wave did not own.** None of these is required for the
+above to work; each moves a capability from "reachable through the handle" to
+"visible in the UI".
+
+1. **The browser should list the daemon's catalog** (`src/ui/app_devices.cpp`).
+   `ensurePluginScan()` becomes "if `eng_.remoteOpen()`, `eng_.requestScan()`
+   and show a spinner while `eng_.scanRunning()`"; `drawPluginBrowser()`'s
+   `const std::vector<PluginDesc>& all = registry_.plugins();` becomes
+   `= eng_.catalogReady() ? eng_.catalog() : registry_.plugins();`, and
+   `eng_.catalogTruncated()` must be drawn when non-zero. Until this lands the
+   browser is §3 option A — the GUI's own scan — which is the bridge §3 permits
+   for exactly one wave.
+   *Caveat worth carrying into the diff:* `App::addDevice()` still calls
+   `registry_.instantiate()` to build the model's instance, so a row only the
+   daemon can see would be listed and then fail locally. Both processes scan the
+   same machine, so this is the divergence the catalog exists to make visible
+   rather than a new failure — it disappears when `DeviceModel::inst` does.
+2. **The banner** (`src/ui/app_chrome.cpp`), one line under the control bar:
+   `if (const char* b = engineLinkBanner(es_.link)) …`, plus a Restart button
+   gated on `engineLinkOffersRestart(es_.link)` calling `eng_.restartEngine()`.
+   Everything it needs is in the snapshot; there is no policy to get wrong.
+3. **"Loading…" and the reject reason on a device slot**
+   (`drawDeviceStrip`, `src/ui/app_devices.cpp`):
+   `const RemoteDevice* rd = eng_.remoteDevice(d.inst.get());` — null or
+   `!rd->live` means the engine has not made it yet, `rd->failed` means it will
+   not and `rd->error` says why, and `rd->paramsTruncated` is §1.6's "…and N more
+   controls this build cannot reach". Today a slot the engine refused draws as an
+   ordinary device that happens to be silent.
+4. **The status bar** should read `es_.devicesPending` and
+   `eng_.remoteDevice(...)->latencyFrames`, and §5 step 4's `sessionSyncing_` is
+   exactly `es_.devicesPending != 0`.
+5. **The rename**, still owed from §11.9: `eng_.openLocal(...)` at
+   `src/ui/app.cpp:54` should be `eng_.open(...)`.
+
+**Still genuinely missing, for step 7's wave:**
+
+* **Rack contents** (§12.3). A `PoolKindRackState` blob and one field on
+  `CmdAddDevice`.
+* **`DeviceModel::inst` deleted**, which is §5 step 4 as written and which is
+  what makes the browser caveat in (1) go away. It is a step-7-era change
+  because it is the moment the in-process path leaves `App`, per §8 (3).
+* **Recording** (§7). Unchanged and still the reason `inproc` is the default.
+* **The arrangement over the wire** (§11.9). Unchanged.
+* **Hardware MIDI** (§11.9). Unchanged.
+* **`deviceParamEngineGeneration()` is still not read.** §1.6 predicted this
+  becomes load-bearing the day presets or native plugin UIs land: the daemon does
+  not mirror a plugin moving its own controls back, so `syncParams()` would
+  overwrite it on the next frame. The field is there; nothing consumes it yet.
+* **A second GUI on the same session would fight over the chains.** The
+  reconciler assumes it is the only writer of the device tables, which it is
+  today (§4.3's reattach is not reachable). Worth a sentence in the release note
+  rather than a mechanism.

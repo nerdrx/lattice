@@ -59,6 +59,18 @@ struct ParamMirror {
     bool isLog()  const { return (flags & ParamIsLog)  != 0; }
 };
 
+// One row of the daemon's plugin catalog, with the strings back. Deliberately
+// not lat::PluginDesc for the same reason ParamMirror is not lat::ParamInfo:
+// src/plugin does not link here, and the point of the catalog is that this list
+// is the DAEMON's answer rather than whatever this process could find.
+struct CatalogEntry {
+    std::string uri, name, vendor, category;
+    u32  format = 0, kind = 0;
+    u32  audioIn = 0, audioOut = 0;
+    u32  paramCount = 0;
+    bool hasMidiIn = false;
+};
+
 struct DeviceMirror {
     u32  id = 0;
     u32  generation = 0;
@@ -604,6 +616,63 @@ public:
 
     u32 scanState()   const { return header().scanState.load(std::memory_order_acquire); }
     u32 scanPluginCount() const { return header().scanPlugins.load(std::memory_order_relaxed); }
+
+    // -- the catalog (v6, GUI-ON-DAEMON.md §3 option B) ---------------------
+    //
+    // What the DAEMON can instantiate. The scan is the daemon's, so this is the
+    // only honest source for a browser: a GUI listing its own PluginRegistry
+    // can offer a row whose double-click can only ever come back
+    // EvDeviceFailed(RejectUnknownUri).
+    //
+    // Read once, on EvScanComplete or on attach when scanState is already Done.
+    // Nothing rewrites the table afterwards, so there is no generation to
+    // watch and no tearing to guard against beyond the per-row release store.
+    u32 catalogCount() const {
+        const u32 n = header().catalogCount.load(std::memory_order_acquire);
+        return n < kMaxCatalog ? n : kMaxCatalog;
+    }
+    // Plugins the scan found that did not fit kMaxCatalog. A browser MUST draw
+    // this when it is non-zero; a silently short list is the failure mode the
+    // fixed budget buys and the only thing that makes it acceptable is that it
+    // is visible.
+    u32 catalogTruncated() const {
+        return header().catalogTruncated.load(std::memory_order_relaxed);
+    }
+
+    // One row, with every string terminated by us rather than trusted: the
+    // table is written by another process, and a name that ran off the end of
+    // its array would be a read past the mapping.
+    bool readCatalogEntry(u32 i, CatalogEntry& out) const {
+        const WirePluginDesc* p = attached() ? map_.catalogRow(i) : nullptr;
+        if (!p) return false;
+        // Acquire: `state` is stored last, so seeing Live means seeing the row.
+        if (p->state.load(std::memory_order_acquire) != CatalogSlotLive) return false;
+        out = CatalogEntry{};
+        out.uri        = fixed(p->uri,      sizeof p->uri);
+        out.name       = fixed(p->name,     sizeof p->name);
+        out.vendor     = fixed(p->vendor,   sizeof p->vendor);
+        out.category   = fixed(p->category, sizeof p->category);
+        out.format     = p->format;
+        out.kind       = p->kind;
+        out.audioIn    = p->audioIn;
+        out.audioOut   = p->audioOut;
+        out.paramCount = p->paramCount;
+        out.hasMidiIn  = p->hasMidiIn != 0;
+        return !out.uri.empty();
+    }
+
+    // The whole table, in the daemon's own order. Returns the number appended;
+    // `out` is cleared first, so a reader that calls this on every
+    // EvScanComplete cannot accumulate duplicates.
+    int readCatalog(std::vector<CatalogEntry>& out) const {
+        out.clear();
+        const u32 n = catalogCount();
+        out.reserve(n);
+        CatalogEntry e;
+        for (u32 i = 0; i < n; ++i)
+            if (readCatalogEntry(i, e)) out.push_back(std::move(e));
+        return (int)out.size();
+    }
 
     // -- the param table ----------------------------------------------------
     //

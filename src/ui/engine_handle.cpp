@@ -7,15 +7,19 @@
 #include "engine_handle.h"
 #include "../ipc/client.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <new>
 #include <string>
 #include <unordered_map>
 
+#include <cerrno>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace lat {
@@ -124,11 +128,38 @@ std::string daemonPath() {
     return std::string(buf) + "/nxtaktd";
 }
 
+// The chain an App owner id and a Cmd name, as one flat index. The daemon uses
+// exactly this layout for its own chains_[] (nxtaktd.cpp, chainIndex()), and
+// for the same reason: every operation below is "whatever chain this device is
+// on", and a three-way branch per operation is three chances to get it wrong.
+constexpr int kChainCount  = kMaxTracks + kMaxReturns + 1;
+constexpr int kMasterChain = kMaxTracks + kMaxReturns;
+constexpr u32 kNoDev       = 0xffffffffu;
+
+// A state-bearing scalar is one whose value the engine HOLDS. Those are the
+// ones a respawned daemon has to be told again (§6's "push mixer scalars and
+// tempo"). The rest are actions — a launch, a stop, a locate — and replaying
+// one after a crash would be the GUI inventing a performance the user did not
+// give: §4.4's honest default is that the transport comes back STOPPED.
+bool cmdIsResyncState(Cmd t) {
+    switch (t) {
+        case Cmd::SetTempo: case Cmd::SetQuantum: case Cmd::SetMetronome:
+        case Cmd::TrackVol: case Cmd::TrackPan: case Cmd::TrackMute:
+        case Cmd::TrackSolo: case Cmd::TrackArm: case Cmd::MasterVol:
+        case Cmd::ClipGain: case Cmd::ClipWarp: case Cmd::ClipLoop:
+        case Cmd::SendLevel: case Cmd::ReturnVol:
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
 struct RemoteEngine {
     ipc::EngineClient cli;
     std::string session;
+    std::string driver;                 // what we would spawn a replacement with
     // > 0 only when WE started it. §6's parent-of-record rule: quitting the GUI
     // stops the daemon it spawned and leaves alone one it merely attached to.
     pid_t spawned = -1;
@@ -170,7 +201,75 @@ struct RemoteEngine {
     const void* pubWarp [kMaxTracks][kMaxScenes] = {};
     const void* pubArr  [kMaxTracks + 1] = {};      // index kMaxTracks = transport
     const void* pubTrackAutos[kMaxTracks] = {};
+    const void* pubChain[kChainCount] = {};
+    // ONE inbox for both the wire's events and the synthesised ones, drained by
+    // App through popEvent(). It is filled by pumpWire(), which runs from
+    // poll() — deliberately, so that a device add completes whether or not the
+    // caller happens to be draining events this frame. Reconciliation that only
+    // advanced when somebody asked for an event would be a coupling nothing
+    // states and nothing tests.
     std::deque<Event> synth;
+
+    // -- step 4: devices ----------------------------------------------------
+    //
+    // The GUI's PluginInstance is the identity and the model; the daemon's
+    // device id is what sounds. See the long note in engine_handle.h for why
+    // the seam is here rather than in App.
+    struct DevSlot {
+        PluginInstance* src = nullptr;
+        u32  id  = kNoDev;
+        bool live = false;              // EvDeviceAdded landed
+        bool bypass = false;            // what we last told the daemon
+        std::vector<i32> map;           // GUI param index -> daemon index, -1 none
+        std::vector<f32> pushed;        // last value written, per GUI param index
+    };
+    struct DevChain {
+        u32 target = ipc::DevTargetTrack;
+        i32 idx    = 0;
+        // Mirrors the daemon's chain, in processing order, including entries
+        // whose AddDevice has not been answered yet. Keeping the placeholders
+        // in place is what makes the next add's chainPos correct: the daemon
+        // applies device commands strictly in the order it dequeued them.
+        std::vector<DevSlot> live;
+        std::vector<PluginInstance*> want;    // what the GUI last published
+        // Instances the daemon REFUSED. Kept so reconcile() does not retry the
+        // same failing AddDevice sixty times a second; dropped as soon as the
+        // GUI stops asking for that instance, so a remove-and-re-add retries.
+        std::vector<PluginInstance*> refused;
+        bool dirty = false;
+        bool loggedRack = false;
+    };
+    DevChain chains[kChainCount];
+    struct PendingAdd { int chain = 0; PluginInstance* src = nullptr; };
+    std::deque<PendingAdd> pendingAdds;
+    // Stable storage for what remoteDevice() hands back: a vector's elements
+    // move when it grows, and a caller holding the pointer across a chain edit
+    // would be reading freed memory.
+    std::unordered_map<const PluginInstance*, RemoteDevice> devInfo;
+    u64 devAdded = 0, devFailed = 0;
+    bool loggedAsync = false;
+
+    // -- step 5: the catalog -------------------------------------------------
+    std::vector<PluginDesc> catalog;
+    u32  catalogCut = 0;
+    bool catalogRead = false;
+
+    // -- step 6: lifecycle ---------------------------------------------------
+    bool stopping   = false;            // EvEngineStopping seen
+    bool spawnedDied = false;           // the child we started has exited
+    u64  openedNs   = 0;
+    u64  lastHb     = 0;
+    u64  lastHbNs   = 0;
+    u64  resyncs    = 0;
+    // Every state-bearing scalar this handle has forwarded, by (type, a, b).
+    // §6's recovery needs the mixer and the tempo put back, and the handle is
+    // the only thing on this path that saw them go by — App's model has them,
+    // but App has no idea an engine was replaced. std::map and not a hash: it
+    // is walked in full exactly once per respawn and never touched on a hot
+    // path, and an ordered container makes the replay deterministic.
+    std::map<u64, Command> scalarShadow;
+    static constexpr size_t kMaxShadow = 4096;
+    bool loggedShadowFull = false;
 
     // -- accounting ---------------------------------------------------------
     u64  refusals = 0;                  // commands consumed because we cannot carry them
@@ -189,33 +288,24 @@ struct RemoteEngine {
     // spawn when that fails. Attaching first is what stops a pre-emptive reap
     // from unlinking a region whose daemon is merely between shm_open() and
     // ftruncate() — see the note on EngineClient::attach().
-    bool open(const char* sess, const char* driver) {
+    bool open(const char* sess, const char* drv) {
         session = (sess && *sess) ? sess : "default";
+        driver  = (drv && *drv) ? drv : "";
 
         if (!cli.attach(session.c_str(), 0)) {
-            const std::string path = daemonPath();
-            const char* args[6];
-            int n = 0;
-            args[n++] = "--session";
-            args[n++] = session.c_str();
-            if (driver && *driver) { args[n++] = "--driver"; args[n++] = driver; }
-            args[n] = nullptr;
-            LOGI("no engine on session '%s'; starting %s", session.c_str(), path.c_str());
-            spawned = ipc::EngineClient::spawnDaemon(path.c_str(), args);
-            if (spawned < 0) {
-                LOGE("could not fork a daemon (%s)", path.c_str());
-                return false;
-            }
-            if (!cli.attach(session.c_str(), 2000)) {
-                LOGE("the engine did not come up: %s", cli.error());
-                // Reap the corpse rather than leaving a zombie behind a GUI that
-                // is about to run in degraded mode for the rest of the session.
-                ::kill(spawned, SIGTERM);
-                ipc::EngineClient::waitFor(spawned, 1000);
-                spawned = -1;
-                return false;
-            }
+            LOGI("no engine on session '%s'; starting %s",
+                 session.c_str(), daemonPath().c_str());
+            // Reaping the corpse on failure rather than leaving a zombie behind
+            // a GUI that is about to run in degraded mode is inside
+            // spawnAndAttach().
+            if (!spawnAndAttach(2000)) return false;
         }
+
+        openedNs = ipc::monotonicNs();
+        // The catalog may already be there: we could have attached to a daemon
+        // that somebody else had already made scan. EvScanComplete is the other
+        // way in and it will not fire again for a scan that is already done.
+        if (cli.scanState() == ipc::ScanDone) readCatalog();
 
         std::snprintf(driverName, sizeof driverName, "daemon:%s", cli.header().driverName);
         const f64 r = cli.sampleRate();
@@ -265,15 +355,7 @@ struct RemoteEngine {
         // runs nxtaktd's ordinary shutdown (publish the flag, unlink the
         // region); SIGKILL is the escalation a supervisor owes a process that
         // will not go.
-        if (spawned > 0) {
-            ::kill(spawned, SIGTERM);
-            if (!ipc::EngineClient::waitFor(spawned, 2000)) {
-                LOGW("the engine did not stop on SIGTERM; killing it");
-                ::kill(spawned, SIGKILL);
-                ipc::EngineClient::waitFor(spawned, 1000);
-            }
-            spawned = -1;
-        }
+        stopSpawned();
     }
 
     // ---------------------------------------------------------------------
@@ -366,24 +448,35 @@ struct RemoteEngine {
     bool push(const Command& c) {
         const u32 type = (u32)c.type;
 
-        if (ipc::commandIsScalar(type))
-            return cli.pushCommand(c.type, c.a, c.b, c.x);
+        if (ipc::commandIsScalar(type)) {
+            if (!cli.pushCommand(c.type, c.a, c.b, c.x)) return false;
+            shadowScalar(c);
+            return true;
+        }
 
         switch (c.type) {
             case Cmd::SetClip:
             case Cmd::ClearClip:
                 return pushClipCell(c);
 
-            // The chain family is refused permanently by the protocol itself
-            // (§11.7.6): a client has no business naming an RtChain because it
-            // has no RtChains. `false` is safe here and is the honest answer —
-            // App::publishChain() is deliberately NOT on the deferred FIFO, so
-            // it frees the chain it built and logs, and nothing spins.
+            // The chain family stays refused ON THE WIRE — a client has no
+            // business naming an RtChain, because it has no RtChains, and that
+            // is the design and not a "not yet" (control.h's command policy).
+            //
+            // What changed in step 4 is that a refusal on the wire is not a
+            // refusal to the caller. The RtChain App just built is a complete
+            // DESCRIPTION of the chain it wants, readable through
+            // PluginInstance's virtuals, so it is consumed here and turned into
+            // AddDevice/RemoveDevice/MoveDevice against the daemon's own
+            // instances. Answering `true` is what stops App::addDevice() from
+            // rolling the device back out of the model as "engine busy"; the
+            // displaced chain is retired by the synthesised Ev::ChainRetired
+            // that setChain() queues, so App frees exactly what it would have.
             case Cmd::SetChain:
             case Cmd::SetReturnChain:
             case Cmd::SetMasterChain:
-                ++refusals;
-                return false;
+                setChain(c);
+                return true;
 
             // Same: startRecording() handles a refusal by freeing the capture
             // buffer and saying "Engine busy", which is the correct behaviour
@@ -501,28 +594,380 @@ struct RemoteEngine {
     }
 
     // ---------------------------------------------------------------------
+    // Devices (§5 step 4)
+    // ---------------------------------------------------------------------
+
+    // App's owner addressing (Command::a for the three chain commands) as the
+    // flat chain index, plus the wire's (target, index) pair for it.
+    static int chainOf(Cmd t, i32 a, u32& target, i32& idx) {
+        switch (t) {
+            case Cmd::SetChain:
+                if (a < 0 || a >= kMaxTracks) return -1;
+                target = ipc::DevTargetTrack; idx = a; return a;
+            case Cmd::SetReturnChain:
+                if (a < 0 || a >= kMaxReturns) return -1;
+                target = ipc::DevTargetReturn; idx = a; return kMaxTracks + a;
+            case Cmd::SetMasterChain:
+                target = ipc::DevTargetMaster; idx = 0; return kMasterChain;
+            default:
+                return -1;
+        }
+    }
+
+    // Ev::ChainRetired's own addressing (engine.h): a track index, kMaxTracks+i
+    // for a return, -1 for the master. Not the same as Command::a for a return
+    // chain, which is the bare index — App uses this only for its log line, but
+    // sending the wrong one would make that line lie.
+    static i32 retireAddr(int chain) {
+        return chain == kMasterChain ? -1 : (i32)chain;
+    }
+
+    // The GUI has declared a chain. Record it and let reconcile() make it so.
+    //
+    // Nothing is refused here and nothing spins: App::publishChain() is
+    // deliberately not on the deferred FIFO, so a `false` would make it free the
+    // chain it built and log "engine busy", and App::addDevice() would then roll
+    // the device back out of the model — which is exactly the "visible and
+    // silent" failure this step exists to remove. The work is asynchronous and
+    // the answer is "accepted".
+    void setChain(const Command& c) {
+        u32 target = 0; i32 idx = 0;
+        const int ci = chainOf(c.type, c.a, target, idx);
+        if (ci < 0) { refuse(c.type, "no such chain owner"); return; }
+
+        DevChain& ch = chains[ci];
+        ch.target = target;
+        ch.idx    = idx;
+        ch.want.clear();
+        const RtChain* rc = (const RtChain*)c.p;
+        if (rc)
+            for (int i = 0; i < rc->count && i < kMaxChainFx; ++i)
+                if (rc->fx[i]) ch.want.push_back(rc->fx[i]);
+
+        // A refusal tombstone only survives while the GUI keeps asking for that
+        // instance. Drop the others, so removing a device that would not load
+        // and adding it again genuinely retries rather than being remembered as
+        // broken forever.
+        for (size_t i = 0; i < ch.refused.size();) {
+            const bool stillWanted =
+                std::find(ch.want.begin(), ch.want.end(), ch.refused[i]) != ch.want.end();
+            if (stillWanted) ++i;
+            else ch.refused.erase(ch.refused.begin() + (long)i);
+        }
+
+        // docs/RACKS.md §4: a rack's descriptor does not describe its contents,
+        // and there is no wire field that could. The daemon instantiates
+        // 'nxtakt:rack' and gets an EMPTY one — eight macros driving nothing —
+        // so a rack crosses as a passthrough. Said once per chain rather than
+        // silently, because "my rack went quiet" is otherwise unattributable.
+        if (!ch.loggedRack)
+            for (PluginInstance* p : ch.want)
+                if (p && p->rack()) {
+                    ch.loggedRack = true;
+                    LOGW("daemon mode: a rack's CONTENTS have no wire field, so the "
+                         "engine loads an empty rack and it sounds as a passthrough "
+                         "(docs/RACKS.md §4)");
+                    break;
+                }
+
+        ch.dirty = true;
+        retire(pubChain[ci], c.p, Ev::ChainRetired, retireAddr(ci), 0);
+    }
+
+    // Walks every dirty chain and issues at most what the rings will take. Runs
+    // once per frame from poll().
+    //
+    // THE INVARIANT: `live` is what the daemon's chain will be once everything
+    // already sent has been applied — placeholders included. Because the daemon
+    // dequeues device commands strictly in order, a position computed against
+    // `live` is the position the daemon will use, even for commands whose
+    // answers have not come back yet.
+    void reconcile() {
+        if (!cli.attached()) return;
+        for (int ci = 0; ci < kChainCount; ++ci) {
+            DevChain& ch = chains[ci];
+            if (!ch.dirty) continue;
+
+            // A chain with an unanswered add is not reconcilable: its `live`
+            // holds a placeholder with no device id, so a removal or a move on
+            // it could not be expressed. One frame of waiting, and the queue is
+            // the daemon's, not ours.
+            bool waiting = false;
+            for (const DevSlot& s : ch.live) if (!s.live) { waiting = true; break; }
+            if (waiting) continue;
+
+            // What the daemon should end up with: everything the GUI wants,
+            // minus anything it has already refused.
+            std::vector<PluginInstance*> want;
+            want.reserve(ch.want.size());
+            for (PluginInstance* p : ch.want)
+                if (std::find(ch.refused.begin(), ch.refused.end(), p) == ch.refused.end())
+                    want.push_back(p);
+            if ((int)want.size() > kMaxChainFx) want.resize(kMaxChainFx);
+
+            bool stalled = false;
+
+            // 1. Removals first, so that every position computed below is a
+            //    position in the chain as it will be, not as it was.
+            for (size_t i = 0; i < ch.live.size() && !stalled;) {
+                DevSlot& s = ch.live[i];
+                if (std::find(want.begin(), want.end(), s.src) != want.end()) { ++i; continue; }
+                if (!cli.removeDevice(s.id)) { stalled = true; break; }
+                devInfo.erase(s.src);
+                ch.live.erase(ch.live.begin() + (long)i);
+            }
+
+            // 2. Position by position, move what is in the wrong place and add
+            //    what is not there at all.
+            for (size_t pos = 0; pos < want.size() && !stalled; ++pos) {
+                if (pos < ch.live.size() && ch.live[pos].src == want[pos]) continue;
+
+                size_t at = ch.live.size();
+                for (size_t j = pos; j < ch.live.size(); ++j)
+                    if (ch.live[j].src == want[pos]) { at = j; break; }
+
+                if (at < ch.live.size()) {
+                    if (!cli.moveDevice(ch.live[at].id, (i32)pos)) { stalled = true; break; }
+                    DevSlot moved = std::move(ch.live[at]);
+                    ch.live.erase(ch.live.begin() + (long)at);
+                    ch.live.insert(ch.live.begin() + (long)pos, std::move(moved));
+                    continue;
+                }
+
+                PluginInstance* p = want[pos];
+                const std::string uri = p ? p->desc().uri : std::string();
+                if (uri.empty()) { ch.refused.push_back(p); continue; }
+                if (!cli.addDevice(ch.target, ch.idx, (i32)pos, uri.c_str())) {
+                    stalled = true;                 // ring or pool full: retry next frame
+                    break;
+                }
+                DevSlot s;
+                s.src = p;
+                ch.live.insert(ch.live.begin() + (long)pos, std::move(s));
+                pendingAdds.push_back(PendingAdd{ci, p});
+                if (!loggedAsync) {
+                    loggedAsync = true;
+                    LOGI("daemon mode: devices instantiate in the engine, so a chain "
+                         "edit takes effect a moment after it is drawn (the first one "
+                         "waits for the engine's plugin scan)");
+                }
+            }
+
+            // Converged only when nothing is outstanding and the two agree.
+            if (!stalled && ch.live.size() == want.size()) {
+                bool same = true;
+                for (size_t i = 0; i < want.size(); ++i)
+                    if (ch.live[i].src != want[i] || !ch.live[i].live) { same = false; break; }
+                ch.dirty = !same;
+            }
+        }
+    }
+
+    // Every frame, for every device the daemon has: push what moved.
+    //
+    // This is a POLL and not a hook, because there is no hook to have: a knob
+    // drag calls PluginInstance::setParam() on the GUI's own instance and
+    // nothing tells this object. Polling the model is what makes the mirror
+    // complete — it also carries a project load's restored parameters, an undo,
+    // a rack macro driving its targets and a bypass toggle, none of which have
+    // a command of their own on this path.
+    //
+    // Cost is one virtual getParam() per mapped control per frame: a session
+    // with ten devices of twenty controls is 200 calls, which is two orders of
+    // magnitude below one draw call.
+    void syncParams() {
+        for (int ci = 0; ci < kChainCount; ++ci)
+            for (DevSlot& s : chains[ci].live) {
+                if (!s.live || !s.src) continue;
+
+                // Bypass is a COMMAND and not a param write, and getting that
+                // wrong is a one-line reflex: it has to order against the chain
+                // edits around it, because bypass-then-remove and
+                // remove-then-bypass are different (§3.7).
+                const bool bp = s.src->bypassed();
+                if (bp != s.bypass && cli.setBypass(s.id, bp)) s.bypass = bp;
+
+                const int n = s.src->paramCount();
+                const int m = (int)s.map.size();
+                for (int i = 0; i < n && i < m; ++i) {
+                    if (s.map[i] < 0) continue;
+                    const f32 v = s.src->getParam(i);
+                    // Bitwise, not `!=`. A plugin that reports NaN would make
+                    // every comparison unequal and turn this into a write per
+                    // control per frame, forever.
+                    if (std::memcmp(&v, &s.pushed[i], sizeof v) == 0) continue;
+                    if (cli.setDeviceParam(s.id, (u32)s.map[i], v)) s.pushed[i] = v;
+                }
+            }
+    }
+
+    // An AddDevice has been answered. Bind the id, work out which of the GUI's
+    // controls each of the daemon's is, and push every value at once.
+    void bindDevice(int ci, PluginInstance* src, u32 id) {
+        if (ci < 0 || ci >= kChainCount) return;
+        DevSlot* slot = nullptr;
+        for (DevSlot& s : chains[ci].live) if (s.src == src && !s.live) { slot = &s; break; }
+        if (!slot) {
+            // The GUI removed it again before the answer arrived. Undo the add
+            // rather than leaving an instance sounding that nothing references.
+            LOGW("device %u arrived for a chain slot that is gone; removing it", id);
+            cli.removeDevice(id);
+            return;
+        }
+        slot->id   = id;
+        slot->live = true;
+        ++devAdded;
+
+        ipc::DeviceMirror m;
+        const bool ok = cli.readDevice(id, m);
+
+        RemoteDevice info;
+        info.id         = id;
+        info.generation = cli.deviceGeneration(id);
+        info.live       = true;
+        info.uri        = ok ? m.uri  : src->desc().uri;
+        info.name       = ok ? m.name : src->desc().name;
+        info.latencyFrames  = ok ? m.latencyFrames : 0;
+        info.paramsTruncated = ok ? m.truncatedParams : 0;
+
+        // docs/PARAM-ADDRESS.md: a control is named by ParamInfo::id, never by
+        // its position. The two sides load the same plugin build so the ids
+        // match — but neither promises the other an index ORDER, and a
+        // positional guess that was wrong would move the wrong knob silently,
+        // which is the worst failure this corner of the system has.
+        const int n = src->paramCount();
+        slot->map.assign((size_t)n, -1);
+        slot->pushed.assign((size_t)n, 0.f);
+        for (int i = 0; i < n; ++i) {
+            const u32 pid = src->paramInfo(i).id;
+            for (size_t j = 0; j < m.params.size(); ++j)
+                if (m.params[j].id == pid) { slot->map[i] = (i32)j; break; }
+            if (slot->map[i] >= 0) ++info.paramsMapped; else ++info.paramsUnmapped;
+        }
+        if (info.paramsUnmapped)
+            LOGW("device %u ('%s'): %u of %d controls have no counterpart in the "
+                 "engine's copy and will not follow the knob",
+                 id, info.name.c_str(), info.paramsUnmapped, n);
+
+        // Prime every value NOW rather than waiting for syncParams() to notice a
+        // difference: a project load sets the parameters on the instance before
+        // it publishes the chain, so the values are already right and nothing
+        // would ever look changed.
+        for (int i = 0; i < n; ++i) {
+            if (slot->map[i] < 0) continue;
+            const f32 v = src->getParam(i);
+            if (cli.setDeviceParam(id, (u32)slot->map[i], v)) slot->pushed[i] = v;
+        }
+        slot->bypass = src->bypassed();
+        if (slot->bypass) cli.setBypass(id, true);
+
+        devInfo[src] = std::move(info);
+        chains[ci].dirty = true;        // one more pass to declare it converged
+    }
+
+    void failDevice(int ci, PluginInstance* src, u32 reason) {
+        ++devFailed;
+        if (ci >= 0 && ci < kChainCount) {
+            DevChain& ch = chains[ci];
+            for (size_t i = 0; i < ch.live.size(); ++i)
+                if (ch.live[i].src == src && !ch.live[i].live) {
+                    ch.live.erase(ch.live.begin() + (long)i);
+                    break;
+                }
+            // Tombstoned so reconcile() does not ask again every frame. Cleared
+            // the moment the GUI stops asking for this instance.
+            if (std::find(ch.refused.begin(), ch.refused.end(), src) == ch.refused.end())
+                ch.refused.push_back(src);
+            ch.dirty = true;
+        }
+        RemoteDevice info;
+        info.failed = true;
+        info.uri    = src ? src->desc().uri : std::string();
+        info.name   = src ? src->desc().name : std::string();
+        info.error  = ipc::rejectReasonName(reason);
+        LOGE("the engine would not load '%s': %s", info.uri.c_str(), info.error.c_str());
+        devInfo[src] = std::move(info);
+    }
+
+    u32 pendingDevices() const { return (u32)pendingAdds.size(); }
+
+    // Everything the daemon knew is gone with it. Device ids are the DEAD
+    // engine's and mean nothing to its replacement (§11.4), so every chain goes
+    // back to "wanted, nothing there" and reconcile() rebuilds it from the
+    // instances the GUI still holds.
+    void forgetDevices() {
+        for (int ci = 0; ci < kChainCount; ++ci) {
+            chains[ci].live.clear();
+            chains[ci].refused.clear();
+            chains[ci].dirty = !chains[ci].want.empty();
+        }
+        pendingAdds.clear();
+        devInfo.clear();
+    }
+
+    // ---------------------------------------------------------------------
+    // The catalog (§5 step 5)
+    // ---------------------------------------------------------------------
+
+    void readCatalog() {
+        std::vector<ipc::CatalogEntry> rows;
+        cli.readCatalog(rows);
+        catalog.clear();
+        catalog.reserve(rows.size());
+        for (const ipc::CatalogEntry& e : rows) {
+            PluginDesc d;
+            d.uri        = e.uri;
+            d.name       = e.name;
+            d.vendor     = e.vendor;
+            d.category   = e.category;
+            d.format     = (PluginFormat)e.format;
+            d.kind       = (PluginKind)e.kind;
+            d.audioIn    = (int)e.audioIn;
+            d.audioOut   = (int)e.audioOut;
+            d.hasMidiIn  = e.hasMidiIn;
+            d.paramCount = (int)e.paramCount;
+            catalog.push_back(std::move(d));
+        }
+        catalogCut  = cli.catalogTruncated();
+        catalogRead = true;
+        LOGI("the engine's plugin catalog: %zu plugins%s", catalog.size(),
+             catalogCut ? " (and more than the table can carry)" : "");
+        if (catalogCut)
+            LOGW("%u plugin(s) did not fit the catalog table and cannot be browsed",
+                 catalogCut);
+    }
+
+    // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
 
-    bool pop(Event& e) {
-        // Synthesised retirements first: they were queued during this frame's
-        // flushPending() and the caller is draining right after it, so handing
-        // them back before the wire's own events keeps the order App would have
-        // seen in-process.
-        if (!synth.empty()) { e = synth.front(); synth.pop_front(); return true; }
-
+    // Drains the wire into `synth`. Called from poll(), so the boundary's own
+    // bookkeeping advances on the frame clock rather than on whether the caller
+    // felt like asking for an event.
+    void pumpWire() {
         ipc::WireEvent w;
         while (cli.popEvent(w)) {
             if (w.type >= ipc::kDaemonEventBase) { observeDaemon(w); continue; }
             // A pointer-carrying engine event cannot have crossed — the daemon
             // does not forward them — so anything here is a scalar one.
             if (!ipc::eventIsScalar(w.type)) continue;
+            Event e;
             e.type = (Ev)w.type;
             e.a = w.a; e.b = w.b; e.x = w.x;
             e.p = nullptr;
-            return true;
+            synth.push_back(e);
         }
-        return false;
+    }
+
+    bool pop(Event& e) {
+        // One queue, in arrival order: the wire's events as pumpWire() took
+        // them off the ring, and the synthesised retirements interleaved where
+        // the pushes that caused them happened.
+        if (synth.empty()) pumpWire();
+        if (synth.empty()) return false;
+        e = synth.front();
+        synth.pop_front();
+        return true;
     }
 
     void observeDaemon(const ipc::WireEvent& w) {
@@ -532,6 +977,7 @@ struct RemoteEngine {
                      cmdName((Cmd)w.a), ipc::rejectReasonName((u32)w.b));
                 break;
             case ipc::EvEngineStopping:
+                stopping = true;
                 LOGW("the engine is shutting down");
                 break;
             case ipc::EvEventDropped:
@@ -541,14 +987,203 @@ struct RemoteEngine {
                 LOGI("the engine mapped the sample pool (%.0f B, epoch %llu)",
                      w.x, (unsigned long long)w.ref);
                 break;
+
+            // The daemon answers device commands strictly in the order it
+            // dequeued them, so the front of pendingAdds is the request this
+            // answers. EvDeviceFailed is shared with Remove/Move/SetBypass,
+            // which is why `x` (the command type) has to be checked: popping
+            // the queue on somebody else's failure would bind the next add's id
+            // to the wrong instance.
+            case ipc::EvDeviceAdded: {
+                if (pendingAdds.empty()) {
+                    LOGW("EvDeviceAdded for device %llu with nothing outstanding",
+                         (unsigned long long)w.ref);
+                    break;
+                }
+                const PendingAdd pa = pendingAdds.front();
+                pendingAdds.pop_front();
+                bindDevice(pa.chain, pa.src, (u32)w.ref);
+                break;
+            }
+            case ipc::EvDeviceFailed: {
+                if ((u32)w.x != ipc::CmdAddDevice) {
+                    LOGW("the engine refused a device command: %s",
+                         ipc::rejectReasonName((u32)w.b));
+                    break;
+                }
+                if (pendingAdds.empty()) break;
+                const PendingAdd pa = pendingAdds.front();
+                pendingAdds.pop_front();
+                failDevice(pa.chain, pa.src, (u32)w.b);
+                break;
+            }
+            case ipc::EvScanComplete:
+                readCatalog();
+                break;
+            case ipc::EvDeviceRemoved:
+            case ipc::EvDeviceChanged:
+                // Ours to have caused, both of them: we are the only writer of
+                // this chain and of this bypass flag, so the model already
+                // knows. The client's own bookkeeping (the slot generation the
+                // param guard is stamped with) ran in popEvent()'s observe(),
+                // which is the part that matters.
+                break;
             default:
                 // EvClipAck and EvBlockRetired are already applied by
-                // EngineClient::popEvent()'s observe(); the device and scan
-                // events belong to step 4 and there is nothing to do with them
-                // yet. Deliberately quiet rather than deliberately ignored: the
-                // client's bookkeeping ran, which is the part that matters.
+                // EngineClient::popEvent()'s observe().
                 break;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Lifecycle (§6)
+    // ---------------------------------------------------------------------
+
+    // A DAEMON WE SPAWNED IS OUR CHILD, AND A CHILD NOBODY WAITS FOR IS A
+    // ZOMBIE. This is not housekeeping: `processAlive(pid, startTicks)` reads
+    // /proc, and a zombie still has a /proc entry with the same start ticks —
+    // so a GUI that started its own daemon would watch it be SIGKILLed and go
+    // on reporting it alive for the rest of the session, which is precisely the
+    // one state §4.4 says may be acted on automatically. The bug is invisible
+    // to a client that merely ATTACHED (no child, no zombie), which is why
+    // daemon_test never saw it.
+    //
+    // WNOHANG, from poll(), on the GUI thread: never blocks, never reaps
+    // anything that is not ours.
+    void reapChild() {
+        if (spawned <= 0) return;
+        int st = 0;
+        const pid_t r = ::waitpid(spawned, &st, WNOHANG);
+        if (r == spawned || (r < 0 && errno == ECHILD)) {
+            spawned    = -1;        // nothing left to signal in close()
+            spawnedDied = true;
+        }
+    }
+
+    EngineLink linkState() {
+        if (!cli.attached()) return EngineLink::Detached;
+        if (stopping)        return EngineLink::Stopping;
+        // The engine we started has exited. Dead is dead whatever the region
+        // still says, and it is the one state that may provoke a restart.
+        if (spawnedDied)     return EngineLink::Lost;
+        // alive() with an unreachable tolerance answers only the two questions
+        // staleness is not: has the creator gone, and did it publish the
+        // shutdown flag. Both are "dead", and dead is the ONLY state that may
+        // provoke an automatic restart (§4.4).
+        if (!cli.alive(~0ull))  return EngineLink::Lost;
+        if (cli.alive())        return EngineLink::Live;
+        // Attached, the process is there, but nothing has been published
+        // recently. A daemon between fork() and its first pump tick looks
+        // exactly like this, so it is Starting until it has ever beaten.
+        return lastHb == 0 ? EngineLink::Starting : EngineLink::Stale;
+    }
+
+    u32 silentMs() const {
+        if (!lastHbNs) return 0;
+        const u64 now = ipc::monotonicNs();
+        return now > lastHbNs ? (u32)((now - lastHbNs) / 1000000ull) : 0u;
+    }
+
+    void noteHeartbeat() {
+        const u64 hb = cli.heartbeat();
+        if (hb != lastHb || !lastHbNs) { lastHb = hb; lastHbNs = ipc::monotonicNs(); }
+    }
+
+    // The scalars a replacement engine has to be told again.
+    void shadowScalar(const Command& c) {
+        if (!cmdIsResyncState(c.type)) return;
+        const u64 key = ((u64)(u32)c.type << 40) ^ ((u64)(u32)c.a << 20) ^ (u64)(u32)c.b;
+        auto it = scalarShadow.find(key);
+        if (it != scalarShadow.end()) { it->second = c; return; }
+        if (scalarShadow.size() >= kMaxShadow) {
+            if (!loggedShadowFull) {
+                loggedShadowFull = true;
+                LOGW("the scalar shadow is full (%zu); a restarted engine may come back "
+                     "with some mixer values missing", kMaxShadow);
+            }
+            return;
+        }
+        scalarShadow.emplace(key, c);
+    }
+
+    bool spawnAndAttach(int timeoutMs) {
+        const std::string path = daemonPath();
+        const char* args[6];
+        int n = 0;
+        args[n++] = "--session";
+        args[n++] = session.c_str();
+        if (!driver.empty()) { args[n++] = "--driver"; args[n++] = driver.c_str(); }
+        args[n] = nullptr;
+        spawned = ipc::EngineClient::spawnDaemon(path.c_str(), args);
+        if (spawned < 0) { LOGE("could not fork a daemon (%s)", path.c_str()); return false; }
+        if (!cli.attach(session.c_str(), timeoutMs)) {
+            LOGE("the engine did not come up: %s", cli.error());
+            ::kill(spawned, SIGTERM);
+            ipc::EngineClient::waitFor(spawned, 1000);
+            spawned = -1;
+            return false;
+        }
+        return true;
+    }
+
+    void stopSpawned() {
+        if (spawned <= 0) { spawned = -1; return; }
+        ::kill(spawned, SIGTERM);
+        if (!ipc::EngineClient::waitFor(spawned, 2000)) {
+            LOGW("the engine did not stop on SIGTERM; killing it");
+            ::kill(spawned, SIGKILL);
+            ipc::EngineClient::waitFor(spawned, 1000);
+        }
+        spawned = -1;
+    }
+
+    // §6's recovery. The pleasant part is that the POOL SURVIVES: it is the
+    // GUI's region, it was never unlinked, and attach() re-announces it — so
+    // putting a set back is a memcpy of the clip table plus one SetClip per
+    // occupied cell. Nothing is decoded and no offset changes.
+    //
+    // What does NOT survive is device ids, so every chain is re-issued from
+    // scratch, and the transport, which comes back stopped on purpose.
+    bool restart() {
+        LOGW("restarting the audio engine");
+        stopSpawned();
+        // detach(), not close(): closePool() would unlink the samples, which
+        // are the one thing worth keeping across this.
+        cli.detach();
+        ipc::EngineClient::reapStale(session.c_str());
+        forgetDevices();
+        synth.clear();
+        stopping    = false;
+        spawnedDied = false;
+        loggedLost  = false;
+        lastHb     = 0;
+        lastHbNs   = 0;
+        catalogRead = false;
+
+        if (!spawnAndAttach(4000)) return false;
+
+        std::snprintf(driverName, sizeof driverName, "daemon:%s", cli.header().driverName);
+        const f64 r = cli.sampleRate();
+        if (r >= 8000.0 && r <= 384000.0) rate = r;
+        block = cli.blockSize();
+        openedNs = ipc::monotonicNs();
+
+        const int cells = cli.republishClips();
+        // Clips first, then scalars: a republished SetClip carries the cell's
+        // gain/warp/loop from the shadow, and a Cmd::ClipGain the user moved
+        // afterwards is in the scalar shadow. Replaying the scalars last is
+        // what makes the later of the two win, which is the one that is right.
+        int scalars = 0;
+        for (const auto& kv : scalarShadow)
+            if (cli.pushCommand(kv.second.type, kv.second.a, kv.second.b, kv.second.x))
+                ++scalars;
+
+        ++resyncs;
+        LOGI("engine restarted: pid %d, %d clip cell(s) and %d scalar(s) republished, "
+             "%zu chain(s) queued for rebuild. The transport is stopped.",
+             (int)cli.enginePid(), cells, scalars, (size_t)std::count_if(
+                 chains, chains + kChainCount, [](const DevChain& c) { return c.dirty; }));
+        return true;
     }
 };
 
@@ -706,12 +1341,26 @@ void EngineHandle::poll(EngineState& out) {
         // for respawning — a laptop resuming from suspend and a JACK restart
         // both look exactly like a wedged engine for a few hundred milliseconds,
         // and a second daemon under a live one is the worst available outcome.
-        // So this notices and says so, and does nothing else.
+        // So this notices and says so, and does nothing else: a restart happens
+        // on a user click, through restartEngine().
+        remote_->reapChild();
+        remote_->noteHeartbeat();
+        out.link         = remote_->linkState();
+        out.linkSilentMs = out.link == EngineLink::Live ? 0u : remote_->silentMs();
         if (!remote_->cli.alive() && !remote_->loggedLost) {
             remote_->loggedLost = true;
             LOGW("the audio engine stopped answering. Your set is intact; "
-                 "restart the GUI to reconnect.");
+                 "use Restart engine to reconnect.");
         }
+
+        // The frame's housekeeping, in the one order that converges: take the
+        // wire's answers first (an EvDeviceAdded arriving now binds an id this
+        // pass can already use), then make the daemon's chains match the ones
+        // the GUI declared, then mirror the knobs.
+        remote_->pumpWire();
+        remote_->reconcile();
+        remote_->syncParams();
+        out.devicesPending = remote_->pendingDevices();
         return;
     }
 
@@ -756,6 +1405,13 @@ void EngineHandle::poll(EngineState& out) {
 
     out.arrOverride    = e->arrOverride.load(std::memory_order_relaxed);
     out.journalDropped = e->journalDropped.load(std::memory_order_relaxed);
+
+    // An in-process engine cannot be stale (it is this process) and cannot be
+    // lost (it dies with us), so Live is the only thing local mode can honestly
+    // report — and the `!e` path above already returned Detached.
+    out.link           = EngineLink::Live;
+    out.linkSilentMs   = 0;
+    out.devicesPending = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,5 +1486,54 @@ u64  EngineHandle::midiReceived() const { return remote_ ? 0u : midi_.received()
 
 u64 EngineHandle::remoteRefusals() const { return remote_ ? remote_->refusals : 0u; }
 u64 EngineHandle::snapshotTears() const  { return remote_ ? remote_->tears : 0u; }
+
+// ---------------------------------------------------------------------------
+// Devices, the catalog, the link
+// ---------------------------------------------------------------------------
+
+const RemoteDevice* EngineHandle::remoteDevice(const PluginInstance* gui) const {
+    if (!remote_ || !gui) return nullptr;
+    auto it = remote_->devInfo.find(gui);
+    return it == remote_->devInfo.end() ? nullptr : &it->second;
+}
+u32 EngineHandle::devicesPending() const { return remote_ ? remote_->pendingDevices() : 0u; }
+u64 EngineHandle::devicesAdded() const   { return remote_ ? remote_->devAdded : 0u; }
+u64 EngineHandle::devicesFailed() const  { return remote_ ? remote_->devFailed : 0u; }
+
+const std::vector<PluginDesc>& EngineHandle::catalog() const {
+    // Empty in local mode ON PURPOSE, and callers must read it that way: there
+    // the process's own PluginRegistry IS the engine's registry, so a second
+    // copy of the same list would be two things to keep in step for no gain.
+    static const std::vector<PluginDesc> kNone;
+    return remote_ ? remote_->catalog : kNone;
+}
+u32  EngineHandle::catalogTruncated() const { return remote_ ? remote_->catalogCut : 0u; }
+bool EngineHandle::catalogReady() const     { return remote_ ? remote_->catalogRead : false; }
+bool EngineHandle::scanRunning() const {
+    return remote_ && remote_->cli.scanState() == ipc::ScanRunning;
+}
+bool EngineHandle::requestScan() {
+    // Nothing to ask for in local mode: App::ensurePluginScan() runs the scan
+    // in this process and that is the same catalog.
+    if (!remote_) return false;
+    if (remote_->catalogRead) return true;
+    if (remote_->cli.scanState() == ipc::ScanDone) { remote_->readCatalog(); return true; }
+    return remote_->cli.scanPlugins();
+}
+
+EngineLink EngineHandle::link() const {
+    if (remote_) return remote_->linkState();
+    return engine_ ? EngineLink::Live : EngineLink::Detached;
+}
+
+i32 EngineHandle::enginePid() const {
+    return remote_ ? remote_->cli.enginePid() : -1;
+}
+
+bool EngineHandle::restartEngine() {
+    if (!remote_) return false;
+    return remote_->restart();
+}
+u64 EngineHandle::resyncs() const { return remote_ ? remote_->resyncs : 0u; }
 
 } // namespace lat

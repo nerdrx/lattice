@@ -1571,6 +1571,10 @@ private:
         const u32 n = (u32)registry_.plugins().size();
         const f64 secs = (f64)(ipc::monotonicNs() - scanStartNs_) / 1e9;
         map_.hdr->scanPlugins.store(n, std::memory_order_relaxed);
+        // Before the ScanDone store, which is the publication edge for the
+        // whole table: a client that sees Done and then walks [0, catalogCount)
+        // is guaranteed by that release/acquire pair to see every row.
+        publishCatalog();
         map_.hdr->scanState.store(ipc::ScanDone, std::memory_order_release);
         LOGI("plugin scan complete: %u plugins in %.2f s", n, secs);
         ipc::WireEvent e{};
@@ -1579,6 +1583,59 @@ private:
         e.x    = secs;
         map_.evts->push(e);
         return true;
+    }
+
+    // -- the catalog table (v6, docs/GUI-ON-DAEMON.md §3 option B) ----------
+    //
+    // The scan already produced exactly this data; all this does is copy it
+    // where a client can see it. Runs once per scan, on the pump thread, and
+    // nothing rewrites a row afterwards — which is what lets the client read
+    // the table with no generation and no retry loop.
+    //
+    // A plugin whose URI does not fit is DROPPED rather than truncated. A
+    // truncated URI is not a shorter name for the same plugin, it is a
+    // different string that AddDevice would answer RejectUnknownUri for, and a
+    // browser row that cannot be loaded is worse than a row that is not there.
+    void publishCatalog() {
+        const std::vector<PluginDesc>& all = registry_.plugins();
+        u32 out = 0, dropped = 0;
+        for (const PluginDesc& d : all) {
+            if (out >= ipc::kMaxCatalog) { ++dropped; continue; }
+            if (d.uri.size() >= sizeof(ipc::WirePluginDesc::uri)) {
+                ++dropped;
+                LOGW("catalog: '%s' has a %zu-byte URI and cannot be carried",
+                     d.name.c_str(), d.uri.size());
+                continue;
+            }
+            ipc::WirePluginDesc* w = map_.catalogRow(out);
+            if (!w) break;
+            w->state.store(ipc::CatalogSlotFree, std::memory_order_relaxed);
+            w->format     = (u32)d.format;
+            w->kind       = (u32)d.kind;
+            w->audioIn    = (u32)(d.audioIn  < 0 ? 0 : d.audioIn);
+            w->audioOut   = (u32)(d.audioOut < 0 ? 0 : d.audioOut);
+            w->hasMidiIn  = d.hasMidiIn ? 1u : 0u;
+            w->paramCount = (u32)(d.paramCount < 0 ? 0 : d.paramCount);
+            w->reserved   = 0;
+            copyFixed(w->uri,      sizeof w->uri,      d.uri.c_str());
+            copyFixed(w->name,     sizeof w->name,     d.name.c_str());
+            copyFixed(w->vendor,   sizeof w->vendor,   d.vendor.c_str());
+            copyFixed(w->category, sizeof w->category, d.category.c_str());
+            w->state.store(ipc::CatalogSlotLive, std::memory_order_release);
+            ++out;
+        }
+        // Everything past the published rows is left explicitly Free, so a
+        // second scan that found fewer plugins cannot leave the tail of a
+        // longer one readable.
+        for (u32 i = out; i < ipc::kMaxCatalog; ++i)
+            if (ipc::WirePluginDesc* w = map_.catalogRow(i))
+                w->state.store(ipc::CatalogSlotFree, std::memory_order_release);
+
+        map_.hdr->catalogTruncated.store(dropped, std::memory_order_relaxed);
+        map_.hdr->catalogCount.store(out, std::memory_order_release);
+        if (dropped)
+            LOGW("catalog: %u of %zu plugins could not be carried (limit %u)",
+                 dropped, all.size(), (u32)ipc::kMaxCatalog);
     }
 
     // -- the device command queue -------------------------------------------
