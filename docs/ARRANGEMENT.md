@@ -2122,3 +2122,98 @@ wave-8 agent writes.
     drawn in AUTO's mode style. The alternative — REC means "record wherever
     the current view is" — makes one button do two things depending on a tab.
     **Confirm the chip and its position.**
+
+---
+
+## 13. The orchestrator's answers
+
+Binding for wave 8. Where an answer differs from the proposal, the reason is
+given; where it matches, the confirmation is still recorded so an agent never
+has to guess whether a question was seen.
+
+1. **Confirmed: 8a owns every `engine.h` edit**, lands them compiled-and-unused,
+   and is the serialization point. This is what 7a did for the automation
+   structs and it worked; the daemon builds against this header and three
+   shipped phases depend on it, so exactly one wave may touch it. The two
+   `Voice` floats are the proof the rule is right rather than an exception to
+   it: §3.4 shows they *cannot* live in a side table, so the header edit is
+   load-bearing and belongs with the wave that owns the header.
+
+2. **Confirmed: placement copies content.** The rejected alternatives are
+   rejected for the right kind of reason — reference-by-uid lets a scratchpad
+   retroactively rewrite a finished record, which is a product bug, not a
+   performance one. The duplication cost is bounded by `kMaxArrNotes` and audio
+   is shared through `SampleRef` anyway.
+
+3. **Confirmed: the bounded-crossfade divergence, and 4 beats.** Diverging from
+   Live is justified here precisely because it costs nothing: two simultaneous
+   items is `Track::voice` + `Track::prev`, which the engine already has. A
+   divergence that needs no new machinery is a divergence worth taking.
+
+4. **Confirmed with a modification: stop does not rewind, and a SECOND stop
+   does.** Live's behaviour, and it is the right compromise — the timeline
+   semantics are correct, and the muscle memory that expects a rewind still
+   finds one. Home also locates to zero. The double-press window is not a
+   timeout: a second `SetPlaying 0` while already stopped locates to zero, so it
+   is state, not timing, and it cannot misfire on a slow hand.
+
+5. **Confirmed: clip envelope beats arrangement lane.** A clip envelope is the
+   more specific statement and the one the user drew most recently in context.
+   Noted for the record that this is a one-line change today and a
+   compatibility question the moment sets exist that depend on it — which is
+   itself the argument for deciding it now rather than discovering it.
+
+6. **Confirmed: a take with a journal gap is refused.** Silently committing a
+   performance with four bars missing is the worse failure, because the user
+   cannot see what is absent. The refusal must name what happened — "take
+   discarded: N journal entries dropped" — since this is the line that will be
+   quoted back in the bug report.
+
+7. **Confirmed: the v6 spellings and the `aclip` sort exception.** The `off`
+   collision is accepted: the parser is in different states, and renaming either
+   use would be worse than the ambiguity — `off` is the natural word in both
+   places, and the format's readers are the parser and an occasional human with
+   the grammar in front of them. The sort-on-load exception is correct: an
+   ordering invariant the engine depends on must be established by the loader,
+   not assumed of the file.
+
+8. **Confirmed, all five bounds.** They are protocol from v6 on, and every one
+   is a "a human cannot reach this" number with room to spare. `kMaxArrItems =
+   512` per track is the only one worth a second look — a dense edit could
+   approach it — and 512 items on one track is already past what an arrangement
+   built by hand contains.
+
+9. **Confirmed: protocol v5 / pool v4 lands as 8g, on its own.** A deliberate
+   incompatibility on a shipped protocol deserves its own gate and its own
+   commit, exactly as phase 3 got. Starting it the moment 8a merges is right,
+   since it touches neither `src/audio` nor `src/ui`.
+
+10. **Confirmed: the detail panel is shown in Arrangement view. `detailH_` is
+    PER VIEW.** Two fields against one surprise is a trade worth taking: the
+    arrangement wants a tall panel for envelope lanes and the session wants a
+    short one for the grid, and a shared height means every switch between views
+    silently resizes the other. Neither is serialized; view state stays outside
+    the undo snapshot.
+
+11. **Confirmed: both extractions, as moves, and 8e owns `pianoroll.{h,cpp}`
+    for the duration.** `autolane.{h,cpp}` should have been extracted when
+    AUTOMATION.md §6.5 argued for it; a design that refers to a component as
+    though it exists is a debt that has now been called in twice, which is
+    exactly when to pay it. Pixel-identical assertion afterwards, the same gate
+    the `app.cpp` decomposition used.
+
+12. **Confirmed: ARR is a third independent chip** at `uiId(1, 12)`, right of
+    AUTO. One button whose meaning depends on which tab is open is the kind of
+    modality that produces a lost take and no explanation for it.
+
+### Two additions to wave 8's scope, from the warp wave
+
+- **`ClipModel::markers` must be serialized in v6** and included in the undo
+  snapshot. It is not today: the warp wave could touch neither
+  `src/core/project.cpp` nor `app_undo.cpp`, and nothing populates the vector
+  yet. This has to land *before* any marker UI, or the first thing a user does
+  with warp markers is lose them on save.
+- **`publishedWarp_` / `retiringWarp_` move onto `App`.** They live as a
+  file-scope publisher in `app_engine.cpp` for the same ownership reason; the
+  move is a change to their declaration and nothing else, and 8a is already in
+  that file.
