@@ -56,8 +56,9 @@ jobs:
       # wayland-scanner, and --no-install-recommends could otherwise skip it.
       - name: Install build dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          source .github/scripts/apt.sh
+          apt_update
+          apt_install \
             build-essential pkg-config \
             libjack-jackd2-dev libasound2-dev \
             libsndfile1-dev libsamplerate0-dev \
@@ -108,8 +109,9 @@ jobs:
       # fragile than shipping executables between jobs as artifacts.
       - name: Install render dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          source .github/scripts/apt.sh
+          apt_update
+          apt_install \
             build-essential pkg-config \
             libsndfile1-dev libsamplerate0-dev liblilv-dev lv2-dev \
             flac

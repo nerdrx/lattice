@@ -76,15 +76,15 @@ jobs:
       # architecture and no wine32.
       - name: Install mingw-w64 and wine
         run: |
-          set -euxo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends mingw-w64
+          source .github/scripts/apt.sh
+          apt_update
+          apt_install mingw-w64
           # The `wine` meta first: on noble, `wine64` alone installs only
           # /usr/bin/wine64 and no `wine` entry point (found the hard way —
-          # the job died at `wine --version`).
-          sudo apt-get install -y --no-install-recommends wine wine64 \
-            || sudo apt-get install -y --no-install-recommends wine64 \
-            || sudo apt-get install -y --no-install-recommends wine
+          # the job died at `wine --version`). Which spelling exists is a
+          # question apt-cache answers directly, rather than something to
+          # discover by failing an install.
+          apt_install_first_available "wine wine64" "wine64" "wine"
 
       # Whatever the packages actually installed, resolve the entry points once
       # and thread them through GITHUB_ENV; every later step uses $WINE rather
@@ -163,7 +163,9 @@ jobs:
       # headers, with the host g++. A check that only ever saw our own stubs
       # would prove nothing.
       - name: Install the real sndfile/samplerate headers (for the shim check)
-        run: sudo apt-get install -y --no-install-recommends libsndfile1-dev libsamplerate0-dev
+        run: |
+          source .github/scripts/apt.sh
+          apt_install libsndfile1-dev libsamplerate0-dev
 
       - name: Verify the mingw shim matches upstream
         run: make -f Makefile.mingw verify-shim
@@ -180,7 +182,8 @@ jobs:
       - name: Native reference count
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends liblilv-dev
+          source .github/scripts/apt.sh
+          apt_install liblilv-dev
           make build/engine_test
           ./build/engine_test > engine_test-native.txt || {
             echo "::error::the suite fails natively on this runner -- fix that first;"
