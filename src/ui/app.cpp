@@ -1,4 +1,5 @@
 #include "app.h"
+#include "arrange.h"
 #include "pianoroll.h"
 #include "../core/project.h"
 #include "../gfx/gl.h"
@@ -85,6 +86,11 @@ bool App::init(int argc, char** argv) {
         if (!openProject(argv[1])) LOGW("could not load %s: %s", argv[1], status_.c_str());
     } else {
         pushAll();
+        // The arrangement's half of the initial sync. openProject reaches it
+        // through adoptSession; the default set has no adoptSession to run, so
+        // the transport cell -- which carries the loop brace -- would otherwise
+        // never be published at all.
+        publishArrangementAll();
     }
     status_ = "Ready";
 
@@ -126,6 +132,14 @@ bool App::init(int argc, char** argv) {
             showDetail_ = true;
         }
     }
+
+    // The arrangement's two hooks (docs/ARRANGEMENT.md §7.7). Here rather than
+    // on the first Arrangement frame as §7.7 words it, because the seed is what
+    // SWITCHES to that view: a hook that waits for the view it turns on would
+    // never run. Once per run either way, and the guards inside them say so.
+    if (!arrView_) arrView_ = std::make_unique<ArrangeView>();
+    debugSeedArrangement();
+    debugArrangeEdit();
 
     // The other headless hook: undo cannot be clicked inside gamescope, so
     // NXTAKT_DEBUG_UNDO drives the restore path here instead. See
@@ -229,9 +243,20 @@ void App::frame() {
 
     drawControlBar(bar);
 
+    // UN-GATED (docs/ARRANGEMENT.md §7.6, answer #10). In Arrangement view the
+    // CLIP tab shows the selected item's own `src` and edits it IN PLACE, which
+    // is Rule 1 paying for itself: because `src` is by value, the roll editing
+    // "the clip" edits precisely the one item the user selected, with no
+    // possibility of the edit leaking to another placement and no code in the
+    // roll that knows an arrangement exists.
+    //
+    // The height is PER VIEW and not shared: the arrangement wants a tall panel
+    // for envelope lanes and the session a short one for the grid, and one
+    // field would mean every switch between views silently resized the other.
     Rect detail{};
-    if (showDetail_ && view_ == MainView::Session) {
-        detail = {0, body.bottom() - detailH_ * s, W, detailH_ * s};
+    const f32 dH = detailHFor(view_);
+    if (showDetail_) {
+        detail = {0, body.bottom() - dH * s, W, dH * s};
         body.h -= detail.h;
     }
 
@@ -245,7 +270,7 @@ void App::frame() {
     if (view_ == MainView::Session) drawSessionView(main);
     else                            drawArrangementView(main);
 
-    if (showDetail_ && view_ == MainView::Session) drawDetailPanel(detail);
+    if (showDetail_) drawDetailPanel(detail);
     drawStatusBar(status);
     drawDragGhost();
 
@@ -302,6 +327,77 @@ void App::handleShortcuts() {
     }
     if (in.keyPressed['t'] && in.ctrl()) { undoPoint("add track"); addTrack(); }
     if (in.keyPressed[KeyEnter] && in.ctrl()) { undoPoint("add scene"); addScene(); }
+
+    // --- keys the ARRANGEMENT can claim -------------------------------------
+    // Layered exactly as the roll's keys are, and ahead of them because in this
+    // view the same keys mean something else: Delete removes the item under the
+    // selection and not the session slot behind the grid nobody is looking at.
+    // Everything the arrangement does not claim falls through untouched.
+    if (view_ == MainView::Arrangement) {
+        // The roll first, when it is showing the selected item's own clip: a
+        // note selection inside an item outranks the item, for the reason a note
+        // selection outranks the clip in Session view -- clearing the container
+        // from under an active edit is a spectacular way to lose work.
+        PianoRoll* const ar = visibleArrRoll();
+        ArrangeClip* const item = ar ? selectedArrItem() : nullptr;
+        const bool aNote = ar && item && ar->hasSelection(item->src);
+
+        if (in.keyPressed[KeyEscape]) {
+            if (aNote) ar->clearSelection();
+            else       send(Cmd::StopAll);
+        }
+        if (in.keyPressed[KeyDelete] || (in.keyPressed[KeyBackspace] && !in.ctrl())) {
+            if (aNote) {
+                const ClipModel before = item->src;
+                if (ar->deleteSelected(item->src)) {
+                    undoPointWith("delete note", item->src, before);
+                    publishArrangementFor(arrSelTrack_);
+                }
+            } else {
+                arrangeKey(0, "delete clip");
+            }
+        }
+        // Ctrl+E splits at the cursor -- Live's key, and free here. Ctrl+U
+        // duplicates, which is the roll's own duplicate key applied to the thing
+        // this view is about; inside an item's notes it keeps meaning the loop.
+        if (in.keyPressed['e'] && in.ctrl()) arrangeKey(1, "split clip");
+        if (in.keyPressed['u'] && in.ctrl()) {
+            if (ar && item) {
+                const ClipModel before = item->src;
+                if (ar->duplicateLoop(item->src)) {
+                    undoPointWith("duplicate loop", item->src, before);
+                    publishArrangementFor(arrSelTrack_);
+                }
+            } else {
+                arrangeKey(2, "duplicate clip");
+            }
+        }
+        if (aNote) {
+            int steps = 0, semis = 0;
+            if (in.keyPressed[KeyLeft])  --steps;
+            if (in.keyPressed[KeyRight]) ++steps;
+            const int step = in.shift() ? 12 : 1;
+            if (in.keyPressed[KeyUp])    semis += step;
+            if (in.keyPressed[KeyDown])  semis -= step;
+            if (steps || semis) {
+                const ClipModel before = item->src;
+                if (ar->nudgeSelected(item->src, steps, semis)) {
+                    undoPointWith("nudge note", item->src, before, kArrowGesture);
+                    publishArrangementFor(arrSelTrack_);
+                }
+            }
+        }
+        // Home locates to zero (answer #4 names it beside stop-does-not-rewind).
+        if (in.keyPressed[KeyHome]) send(Cmd::Locate, 0, 0, 0.0);
+
+        if (in.keyPressed['s'] && in.ctrl()) {
+            const std::string p = ses_.path.empty()
+                                      ? (homeDir() + "/" + ses_.name + ".lattice")
+                                      : ses_.path;
+            saveProjectTo(p);
+        }
+        return;
+    }
 
     // --- keys the piano roll can claim --------------------------------------
     // The roll only claims a key while it is on screen for the selected clip,
@@ -469,6 +565,18 @@ PianoRoll* App::visibleRoll() {
     return m.valid() ? roll_.get() : nullptr;
 }
 
+// visibleRoll's sibling. The roll only claims a key while it is on screen for
+// the item the arrangement has selected -- and it is a DIFFERENT roll, because
+// a roll's zoom, scroll and selection are about one particular clip and sharing
+// one would reset the session clip's every time the view was switched.
+PianoRoll* App::visibleArrRoll() {
+    if (!arrRoll_ || view_ != MainView::Arrangement || !showDetail_ ||
+        detailTab_ != DetailTab::Clip)
+        return nullptr;
+    const ArrangeClip* it = selectedArrItem();
+    return (it && it->src.valid()) ? arrRoll_.get() : nullptr;
+}
+
 void App::startPreview(int pitch, u64 clipUid) {
     if (pitch < 0 || pitch > 127) return;
     // Previews belong to one clip at a time: the moment the panel shows a
@@ -504,8 +612,21 @@ void App::updatePreviews() {
     // clip and the panel can vanish between frames (another slot selected,
     // Ctrl+D, the DEVICES tab, Arrangement). Nothing downstream will ever end
     // these notes if this does not.
+    // WHICH roll is on screen, and which clip it is showing. Two of them now
+    // (§7.6 un-gated the panel), and the check has to cover both: with only the
+    // session roll consulted, every audition started in Arrangement view was
+    // ended on the very next frame -- a note-on and a note-off with nothing
+    // audible in between.
     const PianoRoll* live = visibleRoll();
-    if (!live || ses_.tracks[selTrack_].slots[selSlot_].uid != previewClip_) {
+    u64 shown = 0;
+    if (live) {
+        shown = ses_.tracks[selTrack_].slots[selSlot_].uid;
+    } else if (const PianoRoll* ar = visibleArrRoll()) {
+        live = ar;
+        const ArrangeClip* it = selectedArrItem();
+        shown = it ? it->src.uid : 0;
+    }
+    if (!live || shown != previewClip_) {
         stopPreviews();
         return;
     }

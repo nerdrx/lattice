@@ -4,6 +4,7 @@
 //
 #include "app.h"
 #include "app_internal.h"
+#include "arrange.h"
 #include "pianoroll.h"
 #include "../core/project.h"
 #include "../gfx/gl.h"
@@ -143,7 +144,36 @@ void App::drawControlBar(const Rect& r) {
                      Align::Center);
         if (hot) ui_.tip = "Automation arm: record control moves into the playing clip";
         if (hot && win_.input().pressed[0]) toggleAutoArm();
-        x = autoR.right() + 12 * s;
+        x = autoR.right() + 4 * s;
+    }
+
+    // Arrangement arm -- a THIRD independent chip, immediately right of AUTO and
+    // before the position readout (docs/ARRANGEMENT.md §7.7, answer #12), in
+    // AUTO's own style because it is likewise a MODE the transport row reports
+    // and not a transport action.
+    //
+    // Rejected, and worth recording at the call site: folding it into REC.
+    // "Record into the session grid" and "record onto the timeline" are
+    // different destinations, and one button would have to pick between them
+    // from view_ -- which means the same click does two different things
+    // depending on which tab is open. That is the modality AUTOMATION.md §5.1
+    // refused when it made the automation arm its own control.
+    {
+        Rect arrR{x, cy, 30 * s, h};
+        const u64 id = uiId(1, 12);
+        const bool hot = ui_.setHot(id, arrR) && ui_.isHot(id);
+        if (hot) ui_.cursor = Cursor::Hand;
+        rend_.roundRect(arrR, 2 * s, arrArm_ ? pal::accent.alpha(0.18f)
+                                             : (hot ? pal::slotHover : pal::appBg));
+        rend_.textIn(fSmall_, arrR, "ARR", arrArm_ ? pal::accentHi : pal::textFaint,
+                     Align::Center);
+        if (hot) ui_.tip = "Arrangement arm: record armed tracks onto the timeline";
+        if (hot && win_.input().pressed[0]) {
+            arrArm_ = !arrArm_;
+            status_ = arrArm_ ? "Arrangement arm on - recording lands on the timeline"
+                              : "Arrangement arm off";
+        }
+        x = arrR.right() + 12 * s;
     }
 
     // --- position readout ---
@@ -421,46 +451,432 @@ void App::refreshBrowser() {
 // arrangement placeholder + chrome
 // ---------------------------------------------------------------------------
 
-void App::drawArrangementView(const Rect& r) {
-    const f32 s = win_.dpiScale();
-    rend_.rect(r, pal::appBg);
+// ---------------------------------------------------------------------------
+// the arrangement view  (docs/ARRANGEMENT.md §7)
+//
+// The placeholder is gone. What is here is the division §7.1 specifies and the
+// piano roll already lives by: the VIEW draws, hit-tests and edits, and the
+// CALLER -- this -- owns everything else. Building the context, arrangeRepair,
+// publishArrangementFor, the undo point, and the transport commands the ruler
+// generates are all on this side of the seam, which is why arrange.cpp knows
+// nothing about Engine, Command, RtClip or a PluginInstance.
+// ---------------------------------------------------------------------------
 
-    // Timeline ruler so the view is oriented even before it does anything.
-    Rect ruler{r.x, r.y, r.w, 22 * s};
-    rend_.rect(ruler, pal::panel);
-    const f32 pxPerBar = 48 * s;
-    for (int bar_ = 0; bar_ * pxPerBar < r.w; ++bar_) {
-        const f32 x = r.x + bar_ * pxPerBar;
-        rend_.rect({x, ruler.y, 1 * s, ruler.h}, pal::ridge);
-        if (bar_ % 4 == 0) {
-            char buf[16];
-            snprintf(buf, sizeof buf, "%d", bar_ + 1);
-            rend_.text(fSmall_, x + 3 * s, ruler.y + 4 * s, buf, pal::textFaint);
+void App::buildArrangeContext(ArrangeContext& ctx, std::vector<AutoTargets>* targets) {
+    ctx.lanes.clear();
+    ctx.lanes.reserve(ses_.tracks.size());
+    if (targets) targets->assign(ses_.tracks.size(), AutoTargets{});
+    const u32 ovr = engine_.arrOverride.load();
+    for (size_t i = 0; i < ses_.tracks.size(); ++i) {
+        TrackModel& t = ses_.tracks[i];
+        ArrangeContext::Lane L;
+        L.name = t.name;
+        L.colorIdx = t.colorIdx;
+        L.items = &t.arrange;
+        L.autos = &t.arrangeAutos;
+        L.height = &t.arrHeight;
+        L.armed = t.arm;
+        // ENGINE-OWNED, and set at the quantized launch the engine computed
+        // rather than when the click happened (engine.h): the flag says what is
+        // actually sounding, which is the only thing worth desaturating a lane
+        // for.
+        L.overridden = i < kMaxTracks && (ovr & (1u << (u32)i)) != 0u;
+        L.expanded = i < kMaxTracks ? &arrExpanded_[i] : nullptr;
+        if (targets) {
+            // What this track's arrangement lanes may name. The SAME builder the
+            // clip envelopes use, handed an empty clip: buildAutoTargets's only
+            // use of the clip is to mark which targets are already automated, and
+            // for a track lane that question is answered against arrangeAutos
+            // instead -- which is done right after, in place.
+            AutoTargets& at = (*targets)[i];
+            buildAutoTargets((int)i, ClipModel{}, at);
+            for (AutoTargets::Entry& e : at.entries)
+                for (const AutoLane& al : t.arrangeAutos)
+                    if (al.address == e.address) { e.automated = true; break; }
+            L.targets = &at;
+        }
+        ctx.lanes.push_back(std::move(L));
+    }
+    ctx.nextUid   = &ses_.nextUid;
+    ctx.loopStart = &ses_.loopStart;
+    ctx.loopEnd   = &ses_.loopEnd;
+    ctx.loopOn    = &ses_.loopOn;
+    ctx.playhead  = engine_.beat.load();
+    ctx.playing   = engine_.playing.load();
+    ctx.sigNum    = ses_.sigNum;
+    ctx.selTrack  = arrSelTrack_;
+    ctx.selItem   = arrSelItem_;
+}
+
+ArrangeClip* App::selectedArrItem() {
+    if (arrSelTrack_ < 0 || arrSelTrack_ >= (int)ses_.tracks.size() || !arrSelItem_)
+        return nullptr;
+    for (ArrangeClip& c : ses_.tracks[(size_t)arrSelTrack_].arrange)
+        if (c.uid == arrSelItem_) return &c;
+    return nullptr;
+}
+
+void App::arrangeCommit(ArrangeContext& ctx, u32 changed) {
+    if (!arrView_) return;
+    arrangeCommitAutos(ctx, changed);
+
+    // THE UNDO HANDSHAKE, first and before anything else can move the model: the
+    // view names the edit on the frame its drag arms itself and mutates from the
+    // NEXT frame on, so this is taken against the set as it still stands. One
+    // entry per gesture, coalesced on the view's own gesture id -- the same
+    // machinery a fader drag uses.
+    if (const char* what = arrView_->takePendingEdit())
+        undoPoint(what, arrView_->gesture());
+
+    // The transport commands the ruler generated. Neither is an edit: a locate
+    // is where the timeline is, not what is on it, and Back to Arrangement
+    // clears an engine-owned flag that undo deliberately does not carry.
+    if (ctx.locateBeat >= 0.0) send(Cmd::Locate, 0, 0, ctx.locateBeat);
+    if (ctx.backToArrTrack >= 0) {
+        send(Cmd::BackToArrangement, ctx.backToArrTrack);
+        status_ = "Back to Arrangement: " + ses_.tracks[(size_t)ctx.backToArrTrack].name;
+    }
+    if (changed & ArrangeView::Loop) publishTransportCell();
+
+    // The one-shot verbs the mouse asked for. The undo point goes FIRST, because
+    // the verb is what moves the model and an entry that already contains the
+    // edit undoes nothing.
+    if (ctx.wantDelete) {
+        undoPoint("delete clip");
+        changed |= arrView_->deleteSelected(ctx);
+    }
+    if (ctx.wantSplit) {
+        undoPoint("split clip");
+        changed |= arrView_->splitSelected(ctx);
+    }
+
+    // A drop from the browser or from the session grid. The VIEW reported where;
+    // what to put there is this side's question, because the view knows nothing
+    // about samples, slots or clip loading.
+    if (ctx.dropped && ctx.dropTrack >= 0 && ctx.dropTrack < (int)ses_.tracks.size()) {
+        ClipModel src;
+        bool have = false;
+        if (drag_.kind == DragState::Kind::Clip &&
+            drag_.srcTrack >= 0 && drag_.srcTrack < (int)ses_.tracks.size() &&
+            drag_.srcSlot >= 0 && drag_.srcSlot < kMaxScenes) {
+            const ClipModel& m = ses_.tracks[(size_t)drag_.srcTrack].slots[drag_.srcSlot];
+            if (m.valid()) { src = m; have = true; }
+        } else if (drag_.kind == DragState::Kind::BrowserFile) {
+            have = makeClipFromFile(drag_.path, ses_.tracks[(size_t)ctx.dropTrack].colorIdx, src);
+            if (!have) status_ = "Could not load " + drag_.path;
+        }
+        if (have) {
+            // After the decode, so a file that could not be read leaves no
+            // history behind, and before the lane is touched.
+            undoPoint("drop clip");
+            ArrangeClip it;
+            it.start = ctx.dropBeat;
+            it.length = src.lengthBeats > kMinArrBeats ? src.lengthBeats : 4.0;
+            it.sourceUid = src.uid;          // PROVENANCE ONLY; it dangles soft
+            it.src = std::move(src);
+            std::vector<ArrangeClip>& lane = ses_.tracks[(size_t)ctx.dropTrack].arrange;
+            if ((int)lane.size() < kMaxArrItems) {
+                lane.push_back(std::move(it));
+                arrangeRepair(lane);
+                ctx.dirty.push_back(ctx.dropTrack);
+                changed |= ArrangeView::Items;
+                status_ = "Dropped onto " + ses_.tracks[(size_t)ctx.dropTrack].name;
+            }
+        }
+        drag_ = DragState{};
+    }
+
+    if (ctx.dirty.empty()) {
+        arrSelTrack_ = ctx.selTrack;
+        arrSelItem_  = ctx.selItem;
+        return;
+    }
+
+    // Identity, as a belt to the view's own stamping: the view mints a uid for
+    // everything it creates (ArrangeContext::nextUid), and this catches an item
+    // that arrived from a file written before uids existed. It is also what
+    // keeps ClipModel::src.uid equal to the item's, which is the identity the
+    // detail panel's roll keys its zoom and selection on.
+    assignUids();
+
+    // Exactly the tracks the view says it touched, and each of them once. A lane
+    // is up to 1.6 MB (§7.6), so "republish everything on every edit" would make
+    // a nudge cost the whole set.
+    std::sort(ctx.dirty.begin(), ctx.dirty.end());
+    ctx.dirty.erase(std::unique(ctx.dirty.begin(), ctx.dirty.end()), ctx.dirty.end());
+    for (int t : ctx.dirty)
+        if (t >= 0 && t < (int)ses_.tracks.size()) publishArrangementFor(t);
+
+    arrSelTrack_ = ctx.selTrack;
+    arrSelItem_  = ctx.selItem;
+}
+
+// ---------------------------------------------------------------------------
+// the one-shot verbs, and the keyboard's wrapper around them
+// ---------------------------------------------------------------------------
+
+u32 App::arrangeVerb(ArrangeContext& ctx, int verb, const char* what) {
+    if (!arrView_) return 0;
+    const int t = arrView_->selectedTrack();
+    if (t < 0 || t >= (int)ses_.tracks.size()) return 0;
+    // The entry has to be taken with the lane as it WAS, and only if the edit
+    // happens at all -- which is not knowable until the call returns, because a
+    // split on an item's own edge and a duplicate at kMaxArrItems are both
+    // legitimate no-ops. Copying a lane is a vector of items, which is why this
+    // is a keypress path and not a per-frame one; see undoPointWith.
+    std::vector<ArrangeClip> before = ses_.tracks[(size_t)t].arrange;
+    const u32 ch = verb == 0   ? arrView_->deleteSelected(ctx)
+                   : verb == 1 ? arrView_->splitSelected(ctx)
+                               : arrView_->duplicateSelected(ctx);
+    if (ch & ArrangeView::Items)
+        undoPointWith(what, ses_.tracks[(size_t)t].arrange, before);
+    return ch;
+}
+
+bool App::arrangeKey(int verb, const char* what) {
+    if (!arrView_ || !arrView_->hasSelection()) return false;
+    ArrangeContext ctx;
+    buildArrangeContext(ctx, nullptr);          // the verbs need lanes, not targets
+    const u32 ch = arrangeVerb(ctx, verb, what);
+    if (!ch) return false;
+    arrangeCommit(ctx, ch);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// the two headless hooks (§7.7)
+//
+// Nothing inside gamescope can drag a clip, and dragging a clip is precisely
+// the part a screenshot cannot check. Both are once per run, both are in the
+// NXTAKT_DEBUG_* shape the undo, ADDFX, AUTOLANE and MIDIMAP hooks already use,
+// and both drive the REAL paths -- the real verbs, the real undo entry, the real
+// publisher -- rather than a test double.
+// ---------------------------------------------------------------------------
+
+void App::debugSeedArrangement() {
+    if (arrDebugSeeded_) return;
+    const char* want = env("DEBUG_ARRANGE");
+    if (!want) return;
+    arrDebugSeeded_ = true;
+
+    // The view switch comes FIRST and unconditionally: this hook is the only
+    // way into Arrangement view without a mouse, and a set with nothing to seed
+    // is exactly the case a screenshot of the empty timeline is for.
+    view_ = MainView::Arrangement;
+    showDetail_ = true;
+    detailTab_ = DetailTab::Clip;
+
+    int t = 0;
+    std::sscanf(want, "%d", &t);
+    if (t < 0 || t >= (int)ses_.tracks.size()) {
+        LOGW("NXTAKT_DEBUG_ARRANGE: no track %d", t);
+        return;
+    }
+    TrackModel& tr = ses_.tracks[(size_t)t];
+    // Slot 0, or the first slot that holds anything: a hook that seeds nothing
+    // because the demo set happens to leave scene A empty is a hook that checks
+    // nothing.
+    int slot = -1;
+    for (int i = 0; i < kMaxScenes; ++i)
+        if (tr.slots[i].valid()) { slot = i; break; }
+    if (slot < 0) {
+        LOGW("NXTAKT_DEBUG_ARRANGE: track %d has no clip to seed from", t);
+        return;
+    }
+    const ClipModel& src = tr.slots[slot];
+    const f64 len = src.lengthBeats > 1.0 ? src.lengthBeats : 4.0;
+
+    // The scripted figure §7.7 asks for: FOUR items, one of them a split, one
+    // CROSSFADE PAIR at exactly kMaxOverlapBeats, one fade-in, and one item at a
+    // NON-ZERO offset. Every case the drawing and the invariant have, in one
+    // frame a screenshot can look at.
+    auto mk = [&](f64 start, f64 length, f64 offset, f64 fin, f64 fout) {
+        ArrangeClip c;
+        c.uid = ses_.newUid();
+        c.start = start;
+        c.length = length;
+        c.offset = offset;
+        c.fadeIn = fin;
+        c.fadeOut = fout;
+        c.sourceUid = src.uid;
+        c.src = src;
+        c.src.uid = c.uid;
+        return c;
+    };
+    tr.arrange.clear();
+    // 1 + 2: the split. One item cut in two at len/2, butt-jointed, which is R3's
+    // own case: no fades on the inner edges, and `offset` carried across the cut.
+    tr.arrange.push_back(mk(0.0,        len * 0.5, 0.0,       len * 0.25, 0.0));
+    tr.arrange.push_back(mk(len * 0.5,  len * 0.5, len * 0.5, 0.0,        kMaxOverlapBeats));
+    // 3: the other half of the crossfade pair, overlapping by exactly
+    // kMaxOverlapBeats with a matching fadeIn -- the one overlap the invariant
+    // admits, and the reason it is admitted at all.
+    tr.arrange.push_back(mk(len - kMaxOverlapBeats, len, 0.0, kMaxOverlapBeats, 0.0));
+    // 4: a non-zero offset, well clear of the pair.
+    tr.arrange.push_back(mk(len * 2.5, len * 0.75, len * 0.25, 0.0, 0.0));
+
+    const bool repaired = arrangeRepair(tr.arrange);
+
+    // One track automation lane, so the expanded row has something in it.
+    if (tr.arrangeAutos.empty()) {
+        AutoLane al;
+        al.address = addr::trackField(tr.uid, "vol");
+        al.points.push_back(AutoPoint{0.0,            0.30f, 0, {}});
+        al.points.push_back(AutoPoint{len * 0.5,      0.95f, 0, {}});
+        al.points.push_back(AutoPoint{len * 1.5,      0.55f, 0, {}});
+        al.points.push_back(AutoPoint{len * 3.0,      0.85f, 0, {}});
+        tr.arrangeAutos.push_back(std::move(al));
+    }
+
+    if (t < kMaxTracks) arrExpanded_[t] = true;
+    selectTrack(t);
+    // Item 1 (the second), so the panel draws a clip at a NON-ZERO offset and the
+    // split's inner edge is what the selection outline is around.
+    if (tr.arrange.size() > 1) {
+        arrSelTrack_ = t;
+        arrSelItem_  = tr.arrange[1].uid;
+        if (arrView_) arrView_->selectItem(t, arrSelItem_);
+    }
+    publishArrangementFor(t);
+
+    // What the LOG line checks, which a screenshot cannot: that arrangeRepair
+    // left the invariant intact. Re-derived here from the lane rather than
+    // trusted, which is the whole point of stating it.
+    bool ok = true;
+    const std::vector<ArrangeClip>& v = tr.arrange;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i].length < kMinArrBeats) ok = false;
+        if (v[i].fadeIn < 0.0 || v[i].fadeOut < 0.0) ok = false;
+        if (v[i].fadeIn + v[i].fadeOut > v[i].length + kArrOverlapEps) ok = false;
+        if (i == 0) continue;
+        if (v[i].start < v[i - 1].start) ok = false;
+        const f64 ov = v[i - 1].end() - v[i].start;
+        if (ov > kArrOverlapEps &&
+            !(ov <= kMaxOverlapBeats && v[i - 1].fadeOut >= ov && v[i].fadeIn >= ov))
+            ok = false;
+        if (i >= 2 && v[i].start < v[i - 2].end() - kArrOverlapEps) ok = false;
+    }
+    LOGI("NXTAKT_DEBUG_ARRANGE: track %d '%s' seeded %zu items from slot %d, "
+         "repair %s, invariant %s",
+         t, tr.name.c_str(), v.size(), slot, repaired ? "changed" : "clean",
+         ok ? "HOLDS" : "VIOLATED");
+    for (size_t i = 0; i < v.size(); ++i)
+        LOGI("  item %zu uid %llu  start %.3f len %.3f off %.3f fin %.3f fout %.3f  %s",
+             i, (unsigned long long)v[i].uid, v[i].start, v[i].length, v[i].offset,
+             v[i].fadeIn, v[i].fadeOut,
+             v[i].src.kind == ClipKind::Midi ? "midi" : "audio");
+    status_ = std::string("NXTAKT_DEBUG_ARRANGE: seeded ") + std::to_string(v.size()) +
+              " items on " + tr.name + (ok ? " - invariant holds" : " - INVARIANT VIOLATED");
+}
+
+// NXTAKT_DEBUG_ARREDIT=<verb>, one of split / dup / delete / move.
+//
+// Drives ONE arrangement edit through exactly the path a mouse would: the same
+// verb, the same undo entry, the same republish. What it prints is the two
+// things a screenshot cannot see -- that the gesture produced EXACTLY ONE undo
+// entry, and that the lane it touched came back through arrangeRepair intact.
+void App::debugArrangeEdit() {
+    if (arrDebugEdited_) return;
+    const char* want = env("DEBUG_ARREDIT");
+    if (!want) return;
+    arrDebugEdited_ = true;
+    if (!arrView_ || !arrView_->hasSelection()) {
+        LOGW("NXTAKT_DEBUG_ARREDIT: nothing selected (seed with NXTAKT_DEBUG_ARRANGE first)");
+        return;
+    }
+    const int t = arrView_->selectedTrack();
+    const size_t undoBefore = undo_.size();
+    const size_t nBefore = ses_.tracks[(size_t)t].arrange.size();
+
+    int verb = -1;
+    if      (icontains(want, "split"))  verb = 1;
+    else if (icontains(want, "dup"))    verb = 2;
+    else if (icontains(want, "del"))    verb = 0;
+    if (verb < 0) {
+        LOGW("NXTAKT_DEBUG_ARREDIT: unknown verb \"%s\" (split | dup | delete)", want);
+        return;
+    }
+    // "<verb>[:<item index>]". The seed leaves the selection on item 1, which is
+    // inside the crossfade pair -- so a split there has its head reclaimed by
+    // arrangeRepair, which is correct and is exactly the wrong thing to
+    // demonstrate a split with. The index says which item to act on instead.
+    if (const char* colon = std::strchr(want, ':')) {
+        const int want_i = std::atoi(colon + 1);
+        const std::vector<ArrangeClip>& v0 = ses_.tracks[(size_t)t].arrange;
+        if (want_i >= 0 && want_i < (int)v0.size()) {
+            arrSelTrack_ = t;
+            arrSelItem_  = v0[(size_t)want_i].uid;
+            arrView_->selectItem(t, arrSelItem_);
         }
     }
-
-    f32 y = ruler.bottom();
-    for (size_t i = 0; i < ses_.tracks.size(); ++i) {
-        Rect lane{r.x, y, r.w, 44 * s};
-        rend_.rect({lane.x, lane.y, lane.w, lane.h - 1 * s},
-                   i % 2 ? pal::appBg : pal::appBg.scale(1.12f));
-        rend_.rect({lane.x, lane.y, 3 * s, lane.h - 1 * s},
-                   pal::clipColors[ses_.tracks[i].colorIdx % pal::clipColorCount]);
-        rend_.textIn(fBody_, {lane.x + 10 * s, lane.y, 160 * s, lane.h},
-                     ses_.tracks[i].name.c_str(), pal::textDim, Align::Left, 0);
-        y += 44 * s;
-        if (y > r.bottom()) break;
+    // The cursor a split lands on. Nothing has moved a mouse, so it is put in
+    // the middle of the selected item -- which is where a hand would aim.
+    if (verb == 1) {
+        for (const ArrangeClip& c : ses_.tracks[(size_t)t].arrange)
+            if (c.uid == arrView_->selectedItem())
+                arrView_->setCursorBeat(c.start + c.length * 0.5);
     }
+    const bool did = arrangeKey(verb, verb == 0   ? "delete clip"
+                                      : verb == 1 ? "split clip"
+                                                  : "duplicate clip");
+    const std::vector<ArrangeClip>& v = ses_.tracks[(size_t)t].arrange;
+    LOGI("NXTAKT_DEBUG_ARREDIT: %s on track %d -> %s, items %zu -> %zu, "
+         "undo entries %zu -> %zu (%s)",
+         want, t, did ? "applied" : "refused", nBefore, v.size(),
+         undoBefore, undo_.size(),
+         (undo_.size() == undoBefore + (did ? 1u : 0u)) ? "EXACTLY ONE" : "WRONG COUNT");
+    status_ = std::string("NXTAKT_DEBUG_ARREDIT: ") + want +
+              (did ? " applied" : " refused");
+}
 
-    // Playhead against the same bar grid.
-    const f64 beat = engine_.beat.load();
-    const f32 px = r.x + (f32)(beat / ses_.sigNum) * pxPerBar;
-    if (px >= r.x && px <= r.right())
-        rend_.rect({px, ruler.bottom(), 1.5f * s, r.bottom() - ruler.bottom()}, pal::playGreen);
+void App::drawArrangementView(const Rect& r) {
+    if (!arrView_) arrView_ = std::make_unique<ArrangeView>();
+    std::vector<AutoTargets> targets;
+    ArrangeContext ctx;
+    buildArrangeContext(ctx, &targets);
+    // A drag in flight from the browser (visible in this view) or from the
+    // session grid (started before a Tab). See the report: §7.5 lists the second
+    // as a gesture, and the two views are never on screen at once.
+    ctx.dropActive = drag_.kind != DragState::Kind::None && drag_.armed;
 
-    rend_.textIn(fBody_, {r.x, r.bottom() - 40 * s, r.w, 20 * s},
-                 "Arrangement recording is not wired up yet — Tab returns to Session",
-                 pal::textFaint, Align::Center);
+    // The automation lanes' undo entry, and the one thing the pendingEdit
+    // handshake cannot cover. A breakpoint edit mutates on the very frame of the
+    // press (click-adds-a-point is the lane's whole gesture), so there is no
+    // frame in between for the view to warn on -- the roll has the same problem
+    // and solves it the same way, by copying the thing being edited before the
+    // draw and handing the copy back for the length of the snapshot.
+    //
+    // Only the EXPANDED tracks are copied, because only an expanded track's
+    // lanes are on screen to be clicked. That is what keeps this bounded: a
+    // track's lanes can hold kMaxArrPoints breakpoints, and copying every
+    // track's every frame would be the cost §7.6 warns about, paid for nothing.
+    autosBefore_.clear();
+    for (size_t i = 0; i < ses_.tracks.size() && i < kMaxTracks; ++i)
+        if (arrExpanded_[i]) autosBefore_.push_back({(int)i, ses_.tracks[i].arrangeAutos});
+
+    const u32 changed = arrView_->draw(ui_, r, ctx);
+    arrangeCommit(ctx, changed);
+}
+
+// The Autos half of the commit, split out only because it is the half with a
+// snapshot behind it. One entry per gesture, coalesced on whatever widget owns
+// the mouse -- so dragging a breakpoint across the timeline is one entry and not
+// one per frame, exactly as it is in the roll.
+void App::arrangeCommitAutos(ArrangeContext& ctx, u32 changed) {
+    if (!(changed & ArrangeView::Autos)) return;
+    for (int t : ctx.dirty) {
+        for (auto& snap : autosBefore_) {
+            if (snap.first != t) continue;
+            undoPointWith("automation edit", ses_.tracks[(size_t)t].arrangeAutos,
+                          snap.second, ui_.active);
+            // The snapshot has served its purpose for this gesture; leaving it
+            // would make the NEXT frame of the same drag compare against a state
+            // two frames old, which undoCoalesce already refuses to act on but
+            // which would be a lie if it ever did.
+            snap.second = ses_.tracks[(size_t)t].arrangeAutos;
+            return;
+        }
+    }
 }
 
 void App::drawStatusBar(const Rect& r) {

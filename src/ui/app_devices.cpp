@@ -110,6 +110,14 @@ void App::publishChain(int owner) {
 
     if (*co.published) retiring_.push_back(RetiredChain{*co.published, {}});
     *co.published = chain;
+
+    // A device-param lane names its target by chain SLOT, so a chain edit can
+    // move the parameter an arrangement lane was resolved against — or remove
+    // it. Republishing re-resolves every lane on this track against the chain
+    // that now exists; without it, an automation lane keeps driving whatever
+    // device inherited its slot. Clip envelopes re-resolve through pushClip on
+    // their own schedule; the track's arrangement lanes have no such trigger.
+    if (ownIsTrack(owner)) publishArrangeAutos(owner);
 }
 
 void App::addDevice(int owner, const PluginDesc& d) {

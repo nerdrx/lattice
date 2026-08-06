@@ -3,6 +3,7 @@
 //
 #include "app.h"
 #include "app_internal.h"
+#include "arrange.h"
 #include "pianoroll.h"
 #include "../core/project.h"
 #include "../gfx/gl.h"
@@ -131,7 +132,15 @@ void App::drawDetailPanel(const Rect& r) {
     // looking at even when the content area is empty.
     {
         char buf[128];
-        if (detailTab_ == DetailTab::Clip) {
+        if (detailTab_ == DetailTab::Clip && view_ == MainView::Arrangement) {
+            // In Arrangement view the CLIP tab is about the selected ITEM, so
+            // the context label says where on the timeline it is rather than
+            // which scene it is in -- it is not in one.
+            const ArrangeClip* it = selectedArrItem();
+            if (it) snprintf(buf, sizeof buf, "%s  -  bar %.2f",
+                             it->src.name.c_str(), it->start / std::max(1, ses_.sigNum) + 1.0);
+            else    snprintf(buf, sizeof buf, "no item selected");
+        } else if (detailTab_ == DetailTab::Clip) {
             const ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];
             // ASCII only: the glyph atlas has no dashes or middots.
             snprintf(buf, sizeof buf, "%s  -  scene %d", m.valid() ? m.name.c_str() : "no clip",
@@ -146,8 +155,132 @@ void App::drawDetailPanel(const Rect& r) {
     }
 
     Rect content{r.x, head.bottom(), r.w, r.bottom() - head.bottom()};
-    if (detailTab_ == DetailTab::Clip) drawClipDetail(content);
-    else                               drawDeviceDetail(content);
+    if (detailTab_ != DetailTab::Clip)          drawDeviceDetail(content);
+    else if (view_ == MainView::Arrangement)    drawArrangeClipDetail(content);
+    else                                        drawClipDetail(content);
+}
+
+// ---------------------------------------------------------------------------
+// the CLIP tab in Arrangement view (docs/ARRANGEMENT.md §7.6)
+//
+// The same editor on a different clip, and that is the whole of it: the roll
+// edits ArrangeClip::src IN PLACE and knows nothing about the arrangement.
+//
+// This is Rule 1 paying for itself. Because `src` is BY VALUE, the roll editing
+// "the clip" edits precisely the one item the user selected, with no
+// possibility of the edit leaking to another placement of the same material and
+// no code in the roll that knows an arrangement exists.
+//
+// What the controls column shows is deliberately NOT drawClipDetail's. Launch
+// quantum, probability and follow action are statements about how a clip is
+// LAUNCHED, and an item on the timeline is not launched -- it is placed. So the
+// column shows the placement instead: where the item starts, how long it is,
+// which beat of its clip it begins on, and its two fades.
+// ---------------------------------------------------------------------------
+
+void App::drawArrangeClipDetail(const Rect& r) {
+    const f32 s = win_.dpiScale();
+    ArrangeClip* const it = selectedArrItem();
+    if (!it || !it->src.valid()) {
+        rend_.textIn(fBody_, r,
+                     "No item selected  -  click a clip on the timeline, or drag one onto it",
+                     pal::textFaint, Align::Center);
+        return;
+    }
+    ClipModel& m = it->src;
+    const int track = arrSelTrack_;
+
+    const Col ccol = pal::clipColors[m.colorIdx % pal::clipColorCount];
+    Rect head{r.x, r.y + 1 * s, r.w, 20 * s};
+    rend_.rect({head.x, head.y, 4 * s, head.h}, ccol);
+    rend_.textIn(fBold_, {head.x + 10 * s, head.y, 260 * s, head.h}, m.name.c_str(),
+                 pal::text, Align::Left, 0);
+
+    const f32 panelW = 250 * s;
+    Rect ctrl{r.x + 8 * s, head.bottom() + 6 * s, panelW, r.bottom() - head.bottom() - 12 * s};
+    f32 y = ctrl.y;
+    const f32 rowH = 20 * s, lblW = 62 * s;
+    auto label = [&](const char* tx, const Rect& row) {
+        rend_.textIn(fSmall_, {row.x, row.y, lblW, row.h}, tx, pal::textFaint, Align::Left, 0);
+    };
+    // Every one of these is a placement field, so every one of them goes through
+    // the same commit: repair the lane, republish that track, one undo entry per
+    // drag (the widget's own id is the gesture).
+    bool placed = false;
+    auto num = [&](int id, const char* lbl, f64* v, f64 lo, f64 hi, const char* fmt) {
+        Rect row{ctrl.x, y, ctrl.w, rowH};
+        label(lbl, row);
+        f64 tmp = *v;
+        Rect dn{row.x + lblW, row.y, 90 * s, row.h};
+        if (ui_.dragNumber(uiId(27, id), dn, &tmp, lo, hi, 0.02, fmt)) {
+            undoPoint("clip placement");
+            *v = tmp;
+            placed = true;
+        }
+        y += rowH + 4 * s;
+    };
+    num(0, "START",  &it->start,  0.0, 1e6, "%.3f bt");
+    num(1, "LENGTH", &it->length, kMinArrBeats, 1e6, "%.3f bt");
+    num(2, "OFFSET", &it->offset, 0.0, 1e6, "%.3f bt");
+    num(3, "FADE IN",  &it->fadeIn,  0.0, kMaxOverlapBeats, "%.3f bt");
+    num(4, "FADE OUT", &it->fadeOut, 0.0, kMaxOverlapBeats, "%.3f bt");
+    {   // Gain and loop, which mean the same thing here as anywhere.
+        Rect row{ctrl.x, y, ctrl.w, rowH};
+        label("GAIN", row);
+        f64 db = gainToDb(m.gain);
+        Rect dn{row.x + lblW, row.y, 70 * s, row.h};
+        if (ui_.dragNumber(uiId(27, 5), dn, &db, -70.0, 12.0, 0.1, "%.1f dB")) {
+            undoPoint("clip gain");
+            m.gain = dbToGain((f32)db);
+            placed = true;
+        }
+        Rect lp{dn.right() + 6 * s, row.y, 52 * s, row.h};
+        if (ui_.button(uiId(27, 6), lp, "LOOP", m.loop, pal::accent)) {
+            undoPoint("clip loop");
+            m.loop = !m.loop;
+            placed = true;
+        }
+        y += rowH + 4 * s;
+    }
+    if (ui_.fSmall) {
+        Rect row{ctrl.x, y, ctrl.w, rowH};
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s  -  %.2f .. %.2f bt", ownerName(track).c_str(),
+                 it->start, it->end());
+        rend_.textIn(fSmall_, row, buf, pal::textFaint, Align::Left, 0);
+    }
+
+    Rect wave{ctrl.right() + 12 * s, head.bottom() + 6 * s,
+              r.right() - ctrl.right() - 20 * s, r.bottom() - head.bottom() - 12 * s};
+
+    if (!arrRoll_) arrRoll_ = std::make_unique<PianoRoll>();
+    AutoTargets targets;
+    buildAutoTargets(track, m, targets);
+
+    // Where the playhead is INSIDE this item, so the roll's line means the same
+    // thing it means for a session clip. Only while the transport is inside the
+    // item at all -- an item that is not sounding has no phase to show.
+    const f64 beat = engine_.beat.load();
+    const bool inside = engine_.playing.load() && beat >= it->start && beat < it->end();
+    const f64 phase = inside ? (it->offset + (beat - it->start)) : 0.0;
+
+    const ClipModel before = m;
+    if (arrRoll_->draw(ui_, wave, m, targets, phase, inside)) {
+        undoPointWith(arrRoll_->lastEdit(), m, before);
+        placed = true;
+    }
+    if (placed) {
+        // arrangeRepair after EVERY mutation, which is the rule the whole model
+        // rests on: a start or a length typed into this panel can overlap a
+        // neighbour exactly as a drag can.
+        if (track >= 0 && track < (int)ses_.tracks.size()) {
+            arrangeRepair(ses_.tracks[(size_t)track].arrange);
+            publishArrangementFor(track);
+        }
+    }
+    u8 pv[PianoRoll::kPreviewMax];
+    const int np = arrRoll_->drainPreview(pv, PianoRoll::kPreviewMax);
+    for (int i = 0; i < np; ++i) startPreview((int)pv[i], m.uid);
 }
 
 void App::drawClipDetail(const Rect& r) {

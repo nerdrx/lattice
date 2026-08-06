@@ -495,6 +495,11 @@ void App::pumpEngineEvents() {
 
     Event e;
     while (engine_.popEvent(e)) {
+        // Arrangement lanes and track-automation sets retire through their own
+        // reaper (app_arrange.cpp), which owns the tables they live in. Without
+        // this line every replaced lane leaks until shutdown, and an arrangement
+        // republishes on every edit.
+        if (reapArrangementEvent(e)) continue;
         if (e.type == Ev::ChainRetired) {
             // The audio thread has swapped this chain out and will never look
             // at it again, so the struct and every instance it was the last
@@ -609,7 +614,20 @@ void App::pumpEngineEvents() {
             // never published. AutoBlock::modelLane is the map, kept for exactly
             // this one question.
             const int t = e.a, s = e.b, li = (int)e.x;
-            if (t < 0 || t >= kMaxTracks || s < 0 || s >= kMaxScenes) continue;
+            if (t < 0 || t >= kMaxTracks) continue;
+            // b == -1 means the lane belongs to the TRACK's arrangement
+            // automation rather than to a clip envelope (8b+8c's encoding —
+            // lane index alone is ambiguous once two containers exist). It has
+            // no slot and no ClipModel, so the clip path below cannot resolve
+            // it; say it plainly instead of dropping it, which is the whole
+            // point of the event.
+            if (s == -1) {
+                if (t < (int)ses_.tracks.size())
+                    status_ = "Automation inert: an arrangement lane on " +
+                              ses_.tracks[(size_t)t].name + " has no realtime path";
+                continue;
+            }
+            if (s < 0 || s >= kMaxScenes) continue;
             const RtAutoSet* set = publishedAutos_[t][s];
             if (!set) continue;
             const AutoBlock* blk = nullptr;

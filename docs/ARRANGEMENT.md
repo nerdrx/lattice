@@ -2729,3 +2729,268 @@ size divides `alignof(WireAutoPoint)`. `daemon_test` §16c-2 publishes 1-, 3- an
   leaves the beat where it was, and a *second* `SetPlaying 0` locates to zero.
   Recorded here because the file is 8g's and the decision is 8b+8c's, and a note
   in a finished agent's report is not a place work survives.
+
+---
+
+## 17. 8e shipped — the UI
+
+Something draws the arrangement. `src/ui/timeaxis.h`, `src/ui/autolane.{h,cpp}`
+and `src/ui/arrange.{h,cpp}` are in, the detail panel is un-gated with
+`detailH_` per view, the ARR chip is a third independent toggle at
+`uiId(1, 12)`, and two headless hooks make the whole of it checkable without a
+mouse. `make test` green at **562 / 100 / 521**, every touched translation unit
+compiles at zero warnings with the wave flags, `make -j` links.
+
+### 17.1 The extractions, and the proof they are moves
+
+Both were done first and on their own, before a line of arrangement code
+existed, so the gate could be measured against a binary that differed in nothing
+else.
+
+**The measurement.** Three headless configurations of the piano roll — a MIDI
+clip with an envelope lane on show, the same clip with the velocity stems on
+show, and an audio clip with its waveform and its lane — captured through
+`tools/headless_test.sh` at the roll's own fit-to-width zoom and zero scroll,
+before the extraction and after it. The comparison is over **raw RGBA**, not the
+PNG: ImageMagick stamps `date:create` into a PNG's text chunks, so two encodings
+of one identical image have different file hashes and the first run of this gate
+reported a difference that was not there.
+
+```
+                    before                            after
+midi-lane   da901b52e857a8c914edc77261071b23   da901b52e857a8c914edc77261071b23
+midi-vel    d70406e6e69a74bd297f371c75eb3d90   d70406e6e69a74bd297f371c75eb3d90
+audio-lane  ea0a3cf43f13f0f18a545861612c4262   ea0a3cf43f13f0f18a545861612c4262
+```
+
+These are the **whole frame** below the control bar (`1600x932+0+46`), not the
+panel alone — so the session grid, the mixer, the browser and the scene column
+are inside the assertion too. The control bar is excluded because 8e adds the
+ARR chip to it, and the status bar because it carries an fps counter. `magick
+compare -metric AE` reports **0** differing pixels for all three. The same three
+hashes still hold at the end of the milestone, with the arrangement, the second
+piano roll and the un-gated panel all in the binary.
+
+**What moved.** `timeaxis.h` took `TimeAxis`, `beatToX`, `xToBeat`, `zoomView`,
+`kGridStep`, `kBeatsPerBar`, `kPxPerBeatMin/Max`, `kZoomMin/Max/PerNotch`,
+`quantFloor`/`quantNear` and two shared drawing helpers lifted verbatim out of
+`PianoRoll::draw` — `drawRulerLabels` and `drawTimeGrid`. `autolane.{h,cpp}`
+took `AutoLaneView` (the pure helpers §7.3 lists, plus the lane's slice of
+`draw()` and its `psel_`/`dragPt_`/`bandVal_` state), `IndexSel`, and `dpiOf`.
+`PianoRoll` is the lane's first caller and keeps `drawLaneKey`, which is
+roll-specific: it is what *adds* a lane to a clip.
+
+Five places where a literal move would have been wrong, each recorded because
+the gate would not have caught any of them:
+
+1. **`AutoLaneView::draw` takes two parameters more than §7.3's sketch** —
+   `resolved` and `inertWhy`. The roll's lane already distinguished "switched
+   off", "the engine gave up" and "the address names nothing today", and said
+   which in one line. A signature without them would have dropped that line,
+   which is a rendering change.
+2. **`nudgeSelected` takes `lengthBeats`.** §7.3 omits it; without it an arrow
+   key could push a breakpoint past the end of whatever owns it.
+3. **The lane's interaction now runs at lane-draw time**, not up in the roll's
+   interaction block. Nothing drawn in between reads a breakpoint, and the frame
+   still sees the frame's own edit — which is why the pixels did not move.
+4. **The lane REPORTS its cursor** (`dragging()`, `pointHovered()`) instead of
+   setting `ui.cursor`. The roll decides the cursor for its whole rect in one
+   ordered block at the end, and a lane that set it during its draw would
+   overtake a grid drag that outranks it.
+5. **`AutoLaneView` carries a settable widget id**, defaulting to `uiId(20, 1)`
+   — the id the roll's single lane has always used, so its hot/active behaviour
+   is unchanged. The arrangement's lanes each take one of their own, because
+   there are many and `setHot` is last-writer-wins.
+
+Both helpers learned an optional minimum spacing (`minGapPx`, `minStepPx`) after
+the gate was measured: at 16 px/beat a label on every beat is four numbers in
+the space of one, and 1/16 grid lines four pixels apart are a texture. The
+defaults are the roll's previous behaviour exactly, and the three hashes above
+were re-measured afterwards and are the ones printed.
+
+### 17.2 What `ArrangeContext` carries, and the four fields §7.1 does not have
+
+§7.1's struct, verbatim, plus:
+
+- **`u64* nextUid`** — `Session::nextUid`. Without it a split, a duplicate or a
+  Ctrl+drag copy is an item with no identity, and a uid is the only handle the
+  view, the detail panel and the publisher's envelope table have. It is a plain
+  counter, so the view still sees no model type it did not already see.
+- **`std::vector<int> dirty`** — the tracks the view mutated. A `Changed` mask
+  cannot name a track, and "republish everything on every edit" would make a
+  nudge cost up to 1.6 MB per track in the set.
+- **`f64 locateBeat`, `int backToArrTrack`** — the two ruler/header gestures
+  that are transport commands rather than edits. A mask cannot carry a beat.
+- **`dropActive` / `dropped` / `dropTrack` / `dropBeat`, `wantDelete`,
+  `wantSplit`** — requests. The view reports *where* a drag was let go and *that*
+  a one-shot verb was asked for; what to put there, and the undo point that has
+  to be taken before the model moves, are the caller's.
+- **`Lane::expanded` is a `bool*`**, where §7.1 has a value: the disclosure
+  triangle is one of the view's own gestures. The bit lives on `App`
+  (`arrExpanded_`), not on `TrackModel`, because it is view state and
+  `TrackModel` is what the project format writes.
+
+**The undo handshake**, which §7.1 does not specify and which every drag needs.
+A drag mutates over many frames and the entry has to be taken before the first
+of them — but a press that only selects must not cost an entry. So the view arms
+on the press, waits for the cursor to move, and on that frame, *before* touching
+the model, names the edit in `pendingEdit()`. The caller takes its point and the
+mutation starts on the next frame. One frame of latency at the start of a
+gesture, and the same shape `DragState::armed` already has.
+
+**When the model is repaired.** A drag mutates live, so the item follows the
+hand, but `arrangeRepair` and the republish happen once, on the release. Two
+things fall out and both are wanted: the engine never sees a lane that has not
+been through `arrangeRepair`, and sweeping across a neighbour does not eat it a
+frame at a time — the invariant is restored against the position the hand
+actually finished on. The one-shot verbs and the panel's placement fields repair
+immediately, because they have no in-between state.
+
+### 17.3 Interaction: shipped versus reserved
+
+Shipped: click to select; drag the body to move, grid-quantized, Shift
+unquantized, across tracks, Ctrl to leave a copy behind; drag the left edge to
+trim the head with `start` and `offset` moving **together**; drag the right edge
+to trim the tail; drag a top corner for `fadeIn` / `fadeOut`; double-click or
+Ctrl+E to split at the quantized cursor; Ctrl+U to duplicate; Delete or
+right-click to delete; drag a lane's bottom edge for `arrHeight`; the disclosure
+triangle; wheel / Shift+wheel / Ctrl+wheel through `timeaxis.h`; drag in the
+ruler for the loop brace and a plain click to locate; Home to locate to zero;
+the override chip as Back to Arrangement for its track; per-lane automation with
+a target chooser, a "+", an on/off and right-click to remove; and a drop target
+that accepts a drag from the browser or from the session grid.
+
+Reserved, each for a reason:
+
+- **`fadeShape`.** `ArrangeClip::fadeShape` is "reserved, exactly as
+  `AutoPoint::curve` is" (session.h) and no evaluator consults it, so a midpoint
+  drag would write a number nothing reads. The format preserves it; the editor
+  does not offer it.
+- **Rubber-band multi-select.** §7.5 lists it and §7.1's context cannot express
+  it: the selection there is one `(track, uid)` pair, and the detail panel is
+  built on that being one item. Making it a set is a change to the context, to
+  the panel and to every verb, and it is not what makes the view usable.
+- **`NXTAKT_DEBUG_ARRRENDER`.** §7.7's offline arrangement-versus-session render
+  comparison. §10.3's gate already asserts exactly that property in
+  `engine_test`, where an in-process `Engine` and a render harness already live;
+  reproducing it through `App` means giving the GUI binary an offline render
+  path it has no other use for. The hook that shipped in its place is the one
+  the milestone brief asked for, `NXTAKT_DEBUG_ARREDIT`.
+
+### 17.4 The two headless hooks
+
+- **`NXTAKT_DEBUG_ARRANGE=<track>`** seeds §7.7's scripted figure from the
+  track's first non-empty slot: four items, one of them a split, one crossfade
+  pair at **exactly** `kMaxOverlapBeats` with both fades matching, one fade-in,
+  one item at a non-zero offset — plus one track automation lane so the expanded
+  row has something in it. It switches to Arrangement view, expands the track,
+  selects item 1 and republishes. It runs from `init()` and not "on the first
+  Arrangement frame" as §7.7 words it, because it is what *switches* to that
+  view: a hook that waited for the view it turns on would never run. The view
+  switch happens first and unconditionally, so a set with nothing to seed still
+  produces a screenshot of the empty timeline.
+
+  What the log line checks is what a screenshot cannot: the invariant, re-derived
+  from the lane rather than trusted.
+
+  ```
+  NXTAKT_DEBUG_ARRANGE: track 3 'chord' seeded 4 items from slot 0,
+                        repair clean, invariant HOLDS
+    item 0 uid 27  start 0.000 len 4.000 off 0.000 fin 2.000 fout 0.000  audio
+    item 1 uid 28  start 4.000 len 4.000 off 4.000 fin 0.000 fout 4.000  audio
+    item 2 uid 29  start 4.000 len 8.000 off 0.000 fin 4.000 fout 0.000  audio
+    item 3 uid 30  start 20.000 len 6.000 off 2.000 fin 0.000 fout 0.000  audio
+  ```
+
+- **`NXTAKT_DEBUG_ARREDIT=<verb>[:<item>]`**, one of `split` / `dup` / `delete`,
+  drives one edit through exactly the path a mouse would — the same verb, the
+  same undo entry, the same republish — and prints the two things a screenshot
+  cannot see:
+
+  ```
+  NXTAKT_DEBUG_ARREDIT: split:0 on track 3 -> applied, items 4 -> 5,
+                        undo entries 0 -> 1 (EXACTLY ONE)
+  ```
+
+  The optional item index exists because the seed leaves the selection on item 1,
+  which is *inside* the crossfade pair — so a split there has its head reclaimed
+  by `arrangeRepair`, which is correct and is exactly the wrong thing to
+  demonstrate a split with. `split` (no index) reports `items 4 -> 4` and is the
+  more interesting run: it is the invariant visibly doing its job.
+
+Both run under the demo set, in gamescope, with no window and no mouse. The undo
+self-test additionally reports **12 edits undone and redone cleanly** with an
+arrangement seeded (11 without), which means the lane survives the
+save → load → save round trip the snapshot is made of.
+
+### 17.5 The hand-offs, closed and still owed
+
+**Closed by this milestone:**
+
+- **`App::adoptSession` calls `arrangeRepair`** on every track, on a load *and*
+  on an undo restore. §8.5's sort-on-load is the loader's job and
+  `arrangeRepair` stable-sorts as step one, so the call is the whole fix.
+- **`assignUids` knows about `ArrangeClip::uid`** — both halves: the counter is
+  pulled past every item uid in the set before anything is handed out, and an
+  item that loaded as 0 gets one.
+- **`ClipModel::src.uid` is set to the item's uid** in `adoptSession` and in
+  `assignUids`. It is deliberately not serialized (§14), so it comes back 0 for
+  every item — and `PianoRoll` keys its per-clip zoom, scroll and selection on
+  exactly that field, so two items would have looked like one clip to it. The
+  item's uid is unique, costs nothing to reuse, is never written, and
+  `samePayload` does not compare it, so the publisher's dedupe is unaffected.
+- **`publishArrangementFor` / `publishArrangementAll` are wired.** All from
+  `init()` (the default set), from `adoptSession` (load and restore), and per
+  dirty track from every edit.
+
+**Still owed, in files 8e does not own:**
+
+- **`app_engine.cpp` needs `if (reapArrangementEvent(e)) continue;`** in
+  `pumpEngineEvents()`. This is unchanged from §15's hand-off and 8e could not
+  add it. Until it is there, every replaced lane and every replaced track-automation
+  set leaks until shutdown, where the `ArrPubs` / `ArrAutoPubs` destructors free
+  it — safe, and now reached far more often, because every arrangement edit
+  republishes.
+- **`Ev::AutoLaneInert` from an arrangement lane is silently dropped.** §15's
+  8b+8c note says such an event carries `b = -1`; `app_engine.cpp`'s handler
+  reads `const int s = e.b` and `continue`s on `s < 0`. That fails closed — no
+  corruption, no wrong lane greyed — but an arrangement lane the engine has given
+  up on is never reported and never drawn greyed. `AutoLaneView` already takes
+  the `inert` flag; only the plumbing is missing.
+- **A chain republish owes an arrangement-automation republish** (§6.6's blunt
+  rule). Adding or removing a device changes what `resolveAutoLane` can resolve,
+  so an arrangement lane naming a newly loaded device stays unpublished until the
+  next arrangement edit. The one line is `publishArrangeAutos(track)` beside
+  `publishChain(owner)` in `app_devices.cpp`.
+- **`pushAll` outran the command ring before this, and 8e made the burst
+  bigger.** §15 measured 462 `command ring full` warnings from the undo
+  self-test on a HEAD binary; with `publishArrangementAll` wired it is 753, since
+  the burst grows by `2 * tracks + 1`. The failure mode and the fix are unchanged
+  — the pending-publish set drained across frames that §15 already queued as its
+  own item — but it is now closer to mattering in ordinary use.
+
+### 17.6 Where §7 assumed something that is not true of the code
+
+- **"Drag a clip from the Session grid into the arrangement" (§7.5) is not a
+  gesture a hand can make.** Session and Arrangement are alternative views of the
+  same rect and are never on screen together, so a `DragState::Kind::Clip` drag
+  that started in the grid can only reach the timeline if the user presses Tab
+  mid-drag. The drop target accepts it, and it accepts a `BrowserFile` drag too
+  — the browser *is* visible in Arrangement view, and that is the drop this view
+  can actually be used with. A real session-to-arrangement gesture needs the two
+  views side by side, or a "place selected clip at the playhead" command; neither
+  is wave 8.
+- **§7.5's rubber-band and §7.1's single-item selection contradict each other.**
+  The context carries one `(track, uid)` pair, which is what the detail panel is
+  built on. Single selection shipped; see §17.3.
+- **§7.7 puts the seed hook "on the first Arrangement frame" and has it switch to
+  Arrangement view.** It cannot do both. It runs from `init()`.
+- **`AutoTargets::Entry::automated` is computed against a clip's envelopes.**
+  `buildAutoTargets` is the right builder for an arrangement lane's chooser —
+  same addresses, same ranges, same units — but its one clip-shaped question is
+  "does this clip already automate that". The arrangement passes an empty
+  `ClipModel` and re-answers the question against `arrangeAutos` in place, which
+  is two lines in `buildArrangeContext` rather than a second builder.
+- **§7.6's republish cost is real and is paid on release, not per frame.** An
+  edit inside an item still republishes that track's whole lane; a drag no longer
+  does so once a frame. See §17.2.

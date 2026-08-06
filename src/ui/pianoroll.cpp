@@ -21,59 +21,27 @@ namespace {
 // constants (logical px unless noted; multiply by the DPI scale)
 // ---------------------------------------------------------------------------
 
-constexpr f64 kGridStep   = 0.25;   // 1/16 note, the only grid this wave
-constexpr int kBeatsPerBar = 4;     // no time signature reaches us; assume 4/4
+// kGridStep, kBeatsPerBar, kPxPerBeatMin/Max and kZoomMin/Max/PerNotch moved
+// into timeaxis.h with TimeAxis itself (docs/ARRANGEMENT.md §7.2): they are
+// about *time*, and the arrangement needs the identical numbers. What stays
+// here is everything that is about a piano roll rather than about a timeline.
 constexpr int kMinFoldRows = 8;     // a one-note clip still needs room to click
 constexpr f32 kKeyW       = 46.f;
 constexpr f32 kRulerH     = 16.f;
 constexpr f32 kLaneH      = 54.f;
 constexpr f32 kRowH       = 12.f;
-// Fit-to-width, the zoom a clip is first shown at, is kept inside a sane band:
-// a two-beat sketch must not draw beats a hand-span apart, and a 64-bar clip
-// must not open at one pixel per bar.
-constexpr f32 kPxPerBeatMin = 44.f;
-constexpr f32 kPxPerBeatMax = 128.f;
-// Ctrl+wheel reaches much further in both directions than the fit ever does:
-// far enough out to see a long pattern whole, far enough in to place a note
-// against the grid line rather than near it.
-constexpr f32 kZoomMin      = 8.f;
-constexpr f32 kZoomMax      = 512.f;
-constexpr f32 kZoomPerNotch = 0.25f;  // octaves of zoom per wheel notch
 constexpr int kCentrePitch  = 60;   // C4, the middle of the default C3..C5 view
 constexpr f64 kMaxLoopBeats = 64.0; // ceiling for Ctrl+U, 16 bars in 4/4
-// A breakpoint is a 5 px square, grabbed from a little further out so it can be
-// picked up without the cursor having to land exactly on it.
-constexpr f32 kPtSize = 5.f;
-constexpr f32 kPtGrab = 7.f;
-// One arrow press of value, as a fraction of the target's range: coarse enough
-// to see, fine enough to trim a fade with.
-constexpr f32 kValueNudge = 1.f / 64.f;
 // The undo labels the caller reads back off lastEdit().
 constexpr const char* kEditNote = "note edit";
 constexpr const char* kEditAuto = "automation edit";
 
 // ---------------------------------------------------------------------------
 // axes
+//
+// The TIME axis moved to timeaxis.h. The PITCH axis did not: nothing but a
+// piano roll has one.
 // ---------------------------------------------------------------------------
-
-// `view` is the scroll offset in content pixels; `x0`/`y0` the screen origin of
-// the grid. Both directions are affine, so one struct each covers draw and hit.
-struct TimeAxis {
-    f32 x0 = 0, pxPerBeat = 64.f, view = 0;
-};
-inline f32 beatToX(const TimeAxis& a, f64 b) { return a.x0 - a.view + (f32)(b * (f64)a.pxPerBeat); }
-inline f64 xToBeat(const TimeAxis& a, f32 x) { return (f64)(x - a.x0 + a.view) / (f64)a.pxPerBeat; }
-
-// Scroll offset for a zoom that must leave the beat under `anchorX` still under
-// `anchorX` — the only zoom that feels like the content is being magnified
-// rather than shuffled. Clamped like every other scroll, so within a view of
-// either end the anchor gives way to the content edge (there is no scroll that
-// satisfies both, and showing empty space past the loop is the worse answer).
-inline f32 zoomView(const TimeAxis& a, f32 newPxPerBeat, f32 anchorX, f64 lenBeats, f32 viewW) {
-    const f64 b = xToBeat(a, anchorX);
-    const f32 view = a.x0 + (f32)(b * (f64)newPxPerBeat) - anchorX;
-    return clampv(view, 0.f, std::max(0.f, (f32)(lenBeats * (f64)newPxPerBeat) - viewW));
-}
 
 struct PitchAxis {
     f32 y0 = 0, rowH = 12.f, view = 0;
@@ -140,8 +108,8 @@ inline bool isBlackKey(int pitch) {
 // edit primitives
 // ---------------------------------------------------------------------------
 
-inline f64 quantFloor(f64 b) { return std::floor(b / kGridStep) * kGridStep; }
-inline f64 quantNear(f64 b)  { return std::floor(b / kGridStep + 0.5) * kGridStep; }
+// quantFloor / quantNear moved to timeaxis.h with the grid step they are
+// measured in: a snap is a statement about the time axis and nothing else.
 
 // Snapped note start, kept inside the clip at both ends.
 inline f64 clampBeat(f64 raw, f64 len, f64 lengthBeats) {
@@ -426,264 +394,22 @@ int noteAt(const std::vector<NoteModel>& notes, const RowMap& rows,
 // ---------------------------------------------------------------------------
 // the automation lane
 //
-// Pure, for the same reason the note helpers above are: the value mapping and
-// the edit clamps are the parts worth being able to reason about without a
-// window. The TIME axis is deliberately not repeated here — the lane uses the
-// grid's TimeAxis, which is the whole reason the editor lives in the roll.
+// It moved. ValAxis, ptLess/samePt, PtKeys, sortTrackingPts, the PtDelta clamp
+// and its apply, ptScreen, pointAt, pointsInBand and insertPoint are now
+// src/ui/autolane.cpp, together with the lane's own drag and selection state
+// and the slice of draw() that used them (docs/ARRANGEMENT.md §7.3, which is
+// docs/AUTOMATION.md §6.5 finally paid). The roll is the lane's FIRST caller
+// and keeps its chooser, drawLaneKey, which is roll-specific: it is what *adds*
+// a lane to a clip. The lane is handed the roll's own TimeAxis, so the property
+// that made it live here in the first place is now a parameter.
 // ---------------------------------------------------------------------------
 
-// Value <-> pixels down the lane. `y0` is the top of the drawable band and `h`
-// its height, so `hi` sits at the top and `lo` at the bottom: the value axis
-// points up, like every fader in the program.
-struct ValAxis {
-    f32 y0 = 0.f, h = 1.f;
-    f32 lo = 0.f, hi = 1.f;
-};
-inline f32 valToY(const ValAxis& a, f32 v) {
-    const f32 span = a.hi - a.lo;
-    const f32 t = span > 1e-9f ? clampv((v - a.lo) / span, 0.f, 1.f) : 0.f;
-    return a.y0 + (1.f - t) * a.h;
-}
-inline f32 yToVal(const ValAxis& a, f32 y) {
-    const f32 t = clampv((a.y0 + a.h - y) / std::max(1.f, a.h), 0.f, 1.f);
-    return a.lo + t * (a.hi - a.lo);
-}
-
-// Points are ordered by beat; the value breaks ties so two points a group move
-// stacked on one beat still have a defined order rather than a coin toss.
-inline bool ptLess(const AutoPoint& a, const AutoPoint& b) {
-    return a.beat != b.beat ? a.beat < b.beat : a.value < b.value;
-}
-inline bool samePt(const AutoPoint& a, const AutoPoint& b) {
-    return a.beat == b.beat && a.value == b.value && a.curve == b.curve;
-}
-
-// The selection expressed as POINTS rather than indices — the only form of it
-// that survives the re-sort a move forces. Exactly SelKeys, one field narrower.
-struct PtKeys {
-    std::vector<AutoPoint> pts;
-    int primary = -1;
-};
-
-// sortTrackingSet for breakpoints. Same argument, key for key: each key claims
-// a slot of its own so a selection holding two identical points never collapses
-// onto one index, and the search starts at the key's sorted position so a group
-// drag of the whole lane stays near-linear.
-void sortTrackingPts(std::vector<AutoPoint>& v, const PtKeys& keys, IndexSel& out) {
-    std::sort(v.begin(), v.end(), ptLess);
-    out.clear();
-    const size_t n = v.size(), k = keys.pts.size();
-    if (k == 0 || n == 0) return;
-    std::vector<bool> taken(n, false);
-    for (size_t j = 0; j < k; ++j) {
-        const AutoPoint& key = keys.pts[j];
-        size_t i = (size_t)(std::lower_bound(v.begin(), v.end(), key, ptLess) - v.begin());
-        for (; i < n; ++i) {
-            if (ptLess(key, v[i])) break;            // past every equal-ordering point
-            if (taken[i] || !samePt(v[i], key)) continue;
-            taken[i] = true;
-            out.items.push_back((int)i);
-            if ((int)j == keys.primary) out.primary = (int)i;
-            break;
-        }
-    }
-    std::sort(out.items.begin(), out.items.end());
-}
-
-// A group move of breakpoints, already clamped: both fields are deltas. The
-// walls are the clip at both ends and the target's own range top and bottom,
-// and the group is clamped as a group — a fade dragged into the floor keeps its
-// shape instead of flattening against it, exactly like a chord in the grid.
-struct PtDelta {
-    f64 beats = 0.0;
-    f32 value = 0.f;
-};
-PtDelta clampPtDelta(const std::vector<AutoPoint>& pts, const IndexSel& sel,
-                     f64 dBeats, f32 dVal, f64 lengthBeats, f32 lo, f32 hi) {
-    PtDelta d;
-    bool any = false;
-    f64 minB = 0.0, maxB = 0.0;
-    f32 minV = 0.f, maxV = 0.f;
-    for (int i : sel.items) {
-        if (i < 0 || i >= (int)pts.size()) continue;
-        const AutoPoint& p = pts[(size_t)i];
-        if (!any) { minB = maxB = p.beat; minV = maxV = p.value; any = true; }
-        else {
-            minB = std::min(minB, p.beat);  maxB = std::max(maxB, p.beat);
-            minV = std::min(minV, p.value); maxV = std::max(maxV, p.value);
-        }
-    }
-    if (!any) return d;
-    const f64 len = std::max(0.0, lengthBeats);
-    // A group that already hangs past the end (a loop dragged shorter under it)
-    // has negative room to the right, and taking that as the clamp pulls it
-    // back inside — which is what the single-point clamp does too.
-    d.beats = clampv(dBeats, -minB, std::max(-minB, len - maxB));
-    d.value = clampv(dVal, lo - minV, std::max(lo - minV, hi - maxV));
-    return d;
-}
-
-// Applies a clamped delta to every selected point and restores the sorted-by-
-// beat invariant, re-deriving the selection through it. False when the delta
-// was zero, in which case nothing was touched and the caller must not report a
-// change.
-bool applyPtDelta(std::vector<AutoPoint>& pts, IndexSel& sel, const PtDelta& d) {
-    if (d.beats == 0.0 && d.value == 0.f) return false;
-    PtKeys keys;
-    keys.pts.reserve(sel.items.size());
-    for (int i : sel.items) {
-        if (i < 0 || i >= (int)pts.size()) continue;
-        AutoPoint& p = pts[(size_t)i];
-        p.beat  = p.beat + d.beats;
-        p.value = p.value + d.value;
-        if (i == sel.primary) keys.primary = (int)keys.pts.size();
-        keys.pts.push_back(p);
-    }
-    if (keys.pts.empty()) return false;
-    sortTrackingPts(pts, keys, sel);
-    return true;
-}
-
-// Screen position of a breakpoint. Draw and hit test both come through here,
-// so they cannot disagree about where a point is.
-inline void ptScreen(const AutoPoint& p, const TimeAxis& ta, const ValAxis& va,
-                     f32& x, f32& y) {
-    x = beatToX(ta, p.beat);
-    y = valToY(va, p.value);
-}
-
-// Nearest breakpoint within `rad` of the cursor, or -1. Later points win ties,
-// matching the draw order, and the distance is Chebyshev because the target is
-// a square and that is what "inside the square, or nearly" means.
-int pointAt(const std::vector<AutoPoint>& pts, const TimeAxis& ta, const ValAxis& va,
-            f32 mx, f32 my, f32 rad) {
-    int found = -1;
-    f32 best = rad;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        f32 x = 0.f, y = 0.f;
-        ptScreen(pts[i], ta, va, x, y);
-        const f32 d = std::max(std::fabs(mx - x), std::fabs(my - y));
-        if (d <= best) { best = d; found = (int)i; }
-    }
-    return found;
-}
-
-// Every breakpoint the band touches, in index order. Touching counts, and a
-// band with no height still takes what it swept — the same rule as notesInBand,
-// and for the same reason: dragging straight along a flat run of points is the
-// commonest way to select one.
-void pointsInBand(const std::vector<AutoPoint>& pts, const TimeAxis& ta, const ValAxis& va,
-                  const Rect& band, f32 half, std::vector<int>& out) {
-    out.clear();
-    for (size_t i = 0; i < pts.size(); ++i) {
-        f32 x = 0.f, y = 0.f;
-        ptScreen(pts[i], ta, va, x, y);
-        if (x + half < band.x || x - half > band.right()) continue;
-        if (y + half < band.y || y - half > band.bottom()) continue;
-        out.push_back((int)i);
-    }
-}
-
-// Inserts a breakpoint, keeping the vector sorted, and returns its index. A
-// point already sitting on that beat is REPLACED rather than joined: two points
-// on one beat are a step the evaluator has no way to render and the user has no
-// way to grab separately. (The caller only reaches this for a click on empty
-// lane, so the replaced point is one the cursor was not near.)
-int insertPoint(std::vector<AutoPoint>& pts, const AutoPoint& p) {
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (pts[i].beat == p.beat) { pts[i] = p; return (int)i; }
-    }
-    pts.push_back(p);
-    std::sort(pts.begin(), pts.end(), ptLess);
-    for (size_t i = 0; i < pts.size(); ++i)
-        if (samePt(pts[i], p)) return (int)i;
-    return -1;
-}
-
-// ---------------------------------------------------------------------------
-// DPI
-// ---------------------------------------------------------------------------
-
-// The renderer keeps its DPI scale private and draw() is handed only a Rect, so
-// recover the scale from the font: App loads fSmall at round(9 * dpiScale) px
-// and fBody at round(11 * dpiScale). Rounding costs at most ~5% at 1x, which is
-// invisible in layout maths and cheaper than widening the frozen interface.
-f32 dpiOf(const Ui& ui) {
-    if (ui.fSmall && ui.fSmall->size() > 0) return std::max(0.5f, (f32)ui.fSmall->size() / 9.f);
-    if (ui.fBody  && ui.fBody->size()  > 0) return std::max(0.5f, (f32)ui.fBody->size()  / 11.f);
-    return 1.f;
-}
+// dpiOf moved to autolane.h with the lane: the arrangement needs the same
+// answer, and two ways of recovering the DPI scale would be two answers.
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// IndexSel: the selection set, shared by the note grid and the automation lane
-//
-// Small, sorted and unique, with one member singled out as the primary — the
-// member the last gesture was about, which is what the view follows, what the
-// audition plays and the anchor a group move is measured from. Every path that
-// can invalidate an index goes through one of these, so there is exactly one
-// place where a set can get out of step with the vector it indexes — and one
-// implementation for both index spaces, which is why a band select, a group
-// drag and a multi-delete behave identically in the grid and in the lane.
-// ---------------------------------------------------------------------------
-
-bool IndexSel::has(int i) const {
-    return i >= 0 && std::binary_search(items.begin(), items.end(), i);
-}
-
-void IndexSel::clear() {
-    items.clear();
-    primary = -1;
-}
-
-void IndexSel::one(int i) {
-    items.clear();
-    if (i >= 0) items.push_back(i);
-    primary = i >= 0 ? i : -1;
-}
-
-void IndexSel::add(int i) {
-    if (i < 0) return;
-    const auto it = std::lower_bound(items.begin(), items.end(), i);
-    if (it != items.end() && *it == i) return;
-    items.insert(it, i);
-    if (primary < 0) primary = i;
-}
-
-void IndexSel::toggle(int i) {
-    if (i < 0) return;
-    const auto it = std::lower_bound(items.begin(), items.end(), i);
-    if (it != items.end() && *it == i) {
-        items.erase(it);
-        // The primary has to stay inside the set; which member inherits it does
-        // not matter, only that one does while there is one to have it.
-        if (primary == i) primary = items.empty() ? -1 : items.front();
-        return;
-    }
-    items.insert(it, i);
-    primary = i;                        // the one just added is under the hand
-}
-
-void IndexSel::erased(int at) {
-    for (size_t k = 0; k < items.size();) {
-        if (items[k] == at)      items.erase(items.begin() + (long)k);
-        else                   { if (items[k] > at) --items[k]; ++k; }
-    }
-    if (primary == at)     primary = items.empty() ? -1 : items.front();
-    else if (primary > at) --primary;
-}
-
-void IndexSel::prune(int n) {
-    while (!items.empty() && items.back() >= n) items.pop_back();
-    if (items.empty())    primary = -1;
-    else if (!has(primary)) primary = items.front();
-}
-
-void IndexSel::adopt(const std::vector<int>& v) {
-    items = v;
-    if (!has(primary)) primary = items.empty() ? -1 : items.front();
-}
+// IndexSel: its implementation moved to autolane.cpp with its declaration.
 
 // ---------------------------------------------------------------------------
 // PianoRoll: the lane's key block
@@ -732,9 +458,7 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
         laneSel_ = shown;
         // The point indices belong to the lane that was on show, so switching
         // lanes drops them rather than carrying a stale set across.
-        psel_.clear();
-        dragPt_ = -1;
-        if (drag_ == Drag::Point || drag_ == Drag::PointBand) drag_ = Drag::None;
+        lane_.detach();
     }
     if (ui.hovered(r0) && laneSel_ > 0 && laneSel_ <= (int)clip.envelopes.size())
         ui.tip = clip.envelopes[(size_t)laneSel_ - 1].address;
@@ -770,13 +494,13 @@ void PianoRoll::drawLaneKey(Ui& ui, const Rect& b, ClipModel& clip,
             if (clip.envelopes[i].address == addr) { found = (int)i; break; }
         if (found >= 0) {
             laneSel_ = found + 1;            // already there: show it
-            psel_.clear();
+            lane_.detach();
         } else if ((int)clip.envelopes.size() < kMaxClipLanes) {
             AutoLane l;
             l.address = addr;
             clip.envelopes.push_back(std::move(l));
             laneSel_ = (int)clip.envelopes.size();
-            psel_.clear();
+            lane_.detach();
             changed = true;
             lastEdit_ = kEditAuto;
         }
@@ -837,10 +561,9 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     if (clip.uid != clipUid_) {
         clipUid_ = clip.uid;
         sel_.clear();
-        psel_.clear();
+        lane_.detach();
         bandBase_.clear();
         dragNote_ = -1;
-        dragPt_ = -1;
         drag_ = Drag::None;
         scrollX_ = scrollY_ = 0.f;
         zoom_ = 0.f;                 // -> fit to width below
@@ -862,13 +585,14 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     sel_.prune(noteCount);
     if (dragNote_ >= noteCount) {
         dragNote_ = -1;
-        // A lane drag holds no note index, so it is not this check's business.
-        if (drag_ != Drag::Point && drag_ != Drag::PointBand) drag_ = Drag::None;
+        // A lane drag holds no note index and is AutoLaneView's anyway, so it is
+        // not this check's business.
+        drag_ = Drag::None;
     }
 
     // Same for the lane: a lane and its points can go away under a live
     // selection (undo, a project load), and laneSel_ is an index like any other.
-    if (laneSel_ > (int)clip.envelopes.size()) { laneSel_ = 0; psel_.clear(); }
+    if (laneSel_ > (int)clip.envelopes.size()) { laneSel_ = 0; lane_.detach(); }
 
     // The lane's key block, drawn (and clicked) FIRST, before anything takes a
     // pointer into clip.envelopes: it can add a lane, and a push_back moves the
@@ -878,15 +602,10 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     drawLaneKey(ui, laneKey, clip, targets, s, changed);
 
     AutoLane* const env = shownLane(clip);
-    psel_.prune(env ? (int)env->points.size() : 0);
-    if (!env) {
-        dragPt_ = -1;
-        if (drag_ == Drag::Point || drag_ == Drag::PointBand) drag_ = Drag::None;
-    } else if (drag_ == Drag::Point &&
-               (dragPt_ < 0 || dragPt_ >= (int)env->points.size())) {
-        dragPt_ = -1;
-        drag_ = Drag::None;
-    }
+    // A lane and its points can go away under a live selection (undo, a project
+    // load), and an index is only ever as good as the frame it was made in.
+    if (env) lane_.prune((int)env->points.size());
+    else     lane_.detach();
     // The target this lane names, and therefore its value axis. A lane whose
     // address the set cannot resolve today (a deleted device, a set opened on
     // another machine) keeps its points and draws greyed against a plain 0..1 —
@@ -895,8 +614,9 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     const AutoTargets::Entry* const tgt = env ? targets.find(env->address) : nullptr;
     const bool laneInert = env && laneSel_ <= 32 &&
                            ((targets.inert & (1u << (u32)(laneSel_ - 1))) != 0u);
-    const bool laneOff   = env && !env->enabled;
-    const bool laneDim   = env && (laneInert || laneOff || !tgt);
+    // "Switched off" and "therefore drawn greyed" are AutoLaneView's own
+    // conclusions now: it is handed `enabled`, `inert` and `resolved` and works
+    // out the rest, which is the same three facts this used to fold by hand.
 
     // --- axes --------------------------------------------------------------
     const int keepPitch = (drag_ == Drag::Move && dragNote_ >= 0) ? dragPitch_ : -1;
@@ -982,12 +702,9 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
 
     const TimeAxis ta{grid.x, pxPerBeat, scrollX_};
     const PitchAxis pa{grid.y, rowH, viewY};
-    // The lane's value axis. The same rect the stems use, so switching the lane
-    // from VEL to an envelope changes what is drawn and not where it is drawn.
-    const ValAxis va{lane.y + 3.f * s, std::max(1.f, lane.h - 6.f * s),
-                     tgt ? tgt->lo : 0.f, tgt ? tgt->hi : 1.f};
-    laneLo_ = va.lo;
-    laneHi_ = va.hi;
+    // The lane's own value axis is AutoLaneView's, built from the same rect the
+    // velocity stems use — so switching the lane from VEL to an envelope changes
+    // what is drawn and not where it is drawn.
     const f32 minNoteW = 3.f * s;
 
     // --- interaction -------------------------------------------------------
@@ -1004,18 +721,6 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         changed = true;
         lastEdit_ = kEditNote;
     };
-    // The lane's counterpart, index for index. Both keep their drag pointing at
-    // the same member it was pointing at, which is what stops a delete mid-drag
-    // from moving somebody else's point.
-    auto erasePt = [&](int i) {
-        if (!env || i < 0 || i >= (int)env->points.size()) return;
-        env->points.erase(env->points.begin() + i);
-        psel_.erased(i);
-        if (dragPt_ == i) { dragPt_ = -1; drag_ = Drag::None; }
-        else if (dragPt_ > i) --dragPt_;
-        changed = true;
-        lastEdit_ = kEditAuto;
-    };
     // Velocity lane drags are absolute: the stem follows the cursor height, so a
     // plain click on the lane also sets the value, like clicking a fader track.
     auto velAt = [&](f32 y) {
@@ -1024,59 +729,21 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     };
 
     // The rubber band, when one is in flight: computed with the interaction and
-    // drawn later, inside the clip of whichever region it belongs to.
+    // drawn later, inside the grid's clip. The LANE's band is the lane's own,
+    // and is drawn by AutoLaneView.
     Rect bandRect{};
-    bool showBand = false, bandInLane = false;
+    bool showBand = false;
 
     if (drag_ != Drag::None) {
-        // The two bands are the drags with nothing under them, and a point drag
-        // is checked against the lane's points rather than the clip's notes.
+        // Band is the one drag with nothing under it.
         const bool needsNote = drag_ == Drag::Move || drag_ == Drag::Resize ||
                                drag_ == Drag::Velocity;
         if (!in.down[0] ||
             (needsNote && (dragNote_ < 0 || dragNote_ >= (int)clip.notes.size()))) {
             drag_ = Drag::None;
             dragNote_ = -1;
-            dragPt_ = -1;
             bandBase_.clear();
-            if (ui.active == gridId || ui.active == laneId) ui.active = 0;
-        } else if (drag_ == Drag::Point) {
-            // The point under the hand is always part of what moves, for the
-            // same reason the note under the hand is: Escape can empty the set
-            // from the keyboard between frames while the button is still down.
-            if (!psel_.has(dragPt_)) psel_.one(dragPt_);
-            const AutoPoint p = env->points[(size_t)dragPt_];   // copy: we sort below
-            // Time is quantized like everything else in the roll; Alt frees it
-            // for a gesture that has to land between the lines, Ctrl freezes it
-            // so a value can be trimmed without the beat sliding.
-            f64 dBeats = 0.0;
-            if (!in.ctrl()) {
-                const f64 raw = xToBeat(ta, in.mx) - dragPtBeat_;
-                dBeats = (in.alt() ? raw : quantNear(raw)) - p.beat;
-            }
-            const f32 dVal = yToVal(va, in.my) - dragPtVal_ - p.value;
-            // Measured on the point under the hand, applied to the whole
-            // selection as one delta — so a fade keeps its shape and the group
-            // stops when its extreme member reaches a wall.
-            const PtDelta d = clampPtDelta(env->points, psel_, dBeats, dVal,
-                                           clip.lengthBeats, va.lo, va.hi);
-            if (applyPtDelta(env->points, psel_, d)) {
-                changed = true;
-                lastEdit_ = kEditAuto;
-            }
-            dragPt_ = psel_.primary;
-            if (dragPt_ < 0) drag_ = Drag::None;
-        } else if (drag_ == Drag::PointBand) {
-            const f32 ax = beatToX(ta, bandBeat_);
-            const f32 ay = valToY(va, bandVal_);
-            bandRect = Rect{std::min(ax, in.mx), std::min(ay, in.my),
-                            std::fabs(in.mx - ax), std::fabs(in.my - ay)};
-            showBand = true;
-            bandInLane = true;
-            std::vector<int> hits;
-            pointsInBand(env->points, ta, va, bandRect, kPtSize * 0.5f * s, hits);
-            psel_.adopt(bandBase_);
-            for (int i : hits) psel_.add(i);
+            if (ui.active == gridId) ui.active = 0;
         } else if (drag_ == Drag::Band) {
             // Live, not on release: the selection is whatever the band touches
             // *now*, so dragging back over a note un-takes it and there is no
@@ -1229,61 +896,6 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
                 lastEdit_ = kEditNote;
             }
         }
-    } else if (hotLane && env && (in.pressed[0] || in.pressed[2])) {
-        // The lane's verbs are the grid's verbs, deliberately: a user who has
-        // learned the note grid should not have to learn a second editor eight
-        // pixels below it.
-        const int hit = pointAt(env->points, ta, va, in.mx, in.my, kPtGrab * s);
-        const bool prevAdded = addedLastPress_;
-        addedLastPress_ = false;
-
-        if (in.pressed[2]) {
-            if (hit >= 0) erasePt(hit);                   // right-click deletes
-        } else if (hit >= 0 && in.dblClick && !prevAdded) {
-            erasePt(hit);                                 // double-click deletes
-        } else if (hit >= 0 && in.shift()) {
-            psel_.toggle(hit);                            // membership, no drag
-        } else if (hit >= 0) {
-            if (!psel_.has(hit)) psel_.one(hit);
-            else                 psel_.primary = hit;
-            const AutoPoint& p = env->points[(size_t)hit];
-            dragPt_ = hit;
-            drag_ = Drag::Point;
-            dragPtBeat_ = xToBeat(ta, in.mx) - p.beat;
-            dragPtVal_  = yToVal(va, in.my) - p.value;
-            ui.active = laneId;
-        } else if (in.shift()) {
-            // Rubber band, exactly as on the grid: plain empty-drag still adds
-            // a breakpoint, so the band is what Shift buys on empty lane. The
-            // anchor is a beat and a value, not two pixels, so a wheel mid-band
-            // leaves the corner on the material it was put on.
-            drag_ = Drag::PointBand;
-            dragPt_ = -1;
-            bandBeat_ = xToBeat(ta, in.mx);
-            bandVal_ = yToVal(va, in.my);
-            bandBase_ = psel_.items;
-            ui.active = laneId;
-        } else if (in.pressed[0]) {
-            const f64 raw = xToBeat(ta, in.mx);
-            const f64 b = in.alt() ? raw : quantNear(raw);
-            if (b >= 0.0 && b <= clip.lengthBeats) {
-                AutoPoint np;
-                np.beat = b;
-                np.value = clampv(yToVal(va, in.my), va.lo, va.hi);
-                const int idx = insertPoint(env->points, np);
-                psel_.one(idx);                  // a fresh point is the selection
-                dragPt_ = idx;
-                // Press-drag-add, as in the grid: the new point is grabbed by
-                // the same gesture, so placing it is one movement.
-                drag_ = Drag::Point;
-                dragPtBeat_ = raw - np.beat;
-                dragPtVal_ = yToVal(va, in.my) - np.value;
-                addedLastPress_ = true;
-                ui.active = laneId;
-                changed = true;
-                lastEdit_ = kEditAuto;
-            }
-        }
     } else if (hotLane && !env && midiClip && in.pressed[0]) {
         // Nearest stem within a few pixels; ties go to the later note, matching
         // the draw order.
@@ -1331,15 +943,11 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     const Rect lenBox{ruler.right() - 70.f * s, ruler.y + 2.f * s, 66.f * s, ruler.h - 4.f * s};
     if (ui.fSmall) {
         rr.pushClip({grid.x, ruler.y, std::max(0.f, std::min(grid.right(), lenBox.x) - grid.x), ruler.h});
-        const int b0 = std::max(0, (int)std::floor(xToBeat(ta, grid.x)));
-        const int b1 = (int)std::ceil(xToBeat(ta, grid.right()));
-        const f32 ty = ruler.y + (ruler.h - ui.fSmall->height()) * 0.5f;
-        for (int b = b0; b <= b1; ++b) {
-            char buf[24];
-            std::snprintf(buf, sizeof buf, "%d.%d", b / kBeatsPerBar + 1, b % kBeatsPerBar + 1);
-            rr.text(*ui.fSmall, std::round(beatToX(ta, b)) + 3.f * s, ty, buf,
-                    (b % kBeatsPerBar) == 0 ? pal::textDim : pal::textFaint);
-        }
+        // The shared ruler (timeaxis.h). Same loop, same numbers, same colours —
+        // now also the arrangement's, which is the point of the extraction.
+        drawRulerLabels(rr, *ui.fSmall, ta, grid.x, grid.right(),
+                        ruler.y + (ruler.h - ui.fSmall->height()) * 0.5f, s,
+                        pal::textDim, pal::textFaint);
         rr.popClip();
     }
     const Rect foldBox{ruler.x + 3.f * s, ruler.y + 2.f * s, keyW - 6.f * s, ruler.h - 4.f * s};
@@ -1407,20 +1015,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
         // One separator per octave keeps the eye anchored without banding.
         if (p % 12 == 0) rr.rect({grid.x, y + rowH - 1.f * s, grid.w, 1.f * s}, pal::divider);
     }
-    {
-        const f64 startB = std::max(0.0, quantFloor(xToBeat(ta, grid.x)));
-        const f32 stepPx = pxPerBeat * (f32)kGridStep;
-        const int steps = stepPx > 0.5f ? (int)(grid.w / stepPx) + 2 : 0;
-        for (int k = 0; k <= steps; ++k) {
-            const f64 b = startB + (f64)k * kGridStep;
-            const f32 x = beatToX(ta, b);
-            if (x > grid.right()) break;
-            const bool onBeat = std::fabs(b - std::round(b)) < 1e-6;
-            const bool onBar  = onBeat && ((i64)std::llround(b) % kBeatsPerBar) == 0;
-            rr.rect({std::round(x), grid.y, 1.f * s, grid.h},
-                    onBar ? pal::ridge.scale(1.45f) : (onBeat ? pal::ridge : pal::divider));
-        }
-    }
+    drawTimeGrid(rr, ta, grid, s);          // the shared grid (timeaxis.h)
     {   // Past the loop length is not editable, so dim it like Live does.
         const f32 endX = beatToX(ta, clip.lengthBeats);
         if (endX < grid.right())
@@ -1460,7 +1055,7 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     }
     // The band goes over the notes it is taking, translucent enough to leave
     // them readable underneath.
-    if (showBand && !bandInLane) {
+    if (showBand) {
         rr.rect(bandRect, pal::accent.alpha(0.12f));
         rr.roundRectOutline(bandRect, 0.f, 1.f * s, pal::accent);
     }
@@ -1476,102 +1071,23 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     rr.rect(lane, pal::appBg);
     rr.pushClip(lane);
     if (env) {
-        // Greyed for the three states in which the envelope is drawn but is not
-        // driving anything: switched off by hand, given up on by the engine, or
-        // naming a target this set cannot resolve today. Each says so in one
-        // line — a lane that is visibly inert and silent about why is the worst
-        // of both worlds (docs/AUTOMATION.md §3.4).
-        const Col ink = laneDim ? pal::textDim : pal::accentHi;
-        const Col fillC = ink.alpha(laneDim ? 0.07f : 0.14f);
-        const f32 floorY = va.y0 + va.h;
-
-        // "Where is unity" is the question the eye asks first.
-        {
-            const f32 dy = std::round(valToY(va, tgt ? tgt->def : 0.f));
-            for (f32 x = lane.x; x < lane.right(); x += 7.f * s)
-                rr.rect({x, dy, 3.f * s, 1.f * s}, pal::ridge);
-        }
-
-        // One segment of the polyline, with Live's low-alpha fill down to the
-        // lane's floor: the fill is what makes a glance tell you the shape.
-        auto seg = [&](f32 x0, f32 y0, f32 x1, f32 y1) {
-            const f32 a = std::max(x0, lane.x), b = std::min(x1, lane.right());
-            if (b <= a || x1 <= x0) return;
-            const f32 span = x1 - x0;
-            for (f32 x = a; x < b; x += 1.f) {
-                const f32 y = y0 + (y1 - y0) * ((x - x0) / span);
-                rr.rect({x, y, 1.f, std::max(0.f, floorY - y)}, fillC);
-            }
-            rr.line(a, y0 + (y1 - y0) * ((a - x0) / span),
-                    b, y0 + (y1 - y0) * ((b - x0) / span), 1.5f * s, ink);
-        };
-
-        if (env->points.empty()) {
-            // An empty lane is UI state, not content: it draws a flat line at
-            // the target's default and waits to be clicked on. One breakpoint
-            // is a legal constant envelope, not an error.
-            const f32 y = std::round(valToY(va, tgt ? tgt->def : 0.f));
-            for (f32 x = lane.x; x < lane.right(); x += 5.f * s)
-                rr.rect({x, y, 2.5f * s, 1.f * s}, ink.alpha(0.55f));
-            if (ui.fSmall && !laneDim)
-                rr.textIn(*ui.fSmall, lane, "click to draw a breakpoint", pal::textFaint,
-                          Align::Center);
-        } else {
-            // Before the first point and after the last, the envelope holds —
-            // there is no "nowhere" to ramp in from at clip start, and nothing
-            // past the last point but the loop end.
-            f32 px = lane.x, py = valToY(va, env->points.front().value);
-            for (const AutoPoint& p : env->points) {
-                f32 x = 0.f, y = 0.f;
-                ptScreen(p, ta, va, x, y);
-                seg(px, py, x, y);
-                px = x; py = y;
-            }
-            seg(px, py, lane.right(), py);
-
-            const f32 half = kPtSize * 0.5f * s;
-            for (size_t i = 0; i < env->points.size(); ++i) {
-                f32 x = 0.f, y = 0.f;
-                ptScreen(env->points[i], ta, va, x, y);
-                if (x < lane.x - half || x > lane.right() + half) continue;
-                const Rect pr{std::round(x - half), std::round(y - half),
-                              kPtSize * s, kPtSize * s};
-                if (psel_.has((int)i)) {
-                    rr.rect(pr, ink);
-                    if ((int)i == psel_.primary)
-                        rr.roundRectOutline(pr.inset(-1.f * s), 0.f, 1.f * s, pal::text);
-                } else {
-                    rr.rect(pr, pal::appBg);
-                    rr.roundRectOutline(pr, 0.f, 1.f * s, ink);
-                }
-            }
-            // What the hand is actually setting, in the target's own units.
-            if (drag_ == Drag::Point && ui.fSmall && psel_.primary >= 0 &&
-                psel_.primary < (int)env->points.size()) {
-                const AutoPoint& p = env->points[(size_t)psel_.primary];
-                f32 x = 0.f, y = 0.f;
-                ptScreen(p, ta, va, x, y);
-                char buf[48];
-                std::snprintf(buf, sizeof buf, "%.3g %s", (double)p.value,
-                              tgt ? tgt->unit.c_str() : "");
-                rr.textIn(*ui.fSmall, {x + 6.f * s, y - 6.f * s, 90.f * s, 12.f * s}, buf,
-                          pal::text, Align::Left, 0);
-            }
-        }
-        if (showBand && bandInLane) {
-            rr.rect(bandRect, pal::accent.alpha(0.12f));
-            rr.roundRectOutline(bandRect, 0.f, 1.f * s, pal::accent);
-        }
-        if (ui.fSmall) {
-            const char* why = nullptr;
-            if (laneInert)   why = targets.inertWhy.empty()
-                                 ? "inert - this device has no realtime parameter path"
-                                 : targets.inertWhy.c_str();
-            else if (!tgt)   why = "target not in this set - the envelope is kept";
-            else if (laneOff) why = "envelope off";
-            if (why)
-                rr.textIn(*ui.fSmall, {lane.x, lane.y + 1.f * s, lane.w, 11.f * s}, why,
-                          pal::textFaint, Align::Left, 5.f * s);
+        // The lane, which is now a component and no longer a slice of this
+        // function. It is handed the roll's OWN TimeAxis -- the whole property
+        // the lane lived in here to preserve, now stated as a parameter -- and
+        // the plain view of what its address names. Everything else about it,
+        // including its selection and its two drags, is its own.
+        //
+        // Its interaction runs here rather than up in the interaction block,
+        // which is the one ordering the move changes: nothing drawn between the
+        // two points reads a breakpoint, and the frame still sees this frame's
+        // edit.
+        if (lane_.draw(ui, lane, env->points, ta, tgt ? tgt->lo : 0.f,
+                       tgt ? tgt->hi : 1.f, tgt ? tgt->unit.c_str() : nullptr,
+                       tgt ? tgt->def : 0.f, env->enabled, laneInert,
+                       clip.lengthBeats, 0.0, tgt != nullptr,
+                       targets.inertWhy.empty() ? nullptr : targets.inertWhy.c_str())) {
+            changed = true;
+            lastEdit_ = kEditAuto;
         }
     } else if (midiClip) {
         const f32 travel = std::max(1.f, lane.h - 6.f * s);
@@ -1602,15 +1118,15 @@ bool PianoRoll::draw(Ui& ui, const Rect& r, ClipModel& clip, const AutoTargets& 
     rr.rect({lane.x, lane.y, lane.w, 1.f * s}, pal::divider);
 
     // --- cursor ------------------------------------------------------------
+    // The lane REPORTS rather than sets, so its answer keeps the place it had
+    // in this ordered block instead of overtaking a grid drag that outranks it.
     if (drag_ == Drag::Resize)        ui.cursor = Cursor::ResizeH;
     else if (drag_ == Drag::Move)     ui.cursor = Cursor::Grab;
-    else if (drag_ == Drag::Point)    ui.cursor = Cursor::Grab;
+    else if (lane_.dragging())        ui.cursor = Cursor::Grab;
     else if (drag_ == Drag::Velocity) ui.cursor = Cursor::ResizeV;
-    else if (hotLane && env) {
-        ui.cursor = pointAt(env->points, ta, va, in.mx, in.my, kPtGrab * s) >= 0
-                        ? Cursor::Grab
-                        : Cursor::Hand;
-    } else if (hotLane)               ui.cursor = Cursor::ResizeV;
+    else if (hotLane && env)          ui.cursor = lane_.pointHovered() ? Cursor::Grab
+                                                                      : Cursor::Hand;
+    else if (hotLane)                 ui.cursor = Cursor::ResizeV;
     else if (hotGrid && midiClip) {
         const int hover = noteAt(clip.notes, rows, ta, pa, in.mx, in.my, minNoteW);
         if (hover >= 0) {
@@ -1644,13 +1160,14 @@ bool PianoRoll::hasSelection(const ClipModel& clip) const {
     if (!owns(clip)) return false;
     if (!sel_.empty() && sel_.items.back() < (int)clip.notes.size()) return true;
     const AutoLane* env = shownLane(clip);
-    return env && !psel_.empty() && psel_.items.back() < (int)env->points.size();
+    return env && lane_.hasSelection((int)env->points.size());
 }
 
 bool PianoRoll::clearSelection() {
-    if (sel_.empty() && psel_.empty()) return false;
+    const bool any = !sel_.empty() || lane_.hasSelection();
+    if (!any) return false;
     sel_.clear();
-    psel_.clear();
+    lane_.clearSelection();
     return true;
 }
 
@@ -1661,20 +1178,9 @@ bool PianoRoll::clearSelection() {
 bool PianoRoll::nudgeSelected(ClipModel& clip, int gridSteps, int semitones) {
     if (!owns(clip)) return false;
     AutoLane* env = shownLane(clip);
-    if (env && !psel_.empty() && psel_.items.back() < (int)env->points.size()) {
-        const int anchor = psel_.has(psel_.primary) ? psel_.primary : psel_.items.front();
-        const f64 aBeat = env->points[(size_t)anchor].beat;
-        // Through the same snap a mouse move uses, so nudging a recorded point
-        // pulls it onto the grid instead of carrying its offset forever.
-        const f64 want = gridSteps != 0 ? quantNear(aBeat + (f64)gridSteps * kGridStep) - aBeat
-                                        : 0.0;
-        // The value nudge is a fraction of the target's own range, taken from
-        // the last draw (see laneLo_): the arrows move the same visible amount
-        // whether the lane is a 0..1 fader or a 20 Hz..20 kHz cutoff.
-        const f32 step = (f32)semitones * kValueNudge * (laneHi_ - laneLo_);
-        const PtDelta d = clampPtDelta(env->points, psel_, want, step, clip.lengthBeats,
-                                       laneLo_, laneHi_);
-        if (!applyPtDelta(env->points, psel_, d)) return false;
+    if (env && lane_.hasSelection((int)env->points.size())) {
+        if (!lane_.nudgeSelected(env->points, gridSteps, (f32)semitones, clip.lengthBeats))
+            return false;
         lastEdit_ = kEditAuto;
         return true;
     }
@@ -1696,15 +1202,7 @@ bool PianoRoll::deleteSelected(ClipModel& clip) {
     // Back to front in both cases: an index into a vector survives only until
     // something earlier than it is removed, and both sets are sorted.
     AutoLane* env = shownLane(clip);
-    if (env && !psel_.empty() && psel_.items.back() < (int)env->points.size()) {
-        for (size_t k = psel_.items.size(); k-- > 0;) {
-            const int i = psel_.items[k];
-            if (i >= 0 && i < (int)env->points.size())
-                env->points.erase(env->points.begin() + i);
-        }
-        psel_.clear();
-        dragPt_ = -1;
-        if (drag_ == Drag::Point || drag_ == Drag::PointBand) drag_ = Drag::None;
+    if (env && lane_.deleteSelected(env->points)) {
         lastEdit_ = kEditAuto;
         return true;
     }

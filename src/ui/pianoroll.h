@@ -9,6 +9,11 @@
 // whose parameter names, ranges and units arrive as the plain AutoTargets view
 // below rather than as devices the roll would have to know about.
 #pragma once
+// autolane.h brings the automation lane the roll now HOSTS rather than
+// contains (docs/ARRANGEMENT.md §7.3), the IndexSel that moved down with it,
+// and — through timeaxis.h — the one beat<->pixel mapping in the program.
+#include "autolane.h"
+#include "timeaxis.h"
 #include "widgets.h"
 #include "app.h"
 #include <string>
@@ -46,30 +51,8 @@ struct AutoTargets {
     }
 };
 
-// A set of indices into some vector, one member singled out as the primary —
-// the one the last gesture was actually about. Extracted from the note
-// selection so the automation lane's breakpoints can use it unchanged: the two
-// index spaces are different, but every rule about them is the same. Sorted
-// because a multi-delete has to run back to front and a bounds check only needs
-// the last element; unique because every group edit would otherwise apply twice
-// to the same member; the primary is always inside the set while there is one
-// to have it. GUI thread only.
-struct IndexSel {
-    std::vector<int> items;          // sorted ascending, unique
-    int primary = -1;                // a member of `items`, or -1
-
-    bool empty() const { return items.empty(); }
-    int  count() const { return (int)items.size(); }
-    bool has(int i) const;
-    void clear();
-    void one(int i);                 // the set becomes {i}, primary = i
-    void add(int i);                 // no-op when already in
-    void toggle(int i);
-    void erased(int at);             // after `at` was erased from the vector
-    void prune(int n);               // drops anything past the end
-    // Adopts a band's base set and re-anchors the primary inside it.
-    void adopt(const std::vector<int>& v);
-};
+// IndexSel now lives in autolane.h, with the lane that is its second user. It
+// is the same type, unchanged; only which header declares it moved.
 
 class PianoRoll {
 public:
@@ -237,16 +220,18 @@ private:
     }
 
     // --- selection sets ----------------------------------------------------
-    // Two of them, one machine: `sel_` indexes clip.notes, `psel_` indexes the
-    // points of whichever envelope the lane is showing. Both are IndexSel, so
+    // `sel_` indexes clip.notes. Its twin — the breakpoint selection — moved
+    // into AutoLaneView with the lane, but it is still the same IndexSel, so
     // "sorted, unique, primary stays inside, an erase renumbers what follows"
-    // is written once and the lane inherits the note grid's behaviour for free
-    // — a group drag, a band, a multi-delete all work the same way in both.
-    // GUI thread only; no allocation happens on any audio path.
+    // is written once and the lane still inherits the note grid's behaviour for
+    // free. GUI thread only; no allocation happens on any audio path.
     IndexSel sel_;               // notes
-    IndexSel psel_;              // breakpoints of the shown envelope
 
     // --- the lane ----------------------------------------------------------
+    // The lane itself, which the roll now HOSTS rather than contains: it owns
+    // its own selection, its own drags and its own value range, and is handed
+    // the roll's TimeAxis so the two can never disagree about a beat.
+    AutoLaneView lane_;
     // 0 = the velocity stems, n = clip.envelopes[n-1]. Clamped on every draw:
     // the caller can delete a lane (undo, a project load) between frames.
     int  laneSel_ = 0;
@@ -255,12 +240,6 @@ private:
     // A lane choice made from outside for a clip not yet drawn; -1 = none. See
     // showLane(): it survives exactly one identity reset and is then forgotten.
     int  pendingLane_ = -1;
-    // The shown lane's value range as of the last draw. The keyboard API has no
-    // AutoTargets to consult — it runs before the frame that would hand one over
-    // — so the range the lane was last drawn against is what an arrow nudge is
-    // measured and clamped against. 0..1 until a lane has been drawn, which is
-    // the range of every mixer target anyway.
-    f32  laneLo_ = 0.f, laneHi_ = 1.f;
     // The label the caller should put on the undo entry for the last change.
     const char* lastEdit_ = "note edit";
 
@@ -283,29 +262,19 @@ private:
     // into view, so nudging a note off the top does not lose it.
     bool followSel_ = false;
     PreviewQueue preview_{};
-    // Drag state. Band and PointBand are the two drags with nothing under them
-    // — hence the dragNote_ checks that exclude them. Point/PointBand are the
-    // lane's, and are deliberately the same two shapes as the grid's.
-    enum class Drag { None, Move, Resize, Velocity, Band, Point, PointBand } drag_ = Drag::None;
+    // Drag state. Band is the one drag with nothing under it — hence the
+    // dragNote_ checks that exclude it. The lane's two drags moved into
+    // AutoLaneView, where they are deliberately still the same two shapes.
+    enum class Drag { None, Move, Resize, Velocity, Band } drag_ = Drag::None;
     int  dragNote_ = -1;
     f32  dragY_ = 0.f;
     f64  dragBeat_ = 0.0;
     int  dragPitch_ = 0;
-    // Breakpoint being dragged, and the grab offsets that keep it under the
-    // cursor: where inside the point the press landed, in beats and in value.
-    int  dragPt_ = -1;
-    f64  dragPtBeat_ = 0.0;
-    f32  dragPtVal_ = 0.f;
     // Rubber-band anchor, held in CONTENT space rather than screen space
     // (a beat, and a pixel offset down the row stack) so that scrolling or
     // zooming mid-band leaves the corner on the material it was put on.
     f64  bandBeat_ = 0.0;
     f32  bandY_ = 0.f;
-    // The lane's band anchor. Its second coordinate is a VALUE and not a pixel
-    // offset, for the same reason bandY_ is a content offset: the lane's value
-    // axis does not move, but the corner must stay on the material it was put
-    // on when the time axis under it does.
-    f32  bandVal_ = 0.f;
     // The selection as it stood when the band started. The band adds to it
     // rather than replacing it — Shift means "and also" here as everywhere —
     // which also means a band that touches nothing takes nothing away.

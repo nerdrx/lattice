@@ -21,11 +21,43 @@
 
 namespace lat {
 
+// One decoded file, as a clip. Factored out of loadClipInto because the
+// arrangement can be dropped on directly (docs/ARRANGEMENT.md §7.5) and an item
+// owns its clip by value, so there is no slot in the middle -- and because two
+// places building a clip from a file two ways is how they end up disagreeing
+// about the default loop, the guessed tempo or the warp mode.
+//
+// Deliberately does NOT touch the session: no uid, no undo point, no push. The
+// caller decides what the clip becomes.
+bool App::makeClipFromFile(const std::string& path, int colorIdx, ClipModel& out) {
+    SampleRef sb = loadSample(path, engine_.sampleRate());
+    if (!sb) return false;
+    out = ClipModel{};
+    out.kind = ClipKind::Audio;
+    out.sample = sb;
+    out.path = path;
+    out.name = sb->name;
+    const size_t dot = out.name.find_last_of('.');
+    if (dot != std::string::npos) out.name = out.name.substr(0, dot);
+    out.colorIdx = colorIdx;
+    out.clipBpm = sb->guessedBpm;
+    out.lengthBeats = sb->guessedBeats;
+    out.loopStart = 0;
+    out.loopEnd = sb->frames;
+    out.gain = 1.f;
+    out.warp = Warp::Beats;
+    out.loop = true;
+    return true;
+}
+
 void App::loadClipInto(int track, int slot, const std::string& path) {
     if (track < 0 || track >= (int)ses_.tracks.size()) return;
     if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
-    SampleRef sb = loadSample(path, engine_.sampleRate());
-    if (!sb) { status_ = "Could not load " + path; return; }
+    ClipModel fresh;
+    if (!makeClipFromFile(path, ses_.tracks[track].colorIdx, fresh)) {
+        status_ = "Could not load " + path;
+        return;
+    }
     // After the decode, so a file that could not be read leaves no history
     // behind, and before the slot is touched.
     undoPoint("load clip");
@@ -33,25 +65,13 @@ void App::loadClipInto(int track, int slot, const std::string& path) {
     ClipModel& m = ses_.tracks[track].slots[slot];
     // A slot that already held a clip keeps its identity: the material behind
     // it changed, but anything pointing at the clip (automation, a controller
-    // mapping) still means this clip.
-    if (!m.uid) m.uid = ses_.newUid();
+    // mapping) still means this clip. Kept across the assignment for the same
+    // reason, since `fresh` has no uid of its own.
+    const u64 keep = m.uid ? m.uid : ses_.newUid();
     // Dropping a sample onto a pattern turns the slot back into an audio clip;
     // pushClip retires the notes the engine was holding for it.
-    m.kind = ClipKind::Audio;
-    m.notes.clear();
-    m.sample = sb;
-    m.path = path;
-    m.name = sb->name;
-    const size_t dot = m.name.find_last_of('.');
-    if (dot != std::string::npos) m.name = m.name.substr(0, dot);
-    m.colorIdx = ses_.tracks[track].colorIdx;
-    m.clipBpm = sb->guessedBpm;
-    m.lengthBeats = sb->guessedBeats;
-    m.loopStart = 0;
-    m.loopEnd = sb->frames;
-    m.gain = 1.f;
-    m.warp = Warp::Beats;
-    m.loop = true;
+    m = std::move(fresh);
+    m.uid = keep;
     pushClip(track, slot);
     selectTrack(track); selSlot_ = slot;
     status_ = "Loaded " + m.name;

@@ -35,6 +35,12 @@ void App::assignUids() {
     for (const TrackModel& t : ses_.tracks) {
         note(t.uid);
         for (int s = 0; s < kMaxScenes; ++s) note(t.slots[s].uid);
+        // Arrangement items are entities like any other, and a file written
+        // before they had uids -- or by a writer that omitted one -- loads with
+        // uid 0. The counter has to be pulled past them here for the same reason
+        // it is pulled past a clip's: an id handed out below must not collide
+        // with one already in use. See the hand-off in docs/ARRANGEMENT.md §14.
+        for (const ArrangeClip& c : t.arrange) note(c.uid);
     }
     for (const ReturnModel& r : ses_.returns) note(r.uid);
     for (int o : owners) {
@@ -53,6 +59,17 @@ void App::assignUids() {
             // An empty slot is not an entity: only a clip that exists, or one
             // whose audio went missing but whose reference survived, gets one.
             if (!c.uid && (c.valid() || !c.path.empty())) c.uid = ses_.newUid();
+        }
+        for (ArrangeClip& c : t.arrange) {
+            if (!c.uid) c.uid = ses_.newUid();
+            // ArrangeClip::src.uid is deliberately NOT serialized -- the uid
+            // inside an `aclip` is the ITEM's, because two placements of one
+            // loop must not both claim one identity (§14). So it comes back 0,
+            // and the piano roll keys its per-clip zoom, scroll and selection on
+            // exactly that field: two items would look like one clip to it. The
+            // item's own uid is a unique number that costs nothing to reuse
+            // here, is never written, and gives the roll the identity it needs.
+            c.src.uid = c.uid;
         }
     }
     for (ReturnModel& r : ses_.returns) if (!r.uid) r.uid = ses_.newUid();
@@ -355,6 +372,27 @@ void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
     // identities (clip uid, device uid) the restore is matching on.
     if (!restoring) assignUids();
 
+    // §8.5's SORT-ON-LOAD. The parser preserves file order, deliberately: an
+    // ordering the engine depends on must be ESTABLISHED by the loader rather
+    // than assumed of the file. arrangeRepair stable-sorts as its first step and
+    // restores the rest of the lane invariant with it, so calling it is the
+    // whole fix -- and it runs on a restore too, because an undo snapshot is
+    // written by the same writer and read by the same parser.
+    for (TrackModel& t : ses_.tracks) {
+        arrangeRepair(t.arrange);
+        // And the roll's identity for each item's own clip, which assignUids
+        // does not get to do on a RESTORE: the snapshot carries every item uid,
+        // so assignUids is skipped, but src.uid is never serialized either way
+        // and would come back 0 for every item on the lane.
+        for (ArrangeClip& c : t.arrange) c.src.uid = c.uid;
+    }
+
+    // The arrangement selection named items in the set that has just gone. A
+    // uid from the old set could match a different item in the new one, which
+    // would put the detail panel on a clip nobody selected.
+    arrSelTrack_ = -1;
+    arrSelItem_  = 0;
+
     // A set with nothing in it would leave the views indexing past the end.
     if (ses_.tracks.empty()) addTrack();
     if (ses_.scenes.empty()) addScene();
@@ -387,6 +425,12 @@ void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
     }
 
     pushAll();                     // also clears the slots outside the new set
+    // The arrangement's half of pushAll. It is a separate call because pushAll
+    // lives in app_engine.cpp, which this milestone does not own, and because
+    // the publishers were landed by 8d with nothing calling them (§15). Every
+    // lane, every track-automation set, and the transport cell that carries the
+    // loop brace.
+    publishArrangementAll();
 
     // The mixer flags of tracks the new set does not have. Their clips are
     // gone and their chains are empty, so volume and pan no longer describe

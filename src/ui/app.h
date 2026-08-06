@@ -30,6 +30,10 @@ class PianoRoll;
 // Same reason, and the roll's other argument: the plain view of what a clip's
 // envelopes may name (pianoroll.h). Only ever passed by reference from here.
 struct AutoTargets;
+// The arrangement editor and the plain view it is handed (arrange.h). Same
+// argument again: arrange.h includes pianoroll.h, which includes this header.
+class ArrangeView;
+struct ArrangeContext;
 
 class App {
 public:
@@ -84,6 +88,10 @@ private:
     void  drawWaveform(const Rect& r, const SampleBuffer& sb, const Col& c,
                        f64 t0 = 0.0, f64 t1 = 1.0);
     void  loadClipInto(int track, int slot, const std::string& path);
+    // One decoded file as a clip, with nothing else touched. Shared by the slot
+    // loader above and by the arrangement's drop target, which has no slot in
+    // the middle because an item owns its clip by value.
+    bool  makeClipFromFile(const std::string& path, int colorIdx, ClipModel& out);
     void  clearClip(int track, int slot);
     void  pushClip(int track, int slot);          // sync one slot to the engine
     // Hands `fresh` (which may be null) to publishedNotes_[track][slot] and
@@ -892,6 +900,94 @@ private:
     // than against a slot — see the report for why the two are not one function.
     const RtAutoSet* buildAutosFor(int track, const ClipModel& m);
     // === end arrangement block =============================================
+
+    // =======================================================================
+    // ARRANGEMENT VIEW (wave 8e)   docs/ARRANGEMENT.md §7
+    //
+    // One block, appended whole. Everything here is GUI thread. The EDITOR owns
+    // none of it: ArrangeView is handed a plain ArrangeContext each frame and
+    // hands back a mask, exactly as PianoRoll is handed a ClipModel and an
+    // AutoTargets — so this is the state the context is built from and the
+    // state the mask is applied to, and nothing else.
+    // =======================================================================
+private:
+    // Declared rather than included, for PianoRoll's reason: arrange.h includes
+    // pianoroll.h, which includes THIS header, so pulling either in from here
+    // would leave the type incomplete for whichever translation unit reached it
+    // first. App::App/~App are already out of line in the one .cpp that has the
+    // definitions.
+    std::unique_ptr<ArrangeView> arrView_;
+    // A SECOND PianoRoll, for the detail panel in Arrangement view. Not shared
+    // with roll_ because a roll is about one clip: sharing would reset the
+    // session clip's zoom, scroll and selection every time the view was
+    // switched, which is the state the roll deliberately keeps per clip.
+    std::unique_ptr<PianoRoll> arrRoll_;
+    // Which tracks have their automation lanes shown. VIEW STATE, so it is not
+    // in TrackModel (which 8a froze and which the project format writes) and not
+    // in the undo snapshot.
+    bool arrExpanded_[kMaxTracks] = {};
+    // The selection the context carries back and the detail panel reads: a
+    // (track, item uid) pair, uid and not index, because an insert renumbers
+    // indices between frames and a stale index is a wrong-clip edit.
+    int  arrSelTrack_ = -1;
+    u64  arrSelItem_  = 0;
+    // ARR arm (§7.7): a THIRD independent chip beside REC and AUTO. "Record
+    // into the session grid" and "record onto the timeline" are different
+    // destinations, and one button that picked between them from view_ would be
+    // the same click doing two things. 8f is what makes it do anything.
+    bool arrArm_ = false;
+    // detailH_ PER VIEW (answer #10). Two fields against one surprise: the
+    // arrangement wants a tall panel for envelope lanes and the session a short
+    // one for the grid, and a shared height means every switch between views
+    // silently resizes the other. Neither is serialized.
+    f32  detailHArr_ = 260.f;
+    f32& detailHFor(MainView v) { return v == MainView::Session ? detailH_ : detailHArr_; }
+
+    // Builds the plain view of the arrangement. `targets` is the caller's
+    // storage for the per-track AutoTargets the context points into, and may be
+    // null for a caller that only needs the lanes (the keyboard verbs).
+    void buildArrangeContext(ArrangeContext& ctx, std::vector<AutoTargets>* targets);
+    // Applies what the view asked for: the undo point its handshake named, the
+    // transport commands its ruler generated, the one-shot verbs its mouse
+    // requested, the drop it reported, and a republish of exactly the tracks it
+    // says it touched.
+    void arrangeCommit(ArrangeContext& ctx, u32 changed);
+    // The Autos half of it, which needs a pre-draw copy of what it might edit.
+    void arrangeCommitAutos(ArrangeContext& ctx, u32 changed);
+    // That copy: the arrangement lanes of the EXPANDED tracks, as they stood at
+    // the start of this frame. Only the expanded ones, because only their lanes
+    // are on screen to be clicked, and a track's lanes can hold kMaxArrPoints
+    // breakpoints.
+    std::vector<std::pair<int, std::vector<AutoLane>>> autosBefore_;
+    // The CLIP tab in Arrangement view: the selected item's placement, and the
+    // roll editing its own `src` in place.
+    void drawArrangeClipDetail(const Rect& r);
+    // The selected item, or null. The detail panel's whole input.
+    ArrangeClip* selectedArrItem();
+    // The three one-shot verbs, by index: 0 delete, 1 split, 2 duplicate.
+    // arrangeVerb runs one against an existing context and takes the undo entry
+    // ONLY if it actually changed something -- a split on an item's own edge is
+    // a no-op, and a no-op that costs an undo entry is an undo that appears to
+    // do nothing. arrangeKey is the keyboard's wrapper: build a context, run the
+    // verb, commit. Split out of handleShortcuts because three copies of that
+    // sequence is where the bug lives.
+    u32  arrangeVerb(ArrangeContext& ctx, int verb, const char* what);
+    bool arrangeKey(int verb, const char* what);
+    // The roll, but only while it is on screen for the SELECTED ARRANGEMENT
+    // ITEM. visibleRoll()'s sibling, and separate for the same reason arrRoll_
+    // is a second roll: the two are about different clips.
+    PianoRoll* visibleArrRoll();
+    // NXTAKT_DEBUG_ARRANGE=<track>: seeds the scripted figure §7.7 specifies,
+    // once per run, on the first Arrangement frame. Nothing inside gamescope can
+    // drag a clip, and this is the part a screenshot cannot check on its own.
+    void debugSeedArrangement();
+    // NXTAKT_DEBUG_ARREDIT=<track>:<verb>: drives ONE arrangement edit through
+    // the real verbs and the real undo path, and prints what it did — the hook
+    // that says a gesture takes exactly one undo entry and republishes once.
+    void debugArrangeEdit();
+    bool arrDebugSeeded_ = false;
+    bool arrDebugEdited_ = false;
+    // === end arrangement view block ========================================
 };
 
 } // namespace lat
