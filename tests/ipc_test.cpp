@@ -236,6 +236,24 @@ static void testRegionBasics() {
         CHECK(st && st->tempo.load() == 137.5,
               "a write through the attacher is visible to the creator (%.1f)",
               st ? st->tempo.load() : -1.0);
+
+        // shm v4 (GUI-ON-DAEMON.md §1.2): the two fields the GUI polls every
+        // frame that the block could not carry before. init() must zero them,
+        // and they must cross like everything else in here.
+        bool zeroed = pst->latencyFrames.load() == 0;
+        for (int i = 0; i < ipc::kShmReturns; ++i)
+            zeroed = zeroed && pst->returnMeterL[i].load() == 0.f &&
+                     pst->returnMeterR[i].load() == 0.f;
+        CHECK(zeroed, "init() zeroes latencyFrames and the %d return meters",
+              ipc::kShmReturns);
+        pst->latencyFrames.store(1536);
+        pst->returnMeterL[ipc::kShmReturns - 1].store(0.75f);
+        pst->returnMeterR[0].store(0.25f);
+        CHECK(st && st->latencyFrames.load() == 1536 &&
+                  st->returnMeterL[ipc::kShmReturns - 1].load() == 0.75f &&
+                  st->returnMeterR[0].load() == 0.25f,
+              "PDC latency and the return meters cross the mapping (%d frames)",
+              st ? st->latencyFrames.load() : -1);
     }
 
     banner("2. mismatch handling");
@@ -792,7 +810,7 @@ static void testArrangementClassifiers() {
           (unsigned long long)ipc::arrangementBytes(2, 1));
     CHECK(ipc::kMaxArrLanes == kMaxRtArrLanes,
           "the wire lane bound and the engine's agree (%d)", (int)ipc::kMaxArrLanes);
-    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 3,
+    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 4,
           "protocol v%u, pool v%u, shm v%u", ipc::kProtocolVersion, ipc::kPoolVersion,
           ipc::kShmVersion);
     CHECK(ipc::control::kJournal > ipc::control::kParams &&

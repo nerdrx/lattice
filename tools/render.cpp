@@ -43,11 +43,52 @@ struct Owned {
     }
 };
 
+// Offline command pump.
+//
+// The engine's command ring holds 1024 entries and this tool pushes an entire
+// set before the first process(): four mixer scalars per track plus one
+// SetClip or ClearClip per cell, so a full 32x32 set needs about 1155. Past
+// 1024 pushCommand returned false and every caller here ignored it, so a set
+// that large simply could not be rendered.
+//
+// It failed loudly rather than quietly, and by luck rather than design:
+// LaunchScene is pushed last, so it is always among the commands an overflow
+// drops, nothing is ever launched, and the whole render comes out at digital
+// zero -- which the silence guard at the bottom of this file catches and
+// reports with a non-zero exit. Confirmed against the pre-fix binary on a
+// 32x32 set: peak 0.0000, "FAIL: render is silent", exit 1.
+//
+// That is a thin thing to depend on. The guard fires because the *scene* never
+// started; it says nothing about a set that starts and is missing some of its
+// clips, and it does not survive anyone reordering these pushes so LaunchScene
+// is not last. The same overflow the GUI hit; the GUI's fix is flow control
+// across frames, because it has frames.
+//
+// Offline there is nothing to schedule around: no audio thread, no deadline.
+// So when the ring is full, just run a block to drain it and push again.
+// Everything here happens before LaunchScene, and the transport is stopped
+// until then, so a drain block renders silence and advances no musical time.
+//
+// The retry is bounded and loud. drainCommands() empties the ring completely,
+// so one block always clears it and a second failure means something is wrong
+// that a third attempt will not fix.
+static bool pumpCommand(Engine& e, const Command& c) {
+    if (e.pushCommand(c)) return true;
+    f32 l[kBlock], r[kBlock];
+    e.process(nullptr, nullptr, l, r, kBlock);        // drains the ring
+    if (e.pushCommand(c)) return true;
+    std::fprintf(stderr,
+                 "render: command ring still full after a drain block "
+                 "(command type %u) -- this is a bug, not a large set\n",
+                 (unsigned)c.type);
+    return false;
+}
+
 static void pushClip(Engine& e, const Session& s, int t, int slot, Owned& own) {
     const ClipModel& m = s.tracks[t].slots[slot];
     Command c;
     c.a = t; c.b = slot;
-    if (!m.valid()) { c.type = Cmd::ClearClip; e.pushCommand(c); return; }
+    if (!m.valid()) { c.type = Cmd::ClearClip; pumpCommand(e, c); return; }
     c.type = Cmd::SetClip;
     RtClip rc;
     if (m.kind == ClipKind::Midi) {
@@ -82,7 +123,7 @@ static void pushClip(Engine& e, const Session& s, int t, int slot, Owned& own) {
     rc.quantumIdx  = m.quantumIdx;
     rc.valid       = true;
     c.clip = rc;
-    e.pushCommand(c);
+    pumpCommand(e, c);
 }
 
 // savedDevices -> live instances -> one RtChain per track: the essence of
@@ -145,8 +186,12 @@ static void materializeDevices(Engine& e, const Session& s, PluginRegistry& reg,
         c.type = Cmd::SetChain;
         c.a = (i32)t;
         c.p = chain;
-        if (!e.pushCommand(c)) {
-            std::fprintf(stderr, "render: command ring full - track %zu has no chain\n", t);
+        // Through the pump like everything else. This one already reported the
+        // overflow instead of swallowing it, which is why "track N has no
+        // chain" was the only visible symptom of a bug whose other half --
+        // every clip past the 1024th command -- was completely silent.
+        if (!pumpCommand(e, c)) {
+            std::fprintf(stderr, "render: track %zu has no chain\n", t);
             delete chain;
             continue;
         }
@@ -219,19 +264,33 @@ int main(int argc, char** argv) {
     }
 
     Command c;
-    c.type = Cmd::SetTempo; c.x = s.tempo; eng.pushCommand(c);
-    c = Command{}; c.type = Cmd::SetQuantum; c.a = s.quantumIdx; eng.pushCommand(c);
+    c.type = Cmd::SetTempo; c.x = s.tempo; pumpCommand(eng, c);
+    c = Command{}; c.type = Cmd::SetQuantum; c.a = s.quantumIdx; pumpCommand(eng, c);
+
+    // The signature map, before anything is launched. Without this the engine
+    // renders every set in 4/4 while the length below is computed from the map,
+    // and the two disagree by exactly the amount the set is not in 4/4 -- a
+    // render that stops mid-phrase, with nothing to say why. The pointer is
+    // owned for the life of the render, like the chains and note arrays above;
+    // Ev::SigsRetired is drained with the rest at the end.
+    const RtSig* sigs = publishSignatures(eng, s);
     for (size_t t = 0; t < s.tracks.size(); ++t) {
         const TrackModel& tr = s.tracks[t];
-        c = Command{}; c.type = Cmd::TrackVol;  c.a = (i32)t; c.x = faderToGain(tr.fader); eng.pushCommand(c);
-        c = Command{}; c.type = Cmd::TrackPan;  c.a = (i32)t; c.x = tr.pan;  eng.pushCommand(c);
-        c = Command{}; c.type = Cmd::TrackMute; c.a = (i32)t; c.b = tr.mute; eng.pushCommand(c);
-        c = Command{}; c.type = Cmd::TrackSolo; c.a = (i32)t; c.b = tr.solo; eng.pushCommand(c);
+        c = Command{}; c.type = Cmd::TrackVol;  c.a = (i32)t; c.x = faderToGain(tr.fader); pumpCommand(eng, c);
+        c = Command{}; c.type = Cmd::TrackPan;  c.a = (i32)t; c.x = tr.pan;  pumpCommand(eng, c);
+        c = Command{}; c.type = Cmd::TrackMute; c.a = (i32)t; c.b = tr.mute; pumpCommand(eng, c);
+        c = Command{}; c.type = Cmd::TrackSolo; c.a = (i32)t; c.b = tr.solo; pumpCommand(eng, c);
         for (int sl = 0; sl < (int)s.scenes.size(); ++sl) pushClip(eng, s, (int)t, sl, own);
     }
-    c = Command{}; c.type = Cmd::LaunchScene; c.a = scene; eng.pushCommand(c);
+    c = Command{}; c.type = Cmd::LaunchScene; c.a = scene; pumpCommand(eng, c);
 
-    const i64 total = (i64)(sr * 60.0 / s.tempo * s.sigNum * bars);
+    // Bars to beats through the signature map, not `sigNum * bars`. Those agree
+    // exactly when the set never changes signature, which is why the demo
+    // renders stay bit-identical -- and disagree the moment it does. A set that
+    // opens in 7/8 rendered as though every bar were 4/4 comes out long by
+    // 12.5% and cut off at a place that looks like a bug in the scheduler.
+    const f64 beats  = s.beatOfBar((f64)bars) - s.beatOfBar(0.0);
+    const i64 total  = (i64)(sr * 60.0 / s.tempo * beats);
     std::vector<f32> l(kBlock), r(kBlock), inter;
     inter.reserve((size_t)total * 2);
 
@@ -255,6 +314,7 @@ int main(int argc, char** argv) {
     // when it goes out of scope.
     Event ev;
     while (eng.popEvent(ev)) {}
+    delete[] sigs;   // published above; nothing will read it again
 
     SF_INFO info{};
     info.samplerate = (int)sr;

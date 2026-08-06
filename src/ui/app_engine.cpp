@@ -36,10 +36,191 @@ constexpr int kRecordNotes = 4096;
 // engine plumbing
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Deferred publication — the flow control pushAll needs
+//
+// docs/ARRANGEMENT.md §15 names the bug and the shape; app.h carries the design
+// note. This is the whole mechanism: five short functions, and the property to
+// keep hold of while reading them is that an entry names WORK, not a payload.
+// Nothing is allocated when something is queued and nothing is retired; both
+// happen when it drains, against the model as it stands then.
+// ---------------------------------------------------------------------------
+
+bool* App::pendSeen(PubKind k, i32 a, i32 b) {
+    switch (k) {
+        case PubKind::Clip:
+            // Bounds are the TABLE's, not the session's: a cell can be queued
+            // while it is inside the set and drain after a load has shrunk it,
+            // which is precisely the case syncClipCell exists for.
+            if (a < 0 || a >= kMaxTracks || b < 0 || b >= kMaxScenes) return nullptr;
+            return &pendClip_[a][b];
+        case PubKind::ArrLane: {
+            const int cell = (a == -1) ? kMaxTracks : a;
+            if (cell < 0 || cell > kMaxTracks) return nullptr;
+            return &pendLane_[cell];
+        }
+        case PubKind::ArrAutos:
+            if (a < 0 || a >= kMaxTracks) return nullptr;
+            return &pendAutos_[a];
+        case PubKind::Scalar:
+        default:
+            return nullptr;          // every scalar is its own entry, in order
+    }
+}
+
+void App::queuePub(const PendingPub& p) {
+    if (bool* seen = pendSeen(p.kind, p.a, p.b)) {
+        // Already waiting. Queuing it twice would publish the same model twice;
+        // the entry that is already there will read whatever the model says when
+        // it drains, which is by definition at least as fresh as this request.
+        if (*seen) return;
+        *seen = true;
+    }
+    if (pending_.size() >= kMaxPending) {
+        // The cap. This is the OLD failure, and it is reached only when the
+        // engine has stopped draining altogether — no audio backend at all, or
+        // a wedged audio thread — so it is said once per hundred rather than
+        // once per command, and counted.
+        if ((pendDropped_++ % 100) == 0)
+            LOGW("engine: publication queue full at %zu - the audio thread is not "
+                 "draining (%llu dropped)", pending_.size(),
+                 (unsigned long long)pendDropped_);
+        if (bool* seen = pendSeen(p.kind, p.a, p.b)) *seen = false;
+        return;
+    }
+    pending_.push_back(p);
+    if (pending_.size() > pendHigh_) pendHigh_ = pending_.size();
+}
+
+bool App::deferPub(PubKind k, i32 a, i32 b) {
+    if (flushing_) return false;          // we are the drain; do the work
+    if (pending_.empty()) return false;   // nothing waiting; the ring is ours
+    PendingPub p; p.kind = k; p.a = a; p.b = b;
+    queuePub(p);
+    return true;
+}
+
+void App::refusePub(PubKind k, i32 a, i32 b) {
+    if (flushing_) { pubRefused_ = true; return; }   // stays at the front
+    PendingPub p; p.kind = k; p.a = a; p.b = b;
+    queuePub(p);
+}
+
+void App::flushPending() {
+    if (pending_.empty()) return;
+    flushing_ = true;
+    while (!pending_.empty()) {
+        const PendingPub p = pending_.front();
+        pubRefused_ = false;
+        switch (p.kind) {
+            case PubKind::Scalar:
+                if (!eng_.send(p.type, p.a, p.b, p.x)) pubRefused_ = true;
+                break;
+            case PubKind::Clip:     syncClipCell(p.a, p.b); break;
+            case PubKind::ArrLane:
+                if (p.a == -1) publishTransportCell();
+                else           publishArrangement(p.a);
+                break;
+            case PubKind::ArrAutos: publishArrangeAutos(p.a); break;
+        }
+        // Refused: the ring is full again. Everything still queued keeps its
+        // order and its place, and the next frame tries again from here.
+        if (pubRefused_) break;
+        if (bool* seen = pendSeen(p.kind, p.a, p.b)) *seen = false;
+        pending_.pop_front();
+    }
+    flushing_ = false;
+}
+
+// Every scalar command in the app comes through here. Two lines, and the order
+// they are in is the point: while anything is queued, this one joins the back
+// rather than overtaking it.
 void App::send(Cmd t, i32 a, i32 b, f64 x) {
-    Command c;
-    c.type = t; c.a = a; c.b = b; c.x = x;
-    engine_.pushCommand(c);
+    if (pending_.empty() && eng_.send(t, a, b, x)) return;
+    PendingPub p;
+    p.kind = PubKind::Scalar;
+    p.type = t; p.a = a; p.b = b; p.x = x;
+    queuePub(p);
+}
+
+// ---------------------------------------------------------------------------
+// NXTAKT_DEBUG_PUSHALL — the proof that the burst arrives whole
+//
+// The old failure was silent by construction: pushClip logged and gave up, so
+// the engine went on playing a clip the model no longer believed in and nothing
+// was scheduled to notice. A screenshot cannot see that, and neither can a
+// warning count on its own, so this asks the engine directly.
+//
+// Cmd::LaunchScene queues a track's slot ONLY when the engine's own
+// clips_[t][scene] is valid (engine.cpp) — an invalid one stops the track
+// instead. So "launch scene s, then read activeSlot[t]" is a read of the
+// engine's slot table, one column at a time, and comparing it with
+// ses_.tracks[t].slots[s].valid() over every scene compares the whole table
+// with the whole model.
+//
+// It runs across frames, because that is what the fix does: the queue drains
+// over as many frames as the ring needs, and a check that ran in one would be
+// checking the wrong thing.
+// ---------------------------------------------------------------------------
+void App::debugPushAllCheck() {
+    if (!pushAllHook_ || pushAllDone_) return;
+
+    // 1. Nothing is checked until every deferred publication has been sent.
+    if (!pending_.empty()) {
+        pushAllWait_ = 0;
+        // Said once a second rather than once a frame: a queue that never
+        // empties is itself the answer, and a silent hook would look like a
+        // hook that never ran.
+        if ((++pushAllStalls_ % 60) == 0)
+            LOGI("NXTAKT_DEBUG_PUSHALL: waiting, %zu publications still queued",
+                 pending_.size());
+        return;
+    }
+
+    const int ns = (int)ses_.scenes.size();
+    if (pushAllScene_ >= ns) {
+        LOGI("NXTAKT_DEBUG_PUSHALL: %d cells over %d tracks x %d scenes agree with "
+             "the model, %d disagree; queue high water %zu, dropped %llu",
+             pushAllCells_, (int)ses_.tracks.size(), ns, pushAllFails_,
+             pendHigh_, (unsigned long long)pendDropped_);
+        if (pushAllFails_ == 0)
+            LOGI("NXTAKT_DEBUG_PUSHALL: PASS - the engine's slot table matches the set");
+        else
+            LOGE("NXTAKT_DEBUG_PUSHALL: FAIL - %d cells the engine and the model "
+                 "disagree about", pushAllFails_);
+        pushAllDone_ = true;
+        return;
+    }
+
+    if (!pushAllLaunched_) {
+        // Unquantized, so the launch happens in the next block rather than on
+        // the next bar line: this is a test of what the engine HOLDS, and
+        // waiting two seconds a scene for 32 scenes is a different test.
+        send(Cmd::SetQuantum, 0);
+        send(Cmd::LaunchScene, pushAllScene_);
+        pushAllLaunched_ = true;
+        pushAllWait_ = 0;
+        return;
+    }
+    // 2. Two frames for the command to be drained and the state republished.
+    if (pushAllWait_ < 2) { ++pushAllWait_; return; }
+
+    for (int t = 0; t < (int)ses_.tracks.size() && t < kMaxTracks; ++t) {
+        const bool want = ses_.tracks[t].slots[pushAllScene_].valid();
+        const bool got  = es_.activeSlot[t] == pushAllScene_;
+        ++pushAllCells_;
+        if (want == got) continue;
+        ++pushAllFails_;
+        if (pushAllFails_ <= 8)
+            LOGE("NXTAKT_DEBUG_PUSHALL: track %d scene %d - model says %s, engine "
+                 "says %s (activeSlot %d)", t, pushAllScene_,
+                 want ? "clip" : "empty", got ? "clip" : "empty", es_.activeSlot[t]);
+    }
+    LOGI("NXTAKT_DEBUG_PUSHALL: scene %d checked (%d cells so far, %d bad)",
+         pushAllScene_, pushAllCells_, pushAllFails_);
+    ++pushAllScene_;
+    pushAllLaunched_ = false;
+    pushAllWait_ = 0;
 }
 
 void App::publishNotes(int track, int slot, const RtNote* fresh) {
@@ -311,7 +492,26 @@ bool App::autoLaneInert(u64 clipUid, const std::string& address) const {
     return false;
 }
 
+// One cell of the engine's slot table against the model, whatever the model now
+// says. Inside the set that is pushClip; outside it -- a load or an undo made
+// the set smaller while this cell was queued -- it is the ClearClip
+// releaseStaleSlots would have sent. Only the deferred drain calls this, and it
+// is the reason a queued cell is safe to survive a session swap.
+void App::syncClipCell(int track, int slot) {
+    if (track < 0 || track >= kMaxTracks || slot < 0 || slot >= kMaxScenes) return;
+    if (track < (int)ses_.tracks.size() && slot < (int)ses_.scenes.size()) {
+        pushClip(track, slot);
+        return;
+    }
+    clearStaleSlot(track, slot);
+}
+
 void App::pushClip(int track, int slot) {
+    // Something is already waiting for the ring. Take a place behind it rather
+    // than overtaking it, and build nothing: the drain will read this cell out
+    // of the model then, which is at least as fresh as now.
+    if (deferPub(PubKind::Clip, track, slot)) return;
+
     Command c;
     c.type = Cmd::SetClip;
     c.a = track; c.b = slot;
@@ -348,10 +548,13 @@ void App::pushClip(int track, int slot) {
 
     if (!m.valid()) {
         c.type = Cmd::ClearClip;
-        if (!engine_.pushCommand(c)) {
-            LOGW("command ring full - slot %d/%d not cleared", track, slot);
+        if (!eng_.pushCommand(c)) {
+            // Nothing was borrowed, so nothing is retired and the slot keeps
+            // whatever the engine is already playing -- for as long as it takes
+            // this cell to come round again in the queue, which is one frame.
             dropAutos(autos);
             delete[] warp;                 // null here, but the rule is the rule
+            refusePub(PubKind::Clip, track, slot);
             return;
         }
         // A cleared MIDI slot retires its notes exactly like a replaced one, and
@@ -404,13 +607,15 @@ void App::pushClip(int track, int slot) {
     rc.autos        = autos;
     rc.valid        = true;
     c.clip = rc;
-    if (!engine_.pushCommand(c)) {
+    if (!eng_.pushCommand(c)) {
         // The engine never saw any of the three allocations, so all three are
         // still solely ours and the slot keeps whatever it was already playing.
-        LOGW("command ring full - slot %d/%d not updated", track, slot);
+        // The cell goes back in the queue, so "the engine plays a clip the model
+        // no longer believes in" now lasts one frame instead of forever.
         delete[] fresh;
         dropAutos(autos);
         delete[] warp;
+        refusePub(PubKind::Clip, track, slot);
         return;
     }
     // Unconditional, not only for MIDI clips: a slot that just turned into an
@@ -461,26 +666,33 @@ void App::pushAll() {
 // from the UI" is not the same as "cannot sound".
 void App::releaseStaleSlots() {
     const int nt = (int)ses_.tracks.size(), ns = (int)ses_.scenes.size();
-    for (int t = 0; t < kMaxTracks; ++t) {
-        for (int s = 0; s < kMaxScenes; ++s) {
-            if (t < nt && s < ns) continue;
-            if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s] &&
-                !warpMaps_.published[t][s]) continue;
-            Command c;
-            c.type = Cmd::ClearClip;
-            c.a = t; c.b = s;
-            if (!engine_.pushCommand(c)) {
-                // The engine still holds it, so the flags stay set and the next
-                // push (or the next restore) tries again.
-                LOGW("command ring full - stale slot %d/%d not cleared", t, s);
-                continue;
-            }
-            clipLive_[t][s] = false;
-            publishNotes(t, s, nullptr);
-            publishAutos(t, s, nullptr);
-            publishWarp(t, s, nullptr);
-        }
+    for (int t = 0; t < kMaxTracks; ++t)
+        for (int s = 0; s < kMaxScenes; ++s)
+            if (t >= nt || s >= ns) clearStaleSlot(t, s);
+}
+
+// One out-of-set cell. Split out of the loop above so the deferred drain can
+// reach a single cell: a cell queued while it was inside the set has to be
+// clearable when it drains after the set has shrunk (syncClipCell).
+void App::clearStaleSlot(int t, int s) {
+    if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s] &&
+        !warpMaps_.published[t][s]) return;
+    if (deferPub(PubKind::Clip, t, s)) return;
+
+    Command c;
+    c.type = Cmd::ClearClip;
+    c.a = t; c.b = s;
+    if (!eng_.pushCommand(c)) {
+        // The engine still holds it, so the flags stay set and the cell goes
+        // back in the queue rather than waiting for something to happen to
+        // republish it.
+        refusePub(PubKind::Clip, t, s);
+        return;
     }
+    clipLive_[t][s] = false;
+    publishNotes(t, s, nullptr);
+    publishAutos(t, s, nullptr);
+    publishWarp(t, s, nullptr);
 }
 
 void App::pumpEngineEvents() {
@@ -502,7 +714,7 @@ void App::pumpEngineEvents() {
     pumpJournal();
 
     Event e;
-    while (engine_.popEvent(e)) {
+    while (eng_.popEvent(e)) {
         // Arrangement lanes and track-automation sets retire through their own
         // reaper (app_arrange.cpp), which owns the tables they live in. Without
         // this line every replaced lane leaks until shutdown, and an arrangement
@@ -664,7 +876,7 @@ void App::setTempo(f64 bpm) {
 }
 
 void App::togglePlay() {
-    const bool p = engine_.playing.load();
+    const bool p = es_.playing;
     // A recording pass is a statement about beats that are about to stop
     // advancing, so it ends here rather than being left open across the stop and
     // resumed against a beat several bars away.
@@ -686,7 +898,7 @@ void App::togglePlay() {
 void App::startRecording(int track, int slot) {
     if (track < 0 || track >= (int)ses_.tracks.size()) return;
     if (slot < 0 || slot >= (int)ses_.scenes.size()) return;
-    if (engine_.recState[track].load() != 0) {
+    if (es_.recState[track] != 0) {
         status_ = "Track is already recording";
         return;
     }
@@ -711,7 +923,7 @@ void App::startRecording(int track, int slot) {
         c.type = Cmd::RecordMidiSlot;
         c.p = notes;
     } else {
-        const i64 cap = (i64)std::llround(engine_.sampleRate() * kRecordSeconds);
+        const i64 cap = (i64)std::llround(eng_.sampleRate() * kRecordSeconds);
         // Zeroed rather than raw: a take that stops early leaves the tail
         // unwritten, and silence is a far better failure than whatever was on
         // that page.
@@ -727,7 +939,7 @@ void App::startRecording(int track, int slot) {
     }
     c.x = (f64)pr.cap;
 
-    if (!engine_.pushCommand(c)) {
+    if (!eng_.pushCommand(c)) {
         // The engine never saw the buffer, so it is still solely ours.
         delete[] pr.buf;
         delete[] pr.notes;
@@ -752,7 +964,7 @@ void App::stopRecording(int track) {
         c.a = track; c.b = p.slot;
         c.p = p.midi ? (void*)p.notes : (void*)p.buf;
         c.x = (f64)p.cap;
-        if (!engine_.pushCommand(c)) status_ = "Engine busy - still recording";
+        if (!eng_.pushCommand(c)) status_ = "Engine busy - still recording";
         return;
     }
 }
@@ -786,7 +998,7 @@ void App::finishRecording(const Event& e) {
     if (frames > 0 && inRange) {
         char name[32];
         snprintf(name, sizeof name, "Rec %d", recTakeNo_++);
-        SampleRef sb = sampleFromRecording(buf, frames, engine_.sampleRate(), ses_.tempo, name);
+        SampleRef sb = sampleFromRecording(buf, frames, eng_.sampleRate(), ses_.tempo, name);
         if (sb) {
             // pushUndoNow rather than undoPoint: this runs while engine events
             // are drained, so a widget the user happens to be dragging still
@@ -905,7 +1117,7 @@ void App::finishMidiRecording(const Event& e) {
         // instead of at whatever instant the second click happened.
         f64 endBeat = 0.0;
         for (int i = 0; i < count; ++i) endBeat = std::max(endBeat, buf[i].beat + buf[i].len);
-        endBeat = std::max(endBeat, engine_.beat.load() - recStartBeat_[track]);
+        endBeat = std::max(endBeat, es_.beat - recStartBeat_[track]);
         const f64 barBeats = std::max(1, ses_.sigNum);
         const f64 bars = std::max(1.0, std::ceil(endBeat / barBeats - 1e-9));
 
@@ -998,7 +1210,7 @@ void App::toggleAutoArm() {
 }
 
 void App::autoCapture(const std::string& address, f32 value, u64 gesture) {
-    if (!autoArm_ || !engine_.playing.load()) return;
+    if (!autoArm_ || !es_.playing) return;
 
     // Which track: the address says so. Resolving it here as well as at publish
     // time is not duplication -- it is the same question ("does this name
@@ -1017,9 +1229,9 @@ void App::autoCapture(const std::string& address, f32 value, u64 gesture) {
     // Which clip: the one playing on that track, and only while it is actually
     // playing (§5.1). Queued, stopping and stopped all mean there is no
     // clip-relative beat to stamp against.
-    const int slot = engine_.activeSlot[track].load();
+    const int slot = es_.activeSlot[track];
     if (slot < 0 || slot >= (int)ses_.scenes.size() ||
-        engine_.slotState[track].load() != (int)SlotState::Playing) {
+        es_.slotState[track] != (int)SlotState::Playing) {
         // Latched, like kbdNoArmHint_: the state holds until the user launches
         // something, and saying it every frame of a fader drag would bury the
         // rest of the status bar.
@@ -1038,7 +1250,7 @@ void App::autoCapture(const std::string& address, f32 value, u64 gesture) {
     // point of stamping from clipPhase rather than from a GUI-side clock: the
     // round trip through the atomic costs one block, and one block is well under
     // a tenth of the shortest deliberate gesture a hand makes.
-    const f64 beat = clampv(engine_.clipPhase[track].load(), 0.0, 1.0) * len;
+    const f64 beat = clampv(es_.clipPhase[track], 0.0, 1.0) * len;
 
     // The gesture a pass is keyed on. A widget owns ui_.active for the whole of
     // a drag, which is exactly the span a pass should be. A caller with no widget

@@ -195,6 +195,21 @@ static f32 peakMaster(ipc::EngineClient& c, int ms) {
     return peak;
 }
 
+// The same for a return bus. Separate from peakTrack because the index space
+// is different (0..kShmReturns-1, the mixer's A-D strips) and confusing the two
+// would read a track meter and call it a return.
+static f32 peakReturn(ipc::EngineClient& c, int ret, int ms) {
+    f32 peak = 0.f;
+    const u64 deadline = ipc::monotonicNs() + (u64)ms * 1000000ull;
+    do {
+        const f32 l = c.state().returnMeterL[ret].load(std::memory_order_relaxed);
+        const f32 r = c.state().returnMeterR[ret].load(std::memory_order_relaxed);
+        peak = std::max(peak, std::max(l, r));
+        sleepMs(1);
+    } while (ipc::monotonicNs() < deadline);
+    return peak;
+}
+
 static f32 peakTrack(ipc::EngineClient& c, int track, int ms) {
     f32 peak = 0.f;
     const u64 deadline = ipc::monotonicNs() + (u64)ms * 1000000ull;
@@ -828,6 +843,62 @@ static void testAudioClip(ipc::EngineClient& c) {
     drainEvents(c, &evs);
     note("%d events drained after the launch, %d of them ClipStarted",
          (int)evs.size(), countEvents(evs, (u32)Ev::ClipStarted));
+}
+
+// ---------------------------------------------------------------------------
+// 7b. the return meters and the compensated latency actually cross
+// ---------------------------------------------------------------------------
+//
+// These two fields were added to SharedState in wave 9 step 0 because
+// docs/GUI-ON-DAEMON.md §1.2 names them as the ones blocking a GUI on the far
+// side: without them the mixer cannot draw its four return strips and the
+// playhead cannot account for plugin delay.
+//
+// They are tested here rather than assumed because of the specific way this
+// kind of field fails. A member that exists in the struct but that nobody ever
+// stores into does not read as missing -- it reads as **zero**, which is a
+// perfectly plausible meter level and a perfectly plausible latency. Four dead
+// return strips and a playhead quietly ignoring delay compensation, with
+// nothing anywhere to indicate why. That is exactly the state the daemon
+// shipped in between the field landing and the mirror line being written, and
+// nothing in the suite noticed.
+//
+// Section 7 leaves a DC clip playing on track 0, so there is already a signal
+// to route. SendLevel is a scalar, so it crosses the boundary as it stands.
+
+static void testReturnMetersAndLatency(ipc::EngineClient& c) {
+    banner("7b. return meters and latencyFrames mirror across the boundary");
+
+    // Latency first: with no plugins anywhere it must read a *published* zero.
+    // Weak on its own -- an unwritten field reads zero too -- which is the
+    // whole reason the return meters below carry the real weight.
+    const i32 lat0 = c.state().latencyFrames.load(std::memory_order_relaxed);
+    CHECK(lat0 == 0, "latencyFrames reads 0 with no plugins in the set (%d)", (int)lat0);
+
+    // The return must be silent before anything is sent to it. If this reads
+    // non-zero the test proves nothing afterwards.
+    const f32 quiet = peakReturn(c, 0, 250);
+    CHECK(quiet < 1e-3f, "return A is silent before any send (peak %.3g)", (double)quiet);
+
+    CHECK(c.pushCommand(Cmd::SendLevel, 0, 0, 1.0), "push SendLevel track 0 -> return A");
+
+    // Post-fader send of a DC clip: the return sums it even with an empty
+    // chain, so the meter is the proof that the engine computed a return level
+    // AND that the daemon copied it out.
+    const f32 sent = peakReturn(c, 0, 600);
+    CHECK(sent > 0.01f, "return A meters the signal sent to it (peak %.4f)", (double)sent);
+
+    // And the other three stay down, which is what distinguishes a real
+    // per-index mirror from a loop that writes the same value into every slot.
+    f32 others = 0.f;
+    for (int i = 1; i < ipc::kShmReturns; ++i)
+        others = std::max(others, peakReturn(c, i, 120));
+    CHECK(others < 1e-3f, "returns B-D stay silent (peak %.3g)", (double)others);
+
+    CHECK(c.pushCommand(Cmd::SendLevel, 0, 0, 0.0), "push SendLevel back to 0");
+    sleepMs(250);
+    const f32 back = peakReturn(c, 0, 400);
+    CHECK(back < 1e-3f, "and it falls silent again (peak %.3g)", (double)back);
 }
 
 // ---------------------------------------------------------------------------
@@ -2919,6 +2990,7 @@ int main(int argc, char** argv) {
         testBurst(client);
         testPoolHandshake(client);
         testAudioClip(client);
+        testReturnMetersAndLatency(client);   // needs the clip 7 leaves playing
         testClearAndRetire(client);
         testMidiClip(client);
         testBadOffsets(client);

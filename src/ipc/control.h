@@ -626,6 +626,12 @@ inline constexpr u32 kMaxDevParams = 64;
 static_assert(kMaxDevices >= (u32)(kMaxTracks * kMaxChainFx + kMaxReturns * kMaxChainFx + kMaxChainFx),
               "the device table must be able to hold every addressable chain position");
 
+// shm.h carries the return-bus meters but cannot see kMaxReturns — it includes
+// core/ and nothing else, deliberately. This header includes both, so this is
+// where the duplicated number is held to account (shm.h, kShmReturns).
+static_assert(kShmReturns == kMaxReturns,
+              "SharedState's return-meter arrays must be exactly kMaxReturns wide");
+
 // WireParamInfo::flags — lat::ParamInfo's three booleans, as bits.
 enum : u32 {
     ParamIsBool = 1u << 0,
@@ -754,6 +760,13 @@ inline constexpr bool commandIsScalar(u32 type) {
         case Cmd::SetChain: case Cmd::SetReturnChain: case Cmd::SetMasterChain:
         case Cmd::RecordSlot: case Cmd::RecordMidiSlot:
         case Cmd::SetArrangement: case Cmd::SetTrackAutos:
+        // Time signatures (wave 9): Cmd::SetSignatures carries a pointer to a
+        // GUI-built map, so it is not a scalar. It is also not in
+        // commandIsKnown's range yet, deliberately -- the daemon answers
+        // RejectUnknownCommand rather than dropping it, which is the same
+        // fail-closed state Cmd::SetArrangement sat in for a wave. Consequence
+        // today: the daemon plays every set in 4/4.
+        case Cmd::SetSignatures:
             return false;
     }
     return false;
@@ -841,6 +854,8 @@ inline constexpr bool eventIsScalar(u32 type) {
         // arrangement's retirement: pushed from inside drainCommands(), so the
         // event's arrival *is* the drain.
         case Ev::ArrangementRetired: case Ev::TrackAutosRetired:
+        // SigsRetired carries a pointer into GUI memory, like AutosRetired.
+        case Ev::SigsRetired:
             return false;
     }
     return false;

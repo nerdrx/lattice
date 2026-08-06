@@ -163,7 +163,7 @@ bool App::restoreEntry(const UndoEntry& e) {
     }
     Session next;
     std::string err;
-    const bool ok = loadProject(next, undoTmp_, engine_.sampleRate(), &err);
+    const bool ok = loadProject(next, undoTmp_, eng_.sampleRate(), &err);
     remove(undoTmp_.c_str());
     if (!ok) {
         // Our own text failed to parse: a bug, not a user error. The session is

@@ -757,3 +757,141 @@ checks against a spawned daemon), and **the migration is net-negative on the
 scariest code in the app** — the whole GUI-owns-what-the-audio-thread-borrows
 protocol goes away, which is the reason to do this even setting the crash
 isolation aside.
+
+---
+
+## 10. Steps 0 and 1 shipped
+
+### Step 0 — `SharedState` v4
+
+`SharedStateT` gained `latencyFrames` (beside `blockSize`) and
+`returnMeterL/R[kShmReturns]` (beside the master meters); `kShmVersion` 2 → 3
+had already been spent by wave 8g, so this is **3 → 4**. Growing the struct moves
+`control::kState`'s successors and therefore `control::kHash` on its own, so the
+layout-hash half of §1.2 needed no edit: a v3 binary and a v4 binary refuse each
+other at `attach()` with a specific message, which is the mechanism working.
+
+`shm.h` deliberately does **not** include `audio/engine.h`, so `kMaxReturns` is
+not reachable there. The width is written out as `ipc::kShmReturns` and
+`control.h` — which has both headers — carries the `static_assert` that holds the
+two numbers together. `src/ui/engine_state.h` repeats the trick for the same
+reason (`kEsReturns`, asserted in `engine_handle.h`).
+
+**One line this wave could not write.** `src/daemon/nxtaktd.cpp` was owned by
+another agent, so `mirrorLoop()` still publishes everything *except* the two new
+fields — they read as zero across the boundary until it does. The daemon
+compiles and `daemon_test` is green (523) because nothing asserts on them yet.
+What is owed, immediately after the `masterMeterR` store at what is currently
+line 2449:
+
+```c++
+for (int i = 0; i < kMaxReturns; ++i) {
+    s.returnMeterL[i].store(e.returnMeterL[i].load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+    s.returnMeterR[i].store(e.returnMeterR[i].load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+}
+s.latencyFrames.store(e.latencyFrames.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+```
+
+§5 step 0 also asked for the MIDI client id and §10.8's mixer scalars while the
+file was open. Both were left out on purpose: this wave's brief was the two
+fields §1.2 proved are a *regression*, and the mixer scalars are wanted by step
+5's reattach, which is where they can be tested by something. They are still one
+version bump each, and the bump they would ride is the next one.
+
+### Step 1 — the seam, local only
+
+`src/ui/engine_state.h` (`EngineState`, pure data), `src/ui/engine_handle.h/.cpp`
+(`EngineHandle`, concrete, no vtable). `App` no longer holds an `Engine`, an
+`AudioBackend` or a `MidiInput`; it holds `EngineHandle eng_` and
+`EngineState es_`, and `frame()` opens with `eng_.poll(es_)`.
+
+**32 atomic loads on 29 source lines became one.** §1.2 counted 20 *sites*; the
+loads are more, because four of the sites read arrays element-wise. All of
+`app_session.cpp`, `app_chrome.cpp`, `app_detail.cpp` and the polled half of
+`app_engine.cpp` now read `es_`, and `grep -c 'engine_' src/ui` is 0.
+
+Three things §2 did not say, each found by contact with the code:
+
+1. **Locally there is nothing to gate the snapshot on.** §2.1 says to snapshot
+   "against `SharedState::generation`", which is right cross-process and has no
+   local twin: `Engine::publish()` bumps no counter, and `blocksRendered` is
+   incremented at the *top* of `process()` while `publish()` runs at the bottom,
+   so equal values either side of a copy do not prove the copy did not straddle
+   a publish. `engine.h` is frozen, so the local `poll()` is a tight unguarded
+   copy and says so. That still fixes the failure §2.1 actually names — the four
+   reads in `drawClipSlot` were separated by a draw, i.e. by several audio
+   blocks, and are now separated by a few hundred nanoseconds — and the daemon
+   branch closes it completely for free.
+2. **Two values must not come from the snapshot.** `sampleRate()` is read by
+   paths that decode and resample, where "as of this frame" is the wrong
+   question and a zero would silently resample a whole set wrong; and
+   `journalDropped()` is read at the instant a take is committed, where §5.4 of
+   ARRANGEMENT.md wants the count *now*. Both are live accessors on the handle,
+   which is also where their daemon versions belong.
+3. **`Engine` moved to the heap** inside the handle. It is ~2.3 MB of scratch,
+   it was already wherever `App` was, and a pointer is what lets `local()`
+   answer "there is no in-process engine" in step 2 without a second flag.
+
+`EngineState` does not remove `audio/engine.h` from the view translation units
+yet — they reach it through `app.h`, and `SlotState`, `Cmd` and `kMaxReturns` all
+still live there. What has happened is the harder half: no view *reads* an engine
+object any more, so the include is the only thing left to cut.
+
+### The `pushAll` flow-control bug (ARRANGEMENT.md §15)
+
+Fixed here rather than left queued, because §15 put it in these files.
+
+`pushAll()` sends `3 + tracks*9 + tracks*scenes + 4` commands in one burst —
+about 1320 for a 32×32 set against a 1023-deep ring — and `adoptSession()` runs
+`publishArrangementAll()` (65 more) straight after it. The fix is **one FIFO of
+deferred work, drained at the top of every frame**, and the two properties that
+make it correct are:
+
+- **it queues intent, not payload.** An entry says "cell (3,7) needs
+  publishing". The allocation, the address resolution and the retirement
+  bookkeeping all happen at drain time from the model as it stands *then* — so a
+  queued cell can be edited, cleared, or fall outside a freshly loaded set before
+  it drains and the right thing still happens, and a fader dragged for a second
+  collapses into one publish. That is why the drain goes through `syncClipCell`
+  rather than `pushClip`: a cell queued while it was inside the set has to be
+  *clearable* when it drains after a load shrank the set.
+- **it is one FIFO.** While anything is waiting, every new command joins the back
+  rather than going to the ring, so nothing overtakes something already queued.
+  Two queues would have needed a rule for a queued `Cmd::ClipGain` against a
+  fresh `Cmd::SetClip` on the same cell, and there is no good one.
+
+Scalars, clip cells, arrangement lanes, the transport cell and arrangement
+automation ride it. Chain publishes deliberately do not: there are at most 37,
+they are independent of clips and scalars, and they carry an `RtChain` whose
+retirement is already a hand-built protocol.
+
+One consequence worth knowing: `adoptSession()` now clears `sampleGrace_` only
+when the queue is empty. Deferred publication means a restore can arrive before
+the one before it has drained — the undo self-test does exactly that,
+synchronously, inside one frame — and the engine would still be reading a buffer
+that line was about to drop.
+
+**Proof** (`NXTAKT_DEBUG_PUSHALL`, in the shape of the undo self-test's hook).
+It waits for the queue to drain, then launches every scene in turn and compares
+each track against the model. `Cmd::LaunchScene` queues a track's slot *only*
+when the engine's own `clips_[t][scene]` is valid, so this reads the engine's
+slot table rather than anything the GUI believes about it.
+
+| | ring-full warnings | cells disagreeing |
+|---|---|---|
+| 8×8 undo self-test, before | 1040 | — |
+| 8×8 undo self-test, after | 0 | — |
+| 32×32 load, flow control **off** (negative control) | — | **254 of 1024** |
+| 32×32 load, flow control on | 0 | **0 of 1024** |
+
+The negative control is the important row: it is the shipped behaviour of the
+last four waves, and it is silent. 254 cells where the engine plays a clip the
+model does not believe in, with nothing scheduled to notice.
+
+Two related overflows this wave did **not** fix, both outside its files:
+`tools/render.cpp` pushes every clip before its first `process()` and so renders
+a 32×32 set as **silence** for exactly the same reason, and `Engine::journal_`
+overflow is already handled correctly (§5.4 refuses the take).

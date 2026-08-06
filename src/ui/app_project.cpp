@@ -169,7 +169,7 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
             if (!rebound) {
                 ensurePluginScan();
                 found = registry_.find(sd.uri);
-                if (found) inst = registry_.instantiate(*found, engine_.sampleRate(), kMaxBlock);
+                if (found) inst = registry_.instantiate(*found, eng_.sampleRate(), kMaxBlock);
             }
 
             if (!inst) {
@@ -241,7 +241,7 @@ void App::releaseAllChains() {
         c.type = co.cmd;
         c.a = co.addr;
         c.p = empty;
-        const bool sent = engine_.pushCommand(c);
+        const bool sent = eng_.pushCommand(c);
         if (!sent) {
             LOGW("command ring full - %s keeps running its old chain",
                  ownerName(owner).c_str());
@@ -357,7 +357,14 @@ void App::adoptSession(Session&& next, const std::vector<ClipSample>* restore) {
                     if (cs.uid == c.uid) { c.sample = cs.sample; break; }
             }
     }
-    sampleGrace_.clear();          // the previous generation, long since idle
+    // The previous generation, long since idle -- PROVIDED the clip pushes that
+    // let the engine go of it actually reached the engine. With deferred
+    // publication (app.h) a restore can arrive before the one before it has
+    // drained, and the undo self-test does exactly that, synchronously, inside
+    // one frame. Then the engine is still reading a buffer this line was about
+    // to drop, so the generation is held one longer instead. Bounded by the
+    // queue, which empties every frame.
+    if (pending_.empty()) sampleGrace_.clear();
     for (const TrackModel& t : ses_.tracks)
         for (const ClipModel& c : t.slots)
             if (c.sample) sampleGrace_.push_back(c.sample);
@@ -451,7 +458,7 @@ bool App::openProject(const std::string& path) {
     // which is not something to do speculatively.
     Session next;
     std::string err;
-    if (!loadProject(next, path, engine_.sampleRate(), &err)) {
+    if (!loadProject(next, path, eng_.sampleRate(), &err)) {
         status_ = "Load failed: " + err;
         return false;
     }

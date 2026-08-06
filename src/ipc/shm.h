@@ -69,7 +69,22 @@ inline constexpr u64 kShmMagic = 0x4C54435F53484D31ull;
 //        arrangement across the boundary: ARRANGEMENT.md §9.1). The block still
 //        mirrors Engine's published atomics exactly, which is the rule that
 //        decides what belongs here — and both of those are now among them.
-inline constexpr u32 kShmVersion = 3;
+//   v4 — SharedStateT gained returnMeterL/R[] and latencyFrames (wave 9 step 0,
+//        docs/GUI-ON-DAEMON.md §1.2/§5). Both landed on Engine in wave 6 (the
+//        return buses, plugin delay compensation) after this block was written
+//        in wave 1, so they were the two published atomics the GUI reads every
+//        frame that the wire could not carry — the first concrete regression a
+//        daemon-backed GUI would have shipped with. Same rule as v3: they are
+//        Engine's own published atomics, so they belong here.
+inline constexpr u32 kShmVersion = 4;
+
+// How many return buses SharedStateT carries meters for. This is kMaxReturns
+// from audio/engine.h, written out rather than included: the wire layer knows
+// nothing about the engine (see the file header), and kMaxTracks is only
+// reachable because it lives in core/common.h. control.h has both headers and
+// static_asserts that the two numbers agree, so the duplication cannot drift
+// without failing a build.
+inline constexpr int kShmReturns = 4;
 
 // Indices and payload sit on separate lines so the producer's write index does
 // not invalidate the consumer's cache line on every push. Cross-process this
@@ -670,6 +685,12 @@ struct SharedStateT {
     std::atomic<f32> cpu;
     std::atomic<f64> sampleRate;
     std::atomic<u32> blockSize;
+    // Engine::latencyFrames — the total plugin delay compensation the engine is
+    // applying, which the status bar prints. An engine scalar like blockSize and
+    // published for the same reason: the GUI cannot compute it, because it is
+    // the engine that knows which chains are running and what each of them
+    // reported.
+    std::atomic<i32> latencyFrames;
 
     // --- per-track ------------------------------------------------------
     std::atomic<i32> slotState[NTracks];
@@ -680,6 +701,13 @@ struct SharedStateT {
     std::atomic<f32> meterR[NTracks];
     std::atomic<f32> masterMeterL;
     std::atomic<f32> masterMeterR;
+
+    // --- the return buses ----------------------------------------------
+    // Engine::returnMeterL/R. The mixer's A-D strips read these every frame
+    // exactly as they read meterL/meterR, so leaving them off the wire would
+    // have given a daemon-backed mixer four permanently dead meters.
+    std::atomic<f32> returnMeterL[kShmReturns];
+    std::atomic<f32> returnMeterR[kShmReturns];
 
     // Recording, mirroring Engine::recState/recSlotIdx: 0 idle, 1 queued,
     // 2 recording (a take with a stop already queued still reads 2), and the
@@ -723,6 +751,7 @@ struct SharedStateT {
         cpu.store(0.f, std::memory_order_relaxed);
         sampleRate.store(sr, std::memory_order_relaxed);
         blockSize.store(block, std::memory_order_relaxed);
+        latencyFrames.store(0, std::memory_order_relaxed);
         for (int i = 0; i < NTracks; ++i) {
             slotState[i].store(0, std::memory_order_relaxed);
             activeSlot[i].store(-1, std::memory_order_relaxed);
@@ -735,6 +764,10 @@ struct SharedStateT {
         }
         masterMeterL.store(0.f, std::memory_order_relaxed);
         masterMeterR.store(0.f, std::memory_order_relaxed);
+        for (int i = 0; i < kShmReturns; ++i) {
+            returnMeterL[i].store(0.f, std::memory_order_relaxed);
+            returnMeterR[i].store(0.f, std::memory_order_relaxed);
+        }
         arrOverride.store(0, std::memory_order_relaxed);
         journalDropped.store(0, std::memory_order_relaxed);
     }

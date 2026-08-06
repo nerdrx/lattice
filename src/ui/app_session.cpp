@@ -30,7 +30,7 @@ namespace lat {
 // Deliberately does NOT touch the session: no uid, no undo point, no push. The
 // caller decides what the clip becomes.
 bool App::makeClipFromFile(const std::string& path, int colorIdx, ClipModel& out) {
-    SampleRef sb = loadSample(path, engine_.sampleRate());
+    SampleRef sb = loadSample(path, eng_.sampleRate());
     if (!sb) return false;
     out = ClipModel{};
     out.kind = ClipKind::Audio;
@@ -312,16 +312,20 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     const bool hot = ui_.setHot(id, cell) && ui_.isHot(id);
     const bool sel = ti == selTrack_ && si == selSlot_;
 
-    const int state = engine_.slotState[ti].load();
-    const int active = engine_.activeSlot[ti].load();
-    const int pending = engine_.pendingSlot[ti].load();
+    // ONE sample of the engine, taken at the top of the frame (engine_state.h).
+    // These four used to be four independent relaxed loads made microseconds to
+    // milliseconds apart, and two of them could straddle a publish: a slot drawn
+    // Playing with activeSlot == -1 is the shape that produced.
+    const int state = es_.slotState[ti];
+    const int active = es_.activeSlot[ti];
+    const int pending = es_.pendingSlot[ti];
     const bool playing = (state == (int)SlotState::Playing || state == (int)SlotState::StopQueued) && active == si;
     const bool queued  = pending == si;
 
     // Recording truth comes from the engine, not from what we asked for: the
     // start is quantized, so a slot can sit queued for a bar before it captures.
-    const int recPhase = engine_.recState[ti].load();
-    const bool recHere = recPhase != 0 && engine_.recSlotIdx[ti].load() == si;
+    const int recPhase = es_.recState[ti];
+    const bool recHere = recPhase != 0 && es_.recSlotIdx[ti] == si;
 
     if (!m.valid()) {
         const bool target = recIntent_ && ses_.tracks[ti].arm;
@@ -331,7 +335,7 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
             rend_.circle(cell.x + 8 * s, cell.cy(), 3.5f * s, pal::textOnClip);
             char buf[24];
             snprintf(buf, sizeof buf, "%.1f",
-                     std::max(0.0, engine_.beat.load() - recStartBeat_[ti]));
+                     std::max(0.0, es_.beat - recStartBeat_[ti]));
             rend_.textIn(fSmall_, {cell.x + 14 * s, cell.y, cell.w - 18 * s, cell.h},
                          buf, pal::textOnClip, Align::Right, 0);
         } else if (recHere) {
@@ -413,7 +417,7 @@ void App::drawClipSlot(const Rect& cell, int ti, int si) {
     // Playback progress along the bottom edge. The engine publishes clipPhase
     // for a MIDI clip exactly as for an audio one, so this needs no special case.
     if (playing) {
-        const f64 ph = clampv(engine_.clipPhase[ti].load(), 0.0, 1.0);
+        const f64 ph = clampv(es_.clipPhase[ti], 0.0, 1.0);
         rend_.rect({cell.x, cell.bottom() - 2 * s, cell.w * (f32)ph, 2 * s}, pal::textOnClip.alpha(0.45f));
     }
     if (sel) rend_.roundRectOutline(cell, 2 * s, 1 * s, pal::accent);
@@ -617,7 +621,7 @@ void App::drawMixer(const Rect& r, f32 scrollX) {
             autoCapture(addr::trackField(t.uid, "vol"), t.fader, uiId(6, (int)ti, 4));
         }
 
-        const f32 lvl = std::max(engine_.meterL[ti].load(), engine_.meterR[ti].load());
+        const f32 lvl = std::max(es_.meterL[ti], es_.meterR[ti]);
         peakHoldT_[ti] = std::max(lvl, peakHoldT_[ti] * 0.985f);
         ui_.meterV(meter, lvl, peakHoldT_[ti]);
     }
@@ -707,7 +711,7 @@ void App::drawReturnStrips(const Rect& r) {
             undoPointWith("return volume", rt.fader, wasFader);
             send(Cmd::ReturnVol, i, 0, faderToGain(rt.fader));
         }
-        const f32 lvl = std::max(engine_.returnMeterL[i].load(), engine_.returnMeterR[i].load());
+        const f32 lvl = std::max(es_.returnMeterL[i], es_.returnMeterR[i]);
         peakHoldR_[i] = std::max(lvl, peakHoldR_[i] * 0.985f);
         ui_.meterV(meter, lvl, peakHoldR_[i]);
 
@@ -771,7 +775,7 @@ void App::drawMasterStrip(const Rect& r) {
     if (ui_.vFader(uiId(7, 0), fader, &masterFader))
         send(Cmd::MasterVol, 0, 0, faderToGain(masterFader));
 
-    const f32 l = engine_.masterMeterL.load(), rr = engine_.masterMeterR.load();
+    const f32 l = es_.masterMeterL, rr = es_.masterMeterR;
     peakHoldM_[0] = std::max(l, peakHoldM_[0] * 0.985f);
     peakHoldM_[1] = std::max(rr, peakHoldM_[1] * 0.985f);
     ui_.meterV(meterL, l, peakHoldM_[0]);

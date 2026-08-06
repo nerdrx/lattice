@@ -99,7 +99,7 @@ void App::drawControlBar(const Rect& r) {
 
     // --- transport ---
     Rect playR{x, cy, 30 * s, h};
-    const bool playing = engine_.playing.load();
+    const bool playing = es_.playing;
     if (ui_.button(uiId(1, 4), playR, "", playing, pal::playGreen)) togglePlay();
     ui_.playTriangle(playR.insetXY(11 * s, 5 * s), playing ? pal::textOnClip : pal::text);
     x += playR.w + 3 * s;
@@ -117,7 +117,7 @@ void App::drawControlBar(const Rect& r) {
     Rect recR{x, cy, 30 * s, h};
     bool anyRec = false;
     for (size_t t = 0; t < ses_.tracks.size(); ++t)
-        if (engine_.recState[t].load() != 0) { anyRec = true; break; }
+        if (es_.recState[t] != 0) { anyRec = true; break; }
     // A dark plate under a bright circle while capturing; the plain armed plate
     // otherwise, so the two states never read as the same light.
     const Col recPlate = anyRec ? pal::recRed.scale(0.4f) : pal::armRed;
@@ -187,7 +187,7 @@ void App::drawControlBar(const Rect& r) {
 
     // --- position readout ---
     {
-        const f64 beat = engine_.beat.load();
+        const f64 beat = es_.beat;
         const int bar_ = (int)std::floor(beat / ses_.sigNum) + 1;
         const int bt   = (int)std::floor(std::fmod(beat, (f64)ses_.sigNum)) + 1;
         const int sx   = (int)std::floor(std::fmod(beat, 1.0) * 4.0) + 1;
@@ -212,7 +212,7 @@ void App::drawControlBar(const Rect& r) {
         rx = vs.x - 10 * s;
     }
     {
-        const f32 cpu = engine_.cpu.load();
+        const f32 cpu = es_.cpu;
         char buf[32];
         snprintf(buf, sizeof buf, "%.0f%%", cpu);
         Rect cr{rx - 44 * s, cy, 44 * s, h};
@@ -223,8 +223,9 @@ void App::drawControlBar(const Rect& r) {
     }
     {
         Rect br{rx - 60 * s, cy, 60 * s, h};
-        rend_.textIn(fSmall_, br, audio_ ? audio_->name() : "no audio",
-                     audio_ ? pal::textFaint : pal::recRed, Align::Right, 0);
+        const char* drv = eng_.driverName();
+        rend_.textIn(fSmall_, br, drv ? drv : "no audio",
+                     drv ? pal::textFaint : pal::recRed, Align::Right, 0);
         rx = br.x - 8 * s;
     }
     // Computer MIDI keyboard. It belongs with the audio/MIDI readouts because
@@ -302,7 +303,7 @@ void App::drawControlBar(const Rect& r) {
             // The one failure mode a user could never guess at: the mapping
             // table is fine, the controller is connected, and nothing moves
             // because the reader thread's tap is not wired up.
-            const bool untapped = midi_.received() > 0 && ctl::midiTapCount() == 0;
+            const bool untapped = eng_.midiReceived() > 0 && ctl::midiTapCount() == 0;
             if (learning)
                 snprintf(tip, sizeof tip, "MIDI learn: move a control to map %s  (click to cancel)",
                          midiMap_.learnAddress().c_str());
@@ -475,7 +476,7 @@ void App::buildArrangeContext(ArrangeContext& ctx, std::vector<AutoTargets>* tar
     ctx.lanes.clear();
     ctx.lanes.reserve(ses_.tracks.size());
     if (targets) targets->assign(ses_.tracks.size(), AutoTargets{});
-    const u32 ovr = engine_.arrOverride.load();
+    const u32 ovr = es_.arrOverride;
     for (size_t i = 0; i < ses_.tracks.size(); ++i) {
         TrackModel& t = ses_.tracks[i];
         ArrangeContext::Lane L;
@@ -510,8 +511,8 @@ void App::buildArrangeContext(ArrangeContext& ctx, std::vector<AutoTargets>* tar
     ctx.loopStart = &ses_.loopStart;
     ctx.loopEnd   = &ses_.loopEnd;
     ctx.loopOn    = &ses_.loopOn;
-    ctx.playhead  = engine_.beat.load();
-    ctx.playing   = engine_.playing.load();
+    ctx.playhead  = es_.beat;
+    ctx.playing   = es_.playing;
     ctx.sigNum    = ses_.sigNum;
     ctx.selTrack  = arrSelTrack_;
     ctx.selItem   = arrSelItem_;
@@ -1092,21 +1093,21 @@ void App::drawStatusBar(const Rect& r) {
     // The MIDI tag carries the sequencer client id: nothing is auto-connected,
     // so the number is what the user needs to hand aconnect or qpwgraph.
     char midiTag[32] = "";
-    if (midi_.running()) snprintf(midiTag, sizeof midiTag, " · MIDI %d:0", midi_.clientId());
+    if (eng_.midiRunning()) snprintf(midiTag, sizeof midiTag, " · MIDI %d:0", eng_.midiClientId());
 
     // Delay compensation, when the engine is applying any. It is latency the
     // user did not ask for and cannot see anywhere else, and it moves when a
     // plugin is added to a chain, so it belongs beside the buffer size.
     char pdcTag[24] = "";
-    const int pdc = engine_.latencyFrames.load();
+    const int pdc = es_.latencyFrames;
     if (pdc > 0) snprintf(pdcTag, sizeof pdcTag, " · PDC %d", pdc);
 
     char buf[224];
     snprintf(buf, sizeof buf, "%s · %s %.0f Hz / %d fr%s%s · %.0f fps · %d draws",
              win_.backendName(),
-             audio_ ? audio_->name() : "silent",
-             audio_ ? audio_->sampleRate() : 0.0,
-             audio_ ? audio_->bufferSize() : 0,
+             eng_.driverName() ? eng_.driverName() : "silent",
+             eng_.driverSampleRate(),
+             eng_.driverBufferSize(),
              pdcTag,
              midiTag,
              fps_, rend_.drawCalls());
@@ -1567,8 +1568,8 @@ void App::cycleMidiLearn(const std::string& address) {
     status_ = "MIDI learn: move a control to map " + address;
     // Say so HERE rather than leaving the user turning knobs at a chip that
     // never changes: both of these are states nothing else in the UI reports.
-    if (!midi_.running()) status_ += " — but no MIDI input is open";
-    else if (ctl::midiTapCount() == 0 && midi_.received() > 0)
+    if (!eng_.midiRunning()) status_ += " — but no MIDI input is open";
+    else if (ctl::midiTapCount() == 0 && eng_.midiReceived() > 0)
         status_ += " — but MIDI input is not tapped";
 }
 

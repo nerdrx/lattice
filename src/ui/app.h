@@ -5,8 +5,13 @@
 // translation units; a member add rebuilds those but not src/core or the roll.
 #pragma once
 #include "session.h"
-#include "../audio/backend.h"
-#include "../audio/midi_in.h"
+// Where the engine is, and what it looked like this frame. App holds no Engine,
+// no AudioBackend and no MidiInput of its own any more: EngineHandle owns all
+// three (or, from step 2, an ipc::EngineClient instead), and everything that
+// used to be an engine_.<atomic>.load() during a draw reads es_ instead.
+// docs/GUI-ON-DAEMON.md §2.
+#include "engine_handle.h"
+#include "engine_state.h"
 // Remote control (the append-only block at the end of class App). Both are
 // self-contained: learn.h reaches no further than MidiMsg, osc.h no further
 // than core/. Neither knows this header exists.
@@ -15,6 +20,7 @@
 #include "../gfx/renderer.h"
 #include "widgets.h"
 #include "window.h"
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,6 +100,14 @@ private:
     bool  makeClipFromFile(const std::string& path, int colorIdx, ClipModel& out);
     void  clearClip(int track, int slot);
     void  pushClip(int track, int slot);          // sync one slot to the engine
+    // One cell of the engine's slot table, brought into line with the model
+    // whatever the model now says about it: inside the set that is pushClip,
+    // outside it that is the ClearClip releaseStaleSlots sends. The deferred
+    // publication below retries cells through here rather than through either,
+    // because a cell queued before a load can be outside the set by the time it
+    // drains.
+    void  syncClipCell(int track, int slot);
+    void  clearStaleSlot(int track, int slot);
     // Hands `fresh` (which may be null) to publishedNotes_[track][slot] and
     // moves whatever was there into retiringNotes_. Only called once the engine
     // has actually accepted the clip carrying `fresh`.
@@ -160,12 +174,108 @@ private:
     Renderer rend_;
     Ui       ui_{};
     Font     fSmall_, fBody_, fBold_, fBig_;
-    Engine   engine_;
-    std::unique_ptr<AudioBackend> audio_;
-    // MIDI reader. Started after the audio backend and stopped before it: the
-    // reader pushes into the engine's ring from its own thread, so it must be
-    // joined before anything begins tearing the engine down.
-    MidiInput midi_;
+
+    // The engine, wherever it is. Owns the Engine, the audio backend and the
+    // MIDI reader on the local path; owns an ipc::EngineClient on the daemon
+    // path when that lands. Nothing outside this member and the six functions
+    // that command it knows which.
+    EngineHandle eng_;
+    // What the engine looked like at the top of this frame. THE ONLY THING the
+    // draw code may read about engine state — see engine_state.h for why one
+    // sample per frame is not a convenience but a correctness fix.
+    EngineState  es_;
+
+    // =======================================================================
+    // ENGINE FLOW CONTROL — deferred publication
+    //   docs/ARRANGEMENT.md §15 (the bug), docs/GUI-ON-DAEMON.md §2.2 (the shape)
+    //
+    // pushAll() sends roughly 3 + tracks*9 + tracks*scenes commands in one
+    // burst. A full 32x32 set is about 1320 of them against a 1024-deep ring
+    // that the audio thread drains once per block, so an ordinary project load
+    // or undo restore OVERFLOWED IT — and the failure mode was the bad kind:
+    // pushClip logged and gave up, leaving the engine playing a clip the model
+    // no longer believed in, with nothing scheduled to notice.
+    //
+    // The fix is flow control, not a bigger ring. A ring is a realtime
+    // structure sized for the steady state; a burst that large wants to be
+    // spread across frames.
+    //
+    // The shape, and the two properties that make it correct:
+    //
+    //   * IT QUEUES INTENT, NOT PAYLOAD. An entry says "cell (3,7) needs
+    //     publishing", not "here is an RtClip". The allocation, the resolve and
+    //     the retirement bookkeeping all happen at DRAIN time, from the model as
+    //     it stands then. So a queued cell can be edited, cleared or fall
+    //     outside a freshly loaded set before it drains and the right thing
+    //     still happens — and a fader dragged for a second collapses into one
+    //     publish instead of sixty.
+    //   * IT IS ONE FIFO. While anything is waiting, every new command joins the
+    //     back rather than going to the ring, so nothing can overtake something
+    //     already queued. Two queues would have needed a rule about how they
+    //     interleave, and the answer for (say) a queued Cmd::ClipGain against a
+    //     fresh Cmd::SetClip for the same cell is not obvious.
+    //
+    // Chain publishes deliberately stay direct: there are at most 37 of them,
+    // they are independent of clips and scalars, and they carry an RtChain whose
+    // retirement is already a hand-built protocol.
+    // =======================================================================
+    enum class PubKind : u8 {
+        Scalar,     // a pointer-free Command: type/a/b/x, replayed verbatim
+        Clip,       // a = track, b = slot   -> syncClipCell
+        ArrLane,    // a = track, or -1 for the transport cell
+        ArrAutos,   // a = track
+    };
+    struct PendingPub {
+        PubKind kind = PubKind::Scalar;
+        Cmd     type = Cmd::SetPlaying;      // Scalar only
+        i32     a = 0, b = 0;
+        f64     x = 0.0;
+    };
+    // Deep enough for the worst burst this app can produce (a 32x32 load is
+    // ~1400 entries) several times over, shallow enough that an engine which has
+    // stopped draining entirely — no audio backend at all — cannot quietly eat
+    // memory. Reaching it is counted and said out loud, exactly as the old
+    // per-command warning was, because that case IS the old failure.
+    static constexpr size_t kMaxPending = 8192;
+    std::deque<PendingPub> pending_;
+    // Membership, so a cell queued twice is queued once. Not for scalars: two
+    // sends of the same command are two facts, and their order is the meaning.
+    bool   pendClip_[kMaxTracks][kMaxScenes] = {};
+    bool   pendLane_[kMaxTracks + 1] = {};    // index kMaxTracks == transport cell
+    bool   pendAutos_[kMaxTracks] = {};
+    bool   flushing_   = false;   // inside flushPending(): do the work, never re-queue
+    bool   pubRefused_ = false;   // a publisher's answer to flushPending()
+    size_t pendHigh_   = 0;       // deepest the queue has ever been, this run
+    u64    pendDropped_ = 0;      // entries the cap threw away
+
+    // Drains the queue into the ring, in order, until the ring refuses. Called
+    // at the top of every frame, before anything else touches the engine.
+    void flushPending();
+    // Asked by every deferrable publisher before it does any work. True when the
+    // work was queued instead — because something is already waiting, and going
+    // straight to the ring would overtake it.
+    bool deferPub(PubKind k, i32 a = 0, i32 b = 0);
+    // The refusal path: the ring said no. Queues the work, or — when we ARE the
+    // drain — tells flushPending to stop and leave it at the front.
+    void refusePub(PubKind k, i32 a = 0, i32 b = 0);
+    void queuePub(const PendingPub& p);
+    // The membership flag for a piece of work, or null for a scalar.
+    bool* pendSeen(PubKind k, i32 a, i32 b);
+
+    // Headless verification hook (NXTAKT_DEBUG_PUSHALL), in the shape of the
+    // undo self-test's: nothing inside gamescope can load a 32x32 set and then
+    // look at what the engine ended up holding, and "the engine's slot table
+    // agrees with the model" is exactly the property the old failure broke
+    // silently. It waits for the queue to drain, then launches every scene in
+    // turn and checks each track against ses_ — a launch only starts a voice
+    // when the engine's own clips_[t][s] is valid (engine.cpp, Cmd::LaunchScene),
+    // so this reads the engine's table rather than anything the GUI believes
+    // about it. Runs across frames because that is what the fix does.
+    void debugPushAllCheck();
+    bool pushAllHook_ = false, pushAllDone_ = false, pushAllLaunched_ = false;
+    int  pushAllScene_ = 0, pushAllWait_ = 0;
+    int  pushAllCells_ = 0, pushAllFails_ = 0;
+    u64  pushAllStalls_ = 0;
 
     // --- recording ---------------------------------------------------------
     // A take in flight. The capture buffer is GUI-owned for its whole life:
@@ -385,7 +495,7 @@ private:
     // a preview is a note-on now plus a deadline, and the frame loop — which
     // runs regardless — sends the off once the deadline passes.
     //
-    // Where they go: engine_.pushMidi, the same ring the computer keyboard and
+    // Where they go: EngineHandle::pushMidi, the same ring the computer keyboard
     // a hardware controller feed, which the engine forwards to note-capable
     // devices on *armed* tracks. That lines up with "the clip on screen" only
     // because selectTrack() auto-arms the selected track (Live's exclusive
@@ -1009,7 +1119,12 @@ public:
     // unconditionally is not tidiness: the ring is what overflows, and a
     // consumer that only drains while armed would arrive at its first take with
     // the ring already full and every entry of that take refused.
-    void pumpJournal() { pumpJournal(engine_); }
+    // One of the two places that still needs the Engine itself rather than a
+    // command or a snapshot field: the journal is its own ring, and there is no
+    // reason to mirror popJournal() through the handle while the only other
+    // caller is the headless hook's private offline engine. In daemon mode
+    // local() is null and the journal comes off ipc::JournalRing instead.
+    void pumpJournal() { if (Engine* e = eng_.local()) pumpJournal(*e); }
     // ...and the same body against any engine, which is what the headless hook
     // drives: ONE accumulate rule, so the hook cannot verify a path the app does
     // not take. `eng` is the app's own everywhere except there.
@@ -1021,7 +1136,10 @@ public:
     // journalDropped as of now — read by the caller, because the caller is the
     // one that knows which engine produced the pass.
     void commitTake(u32 droppedNow);
-    void commitTake() { commitTake(engine_.journalDropped.load(std::memory_order_relaxed)); }
+    // The LIVE count, not es_.journalDropped: §5.4 wants the drop count as of
+    // the commit, and a value one frame old could commit a take that the last
+    // few entries of were lost.
+    void commitTake() { commitTake(eng_.journalDropped()); }
 
 private:
     // The pass, as drained. The ring's capacity bounds what one frame delivers

@@ -99,7 +99,7 @@ void App::publishChain(int owner) {
     c.type = co.cmd;
     c.a = co.addr;
     c.p = chain;
-    if (!engine_.pushCommand(c)) {
+    if (!eng_.pushCommand(c)) {
         // The ring is full, so the engine never saw this chain. It is still
         // solely ours, and the previously published one is still live: drop the
         // new one and leave every piece of state exactly as it was.
@@ -132,7 +132,7 @@ void App::addDevice(int owner, const PluginDesc& d) {
     // instantiate() already calls prepare() on the instance (see the tail of
     // instantiateLV2/instantiateCLAP), so a non-null return is ready to run.
     std::unique_ptr<PluginInstance> inst =
-        registry_.instantiate(d, engine_.sampleRate(), kMaxBlock);
+        registry_.instantiate(d, eng_.sampleRate(), kMaxBlock);
     if (!inst) {
         status_ = "Could not load " + d.name;
         return;

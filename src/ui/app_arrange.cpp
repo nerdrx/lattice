@@ -514,17 +514,22 @@ void App::dropArrangement(const RtArrangement* arr) {
 void App::publishArrangement(int track) {
     const int cell = arrCell(track);
     if (cell < 0 || cell == kMaxTracks) return;   // the transport cell has its own path
+    // Something is already waiting for the ring (app.h, deferred publication).
+    // Take a place behind it and build nothing: the drain reads this track's
+    // lane out of the model then, which is at least as fresh as now.
+    if (deferPub(PubKind::ArrLane, track)) return;
 
     const RtArrangement* fresh = buildArrangement(track);
     Command c;
     c.type = Cmd::SetArrangement;
     c.a = track;
     c.p = const_cast<RtArrangement*>(fresh);
-    if (!engine_.pushCommand(c)) {
+    if (!eng_.pushCommand(c)) {
         // Nobody borrowed it. The track keeps whatever lane the engine already
-        // holds, and the next edit tries again.
-        LOGW("command ring full - track %d's arrangement not updated", track);
+        // holds, and the cell goes back in the queue -- so "the next edit tries
+        // again" becomes "the next frame does", whether or not there is one.
         dropArrangement(fresh);
+        refusePub(PubKind::ArrLane, track);
         return;
     }
     const RtArrangement* old = arr_.published[(size_t)cell];
@@ -565,6 +570,7 @@ void App::publishArrangement(int track) {
 // ---------------------------------------------------------------------------
 
 void App::publishTransportCell() {
+    if (deferPub(PubKind::ArrLane, -1)) return;
     char* mem = new (std::nothrow) char[sizeof(RtArrangement)];
     if (!mem) { status_ = "Out of memory - loop brace not updated"; return; }
     RtArrangement* cellv = new (mem) RtArrangement();
@@ -581,9 +587,9 @@ void App::publishTransportCell() {
     c.type = Cmd::SetArrangement;
     c.a = -1;
     c.p = cellv;
-    if (!engine_.pushCommand(c)) {
-        LOGW("command ring full - loop brace not updated");
+    if (!eng_.pushCommand(c)) {
         freeBlock(cellv);
+        refusePub(PubKind::ArrLane, -1);
         return;
     }
     const size_t cell = (size_t)kMaxTracks;
@@ -716,14 +722,15 @@ void App::dropArrangeAutos(const RtAutoSetN* set) {
 
 void App::publishArrangeAutos(int track) {
     if (track < 0 || track >= kMaxTracks) return;
+    if (deferPub(PubKind::ArrAutos, track)) return;
     const RtAutoSetN* fresh = buildArrangeAutos(track);
     Command c;
     c.type = Cmd::SetTrackAutos;
     c.a = track;
     c.p = const_cast<RtAutoSetN*>(fresh);
-    if (!engine_.pushCommand(c)) {
-        LOGW("command ring full - track %d's arrangement automation not updated", track);
+    if (!eng_.pushCommand(c)) {
         dropArrangeAutos(fresh);
+        refusePub(PubKind::ArrAutos, track);
         return;
     }
     const RtAutoSetN* old = arrAutos_.published[(size_t)track];

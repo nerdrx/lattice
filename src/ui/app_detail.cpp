@@ -260,8 +260,8 @@ void App::drawArrangeClipDetail(const Rect& r) {
     // Where the playhead is INSIDE this item, so the roll's line means the same
     // thing it means for a session clip. Only while the transport is inside the
     // item at all -- an item that is not sounding has no phase to show.
-    const f64 beat = engine_.beat.load();
-    const bool inside = engine_.playing.load() && beat >= it->start && beat < it->end();
+    const f64 beat = es_.beat;
+    const bool inside = es_.playing && beat >= it->start && beat < it->end();
     const f64 phase = inside ? (it->offset + (beat - it->start)) : 0.0;
 
     const ClipModel before = m;
@@ -489,8 +489,8 @@ void App::drawClipDetail(const Rect& r) {
 
     // Where the clip is, in its own beats, so the grid and the lane draw the
     // same playhead from the same number.
-    const bool active = engine_.activeSlot[selTrack_].load() == selSlot_;
-    const f64  phase  = clampv(engine_.clipPhase[selTrack_].load(), 0.0, 1.0);
+    const bool active = es_.activeSlot[selTrack_] == selSlot_;
+    const f64  phase  = clampv(es_.clipPhase[selTrack_], 0.0, 1.0);
 
     if (!roll_) roll_ = std::make_unique<PianoRoll>();
 

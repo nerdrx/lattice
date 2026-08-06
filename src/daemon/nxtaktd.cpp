@@ -2456,6 +2456,25 @@ private:
                                 std::memory_order_relaxed);
             s.journalDropped.store(e.journalDropped.load(std::memory_order_relaxed),
                                    std::memory_order_relaxed);
+            // Wave 9 step 0. The return meters and the compensated latency are
+            // the two fields docs/GUI-ON-DAEMON.md §1.2 identifies as blocking:
+            // a GUI on the far side of the boundary has no other way to draw the
+            // return strips or to place the playhead, and a field that exists in
+            // SharedState but is never written reads as a plausible zero rather
+            // than as missing -- four dead return meters and a playhead that
+            // ignores plugin delay, with nothing to indicate why.
+            //
+            // kMaxReturns (engine.h) and ipc::kShmReturns (shm.h) are the same
+            // number by static_assert in control.h; shm.h deliberately does not
+            // include engine.h, which is why the width is spelled twice at all.
+            for (int i = 0; i < kMaxReturns; ++i) {
+                s.returnMeterL[i].store(e.returnMeterL[i].load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
+                s.returnMeterR[i].store(e.returnMeterR[i].load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
+            }
+            s.latencyFrames.store(e.latencyFrames.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
 
             if (nullDriver_)
                 s.blocksRendered.store(nullDriver_->blocks(), std::memory_order_relaxed);

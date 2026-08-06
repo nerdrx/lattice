@@ -45,18 +45,17 @@ bool App::init(int argc, char** argv) {
     ui_.fBold = &fBold_;
     ui_.fBig = &fBig_;
 
-    audio_ = createBackend(engine_, env("AUDIO"));
-    if (!audio_) {
-        LOGW("no audio backend available - running silent");
-        engine_.prepare(48000.0, 1024);
-    }
-
-    // MIDI comes up after the audio backend: the reader thread pushes straight
-    // into the engine's ring, so the engine must already be prepared. Missing
-    // hardware or a missing sequencer device is not an error - a set can be
-    // played entirely from the mouse.
-    if (midi_.start(engine_)) LOGI("midi in: alsa seq client %d:0", midi_.clientId());
-    else                      LOGW("no MIDI input - continuing without it");
+    // Engine, audio backend and MIDI reader, with the fallbacks that used to be
+    // spelled out here. The ORDERING CONSTRAINT that arrives with the daemon
+    // path (§1.4) starts here: nothing may decode a sample before this returns,
+    // because loadSample resamples to the engine's rate and a detached handle
+    // does not know it yet. Locally that has always been true by construction;
+    // keep it true.
+    if (!eng_.openLocal(env("AUDIO"))) return false;
+    // A first snapshot, so anything that runs before frame() ever does — the
+    // headless hooks, a project on the command line — reads real state and not
+    // a default-constructed one.
+    eng_.poll(es_);
 
     // Default set: eight audio tracks, eight scenes, same as a fresh Live set.
     ses_.tracks.resize(8);
@@ -149,7 +148,20 @@ bool App::init(int argc, char** argv) {
     // debugUndoSelfTest, and note that it puts the set back as it found it.
     if (env("DEBUG_UNDO")) debugUndoSelfTest();
 
-    LOGI("backend: %s   audio: %s", win_.backendName(), audio_ ? audio_->name() : "none");
+    // The flow-control proof (docs/ARRANGEMENT.md §15). Only the arming here:
+    // the check itself runs from frame(), because what it is checking is that a
+    // burst too big for the ring arrives whole ACROSS FRAMES.
+    pushAllHook_ = env("DEBUG_PUSHALL") != nullptr;
+
+    LOGI("backend: %s   audio: %s", win_.backendName(),
+         eng_.driverName() ? eng_.driverName() : "none");
+    // What init() has queued for the engine and has not sent yet — the whole of
+    // pushAll for a big set, plus whatever the debug hooks piled on behind it.
+    // Reported here because nothing has drawn a frame yet, so this is the only
+    // place the burst is visible as one number.
+    if (!pending_.empty())
+        LOGI("engine: %zu deferred publications queued at startup (high water %zu)",
+             pending_.size(), pendHigh_);
     return true;
 }
 
@@ -158,21 +170,19 @@ void App::shutdown() {
     // hear it: previews and held keyboard notes both outlive the state that
     // started them, and a plugin does not know the app is closing.
     stopPreviews();
-    kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
+    kbd_.allNotesOff([this](const MidiMsg& m) { eng_.pushMidi(m); });
 
-    // Order matters. The MIDI reader goes first: it pushes into the engine's
-    // ring from its own thread, so it has to be joined before anything else
-    // starts tearing the engine down, or a push could land in a ring nobody
-    // owns any more.
-    midi_.stop();
-
-    // Stopping the backend joins the audio thread, so once it returns nothing
-    // can be inside process() and nothing can be following a published chain
-    // or writing into a capture buffer. Only then is it safe to free either
+    // Joins the MIDI reader and then the audio thread, in that order and for
+    // the reasons EngineHandle::close() states. Once it returns nothing can be
+    // inside process() and nothing can be following a published chain or
+    // writing into a capture buffer. Only then is it safe to free either
     // without the Ev::ChainRetired / Ev::RecordFinished handshake — the events
     // still sitting in the ring will never be drained, so waiting for them here
     // would deadlock or leak.
-    if (audio_) { audio_->stop(); audio_.reset(); }
+    //
+    // Whatever is still in pending_ is simply dropped: it is work for an engine
+    // that is going away.
+    eng_.close();
     for (const RtChain*& c : published_) { delete c; c = nullptr; }
     for (const RtChain*& c : publishedReturn_) { delete c; c = nullptr; }
     delete publishedMaster_; publishedMaster_ = nullptr;
@@ -210,6 +220,17 @@ void App::frame() {
     const f32 dt = (f32)(t - lastFrameTime_);
     lastFrameTime_ = t;
     fps_ = fps_ * 0.92f + (dt > 0.f ? 1.f / dt : 0.f) * 0.08f;
+
+    // ONE sample of the engine, for the whole frame. Everything below reads es_
+    // and nothing reads an engine atomic — which is what makes a frame
+    // internally coherent (engine_state.h) and what lets step 2 point this one
+    // line at a daemon.
+    eng_.poll(es_);
+    // Then whatever the ring refused last frame, in order, before anything new
+    // is generated. First thing, so the audio thread has the whole frame to
+    // drain what this pushes.
+    flushPending();
+    debugPushAllCheck();          // NXTAKT_DEBUG_PUSHALL only; inert otherwise
 
     pumpEngineEvents();
     // Note previews are ended by the frame loop, not by a timer: whatever else
@@ -509,7 +530,7 @@ void App::updateKbdPiano() {
     // keys and follow the layout like any other named shortcut.
     const KbdPiano::Result res = kbd_.update(in.scanDown, in.keyDown[KeyPageUp],
         in.keyDown[KeyPageDown], live,
-        [this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
+        [this](const MidiMsg& m) { eng_.pushMidi(m); });
 
     if (res.baseChanged) {
         char buf[96];
@@ -542,7 +563,7 @@ void App::toggleKbdMidi() {
         // Anything still held has to be let go here: the key release that would
         // normally end the note is about to be ignored, and a hung note would
         // sit in the instrument with nothing left to stop it.
-        kbd_.allNotesOff([this](const MidiMsg& m) { engine_.pushMidiFromGui(m); });
+        kbd_.allNotesOff([this](const MidiMsg& m) { eng_.pushMidi(m); });
         status_ = "Computer MIDI Keyboard off";
     }
 }
@@ -594,18 +615,18 @@ void App::startPreview(int pitch, u64 clipUid) {
     // audible as repeated notes and never leaves two offs chasing one on.
     for (Preview& p : previews_) {
         if (p.pitch != (u8)pitch) continue;
-        engine_.pushMidiFromGui(MidiMsg{0x80, p.pitch, 0, 0, 0});
-        engine_.pushMidiFromGui(MidiMsg{0x90, p.pitch, (u8)kPreviewVel, 0, 0});
+        eng_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
+        eng_.pushMidi(MidiMsg{0x90, p.pitch, (u8)kPreviewVel, 0, 0});
         p.offAt = off;
         return;
     }
     // Full: the oldest audition gives way. A dropped preview would be a note
     // that never sounds; a hung one would be a note that never stops.
     if ((int)previews_.size() >= kMaxPreviews) {
-        engine_.pushMidiFromGui(MidiMsg{0x80, previews_.front().pitch, 0, 0, 0});
+        eng_.pushMidi(MidiMsg{0x80, previews_.front().pitch, 0, 0, 0});
         previews_.erase(previews_.begin());
     }
-    engine_.pushMidiFromGui(MidiMsg{0x90, (u8)pitch, (u8)kPreviewVel, 0, 0});
+    eng_.pushMidi(MidiMsg{0x90, (u8)pitch, (u8)kPreviewVel, 0, 0});
     previews_.push_back(Preview{(u8)pitch, off});
 }
 
@@ -636,7 +657,7 @@ void App::updatePreviews() {
     const f64 now = nowSeconds();
     for (size_t i = 0; i < previews_.size();) {
         if (previews_[i].offAt <= now) {
-            engine_.pushMidiFromGui(MidiMsg{0x80, previews_[i].pitch, 0, 0, 0});
+            eng_.pushMidi(MidiMsg{0x80, previews_[i].pitch, 0, 0, 0});
             previews_.erase(previews_.begin() + (long)i);
         } else {
             ++i;
@@ -645,7 +666,7 @@ void App::updatePreviews() {
 }
 
 void App::stopPreviews() {
-    for (const Preview& p : previews_) engine_.pushMidiFromGui(MidiMsg{0x80, p.pitch, 0, 0, 0});
+    for (const Preview& p : previews_) eng_.pushMidi(MidiMsg{0x80, p.pitch, 0, 0, 0});
     previews_.clear();
     previewClip_ = 0;
 }
