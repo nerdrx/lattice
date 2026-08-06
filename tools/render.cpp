@@ -168,6 +168,25 @@ static void materializeDevices(Engine& e, const Session& s, PluginRegistry& reg,
                 }
             inst->setBypassed(sd.bypass);
 
+            // SavedDevice::state, AFTER the parameters and never before -- the
+            // same ordering App::materializeDevices documents at length. A rack
+            // restores its contents verbatim here; applying the state first
+            // would let the macro writes above re-derive every mapped
+            // parameter, and the render would not be what the set sounds like.
+            std::string rackNote;
+            if (RackControl* rc = inst->rack()) {
+                RackState rs;
+                if (rackStateFromString(sd.state, rs)) {
+                    rc->setState(rs);
+                    char buf[48];
+                    std::snprintf(buf, sizeof buf, " {%d inside}", rc->deviceCount());
+                    rackNote = buf;
+                } else if (!sd.state.empty()) {
+                    std::fprintf(stderr, "render: rack state did not parse for %s\n",
+                                 sd.uri.c_str());
+                }
+            }
+
             if (!line.empty()) line += ", ";
             line += found->name.empty() ? sd.uri : found->name;
             if (applied > 0) {
@@ -175,6 +194,7 @@ static void materializeDevices(Engine& e, const Session& s, PluginRegistry& reg,
                 std::snprintf(buf, sizeof buf, " [%d param%s]", applied, applied == 1 ? "" : "s");
                 line += buf;
             }
+            line += rackNote;
             if (sd.bypass) line += " (bypassed)";
 
             chain->fx[chain->count++] = inst.get();

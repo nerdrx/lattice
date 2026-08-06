@@ -137,8 +137,14 @@ void App::drawDetailPanel(const Rect& r) {
             // the context label says where on the timeline it is rather than
             // which scene it is in -- it is not in one.
             const ArrangeClip* it = selectedArrItem();
+            // Through Session::barOfBeat, not `start / sigNum`: dividing by the
+            // bar-0 numerator is only right while a set never changes
+            // signature, and from the first change on it prints a wrong bar
+            // silently and plausibly. barOfBeat forwards to the same function
+            // the engine's metronome and the ruler use, so this label cannot
+            // disagree with the grid it is describing.
             if (it) snprintf(buf, sizeof buf, "%s  -  bar %.2f",
-                             it->src.name.c_str(), it->start / std::max(1, ses_.sigNum) + 1.0);
+                             it->src.name.c_str(), ses_.barOfBeat(it->start) + 1.0);
             else    snprintf(buf, sizeof buf, "no item selected");
         } else if (detailTab_ == DetailTab::Clip) {
             const ClipModel& m = ses_.tracks[selTrack_].slots[selSlot_];

@@ -113,6 +113,12 @@ struct DeviceModel {
     // (silent, skipped by publishChain) and carries its saved parameters here
     // so that saving the set again does not throw them away.
     std::vector<std::pair<u32, f32>> lostParams;
+    // The same parking space for SavedDevice::state. A missing plugin's opaque
+    // state is exactly as unrecoverable as its parameters if we drop it, and a
+    // rack's whole contents ride in that string -- losing it would turn "the
+    // plugin is not installed here" into "the plugin is not installed here and
+    // your rack is empty forever".
+    std::string lostState;
 };
 
 // A device as it sits in a saved set: no instance, just what's needed to
@@ -126,6 +132,22 @@ struct SavedDevice {
     std::string name;                  // display fallback if the plugin is gone
     bool bypass = false;
     std::vector<std::pair<u32, f32>> params;   // (ParamInfo::id, value)
+    // Whatever a device needs to describe itself beyond its parameters, as one
+    // opaque line of printable ASCII. Today exactly one device produces it --
+    // `nxtakt:rack`, whose entire contents ride here as the compact form
+    // rackStateToString() writes -- but nothing about the field is rack-shaped,
+    // which is why it is called `state` and why src/core stores it verbatim
+    // without ever parsing it. Empty for every other device, and the project
+    // writer omits the line when it is empty, so a set with no rack in it is
+    // byte-identical to what v7 wrote.
+    //
+    // ORDER MATTERS ON THE WAY BACK IN. `params` must be applied to the
+    // instance BEFORE this string reaches PluginInstance::rack()->setState():
+    // a rack's macros are ordinary params, writing one drives its mapped
+    // targets, and setState deliberately restores the sub-device values
+    // verbatim without re-deriving them. The other order re-rounds every mapped
+    // parameter on every load. See docs/RACKS.md and App::materializeDevices.
+    std::string state;
 };
 
 // A live plugin instance lifted out of a session that is about to be replaced,

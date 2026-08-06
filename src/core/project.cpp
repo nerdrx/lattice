@@ -113,7 +113,42 @@ namespace {
 // clamp here). Changes are sorted and deduplicated on load, last-wins, by
 // Session::normalizeSigs -- the same normalizer every edit and the publisher
 // use, so a hand-written file and an edited one cannot land in different shapes.
-constexpr int kFormatVersion = 7;
+// Version 8 adds device STATE: one optional `state <opaque>` line inside a
+// `device` block, carrying whatever a device needs to describe itself beyond
+// its parameters.
+//
+//     device
+//       uid 12
+//       plugin nxtakt:rack
+//       name Rack
+//       bypass 0
+//       param 1 0.4
+//       state nxrack1;m=0,0,0.4,0,0,0,0,0;d=nxtakt%3Aeq3,0,-,0:100;x=2,0,0,6,30
+//     enddevice
+//
+// Today exactly one device writes it -- `nxtakt:rack`, whose whole contents are
+// that one line -- and THIS FILE DOES NOT KNOW THAT. The value is an opaque
+// scalar: stored verbatim, escaped by esc() like any other string, never parsed
+// here. src/core owns the project format, src/plugin owns what a rack means,
+// and the string is the seam. (It is also what keeps gen_demo linkable: the
+// rack's codec lives in internal_devices.cpp, which the tool does not link.)
+//
+// The compact form is printable ASCII with no whitespace by construction, so
+// esc()/unesc() are the identity on everything the rack writes and the line
+// round-trips byte for byte. A hand-edited file that puts a newline or a tab in
+// there round-trips too, through the escapes every other string uses.
+//
+// Sparse, like everything since v2: a device with no state writes no line, so a
+// set with no rack in it -- which is every set that existed before this version
+// -- produces the identical bytes v7 produced apart from the header line.
+//
+// A state the rack layer cannot parse is NOT a parse error here. It cannot be:
+// the format has no way to tell an unreadable state from one written by a newer
+// build, and refusing the file would lose a whole set over one device. The
+// string survives the round trip either way; the rack drops what it cannot read
+// when it restores, exactly as a `param` naming a control the plugin no longer
+// has is dropped.
+constexpr int kFormatVersion = 8;
 constexpr int kMinFormatVersion = 1;
 
 // What saveProject writes. Reading accepts this and every spelling in
@@ -508,6 +543,10 @@ void writeDevice(std::string& o, const SavedDevice& d) {
     kn(o, "    ", "bypass", d.bypass ? "1" : "0");
     for (const auto& p : d.params)
         kn(o, "    ", "param", std::to_string(p.first) + " " + fmtF32(clParam(p.second)));
+    // v8, and sparse: no state, no line. It goes AFTER the parameters purely so
+    // the block reads in the order the loader has to apply it (params, then
+    // state -- see SavedDevice::state); the reader does not care.
+    if (!d.state.empty()) kv(o, "    ", "state", d.state);
     o += "  enddevice\n";
 }
 
@@ -1519,6 +1558,12 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 if (!sc.integer(id) || !sc.num(v))
                     return fail("param: expected an id and a value");
                 d.params.emplace_back((u32)clampv(id, (i64)0, (i64)UINT32_MAX), clParam((f32)v));
+            } else if (key == "state") {
+                // v8. Opaque: taken verbatim, never parsed here. `rest` is the
+                // whole remainder of the line, so a state carrying anything the
+                // escape layer knows about comes back exactly as written. Last
+                // line wins, as a repeated scalar does everywhere in this file.
+                d.state = unesc(rest);
             } else if (key == "enddevice") {
                 // Back to whichever block opened this one, not unconditionally
                 // to St::Track: the same device grammar serves tracks, returns

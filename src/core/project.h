@@ -67,7 +67,18 @@
 // denominator between two powers rounds down, so the clamp is stable across a
 // re-save.
 //
-// Saving always writes the current version; versions 1 through 7 all load,
+// Version 8 adds one optional `state <opaque>` line inside a `device` block:
+// whatever that device needs to describe itself beyond its parameters, as a
+// single line of text this layer stores verbatim and never parses. Exactly one
+// device writes it today -- `nxtakt:rack` puts its entire contents there -- and
+// the format deliberately does not know that. A device with no state writes no
+// line, so a set with no rack in it again produces the identical bytes version
+// 7 produced apart from the header. A state string the device layer cannot make
+// sense of is not a parse error: it round-trips, and the device drops what it
+// cannot use, exactly as a `param` naming a control that no longer exists is
+// dropped.
+//
+// Saving always writes the current version; versions 1 through 8 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 //

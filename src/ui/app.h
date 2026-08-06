@@ -431,6 +431,25 @@ private:
     void addDevice(int owner, const PluginDesc& d);
     void removeDevice(int owner, int idx);
 
+    // --- racks (app_devices.cpp) -------------------------------------------
+    // The rack the editor panel is open on, resolved from rackOpenUid_ and
+    // rackPath_, or null. Prunes the path it walks, so it is also what keeps
+    // the panel honest after a chain edit.
+    RackControl* openRack();
+    // Called after EVERY structural edit inside a rack (add / remove / move).
+    // docs/RACKS.md §1: a rack's latencyFrames() is the sum of its chain, and
+    // the engine caches that figure when a chain is published -- so the track's
+    // chain has to go across again even though its device list has not changed.
+    void rackChainEdited();
+    // Frees the sub-devices racks have unlinked, and only when that is provably
+    // safe. See the definition for what makes it safe.
+    void reclaimRacks();
+    void drawRackPanel(const Rect& r, RackControl& rc, const Col& tc);
+    // Headless hook, NXTAKT_DEBUG_RACK. Inert without the variable.
+    void debugSeedRack();
+    void debugRackUndoCheck(RackControl* rc);   // NXTAKT_DEBUG_RACK + _UNDO
+    int  rackLatencyOf(RackControl* rc) const;
+
     Session  ses_;
     MainView view_ = MainView::Session;
 
@@ -464,6 +483,24 @@ private:
     int  selDevice_ = -1;              // index into the target chain's devices
     f32  stripScroll_ = 0.f;           // horizontal, device boxes
     f32  paramScroll_ = 0.f;           // vertical, inside the selected device
+
+    // --- the rack editor (app_devices.cpp) ---------------------------------
+    // Which rack is open, named by the UID of the top-level device that holds
+    // it plus the sub-device indices to walk down into nested ones. A uid and
+    // not a chain index, because a chain edit must not slide the open panel
+    // onto a different device; openRack() re-resolves the whole path every
+    // frame and folds the panel shut if what it names has stopped existing.
+    u64  rackOpenUid_ = 0;             // 0 = no rack open
+    std::vector<int> rackPath_;        // sub-device indices, outermost first
+    int  rackSel_ = -1;                // selected sub-device inside the open rack
+    // The mapping editor, which is a sentence being composed: macro <- device /
+    // parameter, over min..max. Held here rather than derived so that changing
+    // the target does not throw away a range the user has already dialled in.
+    int  rackMacro_ = 0;
+    int  rackTgtDev_ = 0, rackTgtParam_ = 0;
+    f64  rackMin_ = 0.0, rackMax_ = 1.0;   // in the TARGET's own units
+    bool rackRangeHeld_ = false;       // false => min/max follow the chosen target
+    f32  rackListScroll_ = 0.f;        // vertical, the mapping list
 
     // --- computer MIDI keyboard -------------------------------------------
     // Off by default: while it is on the letter keys are notes, so this is a

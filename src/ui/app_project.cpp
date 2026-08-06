@@ -103,12 +103,18 @@ void App::serializeDevices() {
                 sd.params.reserve((size_t)n);
                 for (int i = 0; i < n; ++i)
                     sd.params.push_back({d.inst->paramInfo(i).id, d.inst->getParam(i)});
+                // Everything the device is beyond its parameters (SavedDevice::
+                // state). A rack is the only device that has any, and its whole
+                // contents are in this one string.
+                if (RackControl* rc = d.inst->rack())
+                    sd.state = rackStateToString(rc->state());
             } else {
                 // A device whose plugin was missing at load time. Its saved
                 // values were parked on the model rather than thrown away, so
                 // the set round-trips unchanged on a machine that does not have
                 // the plugin and works again on one that does.
                 sd.params = d.lostParams;
+                sd.state  = d.lostState;
             }
             out.push_back(std::move(sd));
         }
@@ -181,6 +187,7 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
                     dm.desc.name = sd.name;
                 }
                 dm.lostParams = sd.params;
+                dm.lostState  = sd.state;
                 co.devices->push_back(std::move(dm));
                 continue;
             }
@@ -200,6 +207,43 @@ void App::materializeDevices(std::vector<LiveDevice>* reuse) {
                 }
             }
             inst->setBypassed(sd.bypass);
+
+            // SavedDevice::state, and THE ordering constraint in the whole
+            // device path: it is applied AFTER the parameters above, never
+            // before. A rack's eight macros are ordinary parameters, so the
+            // loop above drives every mapped target through Rack::setParam;
+            // setState then restores the sub-device values verbatim and writes
+            // the macros WITHOUT re-applying them, which lands each mapped
+            // parameter exactly where it was saved. Reversed, the macro writes
+            // would come last and re-derive every mapped parameter from its
+            // macro position on every single load -- a set that drifts a little
+            // each time it is opened. See docs/RACKS.md §"Persistence".
+            if (RackControl* rc = inst->rack()) {
+                // A REBOUND rack is already running what the snapshot
+                // describes, unless the rack itself is what changed; rebuilding
+                // it would discard everything its sub-plugins hold that their
+                // parameters do not describe, which is the very thing `reuse`
+                // exists to prevent. The compact form is the one canonical
+                // spelling of a rack's contents, so it is what gets compared --
+                // and it is compared HERE, after the parameter loop, so that
+                // the macro writes that loop just made are part of what is
+                // being compared. Equal means the live rack really does match
+                // the snapshot, and only then is skipping the restore correct.
+                if (rackStateToString(rc->state()) != sd.state) {
+                    RackState rs;
+                    if (rackStateFromString(sd.state, rs)) rc->setState(rs);
+                    else if (!sd.state.empty())
+                        LOGW("%s: device state did not parse, contents not restored",
+                             sd.name.c_str());
+                    // NOT reclaim()ed here. A rebound rack's previous contents
+                    // are unlinked but releaseAllChains has only *asked* the
+                    // engine to drop the chain it was in; the swap happens at
+                    // the next block boundary and the acknowledgement is an
+                    // event that has not arrived yet. Unlinking is realtime
+                    // safe, freeing is not. reclaimRacks() (app_devices.cpp)
+                    // does it once every chain we published has come home.
+                }
+            }
 
             if (!rebound) dm.desc = *found;
             dm.inst = std::move(inst);
