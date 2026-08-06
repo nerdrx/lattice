@@ -12,6 +12,7 @@
 #include "../audio/engine.h"
 #include "../audio/sample.h"
 #include "../plugin/host.h"
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -152,6 +153,215 @@ struct ClipSample {
     SampleRef sample;
 };
 
+// ---------------------------------------------------------------------------
+// The arrangement (docs/ARRANGEMENT.md §2)
+// ---------------------------------------------------------------------------
+
+// Bounds. Enforced by the editor and by the publisher, NEVER by the parser --
+// the same split kMaxClipLanes and kMaxClipAutoPoints already make. All are
+// "a human cannot reach this by hand" numbers; hitting one is a bug report
+// rather than a limitation. The first three are validated at the process
+// boundary, so changing them later is a protocol change and not a constant one.
+inline constexpr int kMaxArrItems  = 512;      // items per track
+inline constexpr int kMaxArrNotes  = 65536;    // notes per track, over every item's src
+inline constexpr int kMaxArrLanes  = 32;       // arrangement automation lanes per track
+inline constexpr int kMaxArrPoints = 65536;    // breakpoints per track across its lanes
+// The longest admissible crossfade, in BEATS and not milliseconds: a crossfade
+// is a musical gesture, and a bound in time would mean the invariant a file
+// satisfies at 120 BPM is violated at 60. One bar in 4/4, two seconds at 120.
+inline constexpr f64 kMaxOverlapBeats = 4.0;
+// The shortest item. Below this an item is not grabbable at any zoom and cannot
+// carry a fade, so a trim that would go under it deletes instead. Finer than a
+// note's 1/32 floor because an item may be a one-shot transient and a note may
+// not.
+inline constexpr f64 kMinArrBeats = 1.0 / 64.0;
+// Overlaps below this are float noise from a trim, not a crossfade: a trim sets
+// `length = next.start - start`, and `start + length` need not come back to
+// `next.start` exactly. Both arrangeRepair and anything checking the invariant
+// must use the same slack, or a lane repaired once would be repaired forever.
+inline constexpr f64 kArrOverlapEps = 1e-9;
+// A track's default lane height in the arrangement, in logical px. Named because
+// the project writer suppresses `arrheight` at exactly this value.
+inline constexpr f32 kArrHeightDefault = 68.f;
+
+// One clip placed on the timeline.
+//
+// `src` is BY VALUE, and that is decision one of the arrangement: an item OWNS
+// its clip. Everything a user wants to differ between two placements of the same
+// material -- gain, loop, warp, the clip's own envelopes, its notes -- is
+// already a field of ClipModel, so copying costs nothing in schema and saves
+// declaring the whole of ClipModel a second time as "the per-instance
+// overrides".
+//
+// The rejected alternative is reference-by-uid, and it is rejected for a product
+// reason rather than a performance one: a session scratchpad must not
+// retroactively rewrite the record. Nudging the gain on a loop at 2 a.m. must
+// not silently move the gain of the eight places that loop was committed to the
+// timeline three hours earlier.
+//
+// The copy is cheap where it matters: ClipModel::sample is a SampleRef, so
+// copying an item bumps a refcount and a 40-item arrangement over one drum loop
+// holds one decoded buffer. Notes are genuinely duplicated, bounded by
+// kMaxArrNotes, and deduped again by the publisher on the way to the engine.
+struct ArrangeClip {
+    u64 uid = 0;            // stable identity; Session::newUid()
+    f64 start  = 0.0;       // absolute timeline beats
+    f64 length = 4.0;       // beats occupied on the timeline
+    f64 offset = 0.0;       // clip-relative beat this item begins at
+    f64 fadeIn  = 0.0;      // beats, from `start`
+    f64 fadeOut = 0.0;      // beats, back from `start + length`
+    u8  fadeShape = 0;      // reserved, exactly as AutoPoint::curve is
+    u8  pad[7] = {};
+    // PROVENANCE ONLY. The uid of the ClipModel this item was made from, kept so
+    // that "select every instance of this loop" and a future "update from
+    // source" have something to match on. It is never resolved during playback,
+    // never during save, and never during load: it DANGLES SOFT, exactly as a
+    // parameter address naming a deleted device does (PARAM-ADDRESS.md), and is
+    // written back unchanged forever.
+    u64 sourceUid = 0;
+    ClipModel src;          // the copy -- see above
+    f64 end() const { return start + length; }
+};
+
+// Restores the lane invariant on one track's arrangement and reports whether it
+// changed anything. Idempotent -- repair(repair(x)) == repair(x) -- which is
+// what makes it safe to call after every edit and again after a load.
+//
+// The invariant (§2.3), stated on the vector in ORDER, which is why the sort is
+// step one:
+//
+//   1. sorted by `start`;
+//   2. every `length >= kMinArrBeats`;
+//   3. fades non-negative and `fadeIn + fadeOut <= length`;
+//   4. neighbours overlap only as a crossfade: either `b.start >= a.end`, or all
+//      of `a.end - b.start <= kMaxOverlapBeats`, `a.fadeOut >= the overlap` and
+//      `b.fadeIn >= the overlap`;
+//   5. at most two items sound at once: for every three consecutive items,
+//      `c.start >= a.end`.
+//
+// Rule 5 is the load-bearing one: two simultaneous items per track is exactly
+// Track::voice and Track::prev, the pair the engine already keeps so a same-track
+// clip switch crossfades instead of hard-cutting. So the one place this model
+// diverges from Live's strictly non-overlapping lane costs the engine nothing --
+// no third voice, no voice pool, no change to the mixdown.
+//
+// WHERE THIS LIVES. §2.5 puts the definition in src/ui/app_arrange.cpp, which
+// belongs to a later milestone and does not exist yet; 8a has to ship and test
+// the function, so it is inline here instead. It has no dependency on App -- it
+// is a pure transform of a vector -- so the only thing that changes if it moves
+// is which file it is in.
+//
+// ONE SWEEP is not enough, and the fixed-point loop is not belt and braces: a
+// trim that lands under kMinArrBeats has to become a deletion, and a head-trim
+// moves an item's start, so the lane needs re-sorting. Running to a fixed point
+// is also exactly what makes the whole function idempotent.
+//
+// Termination: across sweeps no item's `start` ever decreases, no `length` ever
+// grows and the count never grows, and every new boundary is copied verbatim
+// from a neighbour's edge rather than computed by a shrinking step -- so the
+// reachable configurations are finite and monotone.
+inline bool arrangeRepair(std::vector<ArrangeClip>& lane) {
+    // One sweep. Returns true if it changed anything.
+    const auto sweep = [](std::vector<ArrangeClip>& lane) {
+        bool changed = false;
+
+        // (a) Per-item clamps, and the minimum length. Deleting rather than clamping
+        //     up: the alternative leaves a sliver the user did not ask for exactly
+        //     where they were trying to remove one.
+        for (size_t i = 0; i < lane.size();) {
+            ArrangeClip& c = lane[i];
+            if (!(c.start >= 0.0)) { c.start = 0.0; changed = true; }        // NaN lands here
+            if (!(c.offset >= 0.0)) { c.offset = 0.0; changed = true; }
+            if (!(c.length >= kMinArrBeats)) {
+                lane.erase(lane.begin() + (long)i);
+                changed = true;
+                continue;
+            }
+            if (!(c.fadeIn >= 0.0))  { c.fadeIn = 0.0;  changed = true; }
+            if (!(c.fadeOut >= 0.0)) { c.fadeOut = 0.0; changed = true; }
+            if (c.fadeIn > c.length) { c.fadeIn = c.length; changed = true; }
+            // The slack is not fussiness: `fadeOut = length - fadeIn` need not add
+            // back up to `length` in binary floating point, so an exact comparison
+            // would re-clamp a lane that is already correct, report a change, and
+            // cost this function its idempotence forever. The rewrite is also gated
+            // on the value actually moving, for the same reason.
+            if (c.fadeIn + c.fadeOut > c.length + kArrOverlapEps) {
+                const f64 fo = c.length - c.fadeIn;
+                const f64 nv = fo > 0.0 ? fo : 0.0;
+                if (nv != c.fadeOut) { c.fadeOut = nv; changed = true; }
+            }
+            ++i;
+        }
+
+        // (b) Sorted, and STABLY: two items that genuinely begin on the same beat
+        //     keep the order the user made them in rather than a coin toss.
+        for (size_t i = 1; i < lane.size(); ++i)
+            if (lane[i].start < lane[i - 1].start) {
+                std::stable_sort(lane.begin(), lane.end(),
+                                 [](const ArrangeClip& a, const ArrangeClip& b) { return a.start < b.start; });
+                changed = true;
+                break;
+            }
+
+        // (c) Overlaps: the LATER statement keeps its span and its neighbour gives
+        //     way, which is what makes a drop onto an occupied stretch of lane do
+        //     what the user's hand just said rather than what the lane used to say.
+        std::vector<char> drop(lane.size(), 0);
+        for (size_t i = 0; i + 1 < lane.size(); ++i) {
+            ArrangeClip& a = lane[i];
+            const ArrangeClip& b = lane[i + 1];
+            const f64 ov = a.end() - b.start;
+            if (ov <= kArrOverlapEps) continue;
+            // The one admitted overlap: a bounded crossfade both sides asked for.
+            // An uncovered overlap is two clips summing at full level, which is a
+            // mix decision the timeline cannot express and the user cannot see.
+            if (ov <= kMaxOverlapBeats && a.fadeOut >= ov && b.fadeIn >= ov) continue;
+            if (b.start <= a.start) {
+                if (b.end() >= a.end()) { drop[i] = 1; }        // entirely covered
+                else {
+                    // Head overlapped: the item moves forward, and `offset` moves
+                    // with `start` by the same number of beats. That is the whole of
+                    // "trimming the front of a clip does not change which audio is
+                    // under the rest of it", and getting it wrong is the classic
+                    // arrangement-editor bug.
+                    const f64 delta = b.end() - a.start;
+                    a.start  += delta;
+                    a.offset += delta;
+                    a.length -= delta;
+                }
+            } else {
+                a.length = b.start - a.start;                   // tail overlapped
+            }
+            changed = true;
+        }
+        for (size_t i = lane.size(); i-- > 0;)
+            if (drop[i]) lane.erase(lane.begin() + (long)i);
+
+        // (d) Rule 5. Three items sounding at once cannot come from a gesture -- (c)
+        //     runs first -- so this only ever fires on a hand-edited file or a
+        //     hostile client, and the middle item is the one that goes.
+        for (size_t i = 0; i + 2 < lane.size(); ++i)
+            if (lane[i + 2].start < lane[i].end() - kArrOverlapEps) {
+                lane.erase(lane.begin() + (long)(i + 1));
+                changed = true;
+                break;
+            }
+
+        return changed;
+    };
+
+    bool changed = false;
+    // The cap is a belt to the termination argument above, not the mechanism:
+    // a lane that hit it would be a bug, and stopping is still safe because a
+    // sweep only ever shortens, moves forward or deletes.
+    const size_t cap = lane.size() * 4 + 8;
+    for (size_t i = 0; i < cap; ++i) {
+        if (!sweep(lane)) return changed;
+        changed = true;
+    }
+    return changed;
+}
+
 struct TrackModel {
     u64 uid = 0;
     std::string name = "Track";
@@ -164,6 +374,17 @@ struct TrackModel {
     f32   sends[kMaxReturns] = {};     // post-fader send levels, 0..1 linear
     bool  mute = false, solo = false, arm = false;
     f32   width = 94.f;
+
+    // --- the arrangement -----------------------------------------------
+    // Sorted by `start` and non-overlapping except for the bounded crossfade;
+    // arrangeRepair() is what upholds that, and every edit goes through it.
+    std::vector<ArrangeClip> arrange;
+    // ABSOLUTE-beat automation lanes, one per address per track. Same AutoLane
+    // type as a clip's envelopes and the same "the address is text, resolution
+    // is GUI-side" rule; only the beat space differs, which is why the format
+    // spells them `autolane` rather than `env`.
+    std::vector<AutoLane> arrangeAutos;
+    f32 arrHeight = kArrHeightDefault;   // this track's lane height, logical px
 };
 
 // A return bus (Live's A/B/... return tracks): a device chain and a level,
@@ -196,6 +417,15 @@ struct Session {
     int  sigNum = 4, sigDen = 4;
     int  quantumIdx = 4;               // index into kQuantumBeats -> "1 Bar"
     bool metronome = false;
+    // The arrangement loop brace. Session-wide, like the tempo and the quantum,
+    // because there is one timeline. A disabled brace still remembers where it
+    // was, which is what makes toggling it useful, so `loopOn` is its own field
+    // rather than a zero-length range. `loopStart >= loopEnd` disables the loop
+    // rather than being clamped: a zero-length loop is a request the engine
+    // cannot honour, and clamping it would invent a length nobody asked for.
+    f64  loopStart = 0.0;
+    f64  loopEnd   = 16.0;
+    bool loopOn    = false;
     std::string name = "Untitled";
     std::string path;                  // last saved location, empty if never
 };

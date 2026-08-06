@@ -730,12 +730,13 @@ inline WarpCtx warpCtxFor(const RtClip& c, f64 tempo, f64 sr) {
 // moving knob, so the displayed value and the applied value cannot disagree
 // (§2.4).
 //
-// LINKAGE: engine.h is frozen for this pass and does not declare it, so it is
-// defined here with external linkage. A `f32 autoValueAt(const RtAutoSet&,
-// const RtAutoLane&, f64, f32);` declaration belongs beside the Rt structs the
-// next time the header opens; until then the UI (and the tests) declare it
-// themselves and link against this definition. Nothing about the body changes
-// when that happens.
+// LINKAGE: declared in engine.h beside the Rt structs, in the pointer form
+// below, with two inline forwarders (one per container) that must never grow a
+// body of their own. There are two containers now -- RtAutoSet for a clip's
+// envelopes and RtAutoSetN for a track's arrangement lanes (ARRANGEMENT.md
+// §6.2) -- and "one evaluator" only stays true while this is one function, so
+// what it takes is a point array and a count rather than either container.
+// Nothing about the body changed when that happened.
 //
 // Semantics, all three load-bearing:
 //   * before the first point: the first point's value (there is no "nowhere" to
@@ -752,13 +753,14 @@ inline WarpCtx warpCtxFor(const RtClip& c, f64 tempo, f64 sr) {
 // mouse is over. At kMaxClipAutoPoints (4096) that is at most 12 compares once
 // per block per lane, against a scan whose worst case is 4096 of them.
 // `curve` is reserved: any non-zero shape renders as linear in this wave (§2.1).
-f32 autoValueAt(const RtAutoSet& s, const RtAutoLane& l, f64 beat, f32 fallback) {
+f32 autoValueAt(const RtAutoPoint* points, int pointCount, const RtAutoLane& l,
+                f64 beat, f32 fallback) {
     const int n = l.count;
     // The window is validated here and not trusted: the set is public memory
     // built on the other side of a process boundary, and a bad first/count must
     // be an inert lane rather than a read outside the block.
-    if (!s.points || n <= 0 || l.first < 0 || l.first > s.pointCount - n) return fallback;
-    const RtAutoPoint* p = s.points + l.first;
+    if (!points || n <= 0 || l.first < 0 || l.first > pointCount - n) return fallback;
+    const RtAutoPoint* p = points + l.first;
 
     // A publisher that inverted lo/hi would otherwise turn clampv into a value
     // that is neither bound.

@@ -2217,3 +2217,106 @@ has to guess whether a question was seen.
   file-scope publisher in `app_engine.cpp` for the same ownership reason; the
   move is a change to their declaration and nothing else, and 8a is already in
   that file.
+
+---
+
+## 14. 8a shipped
+
+The serialization point is in. What landed, and the four places a later
+milestone has to read this section rather than the one above it:
+
+**`src/audio/engine.h`** — `RtArrItem`, `RtArrangement`, `RtAutoSetN`
+(+ `kMaxRtArrLanes`), `JournalKind`, `ArrJournal`, `Cmd::SetArrangement` /
+`SetTrackAutos` / `Locate` / `BackToArrangement` (appended, values 26–29),
+`Ev::ArrangementRetired` / `TrackAutosRetired` (appended, values 13–14),
+`Voice::fade` / `fadeTo`, `Engine::arrOverride`, `Engine::journalDropped`,
+`popJournal()` and the `Ring<ArrJournal, 4096>` behind it. All compiled, none
+used: `tests/engine_test.cpp` §33 renders a set twice, once having pushed all
+four commands (including the `a = -1` transport cell and the null-clears form)
+and once not, and asserts the two are bit-identical.
+
+**`autoValueAt` is now the pointer form** with two inline forwarders, one per
+container, and the body moved verbatim. 7a's evaluator table passes untouched;
+§33 additionally evaluates the same points through `RtAutoSetN` and asserts
+bit-identity with the `RtAutoSet` path.
+
+**`src/ui/session.h`** — `ArrangeClip`, `TrackModel::arrange` /
+`arrangeAutos` / `arrHeight`, `Session::loopStart` / `loopEnd` / `loopOn`, the
+five bounds, and `arrangeRepair`.
+
+**`src/core/project.cpp`** — format v6 exactly as §8 specifies, with
+`writeClipBody` / `clipBodyKey` factored and `St::Arrange` / `St::AClip` /
+`St::AutoLane` added. The v5 → v6 no-arrangement diff is exactly the header
+line, asserted against a hand-written v5 document and confirmed against the
+regenerated demo set.
+
+Four deviations, each deliberate and none of them a change of decision:
+
+1. **`ArrJournal` is 24 bytes, not the 32 §5.3 quotes.** Four 4-byte integers
+   and one `f64` is 24 with natural alignment. The field list is what that
+   section actually specifies, so the fields are kept and the arithmetic is
+   corrected rather than padded up to match the prose.
+2. **`arrangeRepair` is defined inline in `session.h`**, not in
+   `src/ui/app_arrange.cpp` as §2.5 says. That file belongs to 8d and does not
+   exist yet, while 8a has to ship *and test* the function. It is a pure
+   transform of a vector with no dependency on `App`, so the only thing that
+   changes if 8d moves it is which file it is in.
+3. **The warp-marker grammar is `wm <srcFrame> <beat>`, not a `warp` block.**
+   `warp` is already a clip key — `warp 2` is the warp mode — so a block by that
+   name would have to be told apart from the scalar by whether the rest of the
+   line is empty, which is an ambiguity this format has nowhere else. Audio
+   clips only, gated exactly as `note` is gated on MIDI, and refused at the
+   terminator inside a MIDI clip for the same reason `note` is refused inside an
+   audio one.
+4. **`clipBodyKey` returns a three-valued `BodyKey`** (`No` / `Yes` / `Bad`)
+   rather than §8.3's `bool` + `std::string* err`. Offering a line to a shared
+   handler has three outcomes — consumed, not mine, mine and broken — and
+   folding two of them together is precisely where the format's
+   structure-rejected / values-clamped split lives.
+
+And one thing 8a deliberately did **not** do, which the next milestone in that
+file owns: **§8.5's sort-on-load is not implemented.** The parser preserves file
+order, as §8.5 requires it to; the sort belongs to `App::adoptSession`
+(`src/ui/app_project.cpp`), which is not 8a's file. `arrangeRepair` is the hook
+— it stable-sorts as step one — and `assignUids` will need to learn about
+`ArrangeClip::uid` at the same time, since an item loaded from a file that never
+had one comes back as 0.
+
+### 8a shipped — and what it hands to the milestones after it
+
+Landed: the header types (compiled and unused), the model, `arrangeRepair`,
+format v6, warp markers in the format and the undo snapshot, and
+`publishedWarp_`/`retiringWarp_` moved onto `App`. 497 engine checks, the four
+demo renders bit-identical, `make test` green with and without system plugins.
+
+Three hand-offs, each belonging to a file 8a did not own. They are recorded
+here because a note in a finished agent's report is not a place work survives:
+
+- **`App::adoptSession` must call `arrangeRepair`** (`src/ui/app_project.cpp`).
+  §8.5's sort-on-load is deliberately NOT in the parser — the parser preserves
+  file order, and the loader establishes the invariant, because an ordering the
+  engine depends on must be established rather than assumed of the file.
+  `arrangeRepair` stable-sorts as its first step, so calling it is the whole
+  fix. **`assignUids` must also learn about `ArrangeClip::uid`**: an item from
+  a file written without one loads as 0. Owner: whoever takes 8e, or an earlier
+  milestone that touches that file.
+- **8g must extend the wire classifiers.** `commandIsKnown` bounds at
+  `type <= Cmd::RecordMidiSlot`, so `SetArrangement`/`SetTrackAutos`/`Locate`/
+  `BackToArrangement` (26–29) currently classify as unknown. That fails CLOSED
+  — the daemon rejects them with `RejectUnknownCommand`, verified — so the tree
+  is safe today and this is not urgent, only necessary before arrangement
+  crosses the process boundary. `Ev::ArrangementRetired`/`TrackAutosRetired`
+  need cases in `eventIsScalar` at the same time.
+- **`ArrangeClip::src.uid` is deliberately not serialized.** The `uid` inside an
+  `aclip` is the *item's*. Two placements of one loop would otherwise both claim
+  one identity, which is the same reasoning that made placement copy content.
+
+Two corrections to this document, from contact with the code:
+
+- **`ArrJournal` is 24 bytes, not the 32 §5.3 states.** Four 4-byte integers and
+  one `f64` is 24 with natural alignment. The fields are as specified; the
+  arithmetic in the prose was wrong.
+- **`arrangeRepair` ships inline in `session.h`**, not in `app_arrange.cpp` as
+  §2.5 places it. That file is 8d's and does not exist yet, and 8a had to both
+  ship and test the function. It is a pure vector transform; moving it later
+  changes which file it is in and nothing else.

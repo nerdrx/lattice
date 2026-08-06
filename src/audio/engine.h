@@ -96,12 +96,54 @@ struct RtAutoSet {
     int pointCount = 0;
 };
 
-// The one evaluator, shared by the engine and the UI so a drawn envelope and
-// an applied one cannot disagree. Pure: bisects the lane's sorted window,
+// The arrangement's automation container (docs/ARRANGEMENT.md §6.2). Same
+// one-allocation layout as RtAutoSet, same retirement protocol, ONE difference:
+// the lane array is variable-width and lives in the block rather than being a
+// fixed member.
+//
+//   [RtAutoSetN][RtAutoLane[laneCount]][RtAutoPoint[pointCount]]
+//
+// RtAutoSet is NOT widened to 32 lanes instead, for two reasons. Its `lanes` is
+// a fixed array by value, so its width is baked into sizeof(RtAutoSet) on both
+// sides of the process boundary and into the region's layout hash — widening it
+// would change the size of every published clip envelope set, a shipped and
+// versioned shape, for a feature clips do not use. And the right ceilings
+// genuinely differ: sixteen is right for a clip, which is *about* one or two
+// parameters, while a track's timeline accumulates every automated parameter in
+// its chain over the length of a song. One constant for both would be wrong for
+// one of them.
+//
+// A replaced set travels back via Ev::TrackAutosRetired before it may be freed.
+struct RtAutoSetN {
+    const RtAutoPoint* points = nullptr;
+    const RtAutoLane*  lanes  = nullptr;
+    int laneCount  = 0;
+    int pointCount = 0;
+};
+
+inline constexpr int kMaxRtArrLanes = 32;    // == kMaxArrLanes (session.h)
+
+// THE evaluator, shared by the engine and the UI so a drawn envelope and an
+// applied one cannot disagree. Pure: bisects the lane's sorted window,
 // interpolates linearly (a non-zero `curve` is reserved and renders linear),
 // clamps to the lane's [lo,hi], holds before the first point and after the
 // last, and returns `fallback` unchanged for an empty lane.
-f32 autoValueAt(const RtAutoSet& set, const RtAutoLane& lane, f64 beat, f32 fallback);
+//
+// It takes the points as a pointer and a count rather than a container, because
+// there are now two containers (RtAutoSet, RtAutoSetN) and AUTOMATION.md §2.4's
+// claim — "they cannot disagree if there is one function reading one set of
+// points against one beat" — is only true while this stays ONE function. The two
+// convenience overloads below are inline forwarders and must never grow a body
+// of their own.
+f32 autoValueAt(const RtAutoPoint* points, int pointCount, const RtAutoLane& lane,
+                f64 beat, f32 fallback);
+
+inline f32 autoValueAt(const RtAutoSet& s, const RtAutoLane& l, f64 b, f32 f) {
+    return autoValueAt(s.points, s.pointCount, l, b, f);
+}
+inline f32 autoValueAt(const RtAutoSetN& s, const RtAutoLane& l, f64 b, f32 f) {
+    return autoValueAt(s.points, s.pointCount, l, b, f);
+}
 
 // Realtime view of a clip. The GUI fills one of these and ships it across;
 // the audio thread only reads. `data` points into a SampleBuffer the GUI
@@ -158,6 +200,80 @@ struct RtClip {
     int transientCount = 0;
 
     bool valid        = false;
+};
+
+// ---------------------------------------------------------------------------
+// The arrangement, as the audio thread sees it. Full design: docs/ARRANGEMENT.md
+// §3. Landed here, compiled and not yet used, because engine.h is the daemon's
+// contract and exactly one wave may open it.
+// ---------------------------------------------------------------------------
+
+// One placed item.
+struct RtArrItem {
+    f64 start  = 0.0;      // absolute timeline beats
+    f64 length = 0.0;
+    f64 offset = 0.0;      // clip-relative beat the item begins at
+    f32 fadeIn = 0.f, fadeOut = 0.f;   // beats
+    i32 fadeShape = 0;
+    i32 clip = -1;         // index into RtArrangement::clips
+};
+
+// One track's lane, or -- for the cell addressed as track -1 -- the transport's
+// loop brace (§3.6). ONE ALLOCATION, always:
+//
+//   [RtArrangement][RtArrItem[itemCount]][RtClip[clipCount]][RtNote[noteCount]]
+//
+// `items`, `clips` and every RtClip::notes inside it address memory in this same
+// block, so the whole lane is one new[] and one delete[] and the retirement
+// protocol has exactly ONE pointer to talk about. That is the RtAutoSet argument
+// above extended by one more array: two allocations would need two retirement
+// events or a rule about which one implies the other, and the RtNote protocol is
+// only simple because there is one pointer per slot.
+//
+// Clip envelopes are the deliberate exception and stay in their own RtAutoSet
+// allocations, pointed at by RtClip::autos. Folding them in would mean dragging
+// one breakpoint republishes the lane, and the lane is up to 1.6 MB of notes
+// (kMaxArrNotes * sizeof(RtNote)); a 60 Hz drag would move 96 MB/s to change
+// sixteen bytes.
+//
+// A replaced lane travels back to the owner in Ev::ArrangementRetired before it
+// may be freed.
+struct RtArrangement {
+    const RtArrItem* items = nullptr;
+    const RtClip*    clips = nullptr;
+    int itemCount = 0;
+    int clipCount = 0;
+    int noteCount = 0;                 // for the daemon's bounds arithmetic
+    // Transport cell only (a = -1); zero on every track's lane.
+    f64 loopStart = 0.0, loopEnd = 0.0;
+    u32 loopOn = 0;
+};
+
+// ---------------------------------------------------------------------------
+// The arrangement record journal (§5.3).
+//
+// Audio thread -> GUI thread, its own SPSC ring, and deliberately NOT the event
+// ring: `evts_` is designed to drop under load (push returns false when full and
+// the engine discards), and a channel that is designed to drop cannot be the
+// thing a recording is made of. Nor can the GUI's own clock: an event stamped
+// when the reader pops it is a recording of the reader.
+// ---------------------------------------------------------------------------
+enum class JournalKind : u32 {
+    None = 0, TakeStart, TakeEnd, ClipOn, ClipOff, NoteOn, NoteOff, Locate, LoopWrap
+};
+
+// Pointer-free and trivially copyable, because it rides an SPSC ring here and a
+// shared-memory ring under the process split. §5.3 calls it 32 B; the field list
+// it gives is four 4-byte integers and one f64, which is 24 with natural
+// alignment, and 24 is what this is. Nothing depends on the number -- the ring is
+// a template over the type -- so the fields are kept and the arithmetic is
+// corrected rather than padded up to match the prose.
+struct ArrJournal {            // 24 B, pointer-free, trivially copyable
+    u32 kind  = 0;             // JournalKind
+    u32 seq   = 0;             // monotonic per engine run; a gap means a drop
+    i32 track = 0;
+    i32 a     = 0;             // slot / pitch / velocity, per kind
+    f64 beat  = 0.0;           // the ENGINE's beat, exact
 };
 
 // Raw MIDI into the engine, pushed from a reader thread via pushMidi(). The
@@ -228,6 +344,46 @@ enum class Cmd : u32 {
     // any pass lands at its in-loop position. The finish event still returns
     // only the NEW notes; the GUI merges them into the clip and re-pushes.
     RecordMidiSlot,
+
+    // --- the arrangement (docs/ARRANGEMENT.md §3, §4, §6) ------------------
+    //
+    // APPENDED, never inserted: the numeric value of every command above is
+    // protocol (ipc/control.h classifies by it and WireCommand carries it), so
+    // the enum only ever grows at the end.
+
+    // a = track, p = const RtArrangement* (null clears). The displaced pointer
+    // comes back in Ev::ArrangementRetired, pushed from inside drainCommands()
+    // and only when it differs from the incoming one -- the RtNote protocol
+    // verbatim.
+    //
+    // a = -1 names the TRANSPORT CELL rather than a track: its RtArrangement
+    // carries no items, only loopStart/loopEnd/loopOn. That is deliberately
+    // Ev::ChainRetired's own addressing (a = kMaxTracks + returnIdx, a = -1 for
+    // the master chain), so a reader who knows one knows the other. The loop
+    // brace rides this table instead of a Cmd::SetLoop because `Command` has one
+    // f64 and a brace is two numbers and a flag: widening Command would grow
+    // every entry of a 1024-deep ring and break WireCommand, which is 32 B,
+    // pointer-free and load-bearing in the region layout hash.
+    SetArrangement,
+
+    // a = track, p = const RtAutoSetN* (null clears). Retired through
+    // Ev::TrackAutosRetired. The arrangement's automation lanes: absolute-beat,
+    // one lane per address per track, evaluated in a pass that runs BEFORE the
+    // clip envelope pass so that the clip's value wins by overwriting it (§6.4).
+    SetTrackAutos,
+
+    // a = 0 (reserved), x = the beat to go to. Flushes every sounding note-off
+    // at frame 0, re-seeks every arrangement cursor, and ASSIGNS beat_ rather
+    // than adding to it, so sixty-four laps of a loop accumulate no drift.
+    // Deliberately leaves session voices alone: a locate is a statement about
+    // the timeline, not about the performance a track is currently playing.
+    Locate,
+
+    // a = track, or -1 for every track. Clears the per-track override that a
+    // session clip launch set, unquantized -- it is a corrective gesture, and a
+    // correction that waits a bar is the wrong feel. The track's cursor
+    // re-seeks to beat_ and resumes whatever item covers it, mid-item.
+    BackToArrangement,
 };
 
 struct Command {
@@ -246,7 +402,13 @@ enum class Ev : u32 { ClipStarted, ClipStopped, TrackStopped, Xrun, TransportSto
                       MidiRecordFinished, // a = track, b = slot, x = note count, p = the buffer
                       AutosRetired,   // p = the RtAutoSet* now safe to free
                       AutoLaneInert,  // a = track, b = slot, x = lane index
-                      WarpRetired     // p = the WarpMarker* now safe to free
+                      WarpRetired,    // p = the WarpMarker* now safe to free
+                      // Appended, never inserted: ipc/control.h classifies
+                      // events by this value. Both are the RtNote retirement
+                      // protocol, a = the cell the pointer was published to
+                      // (a = -1 being SetArrangement's transport cell).
+                      ArrangementRetired, // a = track, p = the RtArrangement*
+                      TrackAutosRetired   // a = track, p = the RtAutoSetN*
                     };
 struct Event { Ev type = Ev::Xrun; i32 a = 0, b = 0; f64 x = 0.0; void* p = nullptr; };
 
@@ -306,6 +468,33 @@ public:
     // primitive the process split's sample pool needs (PROCESS-SPLIT.md §10).
     std::atomic<u64>  drains{0};
 
+    // --- the arrangement (docs/ARRANGEMENT.md §4, §5) ----------------------
+
+    // Bit i set == track i is overridden: a session clip was launched on it, so
+    // its arrangement lane and its arrangement automation are both suspended
+    // until Cmd::BackToArrangement.
+    //
+    // ENGINE-OWNED, and set at the quantized launch the engine computes rather
+    // than when the command arrives or when the user clicks. The GUI asks for
+    // "launch clip 3"; the engine decides which bar line that lands on, from the
+    // quantum, the clip's own quantumIdx and beat_. A flag set at click time
+    // would silence the arrangement on that track up to a whole bar before the
+    // session clip started -- an audible hole in the gesture a performer makes
+    // most. Published here for the UI only (the Back to Arrangement button, and
+    // drawing an overridden lane desaturated).
+    std::atomic<u32>  arrOverride{0};
+
+    // The record journal (§5.3). Drained by the GUI; every entry is stamped with
+    // the engine's own beat_ at the sub-block boundary it happened on -- the same
+    // number the scheduler used, not one anyone inferred.
+    bool popJournal(ArrJournal& j) { return journal_.pop(j); }
+    // Refused pushes. The same information as a gap in ArrJournal::seq, and
+    // published separately because a consumer that has not yet drained the ring
+    // can still read it. A take whose span shows either is REFUSED rather than
+    // committed short: a recording silently missing four bars is
+    // indistinguishable from a performance that had four bars of rest in it.
+    std::atomic<u32>  journalDropped{0};
+
     f64 sampleRate() const { return sr_; }
 
 private:
@@ -325,6 +514,23 @@ private:
         int   nextNote = 0;
         struct PendingOff { f64 beat = 0.0; u8 pitch = 0; bool used = false; };
         PendingOff offs[32];
+
+        // Arrangement item fades (docs/ARRANGEMENT.md §3.4). 1.0 in the ordinary
+        // case -- a session clip, an item with no fades, an item past its fade
+        // regions -- so a session render takes the same arithmetic it takes
+        // today. Multiplying by exactly 1.0f is bit-exact in IEEE-754 for every
+        // finite value, which is what lets the headline gate be BIT-identity
+        // rather than a tolerance.
+        //
+        // These are the one part of the arrangement's engine state that cannot
+        // live in the side table the scheduler uses, and the reason is specific:
+        // startVoice copies a Voice wholesale (`t.prev = t.voice`), so a fade
+        // parked in a table keyed by track index would lose its association with
+        // the voice at the exact moment that voice becomes the outgoing half of
+        // a crossfade -- which is the only moment a fade-out is interesting.
+        // They travel with the voice, so they are fields on the voice.
+        f32   fade   = 1.f;          // multiplier at the start of the sub-block
+        f32   fadeTo = 1.f;          // multiplier at its end
     };
     struct Track {
         f32  vol = faderToGain(0.85f);
@@ -414,6 +620,14 @@ private:
     };
     Return returns_[kMaxReturns];
     const RtChain* masterChain_ = nullptr;
+
+    // Capacity 4096: a dense performance -- sixteen notes per beat across eight
+    // armed tracks at 140 BPM -- is about 300 entries per second, so this holds
+    // roughly thirteen seconds of the worst case anyone plays against a GUI
+    // draining it sixty times a second. Sized so that an overflow means "the GUI
+    // stopped", not "the player played fast".
+    Ring<ArrJournal, 4096> journal_;
+    u32 journalSeq_ = 0;            // audio thread only; +1 per ATTEMPTED push
 
     Ring<Command, 1024> cmds_;
     Ring<Event, 1024>   evts_;

@@ -209,6 +209,44 @@ private:
     // stopped owning -- see releaseStaleSlots.
     bool clipLive_[kMaxTracks][kMaxScenes] = {};
 
+    // --- warp maps ---------------------------------------------------------
+    // The fourth instance of the RtChain / RtNote / RtAutoSet retirement
+    // protocol, and deliberately the same one line for line: pushClip()
+    // allocates a fresh WarpMarker[] for the clip it publishes, parks the
+    // pointer here, and moves whatever it displaced into retiringWarp_. An entry
+    // is freed when its Ev::WarpRetired arrives and on no other path while the
+    // audio thread runs — a clip's warp map can be dragged while that clip is
+    // playing.
+    //
+    // These lived as a file-scope publisher in app_engine.cpp, with a runtime
+    // "is a second App using this table" check, purely because the wave that
+    // added them could not edit this header. On App they are per-instance by
+    // construction, which is what that check was defending, so it is gone;
+    // nothing else about the behaviour changed.
+    //
+    // The destructor is the AutoBlocks argument verbatim: App is destroyed after
+    // shutdown() has joined the audio thread, so this is the same moment
+    // shutdown() frees the note arrays, and a destructor cannot be forgotten by
+    // a later edit to shutdown(). What it frees is what the engine still held
+    // when the process ended plus anything whose retirement event was never
+    // drained.
+    struct WarpMaps {
+        const WarpMarker* published[kMaxTracks][kMaxScenes] = {};
+        std::vector<const WarpMarker*> retiring;
+        WarpMaps() = default;
+        WarpMaps(const WarpMaps&) = delete;
+        WarpMaps& operator=(const WarpMaps&) = delete;
+        ~WarpMaps() {
+            for (auto& row : published)
+                for (const WarpMarker*& m : row) { delete[] m; m = nullptr; }
+            for (const WarpMarker* m : retiring) delete[] m;
+            retiring.clear();
+        }
+    };
+    WarpMaps warpMaps_;
+    // publishNotes verbatim, one slot's map at a time.
+    void publishWarp(int track, int slot, const WarpMarker* fresh);
+
     // --- plugin hosting -------------------------------------------------
     // Chain lifecycle: publishChain(t) heap-allocates an RtChain from
     // ses_.tracks[t].devices, sends it via Cmd::SetChain, and moves the

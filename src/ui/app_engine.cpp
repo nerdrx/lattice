@@ -54,68 +54,26 @@ void App::publishNotes(int track, int slot, const RtNote* fresh) {
 // ---------------------------------------------------------------------------
 // warp marker arrays
 //
-// The fourth instance of the RtChain / RtNote / RtAutoSet retirement protocol,
-// and deliberately the same one line for line: pushClip() allocates a fresh
-// WarpMarker[] for the clip it publishes, parks the pointer in `published`, and
-// moves whatever it displaced into `retiring`. An entry is freed when its
-// Ev::WarpRetired arrives and on no other path while the audio thread runs — a
-// clip's warp map can be dragged while that clip is playing.
-//
-// WHERE THIS STATE LIVES. These two belong on App, beside publishedNotes_ and
-// retiringNotes_, and that is exactly the shape they have here — a
-// [kMaxTracks][kMaxScenes] array of published pointers and a vector of displaced
-// ones. They sit in this translation unit because app.h is not this change's to
-// edit; moving them to App is a change to their declaration and to nothing else,
-// since publishWarp() below is the only writer and pumpEngineEvents the only
-// other reader.
-//
-// The leftovers are freed by a destructor rather than by a line in shutdown(),
-// which is the reasoning AutoBlocks already uses in app.h: static destruction
-// runs after main() returns, therefore after App::shutdown() has stopped the
-// audio thread, therefore after the last possible borrow — and a destructor
-// cannot be forgotten by a later edit to shutdown(). What it frees is what the
-// engine still held when the process ended plus anything whose retirement event
-// was never drained, which is the same set shutdown() frees for note arrays.
+// The publisher and the GUI-side gate. The state the two of them talk about --
+// App::warpMaps_ -- moved onto App itself (app.h, beside publishedNotes_), which
+// is where its own comment always said it belonged; it sat in this translation
+// unit only because the wave that added it could not edit that header. The move
+// is a change to the declaration and to nothing else: publishWarp() below is
+// still the only writer and pumpEngineEvents the only other reader.
 // ---------------------------------------------------------------------------
 
-namespace {
-
-struct WarpPublisher {
-    // The single App main.cpp creates. Recorded rather than assumed: two Apps
-    // sharing this table would retire each other's arrays, so the invariant is
-    // checked instead of documented.
-    const App* owner = nullptr;
-    const WarpMarker* published[kMaxTracks][kMaxScenes] = {};
-    std::vector<const WarpMarker*> retiring;
-
-    WarpPublisher() = default;
-    WarpPublisher(const WarpPublisher&) = delete;
-    WarpPublisher& operator=(const WarpPublisher&) = delete;
-    ~WarpPublisher() {
-        for (auto& row : published)
-            for (const WarpMarker*& m : row) { delete[] m; m = nullptr; }
-        for (const WarpMarker* m : retiring) delete[] m;
-        retiring.clear();
-    }
-};
-WarpPublisher gWarp;
-
-// publishNotes verbatim, with the ownership check the members cannot carry.
-void publishWarp(const App* self, int track, int slot, const WarpMarker* fresh) {
+// publishNotes verbatim.
+void App::publishWarp(int track, int slot, const WarpMarker* fresh) {
     if (track < 0 || track >= kMaxTracks || slot < 0 || slot >= kMaxScenes) return;
-    if (!gWarp.owner) gWarp.owner = self;
-    else if (gWarp.owner != self) {
-        LOGW("warp: a second App is publishing markers; refusing to share the "
-             "retirement table with it");
-        return;
-    }
-    const WarpMarker* old = gWarp.published[track][slot];
-    gWarp.published[track][slot] = fresh;
+    const WarpMarker* old = warpMaps_.published[track][slot];
+    warpMaps_.published[track][slot] = fresh;
     // The engine only announces a *replaced* array, and only when it differs
     // from the incoming one; an entry that would never be announced must not be
     // queued for a retirement that will never arrive.
-    if (old && old != fresh) gWarp.retiring.push_back(old);
+    if (old && old != fresh) warpMaps_.retiring.push_back(old);
 }
+
+namespace {
 
 // The GUI-side gate, run once here so the audio thread never pays for it. A map
 // that is empty, or that has a single marker (a point pins, it does not tilt),
@@ -400,7 +358,7 @@ void App::pushClip(int track, int slot) {
         // its envelopes and its warp map with them.
         publishNotes(track, slot, nullptr);
         publishAutos(track, slot, nullptr);
-        publishWarp(this, track, slot, nullptr);
+        publishWarp(track, slot, nullptr);
         clipLive_[track][slot] = false;
         return;
     }
@@ -460,7 +418,7 @@ void App::pushClip(int track, int slot) {
     // turned into a MIDI clip still has an old warp map to hand back.
     publishNotes(track, slot, fresh);
     publishAutos(track, slot, autos);
-    publishWarp(this, track, slot, warp);
+    publishWarp(track, slot, warp);
     clipLive_[track][slot] = true;
 }
 
@@ -507,7 +465,7 @@ void App::releaseStaleSlots() {
         for (int s = 0; s < kMaxScenes; ++s) {
             if (t < nt && s < ns) continue;
             if (!clipLive_[t][s] && !publishedNotes_[t][s] && !publishedAutos_[t][s] &&
-                !gWarp.published[t][s]) continue;
+                !warpMaps_.published[t][s]) continue;
             Command c;
             c.type = Cmd::ClearClip;
             c.a = t; c.b = s;
@@ -520,7 +478,7 @@ void App::releaseStaleSlots() {
             clipLive_[t][s] = false;
             publishNotes(t, s, nullptr);
             publishAutos(t, s, nullptr);
-            publishWarp(this, t, s, nullptr);
+            publishWarp(t, s, nullptr);
         }
     }
 }
@@ -628,15 +586,15 @@ void App::pumpEngineEvents() {
             // own it, which is strictly worse than the leak this takes instead.
             const WarpMarker* old = (const WarpMarker*)e.p;
             if (!old) continue;
-            auto it = gWarp.retiring.begin();
-            for (; it != gWarp.retiring.end(); ++it) if (*it == old) break;
-            if (it == gWarp.retiring.end()) {
+            auto it = warpMaps_.retiring.begin();
+            for (; it != warpMaps_.retiring.end(); ++it) if (*it == old) break;
+            if (it == warpMaps_.retiring.end()) {
                 LOGW("WarpRetired for an unknown map %p - leaking it rather than "
                      "freeing a pointer we do not own", (const void*)old);
                 continue;
             }
             delete[] *it;
-            gWarp.retiring.erase(it);
+            warpMaps_.retiring.erase(it);
             continue;
         }
         if (e.type == Ev::AutoLaneInert) {

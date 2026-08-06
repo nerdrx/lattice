@@ -41,6 +41,31 @@ namespace {
 // none of it saves exactly the bytes version 4 saved apart from the header
 // line. See writeClip and validAddress for the details.
 //
+// Version 6 adds the arrangement (docs/ARRANGEMENT.md §8) and the clip's warp
+// map. Three things are new:
+//
+//   * two top-level lines, `loop <start> <end>` and `loopon <0|1>`, beside
+//     `tempo` and `quantum` -- there is one timeline and one brace, so they
+//     belong to the set and not to a track. Both sparse: a brace that is off at
+//     the default range writes nothing;
+//   * an `arrangement` ... `endarrangement` block inside a track, after its
+//     clips, holding a sparse `arrheight`, zero or more positional `aclip`
+//     blocks (an item's seven fields, then a clip body identical to a `clip`'s)
+//     and zero or more `autolane <address>` ... `endautolane` blocks, whose
+//     `pt` and `off` lines are `env`'s verbatim;
+//   * `wm <srcFrame> <beat>` lines inside an audio clip, one per warp marker.
+//
+// Every one of them is sparse in the way everything above is -- a set with no
+// arrangement emits no `arrangement` block, no `loop`, no `loopon`, and a clip
+// with no markers emits no `wm` -- so a set that uses none of it saves exactly
+// the bytes version 5 saved apart from the header line.
+//
+// The `aclip` body is written by ONE shared writeClipBody and read by ONE
+// shared clipBodyKey, which is what makes an item's payload PROVABLY the same
+// grammar as a slot clip's -- `env` blocks, kind gating and the endclip checks
+// included -- rather than a second copy that agrees today and drifts at the next
+// format addition.
+//
 // There is deliberately ONE parser for all versions rather than a reader per
 // version. The additions are all new keys with defaults, so an older file
 // simply never mentions them and comes out with the defaults; the version
@@ -69,7 +94,7 @@ namespace {
 // word that was read so a re-save preserves it. Load-and-save flips the header
 // to the new spelling, and that is the only thing it flips. See
 // kHeaderWord/isHeaderWord below.
-constexpr int kFormatVersion = 5;
+constexpr int kFormatVersion = 6;
 constexpr int kMinFormatVersion = 1;
 
 // What saveProject writes. Reading accepts this and every spelling in
@@ -228,6 +253,27 @@ f32 clEnvValue(f32 v) { return std::isfinite(v) ? v : 0.f; }
 // parameter is widened to i64 so a negative in a file is caught here rather
 // than wrapping, exactly as clPitch does.
 u8 clCurve(i64 v)     { return (u8)clampv(v, (i64)0, (i64)255); }
+
+// The arrangement. Same symmetry, same structure/value split: a negative `at`
+// or a `len` of NaN is a value and is pulled into range, while a missing `at` is
+// structure and fails the load.
+//
+// clArrLen's floor is kMinArrBeats and not 0 for the reason clNoteLen's is
+// kMinNoteLen: an item shorter than that cannot be grabbed at any zoom and
+// cannot carry a fade, so it is not an item. The editor deletes such a thing
+// (arrangeRepair step 2); the reader, which never deletes content, clamps up.
+f64 clArrBeat(f64 v)   { return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
+f64 clArrLen(f64 v)    { return std::isfinite(v) ? clampv(v, kMinArrBeats, 1e7) : 1.0; }
+f64 clFade(f64 v)      { return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
+// clCurve verbatim, and for the same argument: the byte is PRESERVED, not
+// normalized. A newer build writes `fadeshape 3`; this build must load that set,
+// draw the fade straight, and hand the 3 back on the next save rather than
+// silently flattening somebody's curve into a file that can never say so again.
+u8  clFadeShape(i64 v) { return (u8)clampv(v, (i64)0, (i64)255); }
+f32 clArrHeight(f32 v) { return std::isfinite(v) ? clampv(v, 16.f, 1024.f) : kArrHeightDefault; }
+// A warp marker's clip-relative beat. clEnvBeat's body; named apart because the
+// two clamp different things and one of them may move later.
+f64 clMarkBeat(f64 v)  { return std::isfinite(v) ? clampv(v, 0.0, 1e7) : 0.0; }
 
 // ---------------------------------------------------------------------------
 // parameter addresses -- SHAPE ONLY
@@ -468,37 +514,46 @@ void writeDevice(std::string& o, const SavedDevice& d) {
 // consequence is that a MIDI clip which somehow carries, say, a clipBpm of 150
 // comes back from a load with the default 120 -- the field is not part of what
 // a MIDI clip means, and nothing reads it for one.
-void writeClip(std::string& o, const ClipModel& c, int idx) {
+//
+// Everything in a clip block after its `uid`, at the given indent -- and the
+// ONE place that knowledge lives. A slot clip and an arrangement item write the
+// same bytes through this function, so an `aclip`'s payload is provably the same
+// grammar as a `clip`'s rather than a second copy that agrees today and drifts
+// at the next format addition. Its reader half is clipBodyKey.
+//
+// `indent` is the body's indent; envelope contents sit two spaces deeper, which
+// is the only place the nesting shows.
+void writeClipBody(std::string& o, const ClipModel& c, const char* indent) {
     const bool midi = (c.kind == ClipKind::Midi);
-    o += "  clip " + std::to_string(idx) + "\n";
-    writeUid(o, "    ", c.uid);
+    const std::string innerS = std::string(indent) + "  ";
+    const char* inner = innerS.c_str();
     // Immediately after the uid, i.e. in front of everything that could depend
     // on it. The reader does not actually need it early (the kind-sensitive
     // checks happen at `endclip`, so a hand-shuffled file still parses), but a
     // human scanning a diff should not have to read to the end of the block to
     // find out what kind of clip it is.
-    if (midi) kv(o, "    ", "kind", "midi");
+    if (midi) kv(o, indent, "kind", "midi");
     // ClipModel::path is the authority: unlike the sample's own path it outlives
     // a file that failed to load, so an offline set keeps its references instead
     // of quietly dropping the `file` line on the next save. The sample is only
     // consulted for in-memory clips built before `path` was populated.
     if (!midi) {
-        if (!c.path.empty())                          kv(o, "    ", "file", c.path);
-        else if (c.sample && !c.sample->path.empty()) kv(o, "    ", "file", c.sample->path);
+        if (!c.path.empty())                          kv(o, indent, "file", c.path);
+        else if (c.sample && !c.sample->path.empty()) kv(o, indent, "file", c.sample->path);
     }
-    kv(o, "    ", "name", c.name);
-    kn(o, "    ", "color",  std::to_string(clColor(c.colorIdx)));
-    kn(o, "    ", "gain",   fmtF32(clGain(c.gain)));
+    kv(o, indent, "name", c.name);
+    kn(o, indent, "color",  std::to_string(clColor(c.colorIdx)));
+    kn(o, indent, "gain",   fmtF32(clGain(c.gain)));
     if (!midi)
-        kn(o, "    ", "warp", std::to_string(clWarp((int)c.warp)));
-    kn(o, "    ", "loop",   c.loop ? "1" : "0");
+        kn(o, indent, "warp", std::to_string(clWarp((int)c.warp)));
+    kn(o, indent, "loop",   c.loop ? "1" : "0");
     if (!midi)
-        kn(o, "    ", "bpm", fmtF64(clBpm(c.clipBpm)));
-    kn(o, "    ", "beats",  fmtF64(clBeats(c.lengthBeats)));
+        kn(o, indent, "bpm", fmtF64(clBpm(c.clipBpm)));
+    kn(o, indent, "beats",  fmtF64(clBeats(c.lengthBeats)));
     if (!midi)
-        kn(o, "    ", "range", std::to_string(clFrame(c.loopStart)) + " " +
-                               std::to_string(clFrame(c.loopEnd)));
-    kn(o, "    ", "quantum", std::to_string(clClipQuantum(c.quantumIdx)));
+        kn(o, indent, "range", std::to_string(clFrame(c.loopStart)) + " " +
+                              std::to_string(clFrame(c.loopEnd)));
+    kn(o, indent, "quantum", std::to_string(clClipQuantum(c.quantumIdx)));
     // Sparse: the generative fields are off on almost every clip, and a set of
     // 300 clips should not carry 900 lines saying so. Emitting only non-default
     // values stays round-trip stable because the value a missing line loads as
@@ -506,9 +561,9 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
     const f64 prob = clProb(c.prob);
     const int fol  = clFollow((int)c.followAction);
     const f64 fb   = clFollowBeats(c.followBeats);
-    if (prob != 1.0)              kn(o, "    ", "prob", fmtF64(prob));
-    if (fol != (int)Follow::None) kn(o, "    ", "follow", std::to_string(fol));
-    if (fb != 0.0)                kn(o, "    ", "followbeats", fmtF64(fb));
+    if (prob != 1.0)              kn(o, indent, "prob", fmtF64(prob));
+    if (fol != (int)Follow::None) kn(o, indent, "follow", std::to_string(fol));
+    if (fb != 0.0)                kn(o, indent, "followbeats", fmtF64(fb));
     // Notes last, after every scalar, so the block reads header-then-content
     // and a clip with 400 notes still shows its settings at the top.
     //
@@ -527,10 +582,36 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
     // somehow carries leftover notes must not be written into a file that
     // cannot be read back.
     if (midi) for (const auto& n : c.notes)
-        kn(o, "    ", "note", fmtF64(clNoteBeat(n.beat)) + " " +
+        kn(o, indent, "note", fmtF64(clNoteBeat(n.beat)) + " " +
                               fmtF64(clNoteLen(n.len)) + " " +
                               std::to_string((int)clPitch(n.pitch)) + " " +
                               std::to_string((int)clVel(n.vel)));
+    // The warp map, after the notes and before the envelopes: content, like
+    // both of them, and the two content vectors are mutually exclusive anyway
+    // (only a MIDI clip has notes, only an audio clip has markers).
+    //
+    // One line per marker, `wm <srcFrame> <beat>`, rather than a `warp` ...
+    // `endwarp` block, and that is a decision rather than a preference: `warp`
+    // is ALREADY a clip key -- `warp 2` is the warp mode -- so a block by that
+    // name would have to be told apart from the scalar by whether the rest of
+    // the line is empty, which is exactly the kind of ambiguity this format does
+    // not have anywhere else. A flat line needs no new parser state, costs
+    // nothing when there are no markers, and preserves order on both ends the
+    // way `note` and `pt` do.
+    //
+    // Gated on the kind exactly as `note` is, and mirrored by a rejection at
+    // `endclip`: a MIDI clip has no sample, so a marker pinning a source frame
+    // inside one is content this format cannot carry. The writer must never
+    // produce a file the reader refuses.
+    //
+    // NOT sorted and NOT validated here. warpMapValid() is the publisher's gate
+    // (a map that is empty, single or non-monotone is simply not published and
+    // the clip warps at its clipBpm ratio), and the same argument `note` makes
+    // applies: the editor owns the invariant, the format preserves what it is
+    // given.
+    if (!midi) for (const auto& m : c.markers)
+        kn(o, indent, "wm", std::to_string(clFrame(m.srcFrame)) + " " +
+                            fmtF64(clMarkBeat(m.beat)));
     // Envelopes after the notes, for the reason the notes come after the
     // scalars: the block reads header-then-content, and a clip with 400 notes
     // and 3 lanes still shows its settings at the top.
@@ -549,14 +630,14 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
     // `note` has, for the same reason.
     for (const auto& lane : c.envelopes) {
         if (!laneWorthWriting(lane)) continue;
-        kv(o, "    ", "env", lane.address);
+        kv(o, indent, "env", lane.address);
         // Sparse, like every flag in this file: `enabled` is true on every lane
         // anyone has ever drawn, so the common case emits nothing and only a
         // deactivated lane costs a line. Round-trip stable because the value a
         // missing `off` loads as (true) is exactly the value that suppresses it.
         // It leads the block so a human scanning a diff sees the lane is dead
         // before reading 200 breakpoints.
-        if (!lane.enabled) kv(o, "      ", "off", std::string());
+        if (!lane.enabled) kv(o, inner, "off", std::string());
         for (const auto& p : lane.points) {
             // The curve byte is written only when non-zero -- the same
             // discipline prob/follow/send use and, again, for the same
@@ -566,11 +647,101 @@ void writeClip(std::string& o, const ClipModel& c, int idx) {
             const u8 curve = clCurve((i64)p.curve);
             std::string ln = fmtF64(clEnvBeat(p.beat)) + " " + fmtF32(clEnvValue(p.value));
             if (curve) ln += " " + std::to_string((int)curve);
+            kn(o, inner, "pt", ln);
+        }
+        o += indent; o += "endenv\n";
+    }
+}
+
+// A slot clip: the indexed header, the uid, the shared body, the terminator.
+// The index is on the `clip` line because a slot is a cell in a fixed array and
+// the file has to say which one; contrast `aclip`, which is a list entry.
+void writeClip(std::string& o, const ClipModel& c, int idx) {
+    o += "  clip " + std::to_string(idx) + "\n";
+    writeUid(o, "    ", c.uid);
+    writeClipBody(o, c, "    ");
+    o += "  endclip\n";
+}
+
+// One arrangement item. NO INDEX: it is positional, exactly like `device`, and
+// for exactly the reason writeDevice's comment gives -- load order is the list's
+// order, which here is timeline order. An index on a list is a second statement
+// of the ordering and therefore a second place for it to disagree with the
+// first.
+//
+// The uid on this block is the ITEM's, not the copied clip's: an item is the
+// entity the arrangement addresses (the automation publisher keys retirement on
+// it, and an insertion renumbers every index after it). ArrangeClip::src.uid is
+// deliberately not written -- two placements of one loop would otherwise both
+// claim one identity -- so it comes back as 0, exactly as a MIDI clip's clipBpm
+// comes back as the default.
+void writeAClip(std::string& o, const ArrangeClip& a) {
+    o += "    aclip\n";
+    writeUid(o, "      ", a.uid);
+    // `at` and `len` are NOT sparse: every item has both, and a missing `at`
+    // silently meaning 0 is exactly the failure a required field prevents.
+    kn(o, "      ", "at",  fmtF64(clArrBeat(a.start)));
+    kn(o, "      ", "len", fmtF64(clArrLen(a.length)));
+    // The rest are, in the way everything in this file is: the value a missing
+    // line loads as is exactly the value that suppresses the line.
+    //
+    // `off` here is the item's OFFSET into its clip. Inside an `env` block the
+    // same word means "this lane is deactivated". They never collide, because
+    // the parser is in different states and neither key is legal in the other's
+    // -- but a human reading a file meets two `off`s meaning two things, so it
+    // is said once here and once at the reader.
+    const f64 off  = clArrBeat(a.offset);
+    const f64 fin  = clFade(a.fadeIn);
+    const f64 fout = clFade(a.fadeOut);
+    const u8  shp  = clFadeShape((i64)a.fadeShape);
+    if (off  != 0.0) kn(o, "      ", "off", fmtF64(off));
+    if (fin  != 0.0) kn(o, "      ", "fadein",  fmtF64(fin));
+    if (fout != 0.0) kn(o, "      ", "fadeout", fmtF64(fout));
+    if (shp  != 0)   kn(o, "      ", "fadeshape", std::to_string((int)shp));
+    // Provenance, and dangling is the ordinary case rather than an error: a
+    // `source` naming a clip that has been deleted is written back unchanged
+    // forever, exactly as a dangling parameter address is.
+    if (a.sourceUid) kn(o, "      ", "source", std::to_string(a.sourceUid));
+    writeClipBody(o, a.src, "      ");
+    o += "    endaclip\n";
+}
+
+// A track's arrangement, after its clips: everything in it is per-track, and a
+// top-level block would have to re-state which track it belongs to -- a second
+// way of naming a track, which is a second way to get it wrong. Position within
+// the track is the same argument notes-after-scalars makes: a block reads
+// header-then-content, and a track's mixer settings should not sit below two
+// hundred lines of timeline.
+//
+// Sparse as a whole, which is what makes the v5 -> v6 diff for a set with no
+// arrangement exactly the header line: no items, no worth-writing lanes and a
+// default height write no block at all.
+void writeArrangement(std::string& o, const TrackModel& t) {
+    const f32 h = clArrHeight(t.arrHeight);
+    bool anyLane = false;
+    for (const auto& l : t.arrangeAutos) if (laneWorthWriting(l)) { anyLane = true; break; }
+    if (t.arrange.empty() && !anyLane && h == clArrHeight(kArrHeightDefault)) return;
+
+    o += "  arrangement\n";
+    if (h != clArrHeight(kArrHeightDefault)) kn(o, "    ", "arrheight", fmtF32(h));
+    for (const auto& a : t.arrange) writeAClip(o, a);
+    // `autolane`, not `env`: these lanes are absolute-timeline, and a reader
+    // meeting `env` at arrangement scope would have to infer which beat space it
+    // was in from context. Two names, two meanings, no inference. The contents
+    // are `env`'s verbatim, down to the sparse `off` and the optional curve.
+    for (const auto& lane : t.arrangeAutos) {
+        if (!laneWorthWriting(lane)) continue;
+        kv(o, "    ", "autolane", lane.address);
+        if (!lane.enabled) kv(o, "      ", "off", std::string());
+        for (const auto& p : lane.points) {
+            const u8 curve = clCurve((i64)p.curve);
+            std::string ln = fmtF64(clEnvBeat(p.beat)) + " " + fmtF32(clEnvValue(p.value));
+            if (curve) ln += " " + std::to_string((int)curve);
             kn(o, "      ", "pt", ln);
         }
-        o += "    endenv\n";
+        o += "    endautolane\n";
     }
-    o += "  endclip\n";
+    o += "  endarrangement\n";
 }
 
 void writeTrack(std::string& o, const TrackModel& t, int idx) {
@@ -598,6 +769,9 @@ void writeTrack(std::string& o, const TrackModel& t, int idx) {
     for (const auto& d : t.savedDevices) writeDevice(o, d);
     for (int i = 0; i < kMaxScenes; ++i)
         if (clipOccupied(t.slots[i])) writeClip(o, t.slots[i], i);
+    // The timeline sits after the grid, and writes nothing at all when there is
+    // none of it.
+    writeArrangement(o, t);
     o += "endtrack\n";
 }
 
@@ -707,7 +881,224 @@ struct Scan {
     }
 };
 
-enum class St { Top, Track, Device, Clip, Env, Scene, Return, Master };
+// Parser states. The three arrangement ones are §8.6: St::Arrange opens from
+// St::Track and closes back to it, St::AClip and St::AutoLane open from
+// St::Arrange, and St::Env now has TWO entry points -- a slot clip and an
+// arrangement item -- which is why it has to remember what to close back to
+// (`envPrev`), exactly as St::Device already remembers `devPrev`.
+enum class St { Top, Track, Device, Clip, Env, Scene, Return, Master,
+                Arrange, AClip, AutoLane };
+
+// What a clip's body needs the reader to remember beyond the ClipModel itself:
+// the sample path, whose load is deferred to the block's terminator so `file`
+// may appear in any order, and which fields the file actually stated (so a
+// project that spells out every field re-saves byte-for-byte identically).
+struct ClipReadState {
+    std::string file;
+    bool sawRange = false, sawBpm = false, sawBeats = false, sawName = false;
+    void reset() { file.clear(); sawRange = sawBpm = sawBeats = sawName = false; }
+};
+
+// Offering a line to a shared handler has three outcomes and not two: the key
+// was consumed, the key belongs to the caller's own block, or the key was ours
+// and the line was broken. A bool plus an out-parameter would fold two of them
+// together at exactly the place the format's structure/value split lives.
+enum class BodyKey { No, Yes, Bad };
+
+// `pt` and `off`, shared by St::Env (a clip envelope) and St::AutoLane (an
+// arrangement lane) so the two block types cannot drift apart. §8.2's whole
+// argument for two block NAMES is that the beat space differs; the contents are
+// the same grammar, and this is what makes that true rather than asserted.
+BodyKey autoLaneKey(AutoLane& lane, const std::string& key, Scan& sc, std::string& err) {
+    if (key == "pt") {
+        // Structure rejected, values clamped -- as for `note`, `param` and every
+        // scalar. `beat` and `value` are required, so a line missing either, or
+        // spelling one as something that is not a number, is a broken line with
+        // no sane guess behind it.
+        //
+        // `curve` is optional, and that is the one place this line is stricter
+        // than `note`: `note` ignores whatever trails its four fields, but here
+        // "nothing follows" is itself meaningful (curve 0, linear), so trailing
+        // text that is NOT a number cannot be waved through -- it would be an
+        // unreadable third field silently loading as the value that suppresses
+        // it.
+        f64 beat = 0.0, value = 0.0;
+        if (!sc.num(beat) || !sc.num(value)) { err = "pt: expected a beat and a value"; return BodyKey::Bad; }
+        i64 curve = 0;
+        if (!sc.exhausted() && !sc.integer(curve)) { err = "pt: curve must be an integer"; return BodyKey::Bad; }
+        lane.points.push_back(AutoPoint{clEnvBeat(beat), clEnvValue((f32)value), clCurve(curve), {}});
+        return BodyKey::Yes;
+    }
+    if (key == "off") {
+        // Presence is the whole statement, like `master`. A value is not read
+        // and not required: the line exists only when the lane is deactivated,
+        // so "off 0" would be a contradiction the writer can never produce.
+        //
+        // THE COLLISION, said once at the reader as it is once at the writer:
+        // `off` inside an `aclip` is that item's offset in beats and carries a
+        // number. It cannot be confused with this one, because the parser is in
+        // a different state and neither key is legal in the other's.
+        lane.enabled = false;
+        return BodyKey::Yes;
+    }
+    return BodyKey::No;
+}
+
+// The reader half of writeClipBody: every key inside a clip block except `uid`
+// and the terminator, which belong to whichever block opened it. One handler, so
+// an `aclip`'s payload is provably the same grammar as a `clip`'s.
+BodyKey clipBodyKey(ClipModel& c, const std::string& key, const std::string& rest,
+                    Scan& sc, ClipReadState& crs, St& st, St& envPrev, std::string& err) {
+    if (key == "kind") {
+        // Only the two kinds that exist. `kind audio` is accepted even though
+        // the writer never emits it -- it names the default, and refusing a
+        // redundant statement of the truth would be perverse -- but it is
+        // dropped on the next save, like any other line whose value a clip of
+        // that kind does not carry.
+        if (rest == "midi")       c.kind = ClipKind::Midi;
+        else if (rest == "audio") c.kind = ClipKind::Audio;
+        else { err = "clip kind: expected 'audio' or 'midi'"; return BodyKey::Bad; }
+    } else if (key == "note") {
+        // Structure is rejected, values are clamped -- the same split as `param`
+        // and every scalar above. A note missing a field is a broken line and
+        // there is no sane guess for what it meant; a note at pitch 300 is a
+        // line that says something, just not something MIDI can express, so it
+        // is pulled into range.
+        f64 beat = 0.0, len = 0.0;
+        i64 pitch = 0, vel = 0;
+        if (!sc.num(beat) || !sc.num(len) || !sc.integer(pitch) || !sc.integer(vel)) {
+            err = "note: expected beat, length, pitch and velocity";
+            return BodyKey::Bad;
+        }
+        // Appended, never sorted: see writeClipBody. File order is the order the
+        // session gets.
+        c.notes.push_back(NoteModel{clNoteBeat(beat), clNoteLen(len), clPitch(pitch), clVel(vel)});
+    } else if (key == "wm") {
+        // A warp marker: a source frame pinned to a clip-relative beat. Both
+        // fields required (there is no defaulting one of a pair of coordinates),
+        // both clamped. The map is neither sorted nor validated here -- an
+        // unusable map is simply not published, and the clip then warps at its
+        // single clipBpm/tempo ratio, which is a working clip and not a broken
+        // one.
+        f64 beat = 0.0;
+        i64 frame = 0;
+        if (!sc.integer(frame) || !sc.num(beat)) {
+            err = "wm: expected a source frame and a beat";
+            return BodyKey::Bad;
+        }
+        c.markers.push_back(WarpMarker{clFrame(frame), clMarkBeat(beat)});
+    } else if (key == "file") {
+        crs.file = unesc(rest);
+    } else if (key == "name") {
+        c.name = unesc(rest); crs.sawName = true;
+    } else if (key == "color") {
+        int v; if (!sc.integer(v)) { err = "clip color: expected an integer"; return BodyKey::Bad; }
+        c.colorIdx = clColor(v);
+    } else if (key == "gain") {
+        f64 v; if (!sc.num(v)) { err = "clip gain: expected a number"; return BodyKey::Bad; }
+        c.gain = clGain((f32)v);
+    } else if (key == "warp") {
+        int v; if (!sc.integer(v)) { err = "clip warp: expected an integer"; return BodyKey::Bad; }
+        c.warp = (Warp)clWarp(v);
+    } else if (key == "loop") {
+        int v; if (!sc.integer(v)) { err = "clip loop: expected 0 or 1"; return BodyKey::Bad; }
+        c.loop = v != 0;
+    } else if (key == "bpm") {
+        f64 v; if (!sc.num(v)) { err = "clip bpm: expected a number"; return BodyKey::Bad; }
+        c.clipBpm = clBpm(v); crs.sawBpm = true;
+    } else if (key == "beats") {
+        f64 v; if (!sc.num(v)) { err = "clip beats: expected a number"; return BodyKey::Bad; }
+        c.lengthBeats = clBeats(v); crs.sawBeats = true;
+    } else if (key == "range") {
+        i64 a = 0, e = 0;
+        if (!sc.integer(a) || !sc.integer(e)) { err = "range: expected two frame counts"; return BodyKey::Bad; }
+        c.loopStart = clFrame(a); c.loopEnd = clFrame(e); crs.sawRange = true;
+    } else if (key == "quantum") {
+        int v; if (!sc.integer(v)) { err = "clip quantum: expected an integer"; return BodyKey::Bad; }
+        c.quantumIdx = clClipQuantum(v);
+    } else if (key == "prob") {
+        f64 v; if (!sc.num(v)) { err = "clip prob: expected a number"; return BodyKey::Bad; }
+        c.prob = clProb(v);
+    } else if (key == "follow") {
+        int v; if (!sc.integer(v)) { err = "clip follow: expected an integer"; return BodyKey::Bad; }
+        c.followAction = (Follow)clFollow(v);
+    } else if (key == "followbeats") {
+        f64 v; if (!sc.num(v)) { err = "clip followbeats: expected a number"; return BodyKey::Bad; }
+        c.followBeats = clFollowBeats(v);
+    } else if (key == "env") {
+        // The address is the whole rest of the line, escaped like `name` and
+        // `plugin`, and validated AFTER unescaping because the unescaped text is
+        // what the model holds and what the next save writes back.
+        //
+        // Malformed -> the load fails. See validAddress for the full argument;
+        // the short version is that it is structure, and a repaired address is
+        // automation silently moved onto some other parameter. A *dangling*
+        // address -- well-formed, naming a uid nothing answers to -- is content
+        // and is kept.
+        //
+        // Not gated on the clip kind: an audio clip may carry lanes.
+        const std::string addr = unesc(rest);
+        if (!validAddress(addr)) {
+            err = "env: malformed parameter address '" + addr + "'";
+            return BodyKey::Bad;
+        }
+        c.envelopes.push_back(AutoLane{addr, {}, true});
+        envPrev = st;              // a clip block, or an arrangement item's
+        st = St::Env;
+    } else {
+        return BodyKey::No;
+    }
+    return BodyKey::Yes;
+}
+
+// The kind-sensitive checks, run at a clip block's terminator rather than at the
+// offending line so the block may be written in any order: `note` before
+// `kind midi` is still a MIDI clip, and the reader has to have seen the whole
+// block before it can say otherwise. Returns the failure, or null.
+//
+// These are rejections, not silent repairs, because each combination describes
+// content this format cannot carry and the next save would therefore throw away:
+// a MIDI clip has nowhere to keep a sample path or a warp marker, and an audio
+// clip has nowhere to keep notes. Guessing (promoting the clip to MIDI and
+// dropping its file, or the reverse) would destroy one half of what the file
+// says. Failing loudly leaves the session untouched and the file intact for the
+// user to fix. Inapplicable *scalars* are the tolerated case, not this one: a
+// `bpm` or `range` line inside a MIDI clip parses and is then simply not
+// re-emitted, since nothing is lost that the clip was actually using.
+const char* clipBodyClose(const ClipModel& c, const ClipReadState& crs) {
+    if (c.kind == ClipKind::Midi && !crs.file.empty())
+        return "a midi clip cannot have a 'file' line";
+    if (c.kind != ClipKind::Midi && !c.notes.empty())
+        return "'note' is only valid inside a midi clip";
+    if (c.kind == ClipKind::Midi && !c.markers.empty())
+        return "'wm' is only valid inside an audio clip";
+    return nullptr;
+}
+
+// Resolves a clip once its body has been read: the sample load is deferred to
+// the terminator so `file` may appear in any order. `what` names the clip for
+// the log ("slot 0/3", "arrangement item 2 of track 1").
+void finishClipBody(ClipModel& c, const ClipReadState& crs, f64 engineRate,
+                    int& missing, const std::string& what) {
+    // The reference is recorded whether or not the audio can be decoded -- that
+    // is what lets the next save write the same `file` line back.
+    c.path = crs.file;
+    if (crs.file.empty()) return;
+    c.sample = loadSample(crs.file, engineRate);
+    if (!c.sample) {
+        ++missing;
+        LOGW("project: missing sample '%s' (%s kept, path preserved)", crs.file.c_str(), what.c_str());
+        if (!crs.sawName) c.name = baseName(crs.file);
+        return;
+    }
+    // Only fill in what the file did not state, so a project that spells out
+    // every field re-saves byte-for-byte identically. An explicitly empty `name`
+    // counts as stated.
+    if (!crs.sawName)  c.name = c.sample->name;
+    if (!crs.sawBpm)   c.clipBpm = clBpm(c.sample->guessedBpm);
+    if (!crs.sawBeats) c.lengthBeats = clBeats(c.sample->guessedBeats);
+    if (!crs.sawRange) { c.loopStart = 0; c.loopEnd = c.sample->frames; }
+}
 
 bool readWholeFile(const std::string& path, std::string& out, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
@@ -745,6 +1136,22 @@ bool saveProject(const Session& s, const std::string& path, std::string* err) {
     // numbers that are already in use.
     kn(o, "", "nextuid",   std::to_string(clNextUid(s.nextUid)));
     kv(o, "", "name", s.name);
+    // The arrangement loop brace, beside the tempo and the quantum because there
+    // is one timeline and one brace. `loop <start> <end>` on one line because it
+    // is one range; `loopon` separate because a disabled brace still remembers
+    // where it was, which is what makes toggling it useful.
+    //
+    // Both sparse, and that is what keeps the v5 -> v6 diff for a set with no
+    // arrangement down to the header line: the default range and a brace that is
+    // off write nothing, and the values a missing line loads as are exactly the
+    // ones that suppress it.
+    {
+        const Session deflt{};
+        const f64 ls = clArrBeat(s.loopStart), le = clArrBeat(s.loopEnd);
+        if (ls != clArrBeat(deflt.loopStart) || le != clArrBeat(deflt.loopEnd))
+            kn(o, "", "loop", fmtF64(ls) + " " + fmtF64(le));
+        if (s.loopOn) kn(o, "", "loopon", "1");
+    }
 
     const size_t nTracks = std::min(s.tracks.size(), (size_t)kMaxTracks);
     for (size_t i = 0; i < nTracks; ++i) writeTrack(o, s.tracks[i], (int)i);
@@ -835,34 +1242,29 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         devPrev  = back;
         st = St::Device;
     };
-    std::string clipFile;
-    bool clipSawRange = false, clipSawBpm = false, clipSawBeats = false, clipSawName = false;
+    ClipReadState crs;
     int  missing = 0;
+    // The clip a body is being read into -- a slot's, or an arrangement item's
+    // `src`. St::Env is reachable from both, so the lane it appends to has to be
+    // named through this rather than through ti/ci. Set when a clip block opens,
+    // cleared when it closes, and dereferenced nowhere else: the only things
+    // that could invalidate it (a new `track`, a new `aclip`) are keys that fail
+    // the load inside a clip block, exactly as devOwner's comment argues.
+    ClipModel* curClip = nullptr;
+    // The arrangement item being read, for the same window and the same reason.
+    ArrangeClip* curItem = nullptr;
+    bool aclipSawAt = false, aclipSawLen = false;
+    // What St::Env closes back to: a slot clip's block or an item's. §8.3's one
+    // consequence, and the same trick openDevice already uses for devPrev.
+    St envPrev = St::Clip;
 
-    // Resolves the pending clip once its body has been read: the sample load is
-    // deferred to `endclip` so `file` may appear in any order.
+    // The slot-clip flavour of finishClipBody: same resolution, plus the ghost
+    // check a fixed array needs and a list does not.
     auto finishClip = [&]() {
         if (ti < 0 || ci < 0) return;
         ClipModel& c = out.tracks[(size_t)ti].slots[ci];
-        // The reference is recorded whether or not the audio can be decoded --
-        // that is what lets the next save write the same `file` line back.
-        c.path = clipFile;
-        if (!clipFile.empty()) {
-            c.sample = loadSample(clipFile, engineRate);
-            if (!c.sample) {
-                ++missing;
-                LOGW("project: missing sample '%s' (slot %d/%d kept, path preserved)", clipFile.c_str(), ti, ci);
-                if (!clipSawName) c.name = baseName(clipFile);
-            } else {
-                // Only fill in what the file did not state, so a project that
-                // spells out every field re-saves byte-for-byte identically.
-                // An explicitly empty `name` counts as stated.
-                if (!clipSawName)    c.name = c.sample->name;
-                if (!clipSawBpm)     c.clipBpm = clBpm(c.sample->guessedBpm);
-                if (!clipSawBeats)   c.lengthBeats = clBeats(c.sample->guessedBeats);
-                if (!clipSawRange) { c.loopStart = 0; c.loopEnd = c.sample->frames; }
-            }
-        }
+        finishClipBody(c, crs, engineRate, missing,
+                       "slot " + std::to_string(ti) + "/" + std::to_string(ci));
         if (!clipOccupied(c)) {
             // Nothing identifies this slot; drop it rather than leave a ghost.
             // A MIDI clip never lands here, however empty and unnamed it is:
@@ -928,6 +1330,20 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                 out.nextUid = clNextUid(v);
             } else if (key == "name") {
                 out.name = unesc(rest);
+            } else if (key == "loop") {
+                // Top level, beside `tempo`: there is one timeline and one
+                // brace. Both numbers are required -- a range is one statement
+                // with two halves and there is no sane guess for a missing one
+                // -- and both are clamped. An inverted or empty range is NOT
+                // repaired here: the engine reads `loopStart >= loopEnd` as "no
+                // loop", so it is a value that says something, and inventing a
+                // length would be inventing content.
+                f64 a = 0.0, b = 0.0;
+                if (!sc.num(a) || !sc.num(b)) return fail("loop: expected a start and an end");
+                out.loopStart = clArrBeat(a); out.loopEnd = clArrBeat(b);
+            } else if (key == "loopon") {
+                int v; if (!sc.integer(v)) return fail("loopon: expected 0 or 1");
+                out.loopOn = v != 0;
             } else if (key == "track") {
                 int v; if (!sc.integer(v)) return fail("track: expected an index");
                 if (v < 0 || v >= kMaxTracks)
@@ -1010,9 +1426,15 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
                     return fail("clip index " + std::to_string(v) + " out of range");
                 ci = v;
                 t.slots[ci] = ClipModel{};
-                clipFile.clear();
-                clipSawRange = clipSawBpm = clipSawBeats = clipSawName = false;
+                curClip = &t.slots[ci];
+                crs.reset();
                 st = St::Clip;
+            } else if (key == "arrangement") {
+                // No index and no scalars of its own beyond the height: the
+                // block exists to scope this track's timeline. It is a track's
+                // block and not a top-level one precisely so that it never has
+                // to re-state which track it belongs to.
+                st = St::Arrange;
             } else if (key == "endtrack") {
                 ti = -1;
                 st = St::Top;
@@ -1053,123 +1475,149 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         case St::Clip: {
             ClipModel& c = out.tracks[(size_t)ti].slots[ci];
             if (key == "uid") {
+                // The block's own key, not the body's: a slot clip's uid is the
+                // clip's identity, while an `aclip`'s is the ITEM's. One shared
+                // body handler, two different things called `uid` around it.
                 u64 v; if (!sc.uid(v)) return fail("clip uid: expected an integer");
                 c.uid = v;
-            } else if (key == "kind") {
-                // Only the two kinds that exist. `kind audio` is accepted even
-                // though the writer never emits it -- it names the default, and
-                // refusing a redundant statement of the truth would be perverse
-                // -- but it is dropped on the next save, like any other line
-                // whose value a clip of that kind does not carry.
-                if (rest == "midi")       c.kind = ClipKind::Midi;
-                else if (rest == "audio") c.kind = ClipKind::Audio;
-                else return fail("clip kind: expected 'audio' or 'midi'");
-            } else if (key == "note") {
-                // Structure is rejected, values are clamped -- the same split as
-                // `param` and every scalar above. A note missing a field is a
-                // broken line and there is no sane guess for what it meant; a
-                // note at pitch 300 is a line that says something, just not
-                // something MIDI can express, so it is pulled into range.
-                f64 beat = 0.0, len = 0.0;
-                i64 pitch = 0, vel = 0;
-                if (!sc.num(beat) || !sc.num(len) || !sc.integer(pitch) || !sc.integer(vel))
-                    return fail("note: expected beat, length, pitch and velocity");
-                // Appended, never sorted: see writeClip. File order is the
-                // order the session gets.
-                c.notes.push_back(NoteModel{clNoteBeat(beat), clNoteLen(len),
-                                            clPitch(pitch), clVel(vel)});
-            } else if (key == "file") {
-                clipFile = unesc(rest);
-            } else if (key == "name") {
-                c.name = unesc(rest); clipSawName = true;
-            } else if (key == "color") {
-                int v; if (!sc.integer(v)) return fail("clip color: expected an integer");
-                c.colorIdx = clColor(v);
-            } else if (key == "gain") {
-                f64 v; if (!sc.num(v)) return fail("clip gain: expected a number");
-                c.gain = clGain((f32)v);
-            } else if (key == "warp") {
-                int v; if (!sc.integer(v)) return fail("clip warp: expected an integer");
-                c.warp = (Warp)clWarp(v);
-            } else if (key == "loop") {
-                int v; if (!sc.integer(v)) return fail("clip loop: expected 0 or 1");
-                c.loop = v != 0;
-            } else if (key == "bpm") {
-                f64 v; if (!sc.num(v)) return fail("clip bpm: expected a number");
-                c.clipBpm = clBpm(v); clipSawBpm = true;
-            } else if (key == "beats") {
-                f64 v; if (!sc.num(v)) return fail("clip beats: expected a number");
-                c.lengthBeats = clBeats(v); clipSawBeats = true;
-            } else if (key == "range") {
-                i64 a = 0, e = 0;
-                if (!sc.integer(a) || !sc.integer(e))
-                    return fail("range: expected two frame counts");
-                c.loopStart = clFrame(a); c.loopEnd = clFrame(e); clipSawRange = true;
-            } else if (key == "quantum") {
-                int v; if (!sc.integer(v)) return fail("clip quantum: expected an integer");
-                c.quantumIdx = clClipQuantum(v);
-            } else if (key == "prob") {
-                f64 v; if (!sc.num(v)) return fail("clip prob: expected a number");
-                c.prob = clProb(v);
-            } else if (key == "follow") {
-                int v; if (!sc.integer(v)) return fail("clip follow: expected an integer");
-                c.followAction = (Follow)clFollow(v);
-            } else if (key == "followbeats") {
-                f64 v; if (!sc.num(v)) return fail("clip followbeats: expected a number");
-                c.followBeats = clFollowBeats(v);
-            } else if (key == "env") {
-                // The address is the whole rest of the line, escaped like
-                // `name` and `plugin`, and validated AFTER unescaping because
-                // the unescaped text is what the model holds and what the next
-                // save writes back.
-                //
-                // Malformed -> the load fails. See validAddress for the full
-                // argument; the short version is that it is structure, and a
-                // repaired address is automation silently moved onto some other
-                // parameter. A *dangling* address -- well-formed, naming a uid
-                // nothing answers to -- is content and is kept.
-                //
-                // Not gated on the clip kind: an audio clip may carry lanes.
-                const std::string addr = unesc(rest);
-                if (!validAddress(addr))
-                    return fail("env: malformed parameter address '" + addr + "'");
-                c.envelopes.push_back(AutoLane{addr, {}, true});
-                st = St::Env;
             } else if (key == "endclip") {
-                // Checked here rather than at the offending line so the block
-                // may be written in any order: `note` before `kind midi` is
-                // still a MIDI clip, and the reader has to have seen the whole
-                // block before it can say otherwise.
-                //
-                // These two are rejections, not silent repairs, because both
-                // combinations describe content that this format cannot carry
-                // and the next save would therefore throw away: a MIDI clip has
-                // nowhere to keep a sample path, and an audio clip has nowhere
-                // to keep notes. Guessing (promoting the clip to MIDI and
-                // dropping its file, or the reverse) would destroy one half of
-                // what the file says. Failing loudly leaves the session
-                // untouched and the file on disk intact for the user to fix.
-                // Inapplicable *scalars* are the tolerated case, not this one:
-                // a `bpm` or `range` line inside a MIDI clip parses and is then
-                // simply not re-emitted, since nothing is lost that the clip
-                // was actually using.
-                if (c.kind == ClipKind::Midi && !clipFile.empty())
-                    return fail("a midi clip cannot have a 'file' line");
-                if (c.kind != ClipKind::Midi && !c.notes.empty())
-                    return fail("'note' is only valid inside a midi clip");
+                if (const char* bad = clipBodyClose(c, crs)) return fail(bad);
                 finishClip();
                 ci = -1;
+                curClip = nullptr;
                 st = St::Track;
             } else {
-                return fail("unexpected '" + key + "' inside clip");
+                std::string e;
+                const BodyKey r = clipBodyKey(c, key, rest, sc, crs, st, envPrev, e);
+                if (r == BodyKey::Bad) return fail(e);
+                if (r == BodyKey::No)  return fail("unexpected '" + key + "' inside clip");
             }
             break;
         }
         // ---------------------------------------------------------------
-        // An envelope block, opened from St::Clip and closing back to it. The
-        // lane is always envelopes.back(): `env` is reachable only from a clip,
-        // ti/ci stay valid for the whole block, and nothing else appends to that
-        // vector in between.
+        // A track's arrangement. Three keys and a terminator; everything with
+        // content in it is one of the two blocks below.
+        //
+        // No count is enforced here, and that is the same call `device` and
+        // St::Env already make: kMaxArrItems, kMaxArrNotes, kMaxArrLanes and
+        // kMaxArrPoints are real ceilings, but they belong to the editor and the
+        // publisher, never to the reader. Silently dropping the tail of a user's
+        // timeline at load time would be the worse failure.
+        case St::Arrange: {
+            TrackModel& t = out.tracks[(size_t)ti];
+            if (key == "arrheight") {
+                f64 v; if (!sc.num(v)) return fail("arrheight: expected a number");
+                t.arrHeight = clArrHeight((f32)v);
+            } else if (key == "aclip") {
+                // Positional, like `device`: no index, because load order IS
+                // timeline order. The list is not sorted here -- the format
+                // preserves the order it finds, and the sort that the engine's
+                // O(1) cursor depends on happens in App::adoptSession, next to
+                // the editing code that upholds the invariant.
+                t.arrange.emplace_back();
+                curItem = &t.arrange.back();
+                curClip = &curItem->src;
+                crs.reset();
+                aclipSawAt = aclipSawLen = false;
+                st = St::AClip;
+            } else if (key == "autolane") {
+                // `env`'s grammar under a different name, because these lanes
+                // are absolute-timeline and a reader meeting `env` at
+                // arrangement scope would have to infer the beat space from
+                // context. The address rule is identical: malformed fails the
+                // load, dangling is kept and written back forever.
+                const std::string addr = unesc(rest);
+                if (!validAddress(addr))
+                    return fail("autolane: malformed parameter address '" + addr + "'");
+                t.arrangeAutos.push_back(AutoLane{addr, {}, true});
+                st = St::AutoLane;
+            } else if (key == "endarrangement") {
+                st = St::Track;
+            } else {
+                return fail("unexpected '" + key + "' inside arrangement");
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
+        // One placed item: its own seven fields, then a clip body identical to a
+        // slot clip's. `curItem` is always arrange.back() -- `aclip` is reachable
+        // only from St::Arrange, and the only thing that grows that vector is the
+        // emplace_back that opened this block -- which is devOwner's argument
+        // exactly.
+        case St::AClip: {
+            ArrangeClip& a = *curItem;
+            if (key == "uid") {
+                u64 v; if (!sc.uid(v)) return fail("aclip uid: expected an integer");
+                a.uid = v;
+            } else if (key == "at") {
+                f64 v; if (!sc.num(v)) return fail("at: expected a number");
+                a.start = clArrBeat(v); aclipSawAt = true;
+            } else if (key == "len") {
+                f64 v; if (!sc.num(v)) return fail("len: expected a number");
+                a.length = clArrLen(v); aclipSawLen = true;
+            } else if (key == "off") {
+                // The item's offset into its clip. The `off` inside an `env`
+                // block is a different key in a different state and takes no
+                // value; see autoLaneKey.
+                f64 v; if (!sc.num(v)) return fail("off: expected a number");
+                a.offset = clArrBeat(v);
+            } else if (key == "fadein") {
+                f64 v; if (!sc.num(v)) return fail("fadein: expected a number");
+                a.fadeIn = clFade(v);
+            } else if (key == "fadeout") {
+                f64 v; if (!sc.num(v)) return fail("fadeout: expected a number");
+                a.fadeOut = clFade(v);
+            } else if (key == "fadeshape") {
+                i64 v; if (!sc.integer(v)) return fail("fadeshape: expected an integer");
+                a.fadeShape = clFadeShape(v);
+            } else if (key == "source") {
+                // Provenance, and never resolved: a `source` naming a clip that
+                // no longer exists dangles soft and is written back unchanged,
+                // exactly as a parameter address naming a deleted device does.
+                u64 v; if (!sc.uid(v)) return fail("source: expected an integer");
+                a.sourceUid = v;
+            } else if (key == "endaclip") {
+                // `at` and `len` are the two required fields: an item with no
+                // position is not an item, and a missing `at` silently meaning
+                // beat 0 is exactly the failure a required field prevents.
+                if (!aclipSawAt)  return fail("aclip: missing 'at'");
+                if (!aclipSawLen) return fail("aclip: missing 'len'");
+                if (const char* bad = clipBodyClose(a.src, crs)) return fail(bad);
+                finishClipBody(a.src, crs, engineRate, missing,
+                               "arrangement item " + std::to_string(out.tracks[(size_t)ti].arrange.size() - 1) +
+                               " of track " + std::to_string(ti));
+                curItem = nullptr;
+                curClip = nullptr;
+                st = St::Arrange;
+            } else {
+                std::string e;
+                const BodyKey r = clipBodyKey(a.src, key, rest, sc, crs, st, envPrev, e);
+                if (r == BodyKey::Bad) return fail(e);
+                if (r == BodyKey::No)  return fail("unexpected '" + key + "' inside aclip");
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
+        // An arrangement automation lane. `pt` and `off` are `env`'s, through
+        // the same handler, so the two cannot drift apart.
+        case St::AutoLane: {
+            AutoLane& lane = out.tracks[(size_t)ti].arrangeAutos.back();
+            std::string e;
+            const BodyKey r = autoLaneKey(lane, key, sc, e);
+            if (r == BodyKey::Bad) return fail(e);
+            if (r == BodyKey::No) {
+                if (key != "endautolane")
+                    return fail("unexpected '" + key + "' inside autolane");
+                st = St::Arrange;
+            }
+            break;
+        }
+        // ---------------------------------------------------------------
+        // An envelope block, opened from a clip block -- a slot's or an
+        // arrangement item's -- and closing back to whichever it was. The lane is
+        // always curClip->envelopes.back(): `env` is reachable only from a clip,
+        // that clip stays valid for the whole block, and nothing else appends to
+        // its vector in between.
         //
         // No count is enforced here. kMaxClipLanes and kMaxClipAutoPoints are
         // real ceilings, but AUTOMATION.md §2.1 puts them on the editor and the
@@ -1179,37 +1627,13 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
         // failure than a set the publisher will clamp anyway. The engine's
         // fixed-width lane array is the publisher's problem, not the format's.
         case St::Env: {
-            AutoLane& lane = out.tracks[(size_t)ti].slots[ci].envelopes.back();
-            if (key == "pt") {
-                // Structure rejected, values clamped -- as for `note`, `param`
-                // and every scalar. `beat` and `value` are required, so a line
-                // missing either, or spelling one as something that is not a
-                // number, is a broken line with no sane guess behind it.
-                //
-                // `curve` is optional, and that is the one place this line is
-                // stricter than `note`: `note` ignores whatever trails its four
-                // fields, but here "nothing follows" is itself meaningful (curve
-                // 0, linear), so trailing text that is NOT a number cannot be
-                // waved through -- it would be an unreadable third field
-                // silently loading as the value that suppresses it.
-                f64 beat = 0.0, value = 0.0;
-                if (!sc.num(beat) || !sc.num(value))
-                    return fail("pt: expected a beat and a value");
-                i64 curve = 0;
-                if (!sc.exhausted() && !sc.integer(curve))
-                    return fail("pt: curve must be an integer");
-                lane.points.push_back(AutoPoint{clEnvBeat(beat), clEnvValue((f32)value),
-                                                clCurve(curve), {}});
-            } else if (key == "off") {
-                // Presence is the whole statement, like `master`. A value is not
-                // read and not required: the line exists only when the lane is
-                // deactivated, so "off 0" would be a contradiction the writer
-                // can never produce.
-                lane.enabled = false;
-            } else if (key == "endenv") {
-                st = St::Clip;
-            } else {
-                return fail("unexpected '" + key + "' inside env");
+            AutoLane& lane = curClip->envelopes.back();
+            std::string e;
+            const BodyKey r = autoLaneKey(lane, key, sc, e);
+            if (r == BodyKey::Bad) return fail(e);
+            if (r == BodyKey::No) {
+                if (key != "endenv") return fail("unexpected '" + key + "' inside env");
+                st = envPrev;
             }
             break;
         }
@@ -1274,12 +1698,15 @@ bool loadProject(Session& s, const std::string& path, f64 engineRate, std::strin
 
     if (!sawHeader) return fail("empty or truncated project file");
     if (st != St::Top) {
-        const char* what = (st == St::Env)    ? "endenv"
-                         : (st == St::Clip)   ? "endclip"
-                         : (st == St::Device) ? "enddevice"
-                         : (st == St::Track)  ? "endtrack"
-                         : (st == St::Return) ? "endreturn"
-                         : (st == St::Master) ? "endmaster" : "endscene";
+        const char* what = (st == St::Env)      ? "endenv"
+                         : (st == St::Clip)     ? "endclip"
+                         : (st == St::Device)   ? "enddevice"
+                         : (st == St::AClip)    ? "endaclip"
+                         : (st == St::AutoLane) ? "endautolane"
+                         : (st == St::Arrange)  ? "endarrangement"
+                         : (st == St::Track)    ? "endtrack"
+                         : (st == St::Return)   ? "endreturn"
+                         : (st == St::Master)   ? "endmaster" : "endscene";
         return fail(std::string("unexpected end of file, missing '") + what + "'");
     }
 

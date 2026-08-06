@@ -24,6 +24,7 @@
 #include <functional>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace lat;
@@ -3442,13 +3443,12 @@ static void testDrains() {
 // 23. automation: the shared evaluator
 //
 // docs/AUTOMATION.md §2.4/§3. autoValueAt is the ONE function the engine and
-// (later) the UI both call, which is what makes the displayed value and the
-// applied value incapable of disagreeing. engine.h is frozen for this pass and
-// does not declare it yet, so the test names it exactly as the UI will once the
-// declaration lands beside the Rt structs.
+// the UI both call, which is what makes the displayed value and the applied
+// value incapable of disagreeing. It is declared in engine.h now, in the
+// pointer form ARRANGEMENT.md §6.2 refactored it to, with an inline forwarder
+// per container -- so this whole table runs against the refactored evaluator
+// unchanged, which is the assertion that says the refactor was a refactor.
 // ---------------------------------------------------------------------------
-
-namespace lat { f32 autoValueAt(const RtAutoSet&, const RtAutoLane&, f64, f32); }
 
 // One allocation holding the set followed by its points, which is the shape
 // App::publishAutos will build and the shape the retirement protocol frees:
@@ -4840,6 +4840,190 @@ static void testGrainAlignment() {
 }
 
 // ---------------------------------------------------------------------------
+// 33. the arrangement's header types, compiled and NOT YET USED
+//
+// docs/ARRANGEMENT.md §10.2. 8a lands every engine.h edit the wave needs and
+// wires none of them up, because engine.h is the daemon's contract and exactly
+// one milestone may open it. That makes "unused" the property under test, and
+// there are three halves to it:
+//
+//   * the shapes are what §3, §5 and §6 specified;
+//   * the numbering of Cmd and Ev did not move, since ipc/control.h classifies
+//     by that number and WireCommand carries it;
+//   * an engine handed the four new commands renders BIT-IDENTICALLY to one
+//     that never saw them. That is the "a set with no arrangement must render
+//     exactly what it renders today" gate, tested at the only place 8a can
+//     reach it.
+// ---------------------------------------------------------------------------
+
+// The numbering is protocol. Both enums may only ever grow at the end; an
+// insertion would silently reclassify every command above it at the process
+// boundary, which is the kind of break that shows up as "the daemon refused a
+// fader move" three phases later.
+static_assert((u32)Cmd::RecordMidiSlot    == 25, "Cmd numbering moved");
+static_assert((u32)Cmd::SetArrangement    == 26, "SetArrangement must be appended");
+static_assert((u32)Cmd::SetTrackAutos     == 27, "SetTrackAutos must be appended");
+static_assert((u32)Cmd::Locate            == 28, "Locate must be appended");
+static_assert((u32)Cmd::BackToArrangement == 29, "BackToArrangement must be appended");
+static_assert((u32)Ev::WarpRetired        == 12, "Ev numbering moved");
+static_assert((u32)Ev::ArrangementRetired == 13, "ArrangementRetired must be appended");
+static_assert((u32)Ev::TrackAutosRetired  == 14, "TrackAutosRetired must be appended");
+
+// Pointer-free and trivially copyable: it rides an SPSC ring and, later, a
+// shared-memory region, and neither can carry anything that needs a constructor.
+// 24 and not the 32 §5.3 quotes -- four 4-byte integers and an f64 is 24 bytes,
+// and the field list is what that section actually specifies.
+static_assert(sizeof(ArrJournal) == 24, "ArrJournal is four u32/i32 and one f64");
+static_assert(std::is_trivially_copyable<ArrJournal>::value, "ArrJournal must be POD-ish");
+static_assert(std::is_trivially_copyable<RtArrItem>::value, "RtArrItem must be POD-ish");
+static_assert(std::is_trivially_copyable<RtArrangement>::value, "RtArrangement must be POD-ish");
+static_assert(kMaxRtArrLanes == 32, "kMaxRtArrLanes == kMaxArrLanes");
+
+static void testArrangementTypes() {
+    banner("33. arrangement header types (compiled, unused)");
+
+    // --- shapes -------------------------------------------------------
+    {
+        RtArrItem it;
+        CHECK(it.start == 0.0 && it.length == 0.0 && it.offset == 0.0 &&
+              it.fadeIn == 0.f && it.fadeOut == 0.f && it.fadeShape == 0 && it.clip == -1,
+              "a default RtArrItem points at no clip and occupies nothing");
+        RtArrangement arr;
+        CHECK(!arr.items && !arr.clips && arr.itemCount == 0 && arr.clipCount == 0 &&
+              arr.noteCount == 0,
+              "a default RtArrangement is an empty lane");
+        CHECK(arr.loopStart == 0.0 && arr.loopEnd == 0.0 && arr.loopOn == 0,
+              "and carries a zeroed transport cell, which every track's lane leaves alone");
+        RtAutoSetN n;
+        CHECK(!n.points && !n.lanes && n.laneCount == 0 && n.pointCount == 0,
+              "a default RtAutoSetN is empty, and its lanes are a POINTER -- the one "
+              "difference from RtAutoSet, so widening it never touches sizeof(RtAutoSet)");
+    }
+
+    // --- ONE evaluator ------------------------------------------------
+    //
+    // The refactor's whole point: the same points, read through the other
+    // container, must produce the same float. Not "close" -- the same bits, at
+    // every beat, because it is literally the same function underneath.
+    {
+        const std::vector<RtAutoPoint> pts = {
+            {0.0, 0.20f, 0, {}}, {1.0, 0.90f, 0, {}}, {2.5, 0.35f, 3, {}}, {4.0, 0.75f, 0, {}},
+        };
+        RtAutoLane lane;
+        lane.first = 0; lane.count = (int)pts.size();
+        lane.lo = 0.f; lane.hi = 1.f;
+        RtAutoSet* a = mkAutoSet({lane}, pts);
+
+        const size_t bytes = sizeof(RtAutoSetN) + sizeof(RtAutoLane) + pts.size() * sizeof(RtAutoPoint);
+        char* blk = new char[bytes];
+        RtAutoSetN* b = new (blk) RtAutoSetN();
+        RtAutoLane*  bl = (RtAutoLane*)(blk + sizeof(RtAutoSetN));
+        RtAutoPoint* bp = (RtAutoPoint*)(blk + sizeof(RtAutoSetN) + sizeof(RtAutoLane));
+        bl[0] = lane;
+        for (size_t i = 0; i < pts.size(); ++i) bp[i] = pts[i];
+        b->lanes = bl; b->laneCount = 1;
+        b->points = bp; b->pointCount = (int)pts.size();
+
+        bool same = true;
+        for (int k = -20; k <= 120; ++k) {
+            const f64 beat = 4.0 * (f64)k / 100.0;
+            if (!sameBits(std::vector<f32>{autoValueAt(*a, a->lanes[0], beat, -9.f)},
+                          std::vector<f32>{autoValueAt(*b, b->lanes[0], beat, -9.f)}))
+                same = false;
+        }
+        CHECK(same, "RtAutoSetN evaluates bit-identically to RtAutoSet over 141 beats -- "
+                    "one evaluator, two containers");
+        CHECK(autoValueAt(b->points, b->pointCount, b->lanes[0], 1.75, -9.f) ==
+              autoValueAt(*b, b->lanes[0], 1.75, -9.f),
+              "and the forwarders forward: the pointer form is the same call");
+
+        // The window validation is the container-independent half, so it has to
+        // hold through the new one too: a lane whose window leaves the block is
+        // inert, not a read past the end.
+        RtAutoLane bad = lane;
+        bad.first = 3; bad.count = 4;
+        CHECK(autoValueAt(*b, bad, 1.0, 0.42f) == 0.42f,
+              "an out-of-range window is an inert lane in RtAutoSetN too");
+
+        delete[] (char*)a;
+        delete[] blk;
+    }
+
+    // --- the journal --------------------------------------------------
+    {
+        Host h; h.init();
+        ArrJournal j;
+        CHECK(!h.e.popJournal(j), "a fresh engine's journal is empty");
+        CHECK(h.e.journalDropped.load() == 0, "and nothing has been dropped");
+        CHECK(h.e.arrOverride.load() == 0u, "no track is overridden before anything is launched");
+        h.runBlocks(4);
+        CHECK(!h.e.popJournal(j) && h.e.journalDropped.load() == 0,
+              "and rendering writes no journal entries yet -- the ring is landed, not wired");
+        CHECK(h.e.arrOverride.load() == 0u, "arrOverride stays clear across a render");
+    }
+
+    // --- the four commands are inert ----------------------------------
+    //
+    // Pushed mid-render, at a sub-block boundary, against a playing clip and a
+    // real RtArrangement pointer -- including the a = -1 transport cell, which
+    // is the addressing Ev::ChainRetired already uses for the master chain. The
+    // engine's drainCommands has a `default:` arm, so an unrecognised command is
+    // dropped on the floor; this asserts it is dropped SILENTLY, with no event,
+    // no crash on the pointer it was handed, and not one sample of difference.
+    {
+        const auto buf = dcBuf(4 * kBeat120, 1, 0.5f);
+        auto render = [&](bool withArrangement) {
+            Host h; h.init();
+            const RtClip c = mkClip(buf, 1, 1.f, Warp::Off, true, 120.0);
+            h.setClip(0, 0, c);
+            h.push(Cmd::SetQuantum, 0, 0, 0.0);
+            h.push(Cmd::SetPlaying, 1);
+            h.push(Cmd::LaunchClip, 0, 0);
+            h.runBlocks(4);
+            if (withArrangement) {
+                static RtArrItem items[2];
+                static RtArrangement arr;
+                items[0] = RtArrItem{0.0, 4.0, 0.0, 0.f, 0.f, 0, 0};
+                items[1] = RtArrItem{4.0, 4.0, 2.0, 0.5f, 0.5f, 1, 0};
+                arr.items = items; arr.itemCount = 2;
+                arr.clips = nullptr; arr.clipCount = 0;
+                static RtAutoSetN autos;
+                Command k;
+                k.type = Cmd::SetArrangement; k.a = 0; k.p = (void*)&arr;
+                h.e.pushCommand(k);
+                k = Command{}; k.type = Cmd::SetTrackAutos; k.a = 0; k.p = (void*)&autos;
+                h.e.pushCommand(k);
+                // The transport cell: a = -1, no items, only the brace.
+                static RtArrangement brace;
+                brace.loopStart = 4.0; brace.loopEnd = 12.0; brace.loopOn = 1;
+                k = Command{}; k.type = Cmd::SetArrangement; k.a = -1; k.p = (void*)&brace;
+                h.e.pushCommand(k);
+                h.push(Cmd::Locate, 0, 0, 4.0);
+                h.push(Cmd::BackToArrangement, -1);
+                // And the null-clears form, which must be equally inert.
+                k = Command{}; k.type = Cmd::SetArrangement; k.a = 0; k.p = nullptr;
+                h.e.pushCommand(k);
+            }
+            h.runBlocks(8);
+            int evts = 0;
+            Event e;
+            while (h.e.popEvent(e))
+                if (e.type == Ev::ArrangementRetired || e.type == Ev::TrackAutosRetired) ++evts;
+            CHECK(evts == 0, "no retirement event is announced for a command nothing consumed%s",
+                  withArrangement ? "" : " (control run)");
+            return h.outL;
+        };
+        const auto plain = render(false);
+        const auto withArr = render(true);
+        CHECK(sameBits(plain, withArr),
+              "the four arrangement commands change not one sample -- landed, not wired");
+        Host h2; h2.init();
+        ArrJournal j;
+        CHECK(!h2.e.popJournal(j), "and none of them writes a journal entry");
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     std::printf("nxtakt engine tests  (sr=%.0f, block=%d)\n", kSR, kBlock);
@@ -4879,6 +5063,7 @@ int main() {
     warpOnMidiClip();
     testOnsetDetector();
     testGrainAlignment();
+    testArrangementTypes();
 
     std::printf("\n----------------------------------------\n");
     std::printf("%d passed, %d failed\n", gPass, gFail);

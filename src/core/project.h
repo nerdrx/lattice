@@ -39,7 +39,25 @@
 // apart from the header. Envelopes are NOT gated on clip kind: an audio clip
 // may carry them too.
 //
-// Saving always writes the current version; versions 1 through 5 all load,
+// Version 6 adds the arrangement (docs/ARRANGEMENT.md §8) and warp markers.
+// Two top-level lines, `loop <start> <end>` and `loopon <0|1>`, carry the one
+// timeline's brace. A track gains an `arrangement` ... `endarrangement` block
+// after its clips, holding a sparse `arrheight`, zero or more POSITIONAL
+// `aclip` ... `endaclip` blocks -- an item's `at`/`len`/`off`/`fadein`/
+// `fadeout`/`fadeshape`/`source`, then a clip body byte-for-byte identical to a
+// slot clip's, written and read by the same two functions -- and zero or more
+// `autolane <address>` ... `endautolane` blocks, whose `pt` and `off` lines are
+// `env`'s verbatim in absolute timeline beats. A clip gains `wm <srcFrame>
+// <beat>` lines, one per warp marker, on audio clips only.
+//
+// Every construct is sparse: a set with no arrangement writes no block, no
+// brace and no height, and a clip with no markers writes no `wm` -- so such a
+// set again produces the same bytes version 5 produced apart from the header.
+// The one thing the format does NOT do is sort: `aclip` order is file order
+// here, and the sort the engine's cursor depends on belongs to App::adoptSession,
+// beside the editing code that upholds the invariant.
+//
+// Saving always writes the current version; versions 1 through 6 all load,
 // through one parser, with every field a file does not mention taking its
 // default.
 //
