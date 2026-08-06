@@ -75,7 +75,11 @@ bool App::snapshotSession(std::string& out, std::vector<ClipSample>& samples) {
     // not where this set lives.
     const std::string home = ses_.path;
     std::string err;
-    const bool ok = saveProject(ses_, undoTmp_, &err);
+    // Quiet, because this runs on every gesture. saveProject logging each write
+    // is right for a save the user asked for and wrong 240 times a session for
+    // one they did not; the failure paths below still report, because LogQuiet
+    // suppresses info and nothing else.
+    const bool ok = [&] { LogQuiet q; return saveProject(ses_, undoTmp_, &err); }();
     ses_.path = home;
     if (!ok) {
         LOGW("undo: could not stage a snapshot: %s", err.c_str());
@@ -163,7 +167,11 @@ bool App::restoreEntry(const UndoEntry& e) {
     }
     Session next;
     std::string err;
-    const bool ok = loadProject(next, undoTmp_, eng_.sampleRate(), &err);
+    // Quiet for the same reason the snapshot above is, and found the same way:
+    // with saveProject silenced, a headless undo self-test still printed
+    // "loaded 5 tracks / 4 scenes from nxtakt-undo-68719.lattice" once per
+    // restore. Half a fix reads as a whole one until you look at the log.
+    const bool ok = [&] { LogQuiet q; return loadProject(next, undoTmp_, eng_.sampleRate(), &err); }();
     remove(undoTmp_.c_str());
     if (!ok) {
         // Our own text failed to parse: a bug, not a user error. The session is

@@ -17,7 +17,19 @@ const char* env(const char* suffix) {
     return std::getenv(buf);
 }
 
+// Depth rather than a bool, so nested quiet scopes compose: an inner scope
+// ending must not un-quiet an outer one that is still open.
+static thread_local int gLogQuiet = 0;
+
+LogQuiet::LogQuiet()  { ++gLogQuiet; }
+LogQuiet::~LogQuiet() { --gLogQuiet; }
+
 void logImpl(const char* lvl, const char* fmt, ...) {
+    // Informational only. A warning or an error inside a quiet scope is exactly
+    // the thing the caller still needs to see -- suppressing those would turn a
+    // tidiness feature into a way of losing failures.
+    if (gLogQuiet > 0 && lvl[0] == 'i') return;
+
     char msg[1024];
     va_list ap;
     va_start(ap, fmt);

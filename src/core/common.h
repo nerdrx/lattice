@@ -68,4 +68,28 @@ void logImpl(const char* lvl, const char* fmt, ...);
 #define LOGW(...) ::lat::logImpl("warn", __VA_ARGS__)
 #define LOGE(...) ::lat::logImpl("err ", __VA_ARGS__)
 
+// Suppresses *informational* logging for the lifetime of the object, on this
+// thread only. Warnings and errors are never suppressed -- that is the whole
+// design. A quiet scope says "this call's chatter is not news", not "I do not
+// want to hear about failures in here", and those are very different requests.
+//
+// It exists because the undo system snapshots the session through the project
+// serializer on every gesture, and saveProject quite reasonably logs each write.
+// One real editing session produced **240 identical "saved 5 tracks / 5 scenes"
+// lines**, which is not merely untidy: it buries the messages someone is
+// actually looking for, and a log nobody can read is a log nobody reads.
+//
+// thread_local because logImpl is called from the MIDI reader and the audio
+// thread too, and a global flag toggled by the GUI would silence whichever
+// thread happened to be logging at the time.
+//
+// Scoped rather than a flag pair, so an early return or a throw cannot leave
+// logging switched off for the rest of the run.
+struct LogQuiet {
+    LogQuiet();
+    ~LogQuiet();
+    LogQuiet(const LogQuiet&) = delete;
+    LogQuiet& operator=(const LogQuiet&) = delete;
+};
+
 } // namespace lat

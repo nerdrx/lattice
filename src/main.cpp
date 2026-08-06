@@ -1,5 +1,6 @@
 // NxTakt — a native, session-first DAW for Linux.
 #include "ui/app.h"
+#include "audio/backend.h"
 #include <clocale>
 #include <csignal>
 #include <cstdio>
@@ -71,6 +72,15 @@ int main(int argc, char** argv) {
 
     // A dying JACK/ALSA peer must not take the process with it.
     std::signal(SIGPIPE, SIG_IGN);
+
+    // Before anything can touch ALSA -- and plugins do, whether or not ALSA is
+    // our audio backend. libasound prints its own diagnostics straight to
+    // stderr, in red, saying "error", and on any machine with a partial
+    // /usr/share/alsa config an instrument that opens a device of its own emits
+    // dozens of them. They arrive with no attribution, so they read as this
+    // program crashing. Routed through our logger they are labelled, printed
+    // once each, and obviously not ours.
+    lat::alsaInstallLogHandler();
 
 #if defined(__x86_64__) || defined(__i386__)
     // Denormals in feedback tails cost orders of magnitude on the audio thread.

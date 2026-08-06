@@ -4,6 +4,12 @@
 
 namespace lat {
 
+// Routes libasound's own stderr diagnostics through our logger, printing each
+// distinct message once. Call early in main(), before anything can touch ALSA
+// -- plugins do, whether or not ALSA is our audio backend. NXTAKT_ALSA_VERBOSE=1
+// leaves libasound's handler in place, unfiltered.
+void alsaInstallLogHandler();
+
 class Engine;
 
 class AudioBackend {

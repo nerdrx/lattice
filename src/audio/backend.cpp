@@ -6,7 +6,11 @@
 
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <set>
+#include <string>
 #include <vector>
+#include <cstdarg>
 #include <cstring>
 #include <pthread.h>
 
@@ -147,13 +151,136 @@ private:
 // ---------------------------------------------------------------------------
 // ALSA fallback
 // ---------------------------------------------------------------------------
+
+// libasound writes its own diagnostics straight to stderr, and on a machine
+// with a partial /usr/share/alsa config -- which is most of them -- opening
+// "default" walks the whole PCM definition tree and prints one line per
+// definition it cannot resolve. A real session produced fifty of these before
+// the app had drawn a frame:
+//
+//   ALSA lib confmisc.c:1377:(snd_func_refer) [error.core] Unable to find
+//     definition 'cards.0.pcm.hdmi.0:CARD=0,AES0=4,AES1=130,AES2=0,AES3=2'
+//   ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM hdmi
+//
+// None of it is about this program. All of it says "error" in red, arrives
+// before anything of ours, and buries the two lines that matter -- which
+// backend came up and at what rate. Users reasonably read it as our crash.
+//
+// So they are routed through our logger instead, and the noisy stretch -- the
+// PCM tree walk inside snd_pcm_open -- is COLLECTED rather than printed.
+//
+// Discarding it outright would be the easy version and the wrong one: if the
+// device genuinely fails to open, those very lines are the explanation, and a
+// silent "ALSA unavailable" is exactly the bug report nobody can act on. So:
+//
+//   * open succeeds -> one line saying how many notes were swallowed, and how
+//     to see them. The walk complained about hdmi and phoneline definitions
+//     while opening the card that works; that is not news.
+//   * open fails    -> every collected line is printed. It is the diagnosis.
+//   * after startup -> printed as they arrive, because a message from a live
+//     stream (an xrun, a device disappearing) is always worth having.
+//
+// NXTAKT_ALSA_VERBOSE=1 leaves libasound's own handler in place, unfiltered.
+static std::atomic<bool> gAlsaCollect{false};
+static std::vector<std::string> gAlsaNotes;
+
+static void alsaLogRedirect(const char* file, int line, const char* fn, int err,
+                            const char* fmt, ...) {
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    // file/line/fn are libasound's own source coordinates; they help nobody
+    // here, so only the message and, when there is one, the errno survive.
+    char full[600];
+    if (err) snprintf(full, sizeof full, "%s (%s)", msg, snd_strerror(err));
+    else     snprintf(full, sizeof full, "%s", msg);
+
+    // Collection only ever runs on the startup thread, between the two calls
+    // that bracket snd_pcm_open, so the vector needs no lock: any handler call
+    // from the audio thread necessarily happens when the flag is false.
+    if (gAlsaCollect.load(std::memory_order_relaxed)) {
+        if (gAlsaNotes.size() < 200) gAlsaNotes.emplace_back(full);
+        return;
+    }
+
+    // Outside a collected window -- overwhelmingly, a plugin opening a device
+    // of its own -- print each DISTINCT message once and never again.
+    //
+    // This is what the real session needed and the device-open brackets did
+    // not cover. The flood there arrived when the user loaded an instrument
+    // that opens ALSA itself: fifty lines, but only about twelve distinct ones,
+    // the same "Unknown PCM cards.pcm.rear" arriving four and twelve times over
+    // as the plugin retried. Repetition carries no information here -- the
+    // second occurrence of a definition libasound cannot resolve says exactly
+    // what the first did -- so once is the honest amount to print.
+    //
+    // A plain std::mutex, not a lock-free structure: a plugin can instantiate
+    // on the GUI thread while the audio thread is running, this handler is not
+    // on any realtime path (libasound calls it while failing, not while
+    // streaming), and correctness here is worth more than never blocking.
+    {
+        static std::mutex m;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> lk(m);
+        if (!seen.insert(full).second) return;
+        if (seen.size() == 1)
+            LOGW("alsa: messages below come from libasound, not from NxTakt; "
+                 "each distinct one is printed once");
+    }
+    LOGW("alsa: %s", full);
+}
+
+// Installed once, before the first snd_* call anywhere in the process.
+//
+// Called from main() rather than only from AlsaBackend::start, because the
+// flood this exists for does not come from our backend at all. In the session
+// that prompted this, the messages arrived MID-SESSION, long after audio was
+// up, when the user loaded an instrument plugin that opens ALSA on its own.
+// Installing it from the backend would have missed that entirely on a JACK
+// machine -- which is the common case, and the case where those lines are
+// least explicable.
+void alsaInstallLogHandler() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char* v = env("ALSA_VERBOSE");
+    if (v && v[0] == '1') return;          // leave libasound's own handler alone
+    snd_lib_error_set_handler(alsaLogRedirect);
+}
+
+// Bracket the device-open walk. `ok` decides whether what was collected was
+// noise or evidence.
+static void alsaCollectBegin() {
+    gAlsaNotes.clear();
+    gAlsaCollect.store(true, std::memory_order_relaxed);
+}
+static void alsaCollectEnd(bool ok) {
+    gAlsaCollect.store(false, std::memory_order_relaxed);
+    if (gAlsaNotes.empty()) return;
+    if (ok) {
+        LOGI("alsa: %zu configuration note(s) while opening the device, "
+             "suppressed because it opened (NXTAKT_ALSA_VERBOSE=1 to see them)",
+             gAlsaNotes.size());
+    } else {
+        LOGE("alsa: the device did not open; libasound said:");
+        for (const std::string& n : gAlsaNotes) LOGE("  %s", n.c_str());
+    }
+    gAlsaNotes.clear();
+}
+
 class AlsaBackend final : public AudioBackend {
 public:
     ~AlsaBackend() override { stop(); }
 
     bool start(Engine& e) override {
         engine_ = &e;
-        if (snd_pcm_open(&pcm_, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) return false;
+        alsaInstallLogHandler();
+        alsaCollectBegin();
+        const bool opened = snd_pcm_open(&pcm_, "default", SND_PCM_STREAM_PLAYBACK, 0) >= 0;
+        alsaCollectEnd(opened);
+        if (!opened) return false;
 
         snd_pcm_hw_params_t* hw;
         snd_pcm_hw_params_alloca(&hw);
@@ -209,7 +336,14 @@ private:
     // between. It is strictly optional: a machine with no input (or an input
     // that will not do float/stereo) still plays back, it just cannot record.
     void openCapture() {
-        if (snd_pcm_open(&cap_, "default", SND_PCM_STREAM_CAPTURE, 0) < 0) {
+        // Bracketed like the playback open, and for a sharper reason: capture
+        // is optional, so its failure is a warning rather than a stop. Without
+        // collection, the *expected* case -- a machine with no capture device --
+        // prints the entire PCM walk before the one line that explains it.
+        alsaCollectBegin();
+        const bool opened = snd_pcm_open(&cap_, "default", SND_PCM_STREAM_CAPTURE, 0) >= 0;
+        alsaCollectEnd(/*ok=*/true);   // never evidence: the next line is the verdict
+        if (!opened) {
             cap_ = nullptr;
             LOGW("ALSA: no capture device, recording and input monitoring disabled");
             return;
