@@ -902,6 +902,181 @@ static void testReturnMetersAndLatency(ipc::EngineClient& c) {
 }
 
 // ---------------------------------------------------------------------------
+// 7c. the mirror publishes under the state seqlock (shm v5)
+// ---------------------------------------------------------------------------
+//
+// ipc_test §4b proves the seqlock PROTOCOL against a writer it controls. This
+// proves that nxtaktd's mirror thread actually uses it, which is a different
+// claim and the one that decides whether a GUI on the daemon can draw a coherent
+// frame. Both halves get a check that fails if the corresponding call is deleted
+// from mirrorLoop():
+//
+//   publishBegin()  delete it and the sequence is never odd, because the only
+//                   remaining increment is the one at the bottom. `sawOdd`
+//                   goes to 0.
+//   publishEnd()    delete it and the sequence goes odd once and stays there.
+//                   readCoherent() then gives up on every call, for ever.
+//
+// The second daemon, spawned with the mirror parked mid-publish, is the negative
+// control for the gate itself: against a writer that really is stuck inside a
+// publish, readCoherent() must REFUSE rather than hand back what it found.
+
+static void testStateSeqlock(ipc::EngineClient& c) {
+    banner("7c. the daemon publishes SharedState under the seqlock");
+
+    const ipc::SharedState& s = c.state();
+
+    u64 samples = 0, sawOdd = 0, gaveUp = 0;
+    const u64 deadline = ipc::monotonicNs() + 2000ull * 1000000ull;
+    while (ipc::monotonicNs() < deadline) {
+        if (s.generation.load(std::memory_order_relaxed) & 1ull) ++sawOdd;
+        ++samples;
+        // A copy of a single field is enough: what is under test is the gate,
+        // not the payload. Passing an empty body would let the compiler fold the
+        // whole call away, so it reads something.
+        f64 beat = 0;
+        if (!s.readCoherent([&] { beat = s.beat.load(std::memory_order_relaxed); })) ++gaveUp;
+        (void)beat;
+        if (sawOdd > 200 && samples > 100000) break;      // proved; stop burning CPU
+    }
+
+    CHECK(sawOdd > 0,
+          "the sequence is observed ODD while the mirror publishes, so "
+          "publishBegin() is in mirrorLoop() (%llu of %llu samples)",
+          (unsigned long long)sawOdd, (unsigned long long)samples);
+    CHECK(gaveUp == 0,
+          "and readCoherent() proved every one of %llu snapshots coherent, so "
+          "publishEnd() closes the window (%llu gave up)",
+          (unsigned long long)samples, (unsigned long long)gaveUp);
+
+    // The negative control: a daemon whose mirror really is parked mid-publish.
+    // 150 ms is far past readCoherent()'s eight-try budget, so a correct gate
+    // must give up rather than return the half-written block.
+    ::setenv("NXTAKT_DEBUG_MIRRORSTALL", "150000", 1);
+    char stallSession[sizeof gSession + 8];
+    std::snprintf(stallSession, sizeof stallSession, "%s-stall", gSession);
+    const pid_t stalled = spawnDaemon(stallSession);
+    ::unsetenv("NXTAKT_DEBUG_MIRRORSTALL");
+
+    ipc::EngineClient sc;
+    if (stalled > 0 && sc.attach(stallSession, 3000)) {
+        const ipc::SharedState& ss = sc.state();
+        // Wait for the FIRST publish before sampling anything. attach() only
+        // proves the region is ready, and the mirror thread starts after that —
+        // a gap of microseconds normally and of milliseconds under a sanitiser,
+        // during which `generation` is still the even 0 that init() left and
+        // every sample would say "quiescent" for the honest reason that nothing
+        // has ever published.
+        const bool started = waitUntil([&] {
+            return ss.generation.load(std::memory_order_relaxed) != 0;
+        }, 5000);
+        CHECK(started, "the stalled daemon's mirror published at least once");
+
+        u64 n = 0, odd = 0, refused = 0;
+        const u64 dl = ipc::monotonicNs() + 1500ull * 1000000ull;
+        while (ipc::monotonicNs() < dl && n < 200) {
+            if (ss.generation.load(std::memory_order_relaxed) & 1ull) ++odd;
+            f64 b = 0;
+            if (!ss.readCoherent([&] { b = ss.beat.load(std::memory_order_relaxed); })) ++refused;
+            (void)b;
+            ++n;
+        }
+        CHECK(odd > n / 2,
+              "a daemon parked mid-publish holds the sequence odd (%llu of %llu)",
+              (unsigned long long)odd, (unsigned long long)n);
+        CHECK(refused > 0,
+              "and readCoherent() REFUSES a snapshot rather than returning a "
+              "half-written block (%llu of %llu gave up)",
+              (unsigned long long)refused, (unsigned long long)n);
+        note("that refusal is what EngineHandle::snapshotTears() counts, and why "
+             "a wedged engine draws a stale frame instead of hanging the UI.");
+        sc.detach();
+    } else {
+        CHECK(false, "could not start a stalled daemon on session '%s'", stallSession);
+    }
+    if (stalled > 0) {
+        ::kill(stalled, SIGTERM);
+        ipc::EngineClient::waitFor(stalled, 2000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7d. the musician's playhead crosses (shm v6)
+// ---------------------------------------------------------------------------
+//
+// posBar/posBeat/posSixteenth and posSigNum/posSigDen. The first three can be
+// tested the obvious way — start the transport and watch them count — but the
+// signature pair cannot: the daemon is stuck at 4/4 (Cmd::SetSignatures is
+// outside commandIsKnown's bound and is answered RejectUnknownCommand), and 4/4
+// is also what an UNWRITTEN field reads, because init() seeds it. A check that
+// only asserted "posSigNum == 4" would pass just as happily against a mirror
+// that never stored it, which is the exact failure mode §7b was written for.
+//
+// So every one of the five is tested by POISONING it and watching the mirror put
+// it back. The client maps the control region read/write, so this is a legal
+// (if impolite) thing for a test to do, and it is the only formulation that
+// makes "the daemon writes this field" decidable from out here: delete any one
+// of the five stores from mirrorLoop() and its poison survives.
+
+static void testPlayheadPosition(ipc::EngineClient& c) {
+    banner("7d. bars.beats.sixteenths and the signature at the playhead cross");
+
+    ipc::SharedState& s = const_cast<ipc::SharedState&>(c.state());
+
+    // -- they carry real values -------------------------------------------
+    CHECK(c.pushCommand(Cmd::SetTempo, 0, 0, 240.0), "push SetTempo 240 (four beats a second)");
+    CHECK(c.pushCommand(Cmd::SetPlaying, 1), "push SetPlaying");
+
+    i32 maxBar = 0, maxBeat = 0, maxSix = 0;
+    int distinctBeats = 0;
+    bool seenBeat[16] = {};
+    const u64 deadline = ipc::monotonicNs() + 4000ull * 1000000ull;
+    while (ipc::monotonicNs() < deadline && !(maxBar > 1 && distinctBeats >= 3 && maxSix > 1)) {
+        const i32 bar = s.posBar.load(std::memory_order_relaxed);
+        const i32 bt  = s.posBeat.load(std::memory_order_relaxed);
+        const i32 six = s.posSixteenth.load(std::memory_order_relaxed);
+        if (bar > maxBar) maxBar = bar;
+        if (bt  > maxBeat) maxBeat = bt;
+        if (six > maxSix) maxSix = six;
+        if (bt >= 1 && bt < 16 && !seenBeat[bt]) { seenBeat[bt] = true; ++distinctBeats; }
+        sleepMs(2);
+    }
+    CHECK(maxBar > 1, "posBar counts past the first bar line (%d)", (int)maxBar);
+    CHECK(distinctBeats >= 3, "posBeat visits at least three beats of the bar (%d distinct, max %d)",
+          distinctBeats, (int)maxBeat);
+    CHECK(maxSix > 1, "posSixteenth subdivides the beat (max %d)", (int)maxSix);
+    CHECK(maxBeat <= 4, "and none of them runs past 4/4's four beats (max %d)", (int)maxBeat);
+
+    c.pushCommand(Cmd::SetPlaying, 0);
+    c.pushCommand(Cmd::SetTempo, 0, 0, 120.0);
+    sleepMs(200);
+
+    // -- and the mirror really writes each one ------------------------------
+    struct Field { const char* name; std::atomic<i32>* p; i32 poison; i32 want; };
+    const Field fields[] = {
+        {"posBar",       &s.posBar,       -12345, 0},      // want 0 == "anything but the poison"
+        {"posBeat",      &s.posBeat,      -12345, 0},
+        {"posSixteenth", &s.posSixteenth, -12345, 0},
+        {"posSigNum",    &s.posSigNum,    -12345, 4},      // 4/4: the daemon has no map
+        {"posSigDen",    &s.posSigDen,    -12345, 4},
+    };
+    for (const Field& f : fields) {
+        f.p->store(f.poison, std::memory_order_relaxed);
+        const bool restored = waitUntil([&] {
+            const i32 v = f.p->load(std::memory_order_relaxed);
+            return v != f.poison && (f.want == 0 || v == f.want);
+        }, 1000);
+        CHECK(restored,
+              "%s is overwritten by the mirror within a tick (poisoned %d, now %d) — "
+              "delete its store from mirrorLoop() and this poison survives",
+              f.name, (int)f.poison, (int)f.p->load(std::memory_order_relaxed));
+    }
+    note("posSigNum/posSigDen read 4/4 because Cmd::SetSignatures is still outside "
+         "commandIsKnown's bound: the daemon refuses the map and plays every set in "
+         "4/4. That is why they are tested by poisoning and not by value.");
+}
+
+// ---------------------------------------------------------------------------
 // 8. ClearClip, the retirement echo, and reuse
 // ---------------------------------------------------------------------------
 //
@@ -2991,6 +3166,8 @@ int main(int argc, char** argv) {
         testPoolHandshake(client);
         testAudioClip(client);
         testReturnMetersAndLatency(client);   // needs the clip 7 leaves playing
+        testStateSeqlock(client);
+        testPlayheadPosition(client);
         testClearAndRetire(client);
         testMidiClip(client);
         testBadOffsets(client);

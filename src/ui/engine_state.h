@@ -40,6 +40,23 @@ struct EngineState {
     bool playing   = false;
     f32 cpu        = 0.f;
 
+    // The playhead as a musician reads it: bars.beats.sixteenths, ONE-BASED,
+    // and the signature IN FORCE AT THE PLAYHEAD (which is not in general the
+    // set's — a set in 7/8 with a 4/4 section reads 4/4 while the playhead is
+    // inside it).
+    //
+    // Carried rather than derived, and the reason is a disagreement the UI would
+    // otherwise render with total confidence. The transport readout used to
+    // compute these from the SESSION's signature map. The two agree exactly
+    // until a publication is refused — sigMapValid re-derives every entry's
+    // bar-start beat on arrival and rejects a map whose bar lines do not follow
+    // from its own bar lengths, and a refused map leaves the ENGINE at 4/4. The
+    // session's map still says 7/8, so the readout would say 7/8, and nothing
+    // anywhere would indicate that what is playing is 4/4. Reading the engine's
+    // own counters makes that state unrenderable.
+    i32 posBar = 1, posBeat = 1, posSixteenth = 1;
+    i32 posSigNum = 4, posSigDen = 4;
+
     // --- engine configuration ------------------------------------------
     // Carried here so a status bar can draw them from the snapshot like
     // everything else. The paths that need the value *now* rather than as of

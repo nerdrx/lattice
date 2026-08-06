@@ -895,3 +895,211 @@ Two related overflows this wave did **not** fix, both outside its files:
 `tools/render.cpp` pushes every clip before its first `process()` and so renders
 a 32×32 set as **silence** for exactly the same reason, and `Engine::journal_`
 overflow is already handled correctly (§5.4 refuses the take).
+
+---
+
+## 11. Steps 2 and 3 shipped
+
+`NXTAKT_ENGINE=daemon` (or `LATTICE_ENGINE=daemon`) now runs the shipping GUI
+against `nxtaktd`. `NXTAKT_SESSION` names the session and defaults to
+`default`; `NXTAKT_AUDIO` is forwarded as `--driver` to a daemon we spawn;
+`NXTAKT_DAEMON` overrides the binary, which is otherwise found next to
+`/proc/self/exe`. Unset, everything behaves exactly as before.
+
+```
+NXTAKT_ENGINE=daemon NXTAKT_SESSION=mysession ./build/nxtakt myset.lattice
+```
+
+### 11.1 What crosses, and what is refused
+
+| | daemon mode |
+|---|---|
+| transport, tempo, quantum, metronome | **yes** |
+| mixer scalars, sends, return levels | **yes** |
+| every polled meter, indicator and the playhead | **yes** |
+| computer-MIDI keyboard, note previews | **yes** |
+| session clips, audio and MIDI, through the pool | **yes** (step 3) |
+| device chains | refused — step 4 |
+| recording | refused — §7 |
+| the arrangement and its automation | consumed and reported — see below |
+| time signatures | refused by the daemon — `commandIsKnown`'s bound is unmoved |
+| hardware MIDI input | not connected — §1.3 |
+| clip envelopes, warp markers, transients | dropped, and logged, per clip |
+
+`Cmd::SetSignatures` is deliberately still outside `ipc::commandIsKnown`'s
+bound, so `nxtaktd` answers `RejectUnknownCommand` and **plays every set in
+4/4**. Steps 2 and 3 did not make it carryable: the map is a `const RtSig*`
+with its own `Ev::SigsRetired` handshake, so honouring it means a pool kind, a
+translate-and-validate pass, a retirement layer and an ack event — the
+arrangement's shape, not the clip table's. Refused-and-visible beats
+accepted-and-ignored, so it stays refused. (It cannot even be *sent* today:
+`session.h`'s `publishSignatures()` takes an `Engine&` and there is no Engine
+in daemon mode. Routing it through `EngineHandle` is a prerequisite for
+whoever picks this up.)
+
+### 11.2 `false` means "try again", and nothing else
+
+The sharpest thing this step learned, and the one most likely to be undone by
+someone tidying up. `App::flushPending()` re-queues a refused publication and
+retries it every frame, in order, and nothing behind it in the FIFO moves until
+it succeeds. So a command daemon mode can *never* carry must not answer
+`false`: a permanent `false` wedges the queue and with it the transport.
+
+`EngineHandle` therefore splits refusals in two:
+
+* **transient** (`false`): the ring is full, the clip cell is still
+  un-acknowledged, or nothing is attached. §2.2 asks for a dirty-cell set and a
+  scalar outbox for exactly this — and both already exist, because the wave-8
+  `pushAll` FIFO is precisely that mechanism. Nothing new was needed.
+* **permanent** (`true`, and loud): consumed, counted in `remoteRefusals()`,
+  and logged once per command type with the reason. `close()` prints the tally.
+
+The chain family and the two Record commands answer `false` safely, because
+`publishChain()` and `startRecording()` are deliberately *not* on the FIFO —
+they free what they built and report, which is the behaviour we want anyway.
+
+### 11.3 The retirement stand-in
+
+A GUI-heap `RtNote[]` is **copied into the pool**, so the engine never holds it
+and can never send `Ev::NotesRetired` for it. The handle keeps the same
+per-cell "last published" table the engine keeps, applies the same rule
+(announce the displaced pointer, and only when it differs from the incoming
+one), and synthesises the event. The same goes for `Ev::AutosRetired`,
+`Ev::WarpRetired`, `Ev::ArrangementRetired` and `Ev::TrackAutosRetired`.
+
+Without it `App::retiringNotes_`, `retiringAutos_` and `arr_.retiring` grow for
+the life of the session and nothing ever comes home. `tests/handle_test.cpp`
+asserts the note case directly, because it is the one a normal edit session
+hits sixty times a minute.
+
+### 11.4 The double copy, and how a stale address is caught
+
+§5 step 3 decision (i-a): the GUI keeps its `SampleBuffer` **and** the pool
+keeps a copy, so `drawWaveform()` and every other draw path keep working
+untouched. The cache is keyed by the source address — and the address alone is
+not enough, because a `SampleBuffer` can be freed and a different one allocated
+at the same address (undo does exactly this), which would publish the wrong
+audio under the right offset. So each entry carries a fingerprint: 256 strided
+words plus the shape, recomputed per push and constant-time in the buffer size.
+A mismatch releases the old block and writes a new one.
+
+Converting to (i-b) — decode straight into the pool, keep only the peak summary
+GUI-side — still touches `src/audio/sample.h`, `project.cpp`, the undo snapshot
+and `tools/render.cpp`, and is still the right end state.
+
+### 11.5 The snapshot is genuinely coherent now, and §2.1's recipe was not enough
+
+`SharedState::generation` is a **seqlock sequence** as of `kShmVersion` 5: odd
+while the daemon's mirror is publishing, even when it is not, bumped twice per
+pass by `publishBegin()`/`publishEnd()`. `EngineHandle::poll()`'s daemon branch
+runs its copy inside `SharedStateT::readCoherent()`, which retries until the
+sequence is even and unchanged either side.
+
+§2.1 says "read generation, copy, re-read, retry on change" and that is not
+sufficient on its own, which is worth writing down because the shorter version
+looks obviously correct. Against a writer that bumps only at the END of a
+publish, a reader that samples entirely *inside* one publish sees the same
+counter either side of a copy it has already torn. The parity is what closes
+it: one extra relaxed increment and two fences per publish, on a non-realtime
+thread.
+
+Two writers would break it — `fetch_add` from two threads takes the sequence
+from odd straight back to even — so `shutdown()`'s `engineState` store is
+deliberately left unbracketed and says why at the call site; it runs while the
+mirror thread is still alive.
+
+`readCoherent()` is bounded at eight tries and then hands the copy over anyway,
+counted in `EngineHandle::snapshotTears()`. A UI that spun until a SIGSTOPped
+daemon released the sequence would hang on a breakpoint in another process; a
+stale frame plus a banner is the right failure.
+
+**Proved, both directions.** `ipc_test` §4b runs a writer that parks 200 µs
+mid-publish: an unguarded copy of the same block tears (2.9 M of 12 M samples
+with `publishBegin()` removed; 233 of 400 publishes with it in place), and
+`readCoherent()` returned 18 820 439 of 18 820 439 snapshots provably coherent
+and none torn. `daemon_test` §7c proves `nxtaktd` itself brackets its mirror:
+the sequence is observed odd, every snapshot is proved coherent, and a second
+daemon spawned with `NXTAKT_DEBUG_MIRRORSTALL=150000` — which parks the mirror
+in the *middle* of the pass, deliberately, so that a straddle is what a reader
+would catch — makes `readCoherent()` refuse 200 of 200.
+
+Removing `publishBegin()` from `mirrorLoop()` turns three of those checks red;
+removing `publishEnd()` turns one red. Both were removed and watched.
+
+### 11.6 `SharedState` v6: the musician's playhead
+
+`posBar`/`posBeat`/`posSixteenth` and `posSigNum`/`posSigDen`, mirrored from
+Engine's own published atomics into `SharedState` and into `EngineState` on
+both branches. They are carried rather than derived, and the reason is a
+disagreement that would otherwise be rendered with total confidence: the
+transport readout used to compute bars from the *session's* signature map, and
+`sigMapValid` **refuses** a map whose bar lines do not follow from its own bar
+lengths, leaving the engine in 4/4. The session's copy still says 7/8. Reading
+the engine's counters makes that state unrenderable.
+
+`daemon_test` §7d tests all five by **poisoning the field and watching the
+mirror put it back**, and that formulation is not decoration. `posSigNum` and
+`posSigDen` read 4/4 across the wire — because the daemon refuses the signature
+map — and 4/4 is also what an *unwritten* field reads, since `init()` seeds it.
+A check that asserted "posSigNum == 4" would pass against a mirror that never
+stored it, which is §7b's bug wearing a different hat. Each of the five stores
+was removed from `mirrorLoop()` in turn and its check watched go red.
+
+### 11.7 Lifecycle
+
+`openLocal()` — the name is step 1's and now dispatches; see below — reaps,
+attaches, and on failure spawns `nxtaktd` and attaches with a 2 s deadline. If
+that fails it opens **nothing**, per §8's exception: the GUI still loads,
+edits and saves, and every `send()` is a no-op. It deliberately does not fall
+back to a local engine, because a second engine under a wedged one is §4.4's
+worst available outcome.
+
+`close()` follows §6's parent-of-record rule: a daemon we spawned is SIGTERMed
+(escalating to SIGKILL), a daemon we merely attached to is left running. The
+pool is unlinked **first**, which is not the obvious order: stopping the daemon
+is a signal plus a wait of up to three seconds, and anything that kills the GUI
+inside that window leaves 256 MiB named in `/dev/shm`. Unlinking first is safe
+because `shm_unlink` removes the name and not the mapping — the daemon keeps
+playing the samples right up until it exits.
+
+A GUI that is *killed* still leaves the pool behind, and that is the design
+(§4.3: the samples outlive the GUI so a replacement can adopt them). It
+self-heals: the next `SamplePool::create()` reaps it, because its creator is
+provably gone.
+
+### 11.8 Evidence
+
+* `tests/handle_test.cpp` — 28 checks against a real spawned daemon: `local()`
+  null, the live sample rate before any decode, scalars, MIDI, a DC clip
+  through the pool metering exactly 0.500 on the master, a MIDI clip's notes as
+  a pool block, `Ev::NotesRetired` coming home for the *displaced* array, the
+  two refusal classes, and `/dev/shm` clean after `close()`.
+* `tools/headless_test.sh` with `NXTAKT_ENGINE=daemon` and
+  `NXTAKT_DEBUG_PUSHALL=1`, on the four-scene demo set: **"PASS — the engine's
+  slot table matches the set"**, 20 of 20 cells, queue high water 0, and the
+  daemon's own counters reading `89 commands applied, 0 rejected, 20 clips
+  applied`. The hook reads `es_`, so it is testing the snapshot coming back off
+  the wire as much as the clips going out.
+* A second, independent `EngineClient` attached to the same session while the
+  GUI ran: silent baseline 0.0000, then master peak 0.1870 after
+  `LaunchScene 0`, with the beat advancing. That process never touched a
+  sample; everything it measured was decoded by the GUI, written into the GUI's
+  pool and installed by the daemon.
+
+### 11.9 Owed
+
+* **The rename.** `EngineHandle::openLocal()` dispatches on `NXTAKT_ENGINE` and
+  should be `open()`. `App::init()` has exactly one call to it
+  (`src/ui/app.cpp:54`) and that file was another agent's this wave, so the
+  dispatch went inside the existing entry point rather than into a rename
+  nobody could apply. `openLocalEngine()` is the honest local-only spelling and
+  already exists.
+* **A `Makefile` target for `tests/handle_test.cpp`**, so `make test` runs it.
+  The recipe is in the file's header comment.
+* **The arrangement over the wire.** The daemon can already take one — it has
+  `translateArrangement()` and `daemon_test` §16b proves it plays — but as a
+  pool blob, and the GUI hands the handle an already-built `RtArrangement`. The
+  conversion is a blob encoder over the same pointer→pool-ref cache step 3
+  built, so it is the cheapest remaining feature by some distance.
+* **Hardware MIDI**, §1.3 option 1: move `MidiInput` into `nxtaktd`. It cannot
+  be done from this side — `MidiInput::start()` takes an `Engine&`.

@@ -307,6 +307,14 @@ public:
              opt_.session, gRegionName, sr_, block_, driverName_);
 
         // 4. Serve.
+        if (const char* s = env("DEBUG_MIRRORSTALL")) {
+            mirrorStallUs_ = (u64)std::strtoull(s, nullptr, 10);
+            if (mirrorStallUs_ > 1000000ull) mirrorStallUs_ = 1000000ull;   // 1 s ceiling
+            if (mirrorStallUs_)
+                LOGW("NXTAKT_DEBUG_MIRRORSTALL=%llu: the mirror will park mid-publish "
+                     "with the state seqlock held odd. Debug hook; never set this in "
+                     "a session you care about.", (unsigned long long)mirrorStallUs_);
+        }
         mirrorRun_.store(true, std::memory_order_release);
         mirror_ = std::thread(&Daemon::mirrorLoop, this);
         pumpLoop();
@@ -2411,19 +2419,41 @@ private:
     // one tick fresh is indistinguishable from the latency the display already
     // has (shm.h, SharedStateT).
     //
-    // generation is bumped last, with release, so a reader that observes a new
-    // generation is guaranteed to see the values that went with it — the one
-    // ordering guarantee worth paying for, because it is what lets a client
-    // sample the beat clock without a seqlock.
+    // The pass is bracketed by SharedState::publishBegin()/publishEnd(), which
+    // is what makes `generation` a seqlock sequence (shm.h, v5): odd while this
+    // loop is writing, even when it is not. A client that wants one field still
+    // just loads it; a client that wants a coherent SNAPSHOT — the GUI's
+    // per-frame EngineState, which draws a clip slot out of four fields at once —
+    // calls readCoherent() and gets a copy that provably did not straddle this
+    // loop. Before v5 the counter was bumped only here at the bottom, and a
+    // reader that sampled entirely inside one pass saw an unchanged counter
+    // either side of a copy it had already torn.
+    //
+    // NXTAKT_DEBUG_MIRRORSTALL=<microseconds> parks the loop in the MIDDLE of the
+    // pass, sequence held odd, so a test can make that tear happen on demand
+    // instead of waiting for one (daemon_test §7c). It is a debug hook and does
+    // nothing when the variable is unset.
     void mirrorLoop() {
         Engine& e = *engine_;
         ipc::SharedState& s = *map_.state;
         while (mirrorRun_.load(std::memory_order_relaxed)) {
+            s.publishBegin();
             s.beat.store(e.beat.load(std::memory_order_relaxed), std::memory_order_relaxed);
             s.tempo.store(e.tempo.load(std::memory_order_relaxed), std::memory_order_relaxed);
             s.playing.store(e.playing.load(std::memory_order_relaxed) ? 1u : 0u,
                             std::memory_order_relaxed);
             s.cpu.store(e.cpu.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+            // The stall sits HERE and not at either end on purpose: a reader
+            // that catches this window has already copied beat/tempo/playing/cpu
+            // from the new pass and is about to copy the per-track arrays from
+            // the old one, which is precisely the straddle the seqlock exists to
+            // refuse. Parked at an edge it would prove nothing.
+            if (mirrorStallUs_) {
+                timespec ts{(time_t)(mirrorStallUs_ / 1000000),
+                            (long)(mirrorStallUs_ % 1000000) * 1000};
+                ::nanosleep(&ts, nullptr);
+            }
 
             for (int t = 0; t < kMaxTracks; ++t) {
                 s.slotState[t].store(e.slotState[t].load(std::memory_order_relaxed),
@@ -2476,11 +2506,26 @@ private:
             s.latencyFrames.store(e.latencyFrames.load(std::memory_order_relaxed),
                                   std::memory_order_relaxed);
 
+            // The musician's playhead, recomputed by the engine once per block
+            // from the signature map it actually holds. Mirrored rather than
+            // derived on the client, because the map is HERE: a client that
+            // divided `beat` by its own numerator would agree with this exactly
+            // until a map was refused, and then it would disagree silently and
+            // draw 7/8 over a set playing in 4/4.
+            s.posBar.store(e.posBar.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            s.posBeat.store(e.posBeat.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            s.posSixteenth.store(e.posSixteenth.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+            s.posSigNum.store(e.posSigNum.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+            s.posSigDen.store(e.posSigDen.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+
             if (nullDriver_)
                 s.blocksRendered.store(nullDriver_->blocks(), std::memory_order_relaxed);
 
-            s.heartbeatNs.store(ipc::monotonicNs(), std::memory_order_relaxed);
-            s.generation.fetch_add(1, std::memory_order_release);
+            // Stamps heartbeatNs and closes the seqlock, in that order.
+            s.publishEnd();
 
             timespec ts{0, 4000000};        // 4 ms
             ::nanosleep(&ts, nullptr);
@@ -2494,6 +2539,15 @@ private:
 
         // Tell whoever is attached before anything stops moving, so a client
         // polling the state block sees "stopping", not "wedged".
+        //
+        // Deliberately NOT bracketed by publishBegin/publishEnd, and this is the
+        // one place that distinction has to be made consciously: the mirror
+        // thread is still running here, and a seqlock has exactly one writer.
+        // Two threads calling publishBegin() would take the sequence from odd
+        // straight back to even and tell every reader the block was quiescent
+        // while both were writing it. engineState is a lone field with no
+        // cross-field invariant and is not part of the GUI's snapshot, so a
+        // plain relaxed store is both correct and the only safe option.
         map_.state->engineState.store(ipc::SharedState::StateStopping, std::memory_order_relaxed);
         ipc::WireEvent e{};
         e.type = ipc::EvEngineStopping;
@@ -2537,8 +2591,13 @@ private:
         // release: an attacher's mapping survives shm_unlink, so this is how a
         // still-attached client learns the difference between "the engine went
         // away cleanly" and "the engine died" without a socket.
+        // The mirror thread was joined above, so this really is the only writer
+        // now and the bracket is legal — and wanted, because `playing` IS in the
+        // GUI's per-frame snapshot and a stopped transport is the last thing a
+        // still-attached client should see.
+        map_.state->publishBegin();
         map_.state->playing.store(0, std::memory_order_relaxed);
-        map_.state->heartbeatNs.store(ipc::monotonicNs(), std::memory_order_relaxed);
+        map_.state->publishEnd();       // stamps heartbeatNs on its way out
         map_.hdr->shutdown.store(1, std::memory_order_release);
 
         logCounters();
@@ -2597,6 +2656,9 @@ private:
     ipc::PoolReader                pool_;       // read-only: the GUI owns it
     std::thread                    mirror_;
     std::atomic<bool>              mirrorRun_{false};
+    // NXTAKT_DEBUG_MIRRORSTALL, in microseconds. Read once at startup and never
+    // written again, so the mirror thread's read of it needs no synchronisation.
+    u64                            mirrorStallUs_ = 0;
     Staged                         pending_{};
     bool                           havePending_ = false;
     int                            rejectLogged_ = 0;

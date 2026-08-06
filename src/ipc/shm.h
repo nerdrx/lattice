@@ -76,7 +76,22 @@ inline constexpr u64 kShmMagic = 0x4C54435F53484D31ull;
 //        frame that the wire could not carry — the first concrete regression a
 //        daemon-backed GUI would have shipped with. Same rule as v3: they are
 //        Engine's own published atomics, so they belong here.
-inline constexpr u32 kShmVersion = 4;
+//   v5 — no field moved: `generation` changed MEANING (wave 9 step 2). It was a
+//        liveness counter bumped once, last, per publish; it is now a seqlock
+//        sequence bumped twice — odd while a publish is in flight, even when the
+//        block is quiescent — so a reader can take a genuinely coherent
+//        multi-field snapshot. A v4 writer bumps by one and would leave the
+//        parity wrong half the time, which a v5 reader would read as "a publish
+//        is permanently in flight". That is exactly the disagreement a version
+//        number exists to refuse, so it is refused.
+//   v6 — SharedStateT gained posBar/posBeat/posSixteenth and posSigNum/posSigDen
+//        (wave 9, the time-signature transport readout). Engine's own published
+//        atomics again, and the same rule as v3/v4 decides it: this block mirrors
+//        what Engine publishes, and it publishes these. The alternative — a
+//        client deriving bars from `beat` and its own copy of the signature map —
+//        is wrong precisely when a map was REFUSED, which is the one case where
+//        being wrong is silent.
+inline constexpr u32 kShmVersion = 6;
 
 // How many return buses SharedStateT carries meters for. This is kMaxReturns
 // from audio/engine.h, written out rather than included: the wire layer knows
@@ -656,22 +671,40 @@ private:
 // The cross-process form of the std::atomic members on Engine. The engine
 // writes it once per block from publish(); the GUI reads it once per frame.
 //
-// Relaxed on both sides, exactly as today. There is no seqlock and no
-// generation gate around the reads because no two fields have an invariant
-// between them: a meter one block stale next to a playhead one block fresh is
-// indistinguishable from the ~11 ms of latency the display already has. The
-// generation counter below is for *liveness*, not consistency — a reader that
-// ever needs a coherent multi-field snapshot (say, a screenshot-accurate
-// mixer capture) should get a dedicated seqlock rather than turning every
-// meter store into a fence on the audio thread.
+// Every field is a relaxed atomic and may still be read on its own — a meter one
+// block stale beside a playhead one block fresh is indistinguishable from the
+// ~11 ms of latency the display already has, and that is all most readers want.
+//
+// THE BLOCK IS ALSO A SEQLOCK (v5)
+// --------------------------------
+// What v4 could not offer is a *coherent multi-field snapshot*, and the GUI
+// turns out to need one: docs/GUI-ON-DAEMON.md §2.1 draws one clip slot from
+// slotState, activeSlot, pendingSlot and clipPhase together, and a copy that
+// straddles a publish can show a slot Playing with activeSlot == -1.
+//
+// `generation` is therefore a seqlock sequence rather than a plain counter:
+// **odd while a publish is in flight, even when the block is quiescent**, bumped
+// twice per publish instead of once (publishBegin/publishEnd below, readCoherent
+// on the reading side). Liveness is unchanged — it still advances whenever the
+// writer is alive and freezes when it wedges — so every reader that only asked
+// "is this number moving?" keeps working.
+//
+// The parity is the point, and it is why §2.1's own recipe ("read generation,
+// copy, re-read, retry on change") is not sufficient by itself: against a writer
+// that bumps only at the END of a publish, a reader that samples entirely
+// *inside* one publish sees the same generation either side of a copy it has
+// already torn. One counter bumped twice costs the writer two relaxed increments
+// and two fences per publish, on a non-realtime thread, and turns the retry loop
+// into an actual proof.
 //
 // Types are fixed-width and there is no std::atomic<bool>: bool's size is
 // implementation-defined and this struct is parsed by two separately compiled
 // binaries.
 template <int NTracks>
 struct SharedStateT {
-    // --- liveness ------------------------------------------------------
-    std::atomic<u64> generation;    // +1 per publish; frozen => engine wedged
+    // --- liveness and the seqlock sequence ------------------------------
+    // +2 per publish, odd while one is in flight; frozen => engine wedged.
+    std::atomic<u64> generation;
     std::atomic<u64> heartbeatNs;   // CLOCK_MONOTONIC at last publish
     std::atomic<i32> enginePid;
     std::atomic<u32> engineState;   // EngineState below
@@ -691,6 +724,19 @@ struct SharedStateT {
     // the engine that knows which chains are running and what each of them
     // reported.
     std::atomic<i32> latencyFrames;
+
+    // The playhead as a musician reads it, ONE-BASED, plus the signature in
+    // force AT THE PLAYHEAD. Engine's own published atomics (posBar/posBeat/
+    // posSixteenth/posSigNum/posSigDen), recomputed once per block from the
+    // signature map, which is why they belong on the wire rather than being
+    // recomputed on the far side: the map lives in the engine, and a client that
+    // divided `beat` by a single numerator would be wrong from the first
+    // signature change on — and wrong DIFFERENTLY from the daemon, which is the
+    // failure that matters. A refused signature map leaves the engine in 4/4
+    // while the client's own copy of the set still says 7/8; carrying these is
+    // what stops a GUI from confidently drawing the wrong bar number.
+    std::atomic<i32> posBar, posBeat, posSixteenth;
+    std::atomic<i32> posSigNum, posSigDen;
 
     // --- per-track ------------------------------------------------------
     std::atomic<i32> slotState[NTracks];
@@ -752,6 +798,15 @@ struct SharedStateT {
         sampleRate.store(sr, std::memory_order_relaxed);
         blockSize.store(block, std::memory_order_relaxed);
         latencyFrames.store(0, std::memory_order_relaxed);
+        // One-based, matching Engine's own defaults. A zeroed bar number in a
+        // one-based readout looks like a rendering quirk rather than a missing
+        // publish, which is exactly the failure this whole block's init() exists
+        // to make impossible.
+        posBar.store(1, std::memory_order_relaxed);
+        posBeat.store(1, std::memory_order_relaxed);
+        posSixteenth.store(1, std::memory_order_relaxed);
+        posSigNum.store(4, std::memory_order_relaxed);
+        posSigDen.store(4, std::memory_order_relaxed);
         for (int i = 0; i < NTracks; ++i) {
             slotState[i].store(0, std::memory_order_relaxed);
             activeSlot[i].store(-1, std::memory_order_relaxed);
@@ -772,12 +827,72 @@ struct SharedStateT {
         journalDropped.store(0, std::memory_order_relaxed);
     }
 
-    // Engine, last statement of publish(): stamps the block so the GUI can tell
-    // "engine is idle" from "engine is dead".
-    void stampHeartbeat() {
-        blocksRendered.fetch_add(1, std::memory_order_relaxed);
-        heartbeatNs.store(monotonicNs(), std::memory_order_relaxed);
+    // -- the seqlock, writer side ----------------------------------------
+    //
+    // Bracket EVERY publish pass with these two. Between them the sequence is
+    // odd and readCoherent() will refuse to hand a reader the block; outside
+    // them it is even and a snapshot taken across a matching pair of even reads
+    // provably did not straddle a publish.
+    //
+    // The fences are load-bearing and are not decoration on the relaxed
+    // increments: without the first, the compiler or the CPU may sink the "I am
+    // writing" store below the field stores it is supposed to announce; without
+    // the second, it may hoist the "I have finished" store above them. Either
+    // reordering hands a reader a torn copy that its own retry loop believes.
+    void publishBegin() {
         generation.fetch_add(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+    void publishEnd() {
+        heartbeatNs.store(monotonicNs(), std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        generation.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Engine, last statement of publish(): stamps the block so the GUI can tell
+    // "engine is idle" from "engine is dead". A degenerate publish pass — it
+    // brackets nothing but the block counter — so that a writer with a single
+    // field to move still leaves the sequence even and still advances it.
+    void stampHeartbeat() {
+        publishBegin();
+        blocksRendered.fetch_add(1, std::memory_order_relaxed);
+        publishEnd();
+    }
+
+    // -- the seqlock, reader side ----------------------------------------
+    //
+    // Runs `copy` (which must read only relaxed loads out of this block, and
+    // must be safe to run more than once) and returns true when the values it
+    // produced provably came from one publish.
+    //
+    // Bounded, and that bound is a deliberate policy rather than an oversight:
+    // a writer SIGSTOPped mid-publish leaves the sequence odd forever, and a UI
+    // that spins until it goes even would hang on a debugger breakpoint in the
+    // daemon. After `tries` attempts the last copy is handed back anyway, with
+    // `false`, so the caller can draw *something* and say the engine is not
+    // answering — which is what the lifecycle banner is for. Eight tries against
+    // a 4 ms publish cadence is several milliseconds of headroom over a publish
+    // that takes microseconds; reaching the bound means the writer is stopped,
+    // not busy.
+    template <class Fn>
+    bool readCoherent(Fn&& copy, int tries = 8) const {
+        for (int i = 0; i < tries; ++i) {
+            const u64 g0 = generation.load(std::memory_order_acquire);
+            if (!(g0 & 1ull)) {                         // no publish in flight
+                copy();
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (generation.load(std::memory_order_relaxed) == g0) return true;
+            }
+            // Yield rather than spin. A publish is a few microseconds of stores
+            // once every few milliseconds, so eight back-to-back reloads inside
+            // one nanosecond would all land inside the same window and the retry
+            // budget would be spent without ever giving the writer time to leave
+            // it. Sleeping is what turns "retry" into "wait for the writer".
+            timespec ts{0, 20000};                      // 20 us
+            nanosleep(&ts, nullptr);
+        }
+        copy();
+        return false;
     }
 
     // GUI. True if the engine has not published inside `toleranceNs`. The

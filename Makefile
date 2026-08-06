@@ -249,15 +249,29 @@ build/timesig_view_test: tests/timesig_view_test.cpp src/audio/engine.cpp \
 	@mkdir -p build
 	$(CXX) $(TOOL_CF) $^ -o $@ $(TOOL_LIBS) -ldl
 
+# EngineHandle across both of its backings: the in-process engine and a real
+# nxtaktd. Warnings stay on (it is our code, not a tool wrapper) and it links
+# no sndfile or lilv, because the handle is the seam and the seam has no
+# business knowing how a wav is decoded.
+#
+# It spawns its own daemon, so it depends on one existing.
+build/handle_test: tests/handle_test.cpp src/ui/engine_handle.cpp src/audio/engine.cpp \
+                   src/audio/backend.cpp src/audio/midi_in.cpp src/core/common.cpp \
+                   build/nxtaktd
+	@mkdir -p build
+	$(CXX) -std=c++20 -O2 $(WARN) -I. $(filter %.cpp,$^) -o $@ \
+	  $(shell pkg-config --libs jack alsa) -lrt -lpthread -lm
+
 # Full headless check: engine unit tests, then a real render that must not be
 # silent, then a plugin scan.
 test: build/engine_test build/ipc_test build/daemon_test build/internal_device_test \
-      build/timesig_view_test build/render build/gen_demo build/plugin_scan
+      build/timesig_view_test build/handle_test build/render build/gen_demo build/plugin_scan
 	./build/engine_test
 	./build/ipc_test
 	./build/daemon_test
 	./build/internal_device_test
 	./build/timesig_view_test
+	./build/handle_test
 	./build/gen_demo /tmp/nxtakt-selftest >/dev/null
 	./build/render /tmp/nxtakt-selftest/demo.lattice /tmp/nxtakt-selftest/render.wav --scene 2 --bars 2
 	./build/plugin_scan | tail -3

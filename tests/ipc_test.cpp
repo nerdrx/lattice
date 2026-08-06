@@ -565,6 +565,178 @@ static void testCrossProcess() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. SharedState is a seqlock (shm v5)
+// ---------------------------------------------------------------------------
+//
+// The property under test is the one docs/GUI-ON-DAEMON.md §2.1 asks for and
+// step 1 could not have locally: a reader can take a snapshot of the WHOLE block
+// that provably came from one publish. Everything else in this file exercises
+// message delivery; this exercises coherence, which is a different failure and
+// an invisible one — a torn snapshot is not a lost message, it is a frame in
+// which a clip slot is drawn Playing with activeSlot == -1.
+//
+// The writer stamps every field it touches with the same publish number `k`, so
+// "coherent" has an exact meaning: every field the reader copied carries one
+// value of k. It then PARKS mid-publish, sequence held odd, which is what turns
+// the negative control from a statistical hope into a certainty — an unguarded
+// copy taken during the park has the new k in the transport fields and the old k
+// in the per-track arrays, every single time.
+//
+// The negative control is the load-bearing half. "readCoherent() never returned
+// a torn copy" proves nothing on its own if nothing was ever torn; the run has
+// to demonstrate that this writer tears an unguarded reader, and then that the
+// guarded reader on the same data does not.
+
+namespace seq {
+inline constexpr size_t kState = 0;
+inline constexpr size_t kDone  = ipc::alignUp(kState + sizeof(ipc::SharedState), ipc::kCacheLine);
+inline constexpr size_t kBytes = kDone + ipc::kCacheLine;
+inline constexpr u32    kHash  =
+    ipc::hashMix(ipc::fnv1a("nxtakt.ipc_test.seqlock.v1"), (u64)kBytes);
+
+// Every field the reader checks, stamped with the publish number. Chosen to
+// span the block: two before the writer's park and two after it, so a straddle
+// cannot hide.
+inline void stamp(ipc::SharedState& s, u64 k) {
+    s.beat.store((f64)k, std::memory_order_relaxed);
+    s.tempo.store((f64)k, std::memory_order_relaxed);
+}
+inline void stampLate(ipc::SharedState& s, u64 k) {
+    for (int t = 0; t < kMaxTracks; ++t) {
+        s.slotState[t].store((i32)k, std::memory_order_relaxed);
+        s.activeSlot[t].store((i32)k, std::memory_order_relaxed);
+    }
+    s.masterMeterL.store((f32)k, std::memory_order_relaxed);
+}
+
+// Copies the four sentinels out. Returns true if they agree, i.e. if the copy
+// came from one publish.
+struct Sample { f64 beat, tempo; i32 slot0, act31; f32 master; };
+inline void grab(const ipc::SharedState& s, Sample& o) {
+    o.beat   = s.beat.load(std::memory_order_relaxed);
+    o.tempo  = s.tempo.load(std::memory_order_relaxed);
+    o.slot0  = s.slotState[0].load(std::memory_order_relaxed);
+    o.act31  = s.activeSlot[kMaxTracks - 1].load(std::memory_order_relaxed);
+    o.master = s.masterMeterL.load(std::memory_order_relaxed);
+}
+inline bool agrees(const Sample& x) {
+    const f64 k = x.beat;
+    return x.tempo == k && (f64)x.slot0 == k && (f64)x.act31 == k && (f64)x.master == k;
+}
+} // namespace seq
+
+static void seqWriterMain() {
+    gOwnsShm = false;                     // the child never unlinks
+    gTag = "child ";
+    ipc::ShmRegion r;
+    if (!r.attach(gShmNameAlt, seq::kHash, ipc::kShmVersion, 2000)) ::_exit(11);
+    auto* s    = r.at<ipc::SharedState>(seq::kState);
+    auto* done = r.at<std::atomic<u32>>(seq::kDone);
+    if (!s || !done) ::_exit(12);
+
+    for (u64 k = 1; k <= 400; ++k) {
+        s->publishBegin();
+        seq::stamp(*s, k);
+        // The park. 200 us out of a 1 ms cadence: a fifth of the time this
+        // block is half-written, which no reader can miss and no reader may
+        // believe.
+        timespec park{0, 200000};
+        ::nanosleep(&park, nullptr);
+        seq::stampLate(*s, k);
+        s->publishEnd();
+        timespec gap{0, 800000};
+        ::nanosleep(&gap, nullptr);
+    }
+    done->store(1, std::memory_order_release);
+    ::_exit(0);
+}
+
+static void testStateSeqlock() {
+    banner("4b. SharedState is a seqlock: a snapshot cannot straddle a publish");
+
+    std::snprintf(gShmNameAlt, sizeof gShmNameAlt, "nxtakt-ipc-seq-%d", (int)::getpid());
+
+    ipc::ShmRegion r;
+    if (!r.create(gShmNameAlt, seq::kBytes, seq::kHash)) {
+        CHECK(false, "create: %s", r.error());
+        gShmNameAlt[0] = '\0';
+        return;
+    }
+    auto* s    = r.at<ipc::SharedState>(seq::kState);
+    auto* done = r.at<std::atomic<u32>>(seq::kDone);
+    if (!s || !done) {
+        CHECK(false, "layout did not fit in %zu payload bytes", r.payloadBytes());
+        gShmNameAlt[0] = '\0';
+        return;
+    }
+    s->init(48000.0, 256);
+    seq::stamp(*s, 0);
+    seq::stampLate(*s, 0);
+    done->store(0, std::memory_order_relaxed);
+    r.publishReady();
+
+    std::fflush(stdout);
+    const pid_t pid = ::fork();
+    if (pid == 0) seqWriterMain();
+    if (pid < 0) { CHECK(false, "fork failed: %s", std::strerror(errno)); gShmNameAlt[0] = '\0'; return; }
+
+    u64 guarded = 0, guardedTorn = 0, guardedGaveUp = 0;
+    u64 plain = 0, plainTorn = 0;
+    u64 sawOdd = 0;
+    const u64 deadline = ipc::monotonicNs() + 10ull * 1000000000ull;
+
+    while (done->load(std::memory_order_acquire) == 0 && ipc::monotonicNs() < deadline) {
+        // The negative control, first and on the same data: §2.1's own recipe
+        // without the parity gate is exactly a plain copy, and a plain copy is
+        // what step 1's local poll() has to live with.
+        seq::Sample p{};
+        seq::grab(*s, p);
+        ++plain;
+        if (!seq::agrees(p)) ++plainTorn;
+
+        if (s->generation.load(std::memory_order_relaxed) & 1ull) ++sawOdd;
+
+        seq::Sample g{};
+        const bool ok = s->readCoherent([&] { seq::grab(*s, g); });
+        ++guarded;
+        if (!ok) ++guardedGaveUp;
+        else if (!seq::agrees(g)) ++guardedTorn;
+    }
+
+    int wstat = 0;
+    ::waitpid(pid, &wstat, 0);
+    CHECK(WIFEXITED(wstat) && WEXITSTATUS(wstat) == 0,
+          "the writer exited cleanly (exited=%d status=%d)", WIFEXITED(wstat) != 0,
+          WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
+
+    CHECK(sawOdd > 0,
+          "the sequence was observed ODD, so publishBegin() really brackets the "
+          "publish (%llu of %llu samples)",
+          (unsigned long long)sawOdd, (unsigned long long)plain);
+    CHECK((s->generation.load() & 1ull) == 0,
+          "and EVEN once the writer is done, so publishEnd() closes it (%llu)",
+          (unsigned long long)s->generation.load());
+
+    // The negative control. Remove publishBegin() from the writer and this stays
+    // 0 while the check below starts failing — which is the same fact from the
+    // other side and the reason both are asserted.
+    CHECK(plainTorn > 0,
+          "an UNGUARDED copy of the same block tears: %llu of %llu samples "
+          "disagreed with themselves",
+          (unsigned long long)plainTorn, (unsigned long long)plain);
+    CHECK(guardedTorn == 0,
+          "readCoherent() never handed back a torn snapshot (%llu of %llu proved "
+          "coherent, %llu gave up on the retry budget)",
+          (unsigned long long)(guarded - guardedTorn - guardedGaveUp),
+          (unsigned long long)guarded, (unsigned long long)guardedGaveUp);
+    note("the writer parks 200 us mid-publish, so the unguarded tear rate is a "
+         "property of the test rather than of the machine it runs on.");
+
+    r.close();
+    gShmNameAlt[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
 // 5. stale-region reaping
 // ---------------------------------------------------------------------------
 
@@ -810,7 +982,7 @@ static void testArrangementClassifiers() {
           (unsigned long long)ipc::arrangementBytes(2, 1));
     CHECK(ipc::kMaxArrLanes == kMaxRtArrLanes,
           "the wire lane bound and the engine's agree (%d)", (int)ipc::kMaxArrLanes);
-    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 4,
+    CHECK(ipc::kProtocolVersion == 5 && ipc::kPoolVersion == 4 && ipc::kShmVersion == 6,
           "protocol v%u, pool v%u, shm v%u", ipc::kProtocolVersion, ipc::kPoolVersion,
           ipc::kShmVersion);
     CHECK(ipc::control::kJournal > ipc::control::kParams &&
@@ -1002,6 +1174,7 @@ int main() {
     testRegionBasics();
     testBackpressure();
     testCrossProcess();
+    testStateSeqlock();
     testStaleReap();
     testForgedRetirement();
     testAdoptedPoolLiveness();
