@@ -3,8 +3,9 @@
 # One job. It cross-compiles the headless subset with mingw-w64 and then
 # actually runs the engine test suite under Wine, so "the Windows build works"
 # stops being a claim about a compiler and starts being a claim about
-# behaviour: the same 199 assertions the Linux job checks, executed by a
-# Windows binary.
+# behaviour: the same assertions the Linux job checks, executed by a Windows
+# binary -- and the job proves it is the same set by building the suite both
+# ways and requiring the check counts to match exactly.
 #
 # Scope is deliberately narrow -- see the header of Makefile.mingw. The GUI is
 # not built (no Windows freetype/glew/sndfile/samplerate in apt, and app.cpp /
@@ -146,8 +147,51 @@ jobs:
       # which files make up engine_test and about the warning flags, and that
       # every path either one references exists. Cheap, and it is the only
       # thing stopping the two builds from silently testing different code.
+      # verify-sources compares the prerequisite lists of the two engine_test
+      # rules; verify-deps (which it now chains) walks the actual #include
+      # closure. The second exists because the first has a blind spot that cost
+      # six commits of red: tests/engine_test.cpp grew
+      # `#include "../src/audio/sample.cpp"` to reach detectTransients(), no
+      # rule changed, and the cross build silently lost the ability to find
+      # <sndfile.h>. Neither step needs a compiler, so both run before the
+      # toolchain can be the thing that fails.
       - name: Verify source lists against the native Makefile
         run: make -f Makefile.mingw verify-sources
+
+      # Proves tools/mingw-shim still describes the real libraries: the same
+      # assertions are compiled against the stubs and against upstream's
+      # headers, with the host g++. A check that only ever saw our own stubs
+      # would prove nothing.
+      - name: Install the real sndfile/samplerate headers (for the shim check)
+        run: sudo apt-get install -y --no-install-recommends libsndfile1-dev libsamplerate0-dev
+
+      - name: Verify the mingw shim matches upstream
+        run: make -f Makefile.mingw verify-shim
+
+      # Builds the SAME tests/engine_test.cpp natively, to get the number of
+      # checks it is supposed to run. tests/engine_test.cpp contains no _WIN32,
+      # __linux or __unix conditional -- grep it -- so the two builds compile
+      # byte-identical test code and any difference in the count is a defect,
+      # not a platform difference. That turns the truncation guard below from a
+      # hardcoded floor (written when the suite had 199 checks, and stale ever
+      # since: it is over 600 now, so "at least 199" would happily pass a run
+      # that died two thirds of the way through) into an exact equality against
+      # ground truth computed in the same job from the same source.
+      - name: Native reference count
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends liblilv-dev
+          make build/engine_test
+          ./build/engine_test > engine_test-native.txt || {
+            echo "::error::the suite fails natively on this runner -- fix that first;"
+            echo "::error::the Windows result below would be meaningless"
+            tail -30 engine_test-native.txt
+            exit 1
+          }
+          native=$(sed -n 's/^\([0-9]\+\) passed.*/\1/p' engine_test-native.txt)
+          [ -n "$native" ] || { echo "::error::could not read the native check count"; exit 1; }
+          echo "NATIVE_CHECKS=$native" >> "$GITHUB_ENV"
+          echo "native reference: $native checks"
 
       - name: Show cross-build configuration
         run: make -f Makefile.mingw config
@@ -232,14 +276,27 @@ jobs:
           }
           passed=$(sed -n 's/^\([0-9]\+\) passed.*/\1/p' engine_test-wine.txt)
           echo "checks passed under wine: ${passed:-none}"
-          if [ "${passed:-0}" -lt 199 ]; then
-            echo "::error::expected at least 199 checks, got ${passed:-0} -- the run was truncated"
+          if [ -z "${passed:-}" ]; then
+            echo "::error::the suite printed no summary line -- it died before finishing"
+            exit 1
+          fi
+          # Exact equality against the native run of the same source. Fewer
+          # means the Windows binary stopped early or skipped work; more would
+          # mean the two builds are not compiling the same tests at all, which
+          # is just as much a defect. Either way the number to look at is in the
+          # message.
+          if [ "$passed" -ne "$NATIVE_CHECKS" ]; then
+            echo "::error::Windows ran $passed checks, Linux ran $NATIVE_CHECKS from the same source"
+            echo "::error::the suite has no platform conditionals, so these must match"
+            diff <(grep -c . engine_test-native.txt) <(grep -c . engine_test-wine.txt) || true
             exit 1
           fi
           {
             echo "### Engine suite under Wine"
             echo ""
             echo "\`$("$WINE" --version)\` ran \`engine_test.exe\`: **${passed} checks passed, 0 failed**"
+            echo ""
+            echo "Matches the native run of the same source exactly (\`$NATIVE_CHECKS\` checks)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # always(), because a .exe that failed under wine is the one you most want

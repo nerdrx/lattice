@@ -8,7 +8,7 @@
 #
 # What this builds
 # ----------------
-#   build-mingw/engine_test.exe        the full 199-check engine suite, linked
+#   build-mingw/engine_test.exe        the engine suite -- the whole of it, linked
 #                                      fully static so `wine engine_test.exe`
 #                                      needs no DLLs next to it.
 #   build-mingw/obj/src/ui/window_win32.o        compile-only, never linked.
@@ -41,6 +41,8 @@
 # so the lists cannot drift apart unnoticed.
 
 CROSS    ?= x86_64-w64-mingw32
+# Host compiler, used only by verify-shim -- see that target.
+NATIVE_CXX ?= g++
 CXX      := $(CROSS)-g++
 BUILD    := build-mingw
 OBJDIR   := $(BUILD)/obj
@@ -72,7 +74,28 @@ WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 WINDEFS  := -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 \
             -D__USE_MINGW_ANSI_STDIO=1
 
-CXXFLAGS := -std=c++20 -fno-math-errno $(WARN) $(WINDEFS) -Ivendor/clap/include -MMD -MP
+# -Itools/mingw-shim supplies <sndfile.h> and <samplerate.h> as compile-only
+# stubs whose every entry point aborts. tests/engine_test.cpp includes
+# src/audio/sample.cpp to reach detectTransients() -- pure in-memory DSP -- and
+# that TU happens to share a file with loadSample(), which reads with libsndfile
+# and resamples with libsamplerate. Neither is packaged cross-built for mingw on
+# any runner image, so the whole cross build stopped compiling the moment that
+# include landed, for a dependency the Windows suite never calls.
+#
+# The stubs cannot fake a pass: reaching one prints which function it was and
+# calls abort(). `verify-shim` compiles the same assertions against both the
+# stubs and the real headers, so they cannot drift from upstream unnoticed.
+# Delete the flag and this directory the day apt ships the real cross builds --
+# the workflow prints, every run, whether that has happened.
+SHIM_INC := -Itools/mingw-shim
+
+# Libraries the cross build satisfies with a shim rather than a real package.
+# verify-sources fails if tests/engine_test.cpp's include closure grows a
+# third-party dependency that is not on this list.
+SHIMMED  := samplerate.h sndfile.h
+
+CXXFLAGS := -std=c++20 -fno-math-errno $(WARN) $(WINDEFS) -Ivendor/clap/include \
+            $(SHIM_INC) -MMD -MP
 
 ifeq ($(MAKECMDGOALS),debug)
   CXXFLAGS += -O0 -g3 -fno-omit-frame-pointer -DLAT_DEBUG=1
@@ -102,7 +125,7 @@ DEP      := $(TEST_OBJ:.o=.d) $(WIN_ONLY_OBJ:.o=.d)
 
 EXE      := $(BUILD)/engine_test.exe
 
-.PHONY: all debug check clean config verify-sources winobjs
+.PHONY: all debug check clean config verify-sources verify-deps verify-shim winobjs
 
 all: $(EXE) winobjs
 debug: all
@@ -160,6 +183,65 @@ verify-sources:
 	  test -f "$$f" || { echo "*** missing source: $$f"; exit 1; }; \
 	done
 	@echo "every referenced source exists"
+	@$(MAKE) -s -f Makefile.mingw verify-deps
+
+# The check the two above could not make.
+#
+# Comparing prerequisite lists proves the native and cross builds compile the
+# same FILES. It says nothing about what those files include -- and that is the
+# gap the Windows job actually fell through. tests/engine_test.cpp grew
+#
+#     #include "../src/audio/sample.cpp"
+#
+# to reach detectTransients(). No rule changed, so verify-sources stayed happy
+# through six commits of red, while the cross build had been unable to find
+# <sndfile.h> the entire time.
+#
+# So: derive the dependencies from the sources instead of from the makefile.
+# tools/scan_deps.sh walks the transitive #include closure and prints every
+# third-party header in it; anything not on $(SHIMMED) is a library the cross
+# build has no way to satisfy, and the failure is reported here, by name, in a
+# step that runs before the compiler and needs no toolchain to run at all.
+verify-deps:
+	@mkdir -p $(BUILD)
+	@tools/scan_deps.sh $(TEST_SRC) | sort -u > $(BUILD)/.deps-found
+	@printf '%s\n' $(SHIMMED) | sort -u > $(BUILD)/.deps-allowed
+	@if comm -23 $(BUILD)/.deps-found $(BUILD)/.deps-allowed | grep -q .; then \
+	  echo "*** engine_test's include closure needs libraries the cross build cannot satisfy:"; \
+	  comm -23 $(BUILD)/.deps-found $(BUILD)/.deps-allowed | sed 's/^/      /'; \
+	  echo ""; \
+	  echo "    Each of these arrived through an #include, not through a link line,"; \
+	  echo "    which is why the source lists still match. Options, best first:"; \
+	  echo "      1. do not pull that TU into engine_test -- move the function the"; \
+	  echo "         tests need into a header or a TU without the dependency;"; \
+	  echo "      2. add a compile-only stub under tools/mingw-shim and list it in"; \
+	  echo "         SHIMMED, if the Windows suite provably never calls into it;"; \
+	  echo "      3. vendor a real cross-built library and link it."; \
+	  exit 1; \
+	fi
+	@echo "third-party deps in engine_test's closure: $$(cat $(BUILD)/.deps-found | tr '\n' ' ')(all shimmed)"
+
+# Compiles tools/mingw-shim/verify_shim.cpp twice -- against the stubs and
+# against the real headers -- so the stubs cannot drift from upstream. Uses the
+# NATIVE compiler on purpose: it is a statement about the headers, not about
+# code generation, and it must run on a developer box with no mingw installed.
+# Skipped with a clear message, never silently, if the real headers are absent.
+verify-shim:
+	@mkdir -p $(BUILD)
+	@$(NATIVE_CXX) -std=c++20 -Itools/mingw-shim -fsyntax-only \
+	   tools/mingw-shim/verify_shim.cpp \
+	  || { echo "*** the mingw shim headers do not satisfy their own assertions"; exit 1; }
+	@echo "shim headers: assertions hold"
+	@if pkg-config --exists sndfile samplerate; then \
+	  $(NATIVE_CXX) -std=c++20 $$(pkg-config --cflags sndfile samplerate) \
+	     -fsyntax-only tools/mingw-shim/verify_shim.cpp \
+	    || { echo "*** the shim has drifted from the real libsndfile/libsamplerate headers"; \
+	         echo "    the static_assert above names the member or signature that moved"; \
+	         exit 1; }; \
+	  echo "real headers: same assertions hold -- shim matches upstream"; \
+	else \
+	  echo "real headers: libsndfile/libsamplerate not installed, upstream half skipped"; \
+	fi
 
 clean:
 	rm -rf $(BUILD)
@@ -185,7 +267,15 @@ $(BUILD)/render.exe: $(RENDER_SRC)
 	  echo "render.exe needs WIN_DEPS=/path/to/win32/sysroot (sndfile+samplerate)"; \
 	  exit 1; }
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -I$(WIN_DEPS)/include $(RENDER_SRC) -o $@ \
+	@# SHIM_INC is filtered out deliberately, and this is not a nicety. Include
+	@# directories are searched left to right, and SHIM_INC sits early in
+	@# CXXFLAGS, so leaving it in would shadow the real sndfile.h/samplerate.h
+	@# in $(WIN_DEPS)/include with the abort-on-call stubs. render.exe genuinely
+	@# reads and resamples files: it would build, link against a real libsndfile
+	@# it never calls, and die on the first loadSample() with a shim message --
+	@# for a target whose whole point is that the real libraries are present.
+	$(CXX) $(filter-out $(SHIM_INC),$(CXXFLAGS)) -I$(WIN_DEPS)/include \
+	  $(RENDER_SRC) -o $@ \
 	  -mconsole -static-libgcc -static-libstdc++ \
 	  -L$(WIN_DEPS)/lib -lsndfile -lsamplerate
 
