@@ -7,6 +7,11 @@
 #include "session.h"
 #include "../audio/backend.h"
 #include "../audio/midi_in.h"
+// Remote control (the append-only block at the end of class App). Both are
+// self-contained: learn.h reaches no further than MidiMsg, osc.h no further
+// than core/. Neither knows this header exists.
+#include "../control/learn.h"
+#include "../control/osc.h"
 #include "../gfx/renderer.h"
 #include "widgets.h"
 #include "window.h"
@@ -611,6 +616,103 @@ private:
     f32  peakHoldM_[2]{};
     f64  lastFrameTime_ = 0.0;
     f32  fps_ = 0.f;
+
+    // =======================================================================
+    // REMOTE CONTROL: MIDI-learn + OSC   (src/control/learn.h, src/control/osc.h)
+    //
+    // One block, appended whole, so it can be moved or merged in one piece.
+    // Everything here is GUI thread. The two transports each hand their work
+    // across a lock-free ring; nothing off the GUI thread ever touches ses_.
+    //
+    // WHY THE APPLY PATH GOES THROUGH App AND NOT THROUGH THE ENGINE DIRECTLY:
+    // a mapped knob has to behave exactly like a mouse-moved one, which means
+    // the model is written, the engine command is sent, an undo entry is taken
+    // for the gesture (one, not one per message) and autoCapture is told — in
+    // that order and from one place. Sending Cmd::TrackVol straight from the
+    // mapping layer would give a fader that moves, an undo that cannot bring it
+    // back, an automation arm that records nothing, and a UI showing the old
+    // value. See applyControl.
+    // =======================================================================
+public:
+    // The MAPPING LAYER'S entry point, public so it can be driven either by
+    // drainControlInput() below (which is what happens today) or straight from
+    // a per-frame MIDI handler in a translation unit this half does not own.
+    // Returns true when the control layer consumed the message.
+    bool routeControlMidi(const MidiMsg& m);
+    // Called once per frame from drawControlBar(): drains the reader-thread
+    // MIDI tap and the OSC ring, and ages out a control gesture that has gone
+    // quiet. Lives on the draw path deliberately — see the report; it is what
+    // keeps this feature down to ONE line of wiring in a file it does not own.
+    void drainControlInput();
+    // The gesture id of the control move in flight, 0 when none. Exposed so
+    // that app_engine.cpp's automation-pass tick can recognise a MIDI/OSC
+    // gesture as a gesture — it currently only knows about ui_.active, so a
+    // pass driven from here is finished and restarted once a frame. Harmless
+    // but chatty; see the report for the one-line fix.
+    u64  controlGesture() const { return ctlGesture_; }
+    // Arms MIDI-learn for an address, or (when it is already armed for that
+    // address, or already bound) cancels / clears it. The one gesture the
+    // device panel offers, because this codebase has no popup-menu machinery
+    // and inventing some for three states would be the larger change.
+    void cycleMidiLearn(const std::string& address);
+    const ctl::MidiMap& midiMap() const { return midiMap_; }
+
+private:
+    // A resolved control: everything applyControl needs, in the TARGET's own
+    // units. Kinds this does not list are addresses that parse and resolve to
+    // nothing, which PARAM-ADDRESS.md requires to be silently inert.
+    struct ControlRef {
+        enum class Kind {
+            None, TrackVol, TrackPan, TrackSend, TrackMute, TrackSolo, TrackArm,
+            DeviceParam, SceneLaunch
+        } kind = Kind::None;
+        int track = -1;                 // index into ses_.tracks
+        int sendIndex = -1;
+        int devIndex = -1, paramIndex = -1;
+        int scene = -1;
+        f32 lo = 0.f, hi = 1.f;         // the target's range, target units
+        f32 value = 0.f;                // its value right now, target units
+        bool isBool = false;
+        const char* label = "control";  // the undo entry's name
+    };
+    bool resolveControl(const std::string& address, ControlRef& out) const;
+    // Writes `value` (TARGET units) the way the widget for that control does.
+    // `gesture` identifies the physical control, so a knob sweep coalesces into
+    // one undo entry exactly as a drag does. False when the address names
+    // nothing today.
+    bool applyControl(const std::string& address, f32 value, u64 gesture);
+    bool applyControlHit(const ctl::Hit& h);
+    void routeControlOsc(const ctl::OscHit& h);
+    void ctlEnsureInit();               // lazy: first frame loads the map, starts OSC
+    void ctlSaveMap();
+    // Headless verification hook (NXTAKT_DEBUG_MIDIMAP=<scratch conf path>), in
+    // the shape of debugUndoSelfTest and the NXTAKT_DEBUG_ADDFX hook: nothing
+    // can turn a knob on a controller inside gamescope, and the MIDI half of
+    // this feature is otherwise unreachable from a screenshot. It drives the
+    // REAL path — the reader-thread ring, consume(), applyControlHit — against
+    // whatever set is loaded, and writes its map to the path the variable
+    // names rather than to the user's own. Once per run.
+    void debugMidiMapSelfTest();
+
+    ctl::MidiMap   midiMap_;
+    ctl::OscServer osc_;
+    std::string    ctlMapPath_;
+    bool ctlInit_ = false;
+    // False once midimap.conf has failed to parse. A save would then overwrite
+    // a file we did not understand with a table we built from the half of it we
+    // did — which is how someone loses a mapping they spent an evening on.
+    bool ctlMapReadable_ = true;
+    // The control gesture in flight and when it was last fed. A MIDI knob has
+    // no mouse-up, so a gesture ends by going quiet; kCtlGestureGap is longer
+    // than the gap between two messages of one sweep and far shorter than the
+    // pause between two deliberate moves.
+    u64  ctlGesture_ = 0;
+    f64  ctlGestureAt_ = 0.0;
+    static constexpr f64 kCtlGestureGap = 0.35;
+    u64  ctlApplied_ = 0;               // hits that moved something
+    u64  ctlInert_   = 0;               // hits whose address resolved to nothing
+    f64  ctlFlashAt_ = 0.0;             // last apply, for the status chip's blink
+    // === end remote-control block ==========================================
 };
 
 } // namespace lat

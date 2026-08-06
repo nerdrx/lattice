@@ -476,8 +476,12 @@ void App::drawDeviceStrip(const Rect& r) {
             // gesture, so one drag is one pass and one undo entry.
             const u64 wid = uiId(12, (int)i * 256 + p, 0);
             const bool ownTrack = ownIsTrack(devOwner_);
+            // Hoisted out of the two branches because the MIDI-learn affordance
+            // below has to decorate whichever control this parameter got.
+            const Rect tg{cell.cx() - 11 * s, cell.y + 8 * s, 22 * s, 14 * s};
+            const Rect kr{cell.cx() - 16 * s, cell.y + 2 * s, 32 * s, 32 * s};
+            const Rect ctrlR = info.isBool ? tg : kr;
             if (info.isBool) {
-                Rect tg{cell.cx() - 11 * s, cell.y + 8 * s, 22 * s, 14 * s};
                 bool on = d.inst->getParam(p) > 0.5f;
                 if (ui_.squareToggle(wid, tg, "", &on, pal::accent)) {
                     undoPoint(info.name.c_str());
@@ -488,7 +492,6 @@ void App::drawDeviceStrip(const Rect& r) {
                                     nv, wid);
                 }
             } else {
-                Rect kr{cell.cx() - 16 * s, cell.y + 2 * s, 32 * s, 32 * s};
                 f32 v = d.inst->getParam(p);
                 if (ui_.knob(wid, kr, &v, info.min, info.max,
                              info.def, info.isInt ? "%.0f" : "%.2f")) {
@@ -498,6 +501,49 @@ void App::drawDeviceStrip(const Rect& r) {
                         autoCapture(addr::deviceParam(ses_.tracks[devOwner_].uid, d.uid, info.id),
                                     v, wid);
                 }
+            }
+
+            // --- MIDI learn ------------------------------------------------
+            // RIGHT-CLICK CYCLES: unmapped -> learning -> mapped -> unmapped.
+            // Not a popup menu, and deliberately: this program has no popup
+            // machinery at all, and the existing idiom for "the other thing a
+            // control can do" is already the right button (Ui::selector steps
+            // backwards on it, the piano roll deletes with it). Inventing a
+            // menu system for three states would be the larger change and the
+            // one that looks foreign. The three states are legible without it
+            // — a dot means mapped, a pulsing ring means listening — and the
+            // status bar spells out what the next right-click will do.
+            //
+            // Only a TRACK's devices can be mapped: the address grammar has no
+            // return or master scope, so a return's knob has no address to bind
+            // and says so rather than doing nothing.
+            const bool overCell = ui_.hovered(cell) && rend_.currentClip().contains(in.mx, in.my);
+            // Costs a string only when there is something to say: no bindings
+            // and no pointer here means no address is ever built.
+            if (ownTrack && (midiMap_.size() || overCell)) {
+                const std::string pa =
+                    addr::deviceParam(ses_.tracks[devOwner_].uid, d.uid, info.id);
+                const bool learning = midiMap_.learningFor(pa);
+                const bool bound = midiMap_.findAddress(pa) >= 0;
+                if (learning) {
+                    // Accent purple, pulsing — the same light the MAP chip in
+                    // the control bar wears while it is armed.
+                    const f32 pulse = 0.5f + 0.5f * (f32)std::sin(nowSeconds() * 6.2831853 * 1.6);
+                    rend_.roundRectOutline(ctrlR.insetXY(-3 * s, -3 * s), 5 * s, 1.5f * s,
+                                           pal::accentHi.alpha(0.30f + 0.70f * pulse));
+                } else if (bound) {
+                    rend_.circle(ctrlR.right() + 1 * s, ctrlR.y + 1 * s, 2.2f * s, pal::accentHi);
+                }
+                if (overCell) {
+                    ui_.tip = learning ? "MIDI learn: move a control on your surface "
+                                         "(right-click again to cancel)"
+                            : bound    ? "MIDI-mapped — right-click to clear the mapping"
+                                       : "Right-click to MIDI-learn this parameter";
+                    if (in.pressed[2]) cycleMidiLearn(pa);
+                }
+            } else if (!ownTrack && overCell && in.pressed[2]) {
+                status_ = "Only a track's devices can be MIDI-mapped - the address "
+                          "space has no return or master scope";
             }
 
             rend_.pushClip(lbl);
